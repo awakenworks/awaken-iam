@@ -1,0 +1,41 @@
+# cargo-deny configuration.
+#
+# Enforces license policy, advisory hygiene, and architectural dependency
+# boundaries. Run with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Document each ignored advisory with a reason and a removal condition.
+    # Example:
+    # { id = "RUSTSEC-0000-0000", reason = "transitive, no fix available yet" },
+]
+
+[licenses]
+version = 2
+# Explicit allowlist: exactly the licenses the current dependency graph uses.
+# Add licenses deliberately as new dependencies introduce them, never with a
+# blanket "allow all".
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# Architectural dependency boundaries are enforced by `xtask guardrail-lints`;
+# keep this cargo-deny file focused on third-party dependency policy until a
+# deny-rule can express the workspace-specific IAM constraints.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

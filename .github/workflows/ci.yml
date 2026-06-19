@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    name: Governance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tracked files
+        id: files
+        run: echo "list=$(git ls-files)" >> "$GITHUB_OUTPUT"
+      - name: Root docs
+        run: python3 scripts/ci/check_root_docs.py ${{ steps.files.outputs.list }}
+      - name: Doc links
+        run: python3 scripts/ci/check_doc_links.py ${{ steps.files.outputs.list }}
+      - name: ADR metadata
+        run: python3 scripts/ci/check_adr.py ${{ steps.files.outputs.list }}
+      - name: ADR immutability
+        run: |
+          python3 scripts/ci/check_adr_immutability.py --self-test
+          python3 scripts/ci/check_adr_immutability.py --base "origin/${{ github.base_ref || 'main' }}"
+      - name: Secrets
+        run: python3 scripts/ci/check_secrets.py ${{ steps.files.outputs.list }}
+      - name: Hidden Unicode
+        run: python3 scripts/ci/check_hidden_unicode.py ${{ steps.files.outputs.list }}
+      - name: Open-core boundary
+        run: |
+          python3 scripts/ci/check_open_core_boundary.py --self-test
+          python3 scripts/ci/check_open_core_boundary.py
+
+  msrv:
+    name: MSRV (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check on the minimum supported Rust version
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 check --workspace --locked
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+      - name: Test
+        run: cargo test --workspace
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2

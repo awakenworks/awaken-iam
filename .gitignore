@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/target/
+rust_out
+*.rs.bk
+
+# Node / frontend
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+.astro/
+.next/
+.turbo/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Tooling / runtime state
+.claude/
+.oversight/
+.playwright-mcp/
+.sigdiff/
+.worktrees/
+sessions/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Generated docs artifacts
+docs/**/*.generated.*
