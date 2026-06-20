@@ -1,13 +1,31 @@
 //! Core IAM evaluation primitives.
 
+mod login;
+
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+
+pub use login::{
+    BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
+    OsEntropy, PkceChallenge, PkceMethod,
+};
 
 use awaken_iam_contract::{
     Account, AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
     ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject,
     IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, Session, SessionId, Timestamp,
 };
+
+/// Identifies which bound login value failed verification on callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginBinding {
+    /// The opaque OAuth `state` value.
+    State,
+    /// The OIDC `nonce` value.
+    Nonce,
+    /// The PKCE code verifier.
+    PkceVerifier,
+}
 
 /// Errors returned by IAM evaluation.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -55,6 +73,21 @@ pub enum IamError {
     #[error("login state has expired")]
     LoginStateExpired {
         /// Expired login-state id.
+        id: OAuthLoginStateId,
+    },
+    /// A presented login binding (state, nonce, or PKCE verifier) did not match
+    /// the value bound when the challenge was issued.
+    #[error("login state binding mismatch: {binding:?}")]
+    LoginStateMismatch {
+        /// Login-state id whose binding failed to verify.
+        id: OAuthLoginStateId,
+        /// Which bound value failed verification.
+        binding: LoginBinding,
+    },
+    /// The requested login window was not a valid forward-going TTL.
+    #[error("login state window is invalid")]
+    InvalidLoginWindow {
+        /// Login-state id with the rejected window.
         id: OAuthLoginStateId,
     },
     /// A session with this id already exists.
