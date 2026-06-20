@@ -4,3 +4,4 @@
 - [IAM model](iam-model.md)
 - [Authorization engine](authorization-engine.md)
 - [Entitlement plane](entitlement-plane.md)
+- [Consumer integration boundary](consumer-integration.md)
