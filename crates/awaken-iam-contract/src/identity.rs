@@ -265,6 +265,43 @@ impl OpenIdProviderMetadata {
     }
 }
 
+/// A single public signing key published in the [`Jwks`] document.
+///
+/// IAM signs access tokens asymmetrically and exposes only the public half here,
+/// so verifiers (product services) fetch keys from `/.well-known/jwks.json`
+/// rather than sharing a secret. This is the RFC 7517 JWK shape for the
+/// `OKP`/`Ed25519` curve used by the `EdDSA` access-token algorithm; the private
+/// seed never leaves the signing store. `kid` selects the key a token was signed
+/// with so the publisher can rotate keys while old tokens still verify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonWebKey {
+    /// Key type. `OKP` (octet key pair) for Edwards-curve keys.
+    pub kty: String,
+    /// Curve identifier. `Ed25519` for the access-token signing curve.
+    pub crv: String,
+    /// Base64url (no padding) encoding of the 32-byte public key.
+    pub x: String,
+    /// Key id matching the `kid` header of tokens signed with this key.
+    pub kid: String,
+    /// Intended key use. `sig` for signature verification.
+    #[serde(rename = "use")]
+    pub key_use: String,
+    /// Algorithm the key is used with. `EdDSA` for Ed25519 access tokens.
+    pub alg: String,
+}
+
+/// JSON Web Key Set served at `GET /.well-known/jwks.json` (RFC 7517).
+///
+/// Carries every signing key still trusted for verification — the active key
+/// plus any rotated-but-not-yet-pruned predecessors — so a verifier can check a
+/// token minted just before a rotation. Pruning a key drops it from this set and
+/// retires the tokens it signed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jwks {
+    /// The published public keys, newest first.
+    pub keys: Vec<JsonWebKey>,
+}
+
 /// OIDC UserInfo claims returned by `GET /v1/oauth/userinfo`.
 ///
 /// `sub` is IAM's own stable subject for the authenticated account, never the
