@@ -1,11 +1,17 @@
 //! Core IAM evaluation primitives.
 
+mod fake_provider;
 mod login;
 mod provider;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+pub use fake_provider::{
+    AuthorizeRedirect, AuthorizeRequest, FailureMode, FakeOidcProvider, FakeUser, IdTokenClaims,
+    JsonWebKey, JsonWebKeySet, OidcDiscoveryDocument, OidcError, TokenRequest, TokenResponse,
+    UserInfoResponse,
+};
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
     OsEntropy, PkceChallenge, PkceMethod,
