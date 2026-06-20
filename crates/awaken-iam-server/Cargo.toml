@@ -13,5 +13,8 @@ awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

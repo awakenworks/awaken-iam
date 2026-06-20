@@ -11,7 +11,7 @@ pub use identity::{
     Account, AccountStatus, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
     ExternalIdentityKey, ExternalSubject, IdentityProviderConfig, IdentityProviderConfigId,
     IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId, Session,
-    SessionId, Timestamp,
+    SessionId, SessionView, Timestamp,
 };
 
 /// Global account identifier.
@@ -136,6 +136,28 @@ mod tests {
         };
         let json = serde_json::to_value(account).unwrap();
         assert!(json.get("email").is_none());
+    }
+
+    #[test]
+    fn session_view_omits_token_hash() {
+        let session = Session {
+            id: SessionId("sess_1".into()),
+            account_id: AccountId("acct_1".into()),
+            token_hash: "secret-token-hash".into(),
+            external_identity_id: Some(ExternalIdentityId("ext_1".into())),
+            created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            last_seen_at: Timestamp("2026-06-19T00:05:00Z".into()),
+            expires_at: Timestamp("2026-06-20T00:00:00Z".into()),
+            revoked_at: None,
+        };
+        let view = SessionView::from(&session);
+        assert_eq!(view.session_id, session.id);
+        assert_eq!(view.account_id, session.account_id);
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("secret-token-hash"));
+        assert!(!json.contains("token_hash"));
+        assert!(json.contains("sess_1"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod fake_provider;
 mod login;
 mod provider;
+mod session;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -20,6 +21,7 @@ pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,
 };
+pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 
 use awaken_iam_contract::{
     Account, AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
@@ -100,6 +102,12 @@ pub enum IamError {
     InvalidLoginWindow {
         /// Login-state id with the rejected window.
         id: OAuthLoginStateId,
+    },
+    /// The requested session window was not a valid forward-going TTL.
+    #[error("session window is invalid")]
+    InvalidSessionWindow {
+        /// Session id with the rejected window.
+        id: SessionId,
     },
     /// A session with this id already exists.
     #[error("session already exists")]
@@ -240,6 +248,10 @@ impl IdentityDirectory {
 pub struct SessionDirectory {
     login_states: HashMap<OAuthLoginStateId, OAuthLoginState>,
     sessions: HashMap<SessionId, Session>,
+    /// Secondary index from session `token_hash` to session id, so a presented
+    /// bearer token (the cookie value, hashed) resolves to its session without
+    /// scanning. Populated on [`SessionDirectory::create_session`].
+    sessions_by_token_hash: HashMap<String, SessionId>,
 }
 
 impl SessionDirectory {
@@ -294,11 +306,16 @@ impl SessionDirectory {
 
     /// Persist a newly established session.
     ///
-    /// Each session id may be created only once.
+    /// Each session id may be created only once. The session's `token_hash` is
+    /// indexed so the session can later be resolved from a presented bearer
+    /// token.
     pub fn create_session(&mut self, session: Session) -> Result<(), IamError> {
         match self.sessions.entry(session.id.clone()) {
             Entry::Vacant(entry) => {
+                let token_hash = session.token_hash.clone();
+                let id = session.id.clone();
                 entry.insert(session);
+                self.sessions_by_token_hash.insert(token_hash, id);
                 Ok(())
             }
             Entry::Occupied(entry) => Err(IamError::DuplicateSession {
@@ -310,6 +327,31 @@ impl SessionDirectory {
     /// Resolve a session by id without checking its liveness.
     pub fn session(&self, id: &SessionId) -> Option<&Session> {
         self.sessions.get(id)
+    }
+
+    /// Resolve the session id bound to a `token_hash` without checking liveness.
+    pub fn session_id_for_token_hash(&self, token_hash: &str) -> Option<&SessionId> {
+        self.sessions_by_token_hash.get(token_hash)
+    }
+
+    /// Authenticate a session by its bearer `token_hash`, refreshing activity.
+    ///
+    /// Resolves the session bound to the presented token hash, then applies the
+    /// same liveness rules as [`SessionDirectory::authenticate`]. An unknown
+    /// token hash fails closed as [`IamError::SessionNotFound`].
+    pub fn authenticate_by_token_hash(
+        &mut self,
+        token_hash: &str,
+        now: Timestamp,
+    ) -> Result<&Session, IamError> {
+        let id = self
+            .sessions_by_token_hash
+            .get(token_hash)
+            .cloned()
+            .ok_or_else(|| IamError::SessionNotFound {
+                id: SessionId(String::new()),
+            })?;
+        self.authenticate(&id, now)
     }
 
     /// Authenticate a session, refreshing its `last_seen_at` activity stamp.
