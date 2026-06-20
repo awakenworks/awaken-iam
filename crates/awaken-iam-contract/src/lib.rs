@@ -95,17 +95,52 @@ pub enum ScopeRef {
 pub struct ActionKey(pub String);
 
 /// Authorization request.
+///
+/// A request carries a principal *chain*: [`AuthorizationRequest::principal`] is
+/// the acting caller, and [`AuthorizationRequest::on_behalf_of`] holds any
+/// further links for delegated / on-behalf-of dispatch (for example an agent
+/// acting for a human, `[human, agent]`). The chain is conjunctive — every link
+/// must be authorized for the request to be allowed. A direct caller leaves
+/// `on_behalf_of` empty, which is the common case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
-    /// Requesting principal.
+    /// Acting principal (the head of the principal chain).
     pub principal: PrincipalRef,
+    /// Additional principals the caller acts on behalf of, evaluated
+    /// conjunctively with `principal`. Empty for a direct caller.
+    #[serde(default)]
+    pub on_behalf_of: Vec<PrincipalRef>,
     /// Action being performed.
     pub action: ActionKey,
     /// Target scope.
     pub scope: ScopeRef,
 }
 
+impl AuthorizationRequest {
+    /// Build a direct (single-principal) request with an empty delegation chain.
+    pub fn direct(principal: PrincipalRef, action: ActionKey, scope: ScopeRef) -> Self {
+        Self {
+            principal,
+            on_behalf_of: Vec::new(),
+            action,
+            scope,
+        }
+    }
+
+    /// Iterate the full principal chain, acting principal first followed by each
+    /// on-behalf-of link in order.
+    pub fn principal_chain(&self) -> impl Iterator<Item = &PrincipalRef> {
+        std::iter::once(&self.principal).chain(self.on_behalf_of.iter())
+    }
+}
+
 /// Authorization decision.
+///
+/// The decision is three-valued. [`AuthorizationDecision::RequireApproval`] is a
+/// real outcome distinct from allow and deny: IAM decides that the action is
+/// permitted only once an approval step completes, and the caller executes that
+/// approval (prompt, pause, resume). Precedence is
+/// `deny > require_approval > allow > default-deny`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorizationDecision {
@@ -113,6 +148,8 @@ pub enum AuthorizationDecision {
     Allow,
     /// The operation is denied.
     Deny,
+    /// The operation is permitted only after the caller completes an approval.
+    RequireApproval,
 }
 
 /// Entitlement request for account-tier/product-plan checks.
@@ -139,6 +176,44 @@ pub enum EntitlementDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_request_defaults_to_an_empty_delegation_chain() {
+        // A payload written before on-behalf-of existed still deserializes, and
+        // the principal chain is just the acting principal.
+        let json = r#"{"principal":{"kind":"account","account_id":"ada"},
+            "action":"pack.read","scope":{"kind":"global"}}"#;
+        let request: AuthorizationRequest = serde_json::from_str(json).unwrap();
+        assert!(request.on_behalf_of.is_empty());
+        let chain: Vec<&PrincipalRef> = request.principal_chain().collect();
+        assert_eq!(chain, vec![&request.principal]);
+    }
+
+    #[test]
+    fn principal_chain_orders_caller_before_delegates() {
+        let human = PrincipalRef::Account {
+            account_id: AccountId("ada".into()),
+        };
+        let agent = PrincipalRef::Service {
+            service_id: "agent".into(),
+        };
+        let request = AuthorizationRequest {
+            principal: agent.clone(),
+            on_behalf_of: vec![human.clone()],
+            action: ActionKey("issue.close".into()),
+            scope: ScopeRef::Global,
+        };
+        let chain: Vec<&PrincipalRef> = request.principal_chain().collect();
+        assert_eq!(chain, vec![&agent, &human]);
+    }
+
+    #[test]
+    fn authorization_decision_is_three_valued() {
+        let json = serde_json::to_string(&AuthorizationDecision::RequireApproval).unwrap();
+        assert_eq!(json, "\"require_approval\"");
+        let restored: AuthorizationDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, AuthorizationDecision::RequireApproval);
+    }
 
     #[test]
     fn scope_ref_serializes_with_kind_tag() {

@@ -220,6 +220,7 @@ mod tests {
             principal: PrincipalRef::Account {
                 account_id: AccountId("ada".into()),
             },
+            on_behalf_of: Vec::new(),
             action: ActionKey("issue.close".into()),
             scope: ScopeRef::Resource {
                 resource_type: ResourceType("issue".into()),

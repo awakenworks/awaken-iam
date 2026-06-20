@@ -3,8 +3,14 @@
 //! Implements the `Principal + Action + Scope -> Decision` shape described in
 //! the IAM model and the authorization-engine design. Evaluation is
 //! default-deny: a request is allowed only when at least one matching grant
-//! (held directly by the principal or through a role binding) permits it, and
-//! deny effects take precedence over allow.
+//! (held directly by the principal or through a role binding) permits it.
+//!
+//! A request carries a conjunctive principal *chain* (length one for a direct
+//! caller, longer for on-behalf-of dispatch such as `[human, agent]`): every
+//! link must be permitted. The decision is three-valued —
+//! `Allow | Deny | RequireApproval` — under the precedence
+//! `deny > require_approval > allow > default-deny`. An empty chain is denied as
+//! `principal_unresolved`; no principal ever means allow.
 //!
 //! The evaluator resolves the scope graph
 //! (`global -> org -> namespace/workspace -> project`) so a grant issued at a
@@ -35,15 +41,21 @@ pub struct GrantId(pub String);
 
 /// Effect of a grant.
 ///
-/// v1 policy is expected to issue only [`Effect::Allow`]; introducing deny
-/// grants in stored policy requires a future ADR. The evaluator still models
-/// [`Effect::Deny`] so the precedence seam (deny overrides allow) exists from
-/// the start and does not need to be retrofitted.
+/// v1 policy is expected to issue [`Effect::Allow`] and
+/// [`Effect::RequireApproval`]; introducing deny grants in stored policy
+/// requires a future ADR. The evaluator still models [`Effect::Deny`] so the
+/// precedence seam (deny overrides everything) exists from the start and does
+/// not need to be retrofitted.
+///
+/// Precedence among matching grants is `Deny > RequireApproval > Allow`,
+/// mirroring the three-valued decision lattice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// Permit the action.
     Allow,
-    /// Forbid the action, overriding any matching allow.
+    /// Permit the action only after the caller completes an approval step.
+    RequireApproval,
+    /// Forbid the action, overriding any matching allow or approval grant.
     Deny,
 }
 
@@ -99,7 +111,7 @@ pub struct Grant {
     /// Scope at which the grant is issued; it covers this scope and everything
     /// beneath it in the scope graph.
     pub scope: ScopeRef,
-    /// Whether the grant allows or denies.
+    /// Whether the grant allows, requires approval, or denies.
     pub effect: Effect,
 }
 
@@ -120,12 +132,20 @@ pub struct RoleBinding {
 /// Stable reason code explaining an authorization decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionReason {
-    /// At least one allow grant matched and no deny grant overrode it.
+    /// Every principal in the chain was allowed and none required approval.
     AllowedByGrant,
-    /// A deny grant matched and took precedence over any allow.
+    /// At least one principal matched a require-approval grant and none was
+    /// denied; the caller must complete the approval before proceeding.
+    NeedsApproval,
+    /// A deny grant matched a principal and took precedence over any allow or
+    /// approval grant.
     DeniedByGrant,
-    /// No grant matched the request; the default-deny rule applied.
+    /// At least one principal in the chain had no matching grant; the
+    /// default-deny rule applied.
     DefaultDeny,
+    /// The request carried no resolvable principal; no principal ever means
+    /// allow, so the chain is denied before any grant is consulted.
+    PrincipalUnresolved,
 }
 
 impl DecisionReason {
@@ -133,8 +153,10 @@ impl DecisionReason {
     pub fn code(&self) -> &'static str {
         match self {
             DecisionReason::AllowedByGrant => "allowed_by_grant",
+            DecisionReason::NeedsApproval => "needs_approval",
             DecisionReason::DeniedByGrant => "denied_by_grant",
             DecisionReason::DefaultDeny => "default_deny",
+            DecisionReason::PrincipalUnresolved => "principal_unresolved",
         }
     }
 }
@@ -142,7 +164,7 @@ impl DecisionReason {
 /// Decision plus the trace explaining how it was reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationTrace {
-    /// The allow/deny outcome.
+    /// The three-valued outcome (allow, deny, or require-approval).
     pub decision: AuthorizationDecision,
     /// Reason code for the outcome.
     pub reason: DecisionReason,
@@ -347,19 +369,21 @@ impl PolicySet {
         roles
     }
 
-    /// Evaluate `request` against the policy and return the decision trace.
-    pub fn evaluate(&self, request: &AuthorizationRequest) -> AuthorizationTrace {
-        let held_roles = self.held_roles(&request.principal, &request.scope);
-
-        let mut allow_grants: Vec<GrantId> = Vec::new();
-        let mut allow_roles: Vec<RoleId> = Vec::new();
-        let mut deny_grants: Vec<GrantId> = Vec::new();
-        let mut deny_roles: Vec<RoleId> = Vec::new();
+    /// Grants matching one principal at `scope` for `action`, partitioned by
+    /// effect in policy order with duplicate role ids removed.
+    fn link_matches(
+        &self,
+        principal: &PrincipalRef,
+        action: &ActionKey,
+        scope: &ScopeRef,
+    ) -> LinkMatches {
+        let held_roles = self.held_roles(principal, scope);
+        let mut matches = LinkMatches::default();
 
         for grant in &self.grants {
             let via_role = match &grant.subject {
-                GrantSubject::Principal(principal) => {
-                    if principal != &request.principal {
+                GrantSubject::Principal(grant_principal) => {
+                    if grant_principal != principal {
                         continue;
                     }
                     None
@@ -371,33 +395,86 @@ impl PolicySet {
                     Some(role)
                 }
             };
-            if !grant.action_pattern.matches(&request.action) {
+            if !grant.action_pattern.matches(action) {
                 continue;
             }
-            if !self.scope_graph.covers(&grant.scope, &request.scope) {
+            if !self.scope_graph.covers(&grant.scope, scope) {
                 continue;
             }
 
-            match grant.effect {
-                Effect::Allow => {
-                    allow_grants.push(grant.id.clone());
-                    if let Some(role) = via_role
-                        && !allow_roles.contains(role)
-                    {
-                        allow_roles.push(role.clone());
-                    }
+            let (grants, roles) = match grant.effect {
+                Effect::Allow => (&mut matches.allow_grants, &mut matches.allow_roles),
+                Effect::RequireApproval => {
+                    (&mut matches.approval_grants, &mut matches.approval_roles)
                 }
-                Effect::Deny => {
-                    deny_grants.push(grant.id.clone());
-                    if let Some(role) = via_role
-                        && !deny_roles.contains(role)
-                    {
-                        deny_roles.push(role.clone());
-                    }
-                }
+                Effect::Deny => (&mut matches.deny_grants, &mut matches.deny_roles),
+            };
+            grants.push(grant.id.clone());
+            if let Some(role) = via_role
+                && !roles.contains(role)
+            {
+                roles.push(role.clone());
             }
         }
 
+        matches
+    }
+
+    /// Evaluate `request` against the policy and return the decision trace.
+    ///
+    /// The request's principal chain is evaluated conjunctively: every link must
+    /// be permitted, and the chain's outcome is the strongest effect any link
+    /// contributes under the `deny > require_approval > allow > default-deny`
+    /// lattice. An empty chain is [`DecisionReason::PrincipalUnresolved`].
+    pub fn evaluate(&self, request: &AuthorizationRequest) -> AuthorizationTrace {
+        let chain: Vec<&PrincipalRef> = request.principal_chain().collect();
+        self.evaluate_chain(&chain, &request.action, &request.scope)
+    }
+
+    /// Evaluate an explicit principal `chain` for `action` at `scope`.
+    ///
+    /// This is the conjunctive core behind [`PolicySet::evaluate`]: it is shared
+    /// by the request path and by callers that hold a chain directly. An empty
+    /// chain denies with [`DecisionReason::PrincipalUnresolved`] — no principal
+    /// never means allow.
+    pub fn evaluate_chain(
+        &self,
+        chain: &[&PrincipalRef],
+        action: &ActionKey,
+        scope: &ScopeRef,
+    ) -> AuthorizationTrace {
+        if chain.is_empty() {
+            return AuthorizationTrace {
+                decision: AuthorizationDecision::Deny,
+                reason: DecisionReason::PrincipalUnresolved,
+                matched_grants: Vec::new(),
+                matched_roles: Vec::new(),
+            };
+        }
+
+        let mut deny_grants: Vec<GrantId> = Vec::new();
+        let mut deny_roles: Vec<RoleId> = Vec::new();
+        let mut approval_grants: Vec<GrantId> = Vec::new();
+        let mut approval_roles: Vec<RoleId> = Vec::new();
+        let mut allow_grants: Vec<GrantId> = Vec::new();
+        let mut allow_roles: Vec<RoleId> = Vec::new();
+        let mut any_unmatched = false;
+
+        for principal in chain {
+            let link = self.link_matches(principal, action, scope);
+            if !link.is_permitted() {
+                any_unmatched = true;
+            }
+            extend_unique(&mut deny_grants, link.deny_grants);
+            extend_unique(&mut deny_roles, link.deny_roles);
+            extend_unique(&mut approval_grants, link.approval_grants);
+            extend_unique(&mut approval_roles, link.approval_roles);
+            extend_unique(&mut allow_grants, link.allow_grants);
+            extend_unique(&mut allow_roles, link.allow_roles);
+        }
+
+        // An explicit deny on any link is the strongest, most informative
+        // outcome, so it is reported ahead of a bare default-deny.
         if !deny_grants.is_empty() {
             return AuthorizationTrace {
                 decision: AuthorizationDecision::Deny,
@@ -406,19 +483,81 @@ impl PolicySet {
                 matched_roles: deny_roles,
             };
         }
-        if !allow_grants.is_empty() {
+        // Conjunction: a link with no matching grant is not permitted, so the
+        // whole chain defaults to deny even if other links would allow.
+        if any_unmatched {
             return AuthorizationTrace {
-                decision: AuthorizationDecision::Allow,
-                reason: DecisionReason::AllowedByGrant,
-                matched_grants: allow_grants,
-                matched_roles: allow_roles,
+                decision: AuthorizationDecision::Deny,
+                reason: DecisionReason::DefaultDeny,
+                matched_grants: Vec::new(),
+                matched_roles: Vec::new(),
+            };
+        }
+        if !approval_grants.is_empty() {
+            return AuthorizationTrace {
+                decision: AuthorizationDecision::RequireApproval,
+                reason: DecisionReason::NeedsApproval,
+                matched_grants: approval_grants,
+                matched_roles: approval_roles,
             };
         }
         AuthorizationTrace {
-            decision: AuthorizationDecision::Deny,
-            reason: DecisionReason::DefaultDeny,
-            matched_grants: Vec::new(),
-            matched_roles: Vec::new(),
+            decision: AuthorizationDecision::Allow,
+            reason: DecisionReason::AllowedByGrant,
+            matched_grants: allow_grants,
+            matched_roles: allow_roles,
+        }
+    }
+
+    /// Filter `candidates` to the scopes on which `principal` may perform
+    /// `action`, in input order.
+    ///
+    /// This answers a list endpoint's "which of these rows can the caller act
+    /// on" in a single pass instead of one [`PolicySet::evaluate`] call per row.
+    /// Only scopes that resolve to [`AuthorizationDecision::Allow`] are
+    /// returned; `RequireApproval` is not yet permitted and is excluded.
+    pub fn visible(
+        &self,
+        principal: &PrincipalRef,
+        action: &ActionKey,
+        candidates: &[ScopeRef],
+    ) -> Vec<ScopeRef> {
+        let chain = [principal];
+        candidates
+            .iter()
+            .filter(|scope| {
+                self.evaluate_chain(&chain, action, scope).decision == AuthorizationDecision::Allow
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Grants matching a single principal link, partitioned by effect.
+#[derive(Debug, Default)]
+struct LinkMatches {
+    allow_grants: Vec<GrantId>,
+    allow_roles: Vec<RoleId>,
+    approval_grants: Vec<GrantId>,
+    approval_roles: Vec<RoleId>,
+    deny_grants: Vec<GrantId>,
+    deny_roles: Vec<RoleId>,
+}
+
+impl LinkMatches {
+    /// Whether this link matched at least one allow or require-approval grant
+    /// (deny is handled separately because it overrides everything).
+    fn is_permitted(&self) -> bool {
+        !self.allow_grants.is_empty() || !self.approval_grants.is_empty()
+    }
+}
+
+/// Append `extra` onto `target`, skipping values already present so the merged
+/// trace preserves policy order without duplicates.
+fn extend_unique<T: PartialEq>(target: &mut Vec<T>, extra: Vec<T>) {
+    for value in extra {
+        if !target.contains(&value) {
+            target.push(value);
         }
     }
 }
@@ -435,11 +574,7 @@ mod tests {
     }
 
     fn request(principal: PrincipalRef, action: &str, scope: ScopeRef) -> AuthorizationRequest {
-        AuthorizationRequest {
-            principal,
-            action: ActionKey(action.into()),
-            scope,
-        }
+        AuthorizationRequest::direct(principal, ActionKey(action.into()), scope)
     }
 
     fn project_scope(ws: &str, proj: &str) -> ScopeRef {
@@ -852,7 +987,246 @@ mod tests {
     #[test]
     fn reason_codes_are_stable() {
         assert_eq!(DecisionReason::AllowedByGrant.code(), "allowed_by_grant");
+        assert_eq!(DecisionReason::NeedsApproval.code(), "needs_approval");
         assert_eq!(DecisionReason::DeniedByGrant.code(), "denied_by_grant");
         assert_eq!(DecisionReason::DefaultDeny.code(), "default_deny");
+        assert_eq!(
+            DecisionReason::PrincipalUnresolved.code(),
+            "principal_unresolved"
+        );
+    }
+
+    fn delegated(
+        principal: PrincipalRef,
+        on_behalf_of: Vec<PrincipalRef>,
+        action: &str,
+        scope: ScopeRef,
+    ) -> AuthorizationRequest {
+        AuthorizationRequest {
+            principal,
+            on_behalf_of,
+            action: ActionKey(action.into()),
+            scope,
+        }
+    }
+
+    #[test]
+    fn require_approval_grant_yields_require_approval_decision() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_appr".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+
+        let trace = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
+        assert_eq!(trace.decision, AuthorizationDecision::RequireApproval);
+        assert_eq!(trace.reason, DecisionReason::NeedsApproval);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_appr".into())]);
+    }
+
+    #[test]
+    fn deny_outranks_require_approval() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_appr".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.*".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+        policy.add_grant(Grant {
+            id: GrantId("g_deny".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Deny,
+        });
+
+        let trace = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
+        assert_eq!(trace.decision, AuthorizationDecision::Deny);
+        assert_eq!(trace.reason, DecisionReason::DeniedByGrant);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_deny".into())]);
+    }
+
+    #[test]
+    fn require_approval_outranks_allow() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_allow".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.*".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+        policy.add_grant(Grant {
+            id: GrantId("g_appr".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+
+        let trace = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
+        assert_eq!(trace.decision, AuthorizationDecision::RequireApproval);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_appr".into())]);
+    }
+
+    #[test]
+    fn principal_chain_allows_only_when_every_link_is_allowed() {
+        let mut policy = PolicySet::new();
+        let agent = PrincipalRef::Service {
+            service_id: "agent".into(),
+        };
+        // Both the human and the agent it acts for are allowed.
+        for (id, subject) in [("g_human", account("ada")), ("g_agent", agent.clone())] {
+            policy.add_grant(Grant {
+                id: GrantId(id.into()),
+                subject: GrantSubject::Principal(subject),
+                action_pattern: ActionPattern("issue.close".into()),
+                scope: ScopeRef::Global,
+                effect: Effect::Allow,
+            });
+        }
+
+        let trace = policy.evaluate(&delegated(
+            agent.clone(),
+            vec![account("ada")],
+            "issue.close",
+            ScopeRef::Global,
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
+        // The trace unions both links' grants in chain order.
+        assert_eq!(
+            trace.matched_grants,
+            vec![GrantId("g_agent".into()), GrantId("g_human".into())]
+        );
+    }
+
+    #[test]
+    fn principal_chain_denies_when_a_delegate_link_is_unauthorized() {
+        let mut policy = PolicySet::new();
+        let agent = PrincipalRef::Service {
+            service_id: "agent".into(),
+        };
+        // Only the agent is granted; the human it acts for is not.
+        policy.add_grant(Grant {
+            id: GrantId("g_agent".into()),
+            subject: GrantSubject::Principal(agent.clone()),
+            action_pattern: ActionPattern("issue.close".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        let trace = policy.evaluate(&delegated(
+            agent,
+            vec![account("ada")],
+            "issue.close",
+            ScopeRef::Global,
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Deny);
+        assert_eq!(trace.reason, DecisionReason::DefaultDeny);
+    }
+
+    #[test]
+    fn chain_require_approval_when_one_link_needs_it_and_none_denied() {
+        let mut policy = PolicySet::new();
+        let agent = PrincipalRef::Service {
+            service_id: "agent".into(),
+        };
+        policy.add_grant(Grant {
+            id: GrantId("g_human".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("issue.close".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+        policy.add_grant(Grant {
+            id: GrantId("g_agent".into()),
+            subject: GrantSubject::Principal(agent.clone()),
+            action_pattern: ActionPattern("issue.close".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+
+        let trace = policy.evaluate(&delegated(
+            agent,
+            vec![account("ada")],
+            "issue.close",
+            ScopeRef::Global,
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::RequireApproval);
+        assert_eq!(trace.reason, DecisionReason::NeedsApproval);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_agent".into())]);
+    }
+
+    #[test]
+    fn empty_principal_chain_is_unresolved() {
+        let policy = PolicySet::new();
+        let trace = policy.evaluate_chain(&[], &ActionKey("pack.read".into()), &ScopeRef::Global);
+        assert_eq!(trace.decision, AuthorizationDecision::Deny);
+        assert_eq!(trace.reason, DecisionReason::PrincipalUnresolved);
+    }
+
+    #[test]
+    fn visible_filters_candidates_to_allowed_scopes_in_order() {
+        let mut policy = PolicySet::new();
+        policy
+            .scope_graph_mut()
+            .assign_workspace(WorkspaceId("ws_main".into()), OrgId("acme".into()));
+        // Allowed across everything under the org, plus an unrelated workspace.
+        policy.add_grant(Grant {
+            id: GrantId("g_org".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("project.read".into()),
+            scope: ScopeRef::Org {
+                org_id: OrgId("acme".into()),
+            },
+            effect: Effect::Allow,
+        });
+
+        let candidates = vec![
+            project_scope("ws_main", "proj_web"),
+            project_scope("ws_other", "proj_api"),
+            ScopeRef::Workspace {
+                workspace_id: WorkspaceId("ws_main".into()),
+            },
+        ];
+        let visible = policy.visible(
+            &account("ada"),
+            &ActionKey("project.read".into()),
+            &candidates,
+        );
+        assert_eq!(
+            visible,
+            vec![
+                project_scope("ws_main", "proj_web"),
+                ScopeRef::Workspace {
+                    workspace_id: WorkspaceId("ws_main".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_excludes_require_approval_scopes() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_appr".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("project.read".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+
+        let candidates = vec![project_scope("ws_main", "proj_web")];
+        let visible = policy.visible(
+            &account("ada"),
+            &ActionKey("project.read".into()),
+            &candidates,
+        );
+        assert!(visible.is_empty());
     }
 }

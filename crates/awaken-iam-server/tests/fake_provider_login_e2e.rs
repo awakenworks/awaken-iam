@@ -386,6 +386,7 @@ fn fake_provider_login_loop_closes_session_and_authorize_path() {
         principal: PrincipalRef::Account {
             account_id: view.account_id.clone(),
         },
+        on_behalf_of: Vec::new(),
         action: ActionKey("pack.publish".into()),
         scope: ScopeRef::Global,
     });

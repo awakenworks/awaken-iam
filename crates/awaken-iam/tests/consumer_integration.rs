@@ -104,6 +104,7 @@ fn oversight_next_delegates_authn_only() {
     let iam = FakeRemoteIam::default();
     let domain_action = AuthorizationRequest {
         principal: principal.clone(),
+        on_behalf_of: Vec::new(),
         action: ActionKey("issue.advance".into()),
         scope: ScopeRef::Project {
             workspace_id: WorkspaceId("ws_acme".into()),
@@ -198,11 +199,13 @@ fn pack_hub_can_publish(
 ) -> bool {
     let can_publish = iam.authorize(AuthorizationRequest {
         principal: principal.clone(),
+        on_behalf_of: Vec::new(),
         action: ActionKey("pack.publish".into()),
         scope: namespace.clone(),
     }) == AuthorizationDecision::Allow;
     let can_sign = iam.authorize(AuthorizationRequest {
         principal: principal.clone(),
+        on_behalf_of: Vec::new(),
         action: ActionKey("namespace.signer.use".into()),
         scope: namespace.clone(),
     }) == AuthorizationDecision::Allow;
