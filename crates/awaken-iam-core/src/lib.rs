@@ -1,6 +1,7 @@
 //! Core IAM evaluation primitives.
 
 mod login;
+mod provider;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -8,6 +9,10 @@ use std::collections::hash_map::Entry;
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
     OsEntropy, PkceChallenge, PkceMethod,
+};
+pub use provider::{
+    AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
+    ProviderError,
 };
 
 use awaken_iam_contract::{
