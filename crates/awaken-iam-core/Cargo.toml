@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 awaken-iam-contract.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,6 +18,9 @@ base64 = "0.22"
 getrandom = "0.3"
 sha2 = "0.10"
 subtle = "2"
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
