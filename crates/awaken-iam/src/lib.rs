@@ -10,9 +10,11 @@ pub use awaken_iam_contract::{
     SessionId, SessionView, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
-    BeginLogin, EntropySource, EstablishSession, IamCore, IamError, IdentityDirectory, IssuedLogin,
-    IssuedSession, LoginAttempt, LoginBinding, LoginSecrets, OAuthChallengeService, OsEntropy,
-    PkceChallenge, PkceMethod, SessionDirectory, SessionMinter, hash_session_token,
+    BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
+    EntitlementReason, EntitlementResolver, EntropySource, EstablishSession, IamCore, IamError,
+    IdentityDirectory, IssuedLogin, IssuedSession, LoginAttempt, LoginBinding, LoginSecrets,
+    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier,
+    SessionDirectory, SessionMinter, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
