@@ -12,6 +12,8 @@ publish.workspace = true
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
+thiserror.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 serde_json.workspace = true

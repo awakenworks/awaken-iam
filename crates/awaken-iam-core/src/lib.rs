@@ -239,6 +239,42 @@ impl IdentityDirectory {
             subject: subject.clone(),
         })
     }
+
+    /// List the external identities linked to an account.
+    ///
+    /// Results are ordered by external identity id so callers and tests observe
+    /// a stable sequence regardless of map iteration order.
+    pub fn identities_for_account(&self, account_id: &AccountId) -> Vec<&ExternalIdentity> {
+        let mut identities: Vec<&ExternalIdentity> = self
+            .external_identities
+            .values()
+            .filter(|identity| &identity.account_id == account_id)
+            .collect();
+        identities.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        identities
+    }
+
+    /// Remove the external identity for a provider subject, returning the
+    /// detached link.
+    ///
+    /// Fails closed with [`IamError::ExternalIdentityNotFound`] when no identity
+    /// matches the provider and subject.
+    pub fn remove_external_identity(
+        &mut self,
+        provider_key: &IdentityProviderKey,
+        subject: &ExternalSubject,
+    ) -> Result<ExternalIdentity, IamError> {
+        let key = ExternalIdentityKey {
+            provider_key: provider_key.clone(),
+            subject: subject.clone(),
+        };
+        self.external_identities
+            .remove(&key)
+            .ok_or_else(|| IamError::ExternalIdentityNotFound {
+                provider_key: provider_key.clone(),
+                subject: subject.clone(),
+            })
+    }
 }
 
 /// In-memory directory enforcing login-state and session invariants.
@@ -491,6 +527,78 @@ mod tests {
                 .email
                 .as_deref(),
             Some("second@example.com")
+        );
+    }
+
+    #[test]
+    fn identity_directory_lists_and_removes_identities_per_account() {
+        let mut directory = IdentityDirectory::new();
+        directory.upsert_account(account("acct_1"));
+        directory.upsert_account(account("acct_2"));
+        directory
+            .link_external_identity(external_identity(
+                "ext_b",
+                "acct_1",
+                "fake",
+                "subject_b",
+                None,
+            ))
+            .unwrap();
+        directory
+            .link_external_identity(external_identity(
+                "ext_a",
+                "acct_1",
+                "github",
+                "subject_a",
+                None,
+            ))
+            .unwrap();
+        directory
+            .link_external_identity(external_identity(
+                "ext_c",
+                "acct_2",
+                "fake",
+                "subject_c",
+                None,
+            ))
+            .unwrap();
+
+        // Listing is scoped to the account and ordered by id.
+        let linked = directory.identities_for_account(&AccountId("acct_1".into()));
+        let ids: Vec<&str> = linked
+            .iter()
+            .map(|identity| identity.id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["ext_a", "ext_b"]);
+
+        // Removing a link detaches exactly that provider subject.
+        let removed = directory
+            .remove_external_identity(
+                &IdentityProviderKey("fake".into()),
+                &ExternalSubject("subject_b".into()),
+            )
+            .unwrap();
+        assert_eq!(removed.id, ExternalIdentityId("ext_b".into()));
+        assert_eq!(
+            directory
+                .identities_for_account(&AccountId("acct_1".into()))
+                .len(),
+            1
+        );
+
+        // Removing an unknown subject fails closed.
+        let missing = directory
+            .remove_external_identity(
+                &IdentityProviderKey("fake".into()),
+                &ExternalSubject("subject_b".into()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            missing,
+            IamError::ExternalIdentityNotFound {
+                provider_key: IdentityProviderKey("fake".into()),
+                subject: ExternalSubject("subject_b".into()),
+            }
         );
     }
 

@@ -1,7 +1,13 @@
 //! Server assembly seam for Awaken IAM.
 
+mod auth_api;
 mod session;
 
+pub use auth_api::{
+    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
+    DEFAULT_LOGIN_COOKIE_NAME, LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary,
+    ReturnToDecision, ReturnToPolicy, StartLogin, StartLoginOutcome, UnlinkIdentity,
+};
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
 };
