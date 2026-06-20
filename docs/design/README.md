@@ -1,7 +1,12 @@
 # Design
 
-- [IAM overview](iam-overview.md)
 - [IAM model](iam-model.md)
+- [Domain model (DDD)](domain-model.md)
+- [Permission mechanisms](permission-mechanisms.md)
 - [Authorization engine](authorization-engine.md)
-- [Entitlement plane](entitlement-plane.md)
-- [Consumer integration boundary](consumer-integration.md)
+- [Identity and auth server](auth-server.md)
+- [Namespace trust model](namespace-trust-model.md)
+- [Entitlement plane](entitlements.md)
+- [Remote protocol and client](remote-protocol.md)
+- [Deployment and storage](deployment.md)
+- [Migration plan](migration-strategy.md)

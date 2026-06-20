@@ -1,0 +1,100 @@
+# Entitlement plane
+
+This document specifies `check_entitlement`, the plane that answers
+*does this account/org/plan allow this feature or package access* — kept strictly
+separate from authorization. It extends
+[IAM model](iam-model.md#authorization-vs-entitlement) and replaces the
+placeholder `entitlement_default_allow() -> Allow` stub.
+
+## Why a separate plane
+
+Authorization and entitlement answer different questions and fail for different
+reasons:
+
+```text
+authorize        -> may this principal do this action at this scope?   (grants)
+check_entitlement-> does this principal's plan permit this feature?     (plans)
+```
+
+Mixing them rots both: plan limits leak into grant evaluation, and a billing
+lapse becomes indistinguishable from a missing role. They are evaluated
+independently and a caller that needs both runs both (authorization first, then
+entitlement), surfacing distinct reason codes.
+
+## Records
+
+```text
+Plan {
+  id,                # e.g. plan:free, plan:team, plan:enterprise
+  features: Set<FeatureKey>,
+  limits:   Map<FeatureKey, Quota>,   # optional numeric ceilings
+}
+
+Subscription {
+  subject_scope,     # Org or Account the plan is attached to
+  plan_id,
+  status,            # active | past_due | canceled
+  valid_until?,
+}
+```
+
+Entitlement is anchored at the **billing** scope (Org or Account), not the
+operational scope, because plans are bought once and apply across the org's
+namespaces, workspaces, and projects.
+
+## Request and decision
+
+The contract shape already exists:
+
+```rust
+EntitlementRequest  { principal, entitlement: String, resource: Option<String> }
+EntitlementDecision { Allow | Deny }
+```
+
+`entitlement` is a feature/SKU key (`pack.publish`, `model.strong_access`,
+`pack.read`). `resource` is an optional coordinate (`acme/pkg`, a workspace id)
+used for per-resource limits. The decision carries a reason code
+(`entitled | plan_missing | quota_exceeded | subscription_inactive`) for billing
+and upsell surfaces.
+
+## Evaluation
+
+```text
+check_entitlement(principal, entitlement, resource?):
+  1. resolve the billing subject (account -> org subscription, or account plan)
+  2. inactive/canceled subscription      -> Deny(subscription_inactive)
+  3. entitlement not in plan.features     -> Deny(plan_missing)
+  4. limit defined and resource over it   -> Deny(quota_exceeded)
+  5. otherwise                            -> Allow(entitled)
+```
+
+## Modes
+
+```toml
+[entitlements]
+mode = "default_allow"   # default_allow | remote
+```
+
+`default_allow` is the v1 path: the seam exists, every check returns
+`Allow(entitled)`, and no plan data is required — so paid packs, private
+namespaces, and product-plan limits can be switched on later without reworking
+grants. `remote` resolves against real subscriptions. The mode is explicit per
+[service configuration](iam-model.md#service-configuration); it is never a silent
+fallback for an unreachable billing service (that is a `Deny`, not an `Allow`).
+
+## Where it applies
+
+- Publishing/registry models — `pack.publish` / `pack.read` gating for paid or
+  private namespaces, layered after the authorization checks in
+  [namespace trust model](namespace-trust-model.md).
+- Runtime models — feature gating (e.g. a model-access or capability feature) per
+  tenant plan, distinct from runtime capability admission.
+- Tenant plans generally — install or feature ceilings and numeric quotas at the
+  org/billing scope; see [permission mechanisms](permission-mechanisms.md).
+
+## Out of scope
+
+- Metering, invoicing, and payment capture — a billing service, not IAM. IAM
+  reads subscription state; it does not own the money path.
+- Runtime quota *enforcement counters* — products meter usage; IAM answers the
+  yes/no entitlement question.
