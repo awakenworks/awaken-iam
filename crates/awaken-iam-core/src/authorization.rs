@@ -18,10 +18,11 @@
 //! audit and debug surfaces can explain why a request was allowed or denied.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use awaken_iam_contract::{
     ActionKey, AuthorizationDecision, AuthorizationRequest, NamespaceId, OrgId, PrincipalRef,
-    ScopeRef, WorkspaceId,
+    ResourceId, ResourceType, ScopeRef, WorkspaceId,
 };
 
 /// Identifier of a role (a reusable bundle of grants).
@@ -160,10 +161,21 @@ pub struct AuthorizationTrace {
 /// `org -> workspace` edges are not encoded in the ids, so they are registered
 /// here to complete the `global -> org -> namespace/workspace -> project`
 /// hierarchy.
+///
+/// Open [`ScopeRef::Resource`] scopes are product data: where a resource sits in
+/// the hierarchy is never inferred from its ids. Each resource instance's parent
+/// edge is registered with [`ScopeGraph::assign_resource_parent`] (typically by
+/// applying a [`ResourceModel`]). Because a resource's parent may itself be a
+/// resource, the walk follows these edges iteratively, so arbitrarily deep
+/// product hierarchies (`issue:42 -> project:web -> workspace:ws -> org:acme ->
+/// global`) resolve through the same ancestor walk. A resource with no
+/// registered parent roots at itself: nothing outside an exactly-matching grant
+/// covers it.
 #[derive(Debug, Default, Clone)]
 pub struct ScopeGraph {
     namespace_org: HashMap<NamespaceId, OrgId>,
     workspace_org: HashMap<WorkspaceId, OrgId>,
+    resource_parent: HashMap<(ResourceType, ResourceId), ScopeRef>,
 }
 
 impl ScopeGraph {
@@ -184,43 +196,77 @@ impl ScopeGraph {
         self
     }
 
+    /// Record the parent scope of an open product resource.
+    ///
+    /// `parent` may be any [`ScopeRef`], including another
+    /// [`ScopeRef::Resource`], which is what lets the walk follow an
+    /// arbitrarily deep product hierarchy up to its root.
+    pub fn assign_resource_parent(
+        &mut self,
+        resource_type: ResourceType,
+        resource_id: ResourceId,
+        parent: ScopeRef,
+    ) -> &mut Self {
+        self.resource_parent
+            .insert((resource_type, resource_id), parent);
+        self
+    }
+
+    /// Returns the direct parent of `scope`, or `None` when `scope` is a root.
+    ///
+    /// `Global` is the well-known root. An open resource is a root when no
+    /// parent edge has been registered for it.
+    fn parent_of(&self, scope: &ScopeRef) -> Option<ScopeRef> {
+        match scope {
+            ScopeRef::Global => None,
+            ScopeRef::Org { .. } => Some(ScopeRef::Global),
+            ScopeRef::Namespace { namespace_id } => Some(
+                self.namespace_org
+                    .get(namespace_id)
+                    .map(|org_id| ScopeRef::Org {
+                        org_id: org_id.clone(),
+                    })
+                    .unwrap_or(ScopeRef::Global),
+            ),
+            ScopeRef::Workspace { workspace_id } => Some(
+                self.workspace_org
+                    .get(workspace_id)
+                    .map(|org_id| ScopeRef::Org {
+                        org_id: org_id.clone(),
+                    })
+                    .unwrap_or(ScopeRef::Global),
+            ),
+            ScopeRef::Project { workspace_id, .. } => Some(ScopeRef::Workspace {
+                workspace_id: workspace_id.clone(),
+            }),
+            ScopeRef::Resource {
+                resource_type,
+                resource_id,
+            } => self
+                .resource_parent
+                .get(&(resource_type.clone(), resource_id.clone()))
+                .cloned(),
+        }
+    }
+
     /// Returns the inclusive ancestors of `scope`, ordered most specific first
-    /// and ending at `Global`.
+    /// and ending at the scope's root.
+    ///
+    /// The walk follows [`ScopeGraph::parent_of`] edges, so it resolves
+    /// arbitrarily deep open-resource hierarchies. A `seen` set guards against
+    /// cycles accidentally introduced by misregistered parent edges, keeping
+    /// evaluation terminating regardless of registration order.
     fn ancestors(&self, scope: &ScopeRef) -> Vec<ScopeRef> {
         let mut chain = vec![scope.clone()];
-        match scope {
-            ScopeRef::Global => {}
-            ScopeRef::Org { .. } => chain.push(ScopeRef::Global),
-            ScopeRef::Namespace { namespace_id } => {
-                if let Some(org_id) = self.namespace_org.get(namespace_id) {
-                    chain.push(ScopeRef::Org {
-                        org_id: org_id.clone(),
-                    });
-                }
-                chain.push(ScopeRef::Global);
+        let mut seen: HashSet<ScopeRef> = HashSet::new();
+        seen.insert(scope.clone());
+        let mut current = scope.clone();
+        while let Some(parent) = self.parent_of(&current) {
+            if !seen.insert(parent.clone()) {
+                break;
             }
-            ScopeRef::Workspace { workspace_id } => {
-                if let Some(org_id) = self.workspace_org.get(workspace_id) {
-                    chain.push(ScopeRef::Org {
-                        org_id: org_id.clone(),
-                    });
-                }
-                chain.push(ScopeRef::Global);
-            }
-            ScopeRef::Project {
-                workspace_id,
-                project_id: _,
-            } => {
-                chain.push(ScopeRef::Workspace {
-                    workspace_id: workspace_id.clone(),
-                });
-                if let Some(org_id) = self.workspace_org.get(workspace_id) {
-                    chain.push(ScopeRef::Org {
-                        org_id: org_id.clone(),
-                    });
-                }
-                chain.push(ScopeRef::Global);
-            }
+            chain.push(parent.clone());
+            current = parent;
         }
         chain
     }
@@ -264,6 +310,18 @@ impl PolicySet {
     /// Mutable access to the scope graph for registering parent links.
     pub fn scope_graph_mut(&mut self) -> &mut ScopeGraph {
         &mut self.scope_graph
+    }
+
+    /// Register a product's [`ResourceModel`](crate::ResourceModel) so the
+    /// evaluator resolves its open resource scopes.
+    ///
+    /// This folds the model's per-instance parent edges into the scope graph;
+    /// afterwards a grant anchored at any registered ancestor covers requests on
+    /// the product's resources through the same ancestor walk used for the
+    /// well-known scopes.
+    pub fn register_resource_model(&mut self, model: &crate::ResourceModel) -> &mut Self {
+        model.apply_to(&mut self.scope_graph);
+        self
     }
 
     /// Read-only access to the scope graph.
@@ -655,6 +713,140 @@ mod tests {
         assert_eq!(trace.decision, AuthorizationDecision::Deny);
         assert_eq!(trace.reason, DecisionReason::DeniedByGrant);
         assert_eq!(trace.matched_grants, vec![GrantId("g_deny".into())]);
+    }
+
+    fn resource_scope(resource_type: &str, resource_id: &str) -> ScopeRef {
+        ScopeRef::Resource {
+            resource_type: awaken_iam_contract::ResourceType(resource_type.into()),
+            resource_id: awaken_iam_contract::ResourceId(resource_id.into()),
+        }
+    }
+
+    #[test]
+    fn grant_at_registered_resource_parent_covers_the_resource() {
+        let mut policy = PolicySet::new();
+        policy.scope_graph_mut().assign_resource_parent(
+            awaken_iam_contract::ResourceType("issue".into()),
+            awaken_iam_contract::ResourceId("42".into()),
+            project_scope("ws_main", "proj_web"),
+        );
+        policy.add_grant(Grant {
+            id: GrantId("g_proj".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("issue.*".into()),
+            scope: project_scope("ws_main", "proj_web"),
+            effect: Effect::Allow,
+        });
+
+        let trace = policy.evaluate(&request(
+            account("ada"),
+            "issue.read",
+            resource_scope("issue", "42"),
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_proj".into())]);
+    }
+
+    #[test]
+    fn arbitrarily_deep_resource_chain_resolves_to_root() {
+        let mut policy = PolicySet::new();
+        // comment:7 -> issue:42 -> project:web -> workspace:ws_main -> org:acme -> global
+        policy
+            .scope_graph_mut()
+            .assign_workspace(WorkspaceId("ws_main".into()), OrgId("acme".into()))
+            .assign_resource_parent(
+                awaken_iam_contract::ResourceType("issue".into()),
+                awaken_iam_contract::ResourceId("42".into()),
+                project_scope("ws_main", "proj_web"),
+            )
+            .assign_resource_parent(
+                awaken_iam_contract::ResourceType("comment".into()),
+                awaken_iam_contract::ResourceId("7".into()),
+                resource_scope("issue", "42"),
+            );
+        policy.add_grant(Grant {
+            id: GrantId("g_org".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("comment.delete".into()),
+            scope: ScopeRef::Org {
+                org_id: OrgId("acme".into()),
+            },
+            effect: Effect::Allow,
+        });
+
+        // A grant at the org root covers a comment five edges below it, and the
+        // intermediate resource->resource edge is part of the same walk.
+        let trace = policy.evaluate(&request(
+            account("ada"),
+            "comment.delete",
+            resource_scope("comment", "7"),
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_org".into())]);
+    }
+
+    #[test]
+    fn unregistered_resource_roots_at_itself() {
+        let mut policy = PolicySet::new();
+        // A global grant does not reach a resource whose parent edge was never
+        // registered: its place in the hierarchy is registered, never inferred.
+        policy.add_grant(Grant {
+            id: GrantId("g_global".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("*".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        let unreached = policy.evaluate(&request(
+            account("ada"),
+            "issue.read",
+            resource_scope("issue", "orphan"),
+        ));
+        assert_eq!(unreached.decision, AuthorizationDecision::Deny);
+        assert_eq!(unreached.reason, DecisionReason::DefaultDeny);
+
+        // An exactly-anchored grant still covers it.
+        policy.add_grant(Grant {
+            id: GrantId("g_exact".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("issue.read".into()),
+            scope: resource_scope("issue", "orphan"),
+            effect: Effect::Allow,
+        });
+        let reached = policy.evaluate(&request(
+            account("ada"),
+            "issue.read",
+            resource_scope("issue", "orphan"),
+        ));
+        assert_eq!(reached.decision, AuthorizationDecision::Allow);
+        assert_eq!(reached.matched_grants, vec![GrantId("g_exact".into())]);
+    }
+
+    #[test]
+    fn cyclic_resource_edges_do_not_loop_forever() {
+        let mut policy = PolicySet::new();
+        // Misregistered cycle: a -> b -> a. The walk must terminate.
+        policy
+            .scope_graph_mut()
+            .assign_resource_parent(
+                awaken_iam_contract::ResourceType("node".into()),
+                awaken_iam_contract::ResourceId("a".into()),
+                resource_scope("node", "b"),
+            )
+            .assign_resource_parent(
+                awaken_iam_contract::ResourceType("node".into()),
+                awaken_iam_contract::ResourceId("b".into()),
+                resource_scope("node", "a"),
+            );
+
+        let trace = policy.evaluate(&request(
+            account("ada"),
+            "node.read",
+            resource_scope("node", "a"),
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Deny);
+        assert_eq!(trace.reason, DecisionReason::DefaultDeny);
     }
 
     #[test]

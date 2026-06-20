@@ -6,15 +6,16 @@ pub use awaken_iam_contract::{
     EntitlementDecision, EntitlementRequest, ExternalIdentity, ExternalIdentityClaims,
     ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderConfig,
     IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ScopeRef, Session,
-    SessionId, SessionView, Timestamp, WorkspaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ResourceId, ResourceType,
+    ScopeRef, Session, SessionId, SessionView, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
     BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
     EntitlementReason, EntitlementResolver, EntropySource, EstablishSession, IamCore, IamError,
     IdentityDirectory, IssuedLogin, IssuedSession, LoginAttempt, LoginBinding, LoginSecrets,
     OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, Quota,
-    RateLimit, RateWindow, SessionDirectory, SessionMinter, hash_session_token,
+    RateLimit, RateWindow, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
+    SessionMinter, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
