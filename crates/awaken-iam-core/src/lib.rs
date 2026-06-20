@@ -4,6 +4,7 @@ mod authorization;
 mod entitlement;
 mod fake_provider;
 mod github;
+mod google;
 mod login;
 mod ports;
 mod provider;
@@ -31,6 +32,11 @@ pub use github::{
     DEFAULT_AUTHORIZE_ENDPOINT, DEFAULT_TOKEN_ENDPOINT, GithubAccessToken, GithubEmail,
     GithubProviderAdapter, GithubTransport, GithubTransportError, GithubUser, SelectedEmail,
     TokenRequest as GithubTokenRequest, select_email,
+};
+pub use google::{
+    Clock, GOOGLE_AUTHORIZATION_ENDPOINT, GOOGLE_ISSUER, GOOGLE_ISSUER_BARE, GOOGLE_JWKS_URI,
+    GOOGLE_TOKEN_ENDPOINT, GoogleOidcProvider, GoogleProviderSecrets, HttpRequest, HttpTransport,
+    IdTokenVerification, Jwk, JwkSet, JwsVerifier, SystemClock, verify_id_token,
 };
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
