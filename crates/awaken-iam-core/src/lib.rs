@@ -17,7 +17,7 @@ pub use authorization::{
 };
 pub use entitlement::{
     EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome, EntitlementReason,
-    EntitlementResolver, Plan, PlanId, PlanTier,
+    EntitlementResolver, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow,
 };
 pub use fake_provider::{
     AuthorizeRedirect, AuthorizeRequest, FailureMode, FakeOidcProvider, FakeUser, IdTokenClaims,

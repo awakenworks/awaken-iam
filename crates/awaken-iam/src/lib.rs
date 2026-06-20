@@ -13,8 +13,8 @@ pub use awaken_iam_core::{
     BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
     EntitlementReason, EntitlementResolver, EntropySource, EstablishSession, IamCore, IamError,
     IdentityDirectory, IssuedLogin, IssuedSession, LoginAttempt, LoginBinding, LoginSecrets,
-    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier,
-    SessionDirectory, SessionMinter, hash_session_token,
+    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, Quota,
+    RateLimit, RateWindow, SessionDirectory, SessionMinter, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
