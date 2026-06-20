@@ -8,6 +8,7 @@ mod login;
 mod provider;
 mod resource_model;
 mod session;
+mod shadow;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -40,6 +41,7 @@ pub use provider::{
 };
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
+pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, ShadowReport};
 
 use awaken_iam_contract::{
     Account, AccountId, AuthorizationDecision, AuthorizationRequest, ExternalIdentity,
