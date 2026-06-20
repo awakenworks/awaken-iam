@@ -16,6 +16,9 @@ thiserror.workspace = true
 base64 = "0.22"
 
 [dev-dependencies]
+awaken-iam-contract.workspace = true
+awaken-iam-core.workspace = true
+awaken-iam-client.workspace = true
 serde_json.workspace = true
 
 [lints]
