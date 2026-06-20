@@ -314,15 +314,15 @@ impl EntitlementCatalog {
                 feature: request.entitlement.clone(),
             });
         }
-        if let Some(Quota::Limited(ceiling)) = plan.quota(&request.entitlement) {
-            if observed > ceiling {
-                return EntitlementOutcome::deny(EntitlementReason::QuotaExceeded {
-                    plan: plan.id.clone(),
-                    feature: request.entitlement.clone(),
-                    ceiling,
-                    observed,
-                });
-            }
+        if let Some(Quota::Limited(ceiling)) = plan.quota(&request.entitlement)
+            && observed > ceiling
+        {
+            return EntitlementOutcome::deny(EntitlementReason::QuotaExceeded {
+                plan: plan.id.clone(),
+                feature: request.entitlement.clone(),
+                ceiling,
+                observed,
+            });
         }
         EntitlementOutcome::allow(EntitlementReason::PlanEntitles {
             plan: plan.id.clone(),

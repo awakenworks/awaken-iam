@@ -42,7 +42,7 @@ use awaken_iam_server::{
 
 const ISSUER: &str = "https://idp.test";
 const CLIENT_ID: &str = "client-iam";
-const REDIRECT_URI: &str = "https://app.test/v1/auth/fake/callback";
+const REDIRECT_URI: &str = "https://app.test/v1/auth/callback/fake";
 const PROVIDER_KEY: &str = "fake";
 
 /// Deterministic entropy so minted ids and secrets are reproducible across runs.
