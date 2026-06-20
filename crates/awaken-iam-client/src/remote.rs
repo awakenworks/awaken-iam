@@ -1,0 +1,361 @@
+//! Remote IAM client and the local/remote mode switch.
+//!
+//! Product services delegate IAM decisions through [`IamClient`]. A deployment
+//! chooses, per the `[iam] mode = "local" | "remote"` configuration described in
+//! `docs/design/remote-protocol.md`, whether those calls resolve in-process
+//! (local mode) or over the wire (remote mode). [`IamClientMode`] is the switch:
+//! it wraps either an in-process [`IamClient`] or a [`RemoteIamClient`] and
+//! implements [`IamClient`] itself, so call sites are identical in both modes.
+//!
+//! Byte transport for remote mode lives behind the [`AuthzTransport`] seam — a
+//! deployment supplies the HTTP client, while this crate owns request shaping,
+//! response mapping, and the fail-closed contract. Authorization fails closed:
+//! when the remote transport errors or times out, the client denies (it never
+//! silently widens access to an allow).
+
+use awaken_iam_contract::{
+    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    PolicySnapshot,
+};
+
+use crate::IamClient;
+
+/// Failure reported by an [`AuthzTransport`] implementation.
+///
+/// Covers transport-level problems (connection, status, decode) uniformly; the
+/// authorization/entitlement *decisions* themselves are carried in the response
+/// DTOs, not in this error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("iam remote transport failed: {0}")]
+pub struct RemoteError(pub String);
+
+/// Byte-transport seam for the remote authorization protocol.
+///
+/// Implementors own the HTTP client and the deployment's `base_url`, audience,
+/// and timeout. Keeping transport behind a trait lets the client logic (request
+/// shaping, decision mapping, fail-closed policy) be unit tested without network
+/// access. Implementations should be `Send + Sync` so the client can be shared.
+pub trait AuthzTransport {
+    /// `POST /v1/authorize`.
+    fn authorize(
+        &self,
+        request: &AuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, RemoteError>;
+
+    /// `POST /v1/authorize/batch`.
+    fn authorize_batch(
+        &self,
+        request: &BatchAuthorizationRequest,
+    ) -> Result<BatchAuthorizationResponse, RemoteError>;
+
+    /// `POST /v1/entitlements/check`.
+    fn check_entitlement(
+        &self,
+        request: &EntitlementRequest,
+    ) -> Result<EntitlementCheckResponse, RemoteError>;
+
+    /// `GET /v1/authz/snapshot`.
+    fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError>;
+}
+
+/// IAM client that resolves decisions over the remote protocol.
+///
+/// Generic over the [`AuthzTransport`] seam so a deployment injects its HTTP
+/// client while tests inject a deterministic fake. The reasoned `*_outcome`
+/// accessors surface transport errors to callers that want to handle them; the
+/// [`IamClient`] trait methods instead fail closed to a deny so a transport
+/// outage can never widen access.
+#[derive(Debug, Clone)]
+pub struct RemoteIamClient<T> {
+    transport: T,
+}
+
+impl<T> RemoteIamClient<T> {
+    /// Build a remote client over the given transport.
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    /// Borrow the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+}
+
+impl<T: AuthzTransport> RemoteIamClient<T> {
+    /// Resolve one authorization request into its reasoned outcome, surfacing
+    /// transport errors.
+    pub fn authorize_outcome(
+        &self,
+        request: &AuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        self.transport.authorize(request)
+    }
+
+    /// Resolve a batch of authorization requests, surfacing transport errors.
+    pub fn authorize_batch(
+        &self,
+        request: &BatchAuthorizationRequest,
+    ) -> Result<BatchAuthorizationResponse, RemoteError> {
+        self.transport.authorize_batch(request)
+    }
+
+    /// Resolve an entitlement request into its reasoned response, surfacing
+    /// transport errors.
+    pub fn check_entitlement_response(
+        &self,
+        request: &EntitlementRequest,
+    ) -> Result<EntitlementCheckResponse, RemoteError> {
+        self.transport.check_entitlement(request)
+    }
+
+    /// Fetch the current authorization policy snapshot for local-mode caching.
+    pub fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
+        self.transport.fetch_snapshot()
+    }
+}
+
+impl<T: AuthzTransport> IamClient for RemoteIamClient<T> {
+    fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
+        self.transport
+            .authorize(&request)
+            .map(|outcome| outcome.decision)
+            .unwrap_or(AuthorizationDecision::Deny)
+    }
+
+    fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
+        self.transport
+            .check_entitlement(&request)
+            .map(|response| response.decision)
+            .unwrap_or(EntitlementDecision::Deny)
+    }
+}
+
+/// The `local | remote` IAM mode switch.
+///
+/// Wraps either an in-process [`IamClient`] (`L`) or a remote one (`R`) and
+/// implements [`IamClient`] by dispatching to whichever is selected, so a
+/// product service binds to one type regardless of deployment mode. Local mode
+/// is an explicit policy, not a permissive fallback: it never substitutes for an
+/// unreachable remote.
+#[derive(Debug, Clone)]
+pub enum IamClientMode<L, R> {
+    /// Resolve decisions in-process.
+    Local(L),
+    /// Resolve decisions over the remote protocol.
+    Remote(R),
+}
+
+impl<L, R> IamClientMode<L, R> {
+    /// Whether this switch is in local mode.
+    pub fn is_local(&self) -> bool {
+        matches!(self, IamClientMode::Local(_))
+    }
+
+    /// Whether this switch is in remote mode.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, IamClientMode::Remote(_))
+    }
+}
+
+impl<L: IamClient, R: IamClient> IamClient for IamClientMode<L, R> {
+    fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
+        match self {
+            IamClientMode::Local(client) => client.authorize(request),
+            IamClientMode::Remote(client) => client.authorize(request),
+        }
+    }
+
+    fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
+        match self {
+            IamClientMode::Local(client) => client.check_entitlement(request),
+            IamClientMode::Remote(client) => client.check_entitlement(request),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awaken_iam_contract::{AccountId, ActionKey, PrincipalRef, ScopeRef};
+    use std::cell::Cell;
+
+    fn auth_request(action: &str) -> AuthorizationRequest {
+        AuthorizationRequest::direct(
+            PrincipalRef::Account {
+                account_id: AccountId("acct_1".into()),
+            },
+            ActionKey(action.into()),
+            ScopeRef::Global,
+        )
+    }
+
+    fn ent_request() -> EntitlementRequest {
+        EntitlementRequest {
+            principal: PrincipalRef::Account {
+                account_id: AccountId("acct_1".into()),
+            },
+            entitlement: "pack.read".into(),
+            resource: None,
+        }
+    }
+
+    /// Transport that allows `pack.read` and otherwise denies, unless `fail` is
+    /// set, in which case every call reports a transport error.
+    struct StubTransport {
+        fail: bool,
+    }
+
+    impl AuthzTransport for StubTransport {
+        fn authorize(
+            &self,
+            request: &AuthorizationRequest,
+        ) -> Result<AuthorizationOutcome, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            let allow = request.action == ActionKey("pack.read".into());
+            Ok(AuthorizationOutcome {
+                decision: if allow {
+                    AuthorizationDecision::Allow
+                } else {
+                    AuthorizationDecision::Deny
+                },
+                reason: if allow {
+                    "allowed_by_grant"
+                } else {
+                    "default_deny"
+                }
+                .into(),
+                matched_grants: if allow { vec!["g1".into()] } else { vec![] },
+                matched_roles: vec![],
+            })
+        }
+
+        fn authorize_batch(
+            &self,
+            request: &BatchAuthorizationRequest,
+        ) -> Result<BatchAuthorizationResponse, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            let mut outcomes = Vec::new();
+            for item in &request.requests {
+                outcomes.push(self.authorize(item)?);
+            }
+            Ok(BatchAuthorizationResponse { outcomes })
+        }
+
+        fn check_entitlement(
+            &self,
+            _request: &EntitlementRequest,
+        ) -> Result<EntitlementCheckResponse, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            Ok(EntitlementCheckResponse {
+                decision: EntitlementDecision::Allow,
+                reason: "default_allow".into(),
+            })
+        }
+
+        fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            Ok(PolicySnapshot {
+                version: 4,
+                ..PolicySnapshot::default()
+            })
+        }
+    }
+
+    #[test]
+    fn remote_client_maps_transport_decisions() {
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        assert_eq!(
+            client.authorize(auth_request("pack.read")),
+            AuthorizationDecision::Allow
+        );
+        assert_eq!(
+            client.authorize(auth_request("pack.delete")),
+            AuthorizationDecision::Deny
+        );
+        assert_eq!(
+            client.check_entitlement(ent_request()),
+            EntitlementDecision::Allow
+        );
+        assert_eq!(client.fetch_snapshot().unwrap().version, 4);
+    }
+
+    #[test]
+    fn remote_batch_preserves_order() {
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        let response = client
+            .authorize_batch(&BatchAuthorizationRequest {
+                requests: vec![auth_request("pack.read"), auth_request("pack.delete")],
+            })
+            .unwrap();
+        assert_eq!(response.outcomes.len(), 2);
+        assert_eq!(response.outcomes[0].decision, AuthorizationDecision::Allow);
+        assert_eq!(response.outcomes[1].decision, AuthorizationDecision::Deny);
+    }
+
+    #[test]
+    fn remote_client_fails_closed_on_transport_error() {
+        let client = RemoteIamClient::new(StubTransport { fail: true });
+        // A transport outage must never widen access: both planes deny.
+        assert_eq!(
+            client.authorize(auth_request("pack.read")),
+            AuthorizationDecision::Deny
+        );
+        assert_eq!(
+            client.check_entitlement(ent_request()),
+            EntitlementDecision::Deny
+        );
+        // The reasoned accessor still surfaces the error for callers that care.
+        assert_eq!(
+            client.authorize_outcome(&auth_request("pack.read")),
+            Err(RemoteError("boom".into()))
+        );
+    }
+
+    /// In-process client used to exercise the local arm of the mode switch.
+    struct LocalStub {
+        calls: Cell<u32>,
+    }
+
+    impl IamClient for LocalStub {
+        fn authorize(&self, _request: AuthorizationRequest) -> AuthorizationDecision {
+            self.calls.set(self.calls.get() + 1);
+            AuthorizationDecision::Allow
+        }
+
+        fn check_entitlement(&self, _request: EntitlementRequest) -> EntitlementDecision {
+            EntitlementDecision::Allow
+        }
+    }
+
+    #[test]
+    fn mode_switch_dispatches_to_selected_client() {
+        let local: IamClientMode<LocalStub, RemoteIamClient<StubTransport>> =
+            IamClientMode::Local(LocalStub {
+                calls: Cell::new(0),
+            });
+        assert!(local.is_local());
+        assert_eq!(
+            local.authorize(auth_request("pack.delete")),
+            AuthorizationDecision::Allow
+        );
+
+        let remote: IamClientMode<LocalStub, RemoteIamClient<StubTransport>> =
+            IamClientMode::Remote(RemoteIamClient::new(StubTransport { fail: false }));
+        assert!(remote.is_remote());
+        // Remote arm honours the transport's deny for an unknown action.
+        assert_eq!(
+            remote.authorize(auth_request("pack.delete")),
+            AuthorizationDecision::Deny
+        );
+    }
+}

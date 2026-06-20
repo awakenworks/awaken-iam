@@ -1,13 +1,17 @@
 //! Convenience facade for Awaken IAM library users.
 
-pub use awaken_iam_client::IamClient;
+pub use awaken_iam_client::{
+    AuthzTransport, IamClient, IamClientMode, RemoteError, RemoteIamClient,
+};
 pub use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ActionKey, AuthorizationDecision, AuthorizationRequest,
-    EntitlementDecision, EntitlementRequest, ExternalIdentity, ExternalIdentityClaims,
-    ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderConfig,
-    IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ResourceId, ResourceType,
-    ScopeRef, Session, SessionId, SessionView, Timestamp, WorkspaceId,
+    Account, AccountId, AccountStatus, ActionKey, AuthorizationDecision, AuthorizationOutcome,
+    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
+    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, ExternalIdentity,
+    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject, GrantEffect,
+    GrantSnapshot, GrantSubjectRef, IdentityProviderConfig, IdentityProviderConfigId,
+    IdentityProviderKey, IdentityProviderKind, NamespaceId, OAuthLoginState, OAuthLoginStateId,
+    OrgId, PolicySnapshot, PrincipalRef, ProjectId, ResourceId, ResourceType, RoleBindingSnapshot,
+    ScopeGraphSnapshot, ScopeRef, Session, SessionId, SessionView, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
     BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
@@ -18,11 +22,11 @@ pub use awaken_iam_core::{
     SessionMinter, hash_session_token,
 };
 pub use awaken_iam_server::{
-    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, IamServer,
-    LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary, ReturnToDecision,
-    ReturnToPolicy, SameSite, SessionCookieConfig, SessionGateway, StartLogin, StartLoginOutcome,
-    UnlinkIdentity,
+    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
+    CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, EstablishedSession,
+    IamServer, LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary,
+    ReturnToDecision, ReturnToPolicy, SameSite, SessionCookieConfig, SessionGateway, StartLogin,
+    StartLoginOutcome, UnlinkIdentity,
 };
 
 #[cfg(test)]

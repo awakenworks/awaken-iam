@@ -27,8 +27,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use awaken_iam_contract::{
-    ActionKey, AuthorizationDecision, AuthorizationRequest, NamespaceId, OrgId, PrincipalRef,
-    ResourceId, ResourceType, ScopeRef, WorkspaceId,
+    ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, GrantEffect,
+    GrantSnapshot, GrantSubjectRef, NamespaceId, NamespaceOrgEdge, OrgId, PolicySnapshot,
+    PrincipalRef, ResourceId, ResourceParentEdge, ResourceType, RoleBindingSnapshot,
+    ScopeGraphSnapshot, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
 
 /// Identifier of a role (a reusable bundle of grants).
@@ -175,6 +177,19 @@ pub struct AuthorizationTrace {
     pub matched_roles: Vec<RoleId>,
 }
 
+impl AuthorizationTrace {
+    /// Project the trace onto the [`AuthorizationOutcome`] wire DTO, flattening
+    /// the reason to its stable code and the matched ids to plain strings.
+    pub fn to_outcome(&self) -> AuthorizationOutcome {
+        AuthorizationOutcome {
+            decision: self.decision,
+            reason: self.reason.code().to_owned(),
+            matched_grants: self.matched_grants.iter().map(|id| id.0.clone()).collect(),
+            matched_roles: self.matched_roles.iter().map(|id| id.0.clone()).collect(),
+        }
+    }
+}
+
 /// Records scope-graph parent links that cannot be derived from a [`ScopeRef`]
 /// on its own.
 ///
@@ -232,6 +247,54 @@ impl ScopeGraph {
         self.resource_parent
             .insert((resource_type, resource_id), parent);
         self
+    }
+
+    /// Capture the scope graph's parent edges as a [`ScopeGraphSnapshot`].
+    ///
+    /// Edges are sorted by their keys so the snapshot is deterministic
+    /// regardless of map iteration order.
+    fn to_snapshot(&self) -> ScopeGraphSnapshot {
+        let mut namespace_orgs: Vec<NamespaceOrgEdge> = self
+            .namespace_org
+            .iter()
+            .map(|(namespace_id, org_id)| NamespaceOrgEdge {
+                namespace_id: namespace_id.clone(),
+                org_id: org_id.clone(),
+            })
+            .collect();
+        namespace_orgs.sort_by(|left, right| left.namespace_id.0.cmp(&right.namespace_id.0));
+
+        let mut workspace_orgs: Vec<WorkspaceOrgEdge> = self
+            .workspace_org
+            .iter()
+            .map(|(workspace_id, org_id)| WorkspaceOrgEdge {
+                workspace_id: workspace_id.clone(),
+                org_id: org_id.clone(),
+            })
+            .collect();
+        workspace_orgs.sort_by(|left, right| left.workspace_id.0.cmp(&right.workspace_id.0));
+
+        let mut resource_parents: Vec<ResourceParentEdge> = self
+            .resource_parent
+            .iter()
+            .map(
+                |((resource_type, resource_id), parent)| ResourceParentEdge {
+                    resource_type: resource_type.clone(),
+                    resource_id: resource_id.clone(),
+                    parent: parent.clone(),
+                },
+            )
+            .collect();
+        resource_parents.sort_by(|left, right| {
+            (left.resource_type.0.as_str(), left.resource_id.0.as_str())
+                .cmp(&(right.resource_type.0.as_str(), right.resource_id.0.as_str()))
+        });
+
+        ScopeGraphSnapshot {
+            namespace_orgs,
+            workspace_orgs,
+            resource_parents,
+        }
     }
 
     /// Returns the direct parent of `scope`, or `None` when `scope` is a root.
@@ -530,6 +593,115 @@ impl PolicySet {
             })
             .cloned()
             .collect()
+    }
+
+    /// Capture this policy as a versioned [`PolicySnapshot`] for local-mode sync.
+    ///
+    /// Grants and role bindings keep policy order; scope-graph edges are sorted
+    /// by their keys so the snapshot is deterministic regardless of map
+    /// iteration order. The result is authorization-only — entitlement is a
+    /// separate plane and is never bundled here.
+    pub fn snapshot(&self, version: u64) -> PolicySnapshot {
+        let grants = self
+            .grants
+            .iter()
+            .map(|grant| GrantSnapshot {
+                id: grant.id.0.clone(),
+                subject: match &grant.subject {
+                    GrantSubject::Principal(principal) => GrantSubjectRef::Principal {
+                        principal: principal.clone(),
+                    },
+                    GrantSubject::Role(role) => GrantSubjectRef::Role {
+                        role_id: role.0.clone(),
+                    },
+                },
+                action_pattern: grant.action_pattern.0.clone(),
+                scope: grant.scope.clone(),
+                effect: effect_to_wire(grant.effect),
+            })
+            .collect();
+        let role_bindings = self
+            .role_bindings
+            .iter()
+            .map(|binding| RoleBindingSnapshot {
+                principal: binding.principal.clone(),
+                role_id: binding.role.0.clone(),
+                scope: binding.scope.clone(),
+            })
+            .collect();
+        PolicySnapshot {
+            version,
+            grants,
+            role_bindings,
+            scope_graph: self.scope_graph.to_snapshot(),
+        }
+    }
+
+    /// Rebuild a policy set from a [`PolicySnapshot`].
+    ///
+    /// This is the local-mode counterpart to [`PolicySet::snapshot`]: a consumer
+    /// that syncs the snapshot rebuilds the policy and evaluates in-process, so
+    /// its decisions are byte-identical to the server's remote `authorize`
+    /// answers. The snapshot `version` is metadata for the caller's freshness
+    /// fence and is not retained in the rebuilt policy.
+    pub fn from_snapshot(snapshot: &PolicySnapshot) -> Self {
+        let mut policy = Self::new();
+        for grant in &snapshot.grants {
+            policy.add_grant(Grant {
+                id: GrantId(grant.id.clone()),
+                subject: match &grant.subject {
+                    GrantSubjectRef::Principal { principal } => {
+                        GrantSubject::Principal(principal.clone())
+                    }
+                    GrantSubjectRef::Role { role_id } => {
+                        GrantSubject::Role(RoleId(role_id.clone()))
+                    }
+                },
+                action_pattern: ActionPattern(grant.action_pattern.clone()),
+                scope: grant.scope.clone(),
+                effect: effect_from_wire(grant.effect),
+            });
+        }
+        for binding in &snapshot.role_bindings {
+            policy.bind_role(RoleBinding {
+                principal: binding.principal.clone(),
+                role: RoleId(binding.role_id.clone()),
+                scope: binding.scope.clone(),
+            });
+        }
+        let graph = policy.scope_graph_mut();
+        for edge in &snapshot.scope_graph.namespace_orgs {
+            graph.assign_namespace(edge.namespace_id.clone(), edge.org_id.clone());
+        }
+        for edge in &snapshot.scope_graph.workspace_orgs {
+            graph.assign_workspace(edge.workspace_id.clone(), edge.org_id.clone());
+        }
+        for edge in &snapshot.scope_graph.resource_parents {
+            graph.assign_resource_parent(
+                edge.resource_type.clone(),
+                edge.resource_id.clone(),
+                edge.parent.clone(),
+            );
+        }
+        policy
+    }
+}
+
+/// Map a core [`Effect`] onto its wire [`GrantEffect`].
+fn effect_to_wire(effect: Effect) -> GrantEffect {
+    match effect {
+        Effect::Allow => GrantEffect::Allow,
+        Effect::RequireApproval => GrantEffect::RequireApproval,
+        Effect::Deny => GrantEffect::Deny,
+    }
+}
+
+/// Map a wire [`GrantEffect`] back onto its core [`Effect`].
+fn effect_from_wire(effect: GrantEffect) -> Effect {
+    match effect {
+        GrantEffect::Allow => Effect::Allow,
+        GrantEffect::RequireApproval => Effect::RequireApproval,
+        GrantEffect::Deny => Effect::Deny,
     }
 }
 

@@ -1,5 +1,9 @@
 //! Client-facing IAM traits.
 
+mod remote;
+
+pub use remote::{AuthzTransport, IamClientMode, RemoteError, RemoteIamClient};
+
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,
 };
