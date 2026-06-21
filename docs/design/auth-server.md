@@ -34,7 +34,9 @@ trait IdentityProvider {
 ```
 
 Config loads from environment, never hardcoded (`GOOGLE_CLIENT_ID`,
-`GITHUB_CLIENT_ID`, …). Each adapter normalizes the upstream profile into the
+`GITHUB_CLIENT_ID`, …); see [provider setup](provider-setup.md) for the operator
+runbook (upstream app registration, callback URLs, env vars, local vs prod).
+Each adapter normalizes the upstream profile into the
 single `ExternalIdentityClaims` shape; the rest of IAM never sees a
 provider-specific field. Adding a provider later is: enum variant + config +
 `From<UpstreamProfile> for ExternalIdentityClaims`. The core login flow is
