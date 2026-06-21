@@ -34,7 +34,9 @@ pub use awaken_iam_server::{
     IssueTokenGrant, LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration,
     ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
     RevokeTokenHint, RouteSpec, SameSite, SessionCookieConfig, SessionGateway, StartLogin,
-    StartLoginOutcome, TokenGrant, UnlinkIdentity,
+    StartLoginOutcome, TOKEN_EXCHANGE_GRANT_TYPE, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse, TokenGrant, TrustedIssuer, TrustedIssuerRegistry, UnlinkIdentity,
+    WorkloadBinding,
 };
 
 #[cfg(test)]

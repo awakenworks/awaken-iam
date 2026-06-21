@@ -117,6 +117,7 @@ const AUTH_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/auth/callback/{provider}"),
     RouteSpec::get("/v1/session"),
     RouteSpec::delete("/v1/session"),
+    RouteSpec::post("/v1/oauth/token"),
     RouteSpec::get("/v1/oauth/userinfo"),
     RouteSpec::get("/v1/account/identities"),
     RouteSpec::post("/v1/account/identities"),
