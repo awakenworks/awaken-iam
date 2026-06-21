@@ -45,7 +45,11 @@ const TYPE_TOKENS: &[(&str, &str, &str)] = &[
     ("{timestamptz}", "TIMESTAMPTZ", "TEXT"),
     ("{now}", "now()", "CURRENT_TIMESTAMP"),
     ("{blob}", "BYTEA", "BLOB"),
-    ("{pk_autoinc}", "BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    (
+        "{pk_autoinc}",
+        "BIGSERIAL PRIMARY KEY",
+        "INTEGER PRIMARY KEY AUTOINCREMENT",
+    ),
 ];
 
 /// Ledger DDL template, rendered per dialect like any bundle step.
@@ -618,7 +622,11 @@ mod tests {
         let (pg_plan, lite_plan) = (pg.plan(), lite.plan());
         assert_eq!(pg_plan.len(), lite_plan.len());
         for (a, b) in pg_plan.iter().zip(lite_plan.iter()) {
-            assert_eq!(a.checksum, b.checksum, "{}::{} identity drifted", a.bundle, a.id);
+            assert_eq!(
+                a.checksum, b.checksum,
+                "{}::{} identity drifted",
+                a.bundle, a.id
+            );
             assert_ne!(a.sql, b.sql, "{}::{} rendered identically", a.bundle, a.id);
         }
     }
