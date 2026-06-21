@@ -112,6 +112,7 @@ impl RouteSpec {
 /// The browser-facing authentication routes ([`AuthApi`]).
 const AUTH_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/.well-known/openid-configuration"),
+    RouteSpec::get("/.well-known/jwks.json"),
     RouteSpec::get("/v1/auth/providers"),
     RouteSpec::get("/v1/auth/login/{provider}"),
     RouteSpec::get("/v1/auth/callback/{provider}"),
@@ -400,6 +401,10 @@ mod tests {
         assert!(routes.contains(&RouteSpec::get("/v1/session")));
         assert!(routes.contains(&RouteSpec::post("/v1/authorize")));
         assert!(routes.contains(&RouteSpec::get("/v1/authz/snapshot")));
+        // The well-known discovery surface mounts both the OIDC metadata and the
+        // JWKS so third parties can verify IAM-signed access tokens.
+        assert!(routes.contains(&RouteSpec::get("/.well-known/openid-configuration")));
+        assert!(routes.contains(&RouteSpec::get("/.well-known/jwks.json")));
         // No path leaks an unrendered template token or omits its version prefix.
         assert!(
             routes
