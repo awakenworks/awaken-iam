@@ -538,4 +538,34 @@ mod tests {
         let result = IamAssembly::embedded(executor);
         assert!(result.is_err(), "drift must abort assembly, not be skipped");
     }
+
+    #[test]
+    fn explicit_entitlement_engine_flows_through_both_constructors() {
+        use awaken_iam_core::EntitlementEngine;
+
+        // The assembly constructor accepts a deployment-supplied engine.
+        let mut assembly = IamAssembly::with_entitlements(
+            Deployment::Embedded,
+            RecordingExecutor::new(),
+            EntitlementEngine::default_allow(),
+        )
+        .expect("assemble with entitlements");
+        assert_eq!(assembly.deployment(), Deployment::Embedded);
+
+        // The auth and authz surfaces are reachable by shared and mutable borrow.
+        let _ = assembly.auth();
+        let _ = assembly.auth_mut();
+        let _ = assembly.authz();
+        let _ = assembly.authz_mut();
+
+        // The daemon wrapper takes the same explicit engine and exposes its
+        // assembly mutably.
+        let mut daemon = IamDaemon::with_entitlements(
+            RecordingExecutor::new(),
+            EntitlementEngine::default_allow(),
+        )
+        .expect("daemon with entitlements");
+        assert_eq!(daemon.assembly().deployment(), Deployment::Standalone);
+        let _ = daemon.assembly_mut().authz_mut();
+    }
 }

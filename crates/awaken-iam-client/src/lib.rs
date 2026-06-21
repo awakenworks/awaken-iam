@@ -44,3 +44,47 @@ impl<C: IamClient + ?Sized> IamClient for &C {
         (**self).check_entitlement(request)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awaken_iam_contract::{AccountId, ActionKey, PrincipalRef, ScopeRef};
+
+    struct AllowAll;
+
+    impl IamClient for AllowAll {
+        fn authorize(&self, _request: AuthorizationRequest) -> AuthorizationDecision {
+            AuthorizationDecision::Allow
+        }
+
+        fn check_entitlement(&self, _request: EntitlementRequest) -> EntitlementDecision {
+            EntitlementDecision::Allow
+        }
+    }
+
+    #[test]
+    fn a_borrowed_client_delegates_to_the_owner() {
+        let engine = AllowAll;
+        // A shared reference forwards both planes to the owned engine, so an
+        // embedded deployment can lend its engine without surrendering ownership.
+        let borrowed: &dyn IamClient = &engine;
+        let request = AuthorizationRequest::direct(
+            PrincipalRef::Account {
+                account_id: AccountId("acct_1".into()),
+            },
+            ActionKey("pack.read".into()),
+            ScopeRef::Global,
+        );
+        assert_eq!(borrowed.authorize(request), AuthorizationDecision::Allow);
+        assert_eq!(
+            borrowed.check_entitlement(EntitlementRequest {
+                principal: PrincipalRef::Account {
+                    account_id: AccountId("acct_1".into()),
+                },
+                entitlement: "pack.read".into(),
+                resource: None,
+            }),
+            EntitlementDecision::Allow
+        );
+    }
+}

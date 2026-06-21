@@ -725,4 +725,151 @@ mod tests {
             .expect_err("transport failure surfaces");
         assert!(matches!(err, ProviderError::ExchangeRejected { .. }));
     }
+
+    fn callback(code: &str) -> CallbackExchange {
+        CallbackExchange {
+            redirect_uri: "https://app.example/cb".into(),
+            code: code.into(),
+            pkce_verifier: None,
+        }
+    }
+
+    #[test]
+    fn overriding_default_scopes_and_request_scopes_reach_the_url() {
+        // Custom default scopes are used when the request carries none.
+        let secrets = GenericOAuthSecrets::new("topsecret", "https://idp.acme.example/userinfo")
+            .with_default_scopes(["openid", "groups"]);
+        let provider = GenericOAuthProvider::new(secrets, ok_transport());
+        assert_eq!(provider.provider_kind(), IdentityProviderKind::Oidc);
+        // The transport is borrowable through the accessor.
+        let _ = provider.transport();
+        let redirect = provider
+            .authorization_url(&config(IdentityProviderKind::Oidc), &auth_request())
+            .expect("url");
+        assert!(redirect.url.contains("scope=openid%20groups"));
+
+        // A request that names its own scopes overrides the defaults.
+        let mut req = auth_request();
+        req.scopes = vec!["openid".into(), "offline_access".into()];
+        let redirect = provider
+            .authorization_url(&config(IdentityProviderKind::Oidc), &req)
+            .expect("url");
+        assert!(redirect.url.contains("scope=openid%20offline_access"));
+    }
+
+    #[test]
+    fn authorization_url_requires_an_authorization_endpoint() {
+        let provider = provider(ok_transport());
+        let mut cfg = config(IdentityProviderKind::Oidc);
+        cfg.authorization_endpoint = None;
+        let err = provider
+            .authorization_url(&cfg, &auth_request())
+            .expect_err("missing authorization endpoint");
+        assert_eq!(
+            err,
+            ProviderError::MissingConfiguration {
+                field: "authorization_endpoint"
+            }
+        );
+    }
+
+    #[test]
+    fn redeem_requires_a_token_endpoint() {
+        let provider = provider(ok_transport());
+        let mut cfg = config(IdentityProviderKind::Oidc);
+        cfg.token_endpoint = None;
+        let err = provider
+            .exchange_callback(&cfg, &callback("auth-code"))
+            .expect_err("missing token endpoint");
+        assert_eq!(
+            err,
+            ProviderError::MissingConfiguration {
+                field: "token_endpoint"
+            }
+        );
+    }
+
+    #[test]
+    fn token_response_must_be_valid_json() {
+        let provider = provider(RoutingTransport {
+            token_body: b"not-json".to_vec(),
+            userinfo_body: Vec::new(),
+            fail: None,
+        });
+        let err = provider
+            .exchange_callback(&config(IdentityProviderKind::Oidc), &callback("auth-code"))
+            .expect_err("malformed token json");
+        assert!(matches!(err, ProviderError::MalformedClaims { .. }));
+    }
+
+    #[test]
+    fn token_response_must_carry_a_non_empty_access_token() {
+        // Missing access_token, then an empty one, both reject as exchange errors.
+        for body in [&b"{}"[..], br#"{"access_token":""}"#] {
+            let provider = provider(RoutingTransport {
+                token_body: body.to_vec(),
+                userinfo_body: ok_transport().userinfo_body,
+                fail: None,
+            });
+            let err = provider
+                .exchange_callback(&config(IdentityProviderKind::Oidc), &callback("auth-code"))
+                .expect_err("no usable access token");
+            assert!(matches!(err, ProviderError::ExchangeRejected { .. }));
+        }
+    }
+
+    #[test]
+    fn userinfo_response_must_be_valid_json() {
+        let provider = provider(RoutingTransport {
+            token_body: ok_transport().token_body,
+            userinfo_body: b"<html>".to_vec(),
+            fail: None,
+        });
+        let err = provider
+            .exchange_callback(&config(IdentityProviderKind::Oidc), &callback("auth-code"))
+            .expect_err("malformed userinfo json");
+        assert!(matches!(err, ProviderError::MalformedClaims { .. }));
+    }
+
+    #[test]
+    fn userinfo_request_failure_surfaces_after_a_successful_redeem() {
+        // A transport that redeems the token but fails the userinfo fetch, so the
+        // failure surfaces from the second leg, not the first.
+        struct UserinfoFails;
+        impl HttpTransport for UserinfoFails {
+            fn execute(&self, request: &HttpRequest) -> Result<Vec<u8>, String> {
+                if request.url.contains("/token") {
+                    Ok(br#"{"access_token":"at"}"#.to_vec())
+                } else {
+                    Err("userinfo down".into())
+                }
+            }
+        }
+        let provider = GenericOAuthProvider::new(
+            GenericOAuthSecrets::new("topsecret", "https://idp.acme.example/userinfo"),
+            UserinfoFails,
+        );
+        let err = provider
+            .exchange_callback(&config(IdentityProviderKind::Oidc), &callback("auth-code"))
+            .expect_err("userinfo failure surfaces");
+        match err {
+            ProviderError::ExchangeRejected { reason } => {
+                assert!(reason.contains("userinfo"), "reason was {reason}");
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn userinfo_must_include_a_subject() {
+        let provider = provider(RoutingTransport {
+            token_body: ok_transport().token_body,
+            userinfo_body: br#"{"sub":""}"#.to_vec(),
+            fail: None,
+        });
+        let err = provider
+            .exchange_callback(&config(IdentityProviderKind::Oidc), &callback("auth-code"))
+            .expect_err("empty subject");
+        assert!(matches!(err, ProviderError::MalformedClaims { .. }));
+    }
 }

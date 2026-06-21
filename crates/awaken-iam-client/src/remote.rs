@@ -452,4 +452,50 @@ mod tests {
             AuthorizationDecision::Deny
         );
     }
+
+    #[test]
+    fn mode_switch_routes_entitlement_checks_through_both_arms() {
+        let local: IamClientMode<LocalStub, RemoteIamClient<StubTransport>> =
+            IamClientMode::Local(LocalStub {
+                calls: Cell::new(0),
+            });
+        assert_eq!(
+            local.check_entitlement(ent_request()),
+            EntitlementDecision::Allow
+        );
+
+        let remote: IamClientMode<LocalStub, RemoteIamClient<StubTransport>> =
+            IamClientMode::Remote(RemoteIamClient::new(StubTransport { fail: false }));
+        assert_eq!(
+            remote.check_entitlement(ent_request()),
+            EntitlementDecision::Allow
+        );
+    }
+
+    #[test]
+    fn reasoned_accessors_surface_responses_and_borrow_the_transport() {
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        // The transport accessor returns the injected seam.
+        assert!(!client.transport().fail);
+        // The reasoned entitlement accessor surfaces the full response.
+        let response = client.check_entitlement_response(&ent_request()).unwrap();
+        assert_eq!(response.decision, EntitlementDecision::Allow);
+        assert_eq!(response.reason, "default_allow");
+    }
+
+    #[test]
+    fn batch_and_snapshot_propagate_transport_errors_to_reasoned_callers() {
+        let client = RemoteIamClient::new(StubTransport { fail: true });
+        assert_eq!(
+            client.authorize_batch(&BatchAuthorizationRequest {
+                requests: vec![auth_request("pack.read")],
+            }),
+            Err(RemoteError("boom".into()))
+        );
+        assert_eq!(client.fetch_snapshot(), Err(RemoteError("boom".into())));
+        assert_eq!(
+            client.check_entitlement_response(&ent_request()),
+            Err(RemoteError("boom".into()))
+        );
+    }
 }

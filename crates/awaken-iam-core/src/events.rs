@@ -635,4 +635,202 @@ mod tests {
         // The fence never advances on a sink that failed to persist the event.
         assert_eq!(ledger.version(), 1);
     }
+
+    /// Every variant's stable action key, audit detail, and intrinsic actor,
+    /// asserted together so a new variant cannot silently skip one of the three.
+    #[test]
+    fn every_variant_renders_action_detail_and_actor() {
+        use crate::PlanId;
+        use awaken_iam_contract::{
+            NamespaceId, OrgId, ProjectId, ResourceId, ResourceType, WorkspaceId,
+        };
+
+        let svc = PrincipalRef::Service {
+            service_id: "svc".into(),
+        };
+        let cases: Vec<(DomainEvent, &str, &str, Option<PrincipalRef>)> = vec![
+            (
+                DomainEvent::SessionRevoked {
+                    session: SessionId("s1".into()),
+                },
+                "session.revoked",
+                "session=s1",
+                None,
+            ),
+            (
+                DomainEvent::ApiTokenIssued {
+                    principal: PrincipalRef::ApiToken {
+                        token_id: "tok".into(),
+                    },
+                    token_id: "tok".into(),
+                },
+                "api_token.issued",
+                "principal=api_token:tok token=tok",
+                Some(PrincipalRef::ApiToken {
+                    token_id: "tok".into(),
+                }),
+            ),
+            (
+                DomainEvent::ApiTokenRevoked {
+                    token_id: "tok".into(),
+                },
+                "api_token.revoked",
+                "token=tok",
+                None,
+            ),
+            (
+                DomainEvent::RoleDefined {
+                    role: RoleId("admin".into()),
+                },
+                "role.defined",
+                "role=admin",
+                None,
+            ),
+            (
+                DomainEvent::MembershipGranted {
+                    principal: svc.clone(),
+                    role: RoleId("admin".into()),
+                    scope: ScopeRef::Org {
+                        org_id: OrgId("acme".into()),
+                    },
+                },
+                "membership.granted",
+                "principal=service:svc role=admin scope=org:acme",
+                Some(svc.clone()),
+            ),
+            (
+                DomainEvent::MembershipRevoked {
+                    principal: svc.clone(),
+                    role: RoleId("admin".into()),
+                    scope: ScopeRef::Namespace {
+                        namespace_id: NamespaceId("ns".into()),
+                    },
+                },
+                "membership.revoked",
+                "principal=service:svc role=admin scope=namespace:ns",
+                Some(svc.clone()),
+            ),
+            (
+                DomainEvent::SignerRegistered {
+                    namespace: NamespaceId("ns".into()),
+                    signer: "fp".into(),
+                },
+                "signer.registered",
+                "namespace=ns signer=fp",
+                None,
+            ),
+            (
+                DomainEvent::SignerRevoked {
+                    namespace: NamespaceId("ns".into()),
+                    signer: "fp".into(),
+                },
+                "signer.revoked",
+                "namespace=ns signer=fp",
+                None,
+            ),
+            (
+                DomainEvent::SubscriptionChanged {
+                    principal: svc.clone(),
+                    plan: PlanId("pro".into()),
+                },
+                "subscription.changed",
+                "principal=service:svc plan=pro",
+                Some(svc.clone()),
+            ),
+        ];
+
+        for (event, action, detail, actor) in cases {
+            assert_eq!(event.action(), action, "action for {action}");
+            assert_eq!(event.detail(), detail, "detail for {action}");
+            assert_eq!(event.actor(), actor, "actor for {action}");
+            // Each non-decision variant fences the snapshot version.
+            assert!(event.fences_snapshot(), "{action} should fence");
+        }
+
+        // The remaining scope shapes render through the detail path.
+        let workspace = DomainEvent::MembershipGranted {
+            principal: PrincipalRef::Account {
+                account_id: account("ada"),
+            },
+            role: RoleId("viewer".into()),
+            scope: ScopeRef::Workspace {
+                workspace_id: WorkspaceId("w1".into()),
+            },
+        };
+        assert_eq!(
+            workspace.detail(),
+            "principal=account:ada role=viewer scope=workspace:w1"
+        );
+
+        let project = DomainEvent::MembershipGranted {
+            principal: PrincipalRef::Account {
+                account_id: account("ada"),
+            },
+            role: RoleId("viewer".into()),
+            scope: ScopeRef::Project {
+                workspace_id: WorkspaceId("w1".into()),
+                project_id: ProjectId("p1".into()),
+            },
+        };
+        assert_eq!(
+            project.detail(),
+            "principal=account:ada role=viewer scope=project:w1/p1"
+        );
+
+        let resource = DomainEvent::MembershipGranted {
+            principal: PrincipalRef::Account {
+                account_id: account("ada"),
+            },
+            role: RoleId("viewer".into()),
+            scope: ScopeRef::Resource {
+                resource_type: ResourceType("pack".into()),
+                resource_id: ResourceId("r1".into()),
+            },
+        };
+        assert_eq!(
+            resource.detail(),
+            "principal=account:ada role=viewer scope=resource:pack/r1"
+        );
+    }
+
+    #[test]
+    fn require_approval_decision_renders_in_the_trace_detail() {
+        let event = DomainEvent::AuthorizationDecided {
+            trace: DecisionTrace::capture(
+                &request("pack.publish"),
+                &AuthorizationTrace {
+                    decision: AuthorizationDecision::RequireApproval,
+                    reason: DecisionReason::DefaultDeny,
+                    matched_grants: Vec::new(),
+                    matched_roles: Vec::new(),
+                },
+            ),
+        };
+        assert!(event.detail().contains("decision=require_approval"));
+        // An empty grant/role set renders as empty bracket lists.
+        assert!(event.detail().contains("grants=[] roles=[]"));
+        // A decision is the only audit-only event.
+        assert!(!event.fences_snapshot());
+    }
+
+    #[test]
+    fn resume_starts_the_fence_at_the_given_version_and_exposes_the_sink() {
+        let mut ledger = AuditLedger::resume(VecSink::default(), 7);
+        assert_eq!(ledger.version(), 7);
+        let after = ledger
+            .emit(
+                ts("2026-06-21T00:00:00Z"),
+                DomainEvent::RoleDefined {
+                    role: RoleId("admin".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(after, 8);
+
+        // The sink is borrowable while the ledger lives...
+        assert_eq!(ledger.sink().events().unwrap().len(), 1);
+        // ...and recoverable by consuming the ledger.
+        let sink = ledger.into_sink();
+        assert_eq!(sink.events().unwrap().len(), 1);
+    }
 }

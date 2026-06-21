@@ -757,4 +757,110 @@ mod tests {
         pap.delete_group(&GroupId("eng".into()), at()).unwrap();
         assert!(pap.list_groups().unwrap().is_empty());
     }
+
+    #[test]
+    fn role_lifecycle_define_update_delete_and_conflicts() {
+        let mut pap = pap();
+        pap.define_role(role("publisher"), at()).unwrap();
+        // A duplicate id is a conflict and does not advance the version.
+        assert_eq!(
+            pap.define_role(role("publisher"), at()),
+            Err(AdminError::AlreadyExists("role publisher".into()))
+        );
+        assert_eq!(pap.version(), 2);
+
+        // Updating an absent role fails closed.
+        assert!(matches!(
+            pap.update_role(role("ghost"), at()),
+            Err(AdminError::NotFound(_))
+        ));
+
+        // A valid update replaces the role and advances the version.
+        let mut updated = role("publisher");
+        updated.action_patterns = vec![ActionPattern("pack.publish".into())];
+        pap.update_role(updated, at()).unwrap();
+        assert_eq!(
+            pap.get_role(&RoleId("publisher".into()))
+                .unwrap()
+                .unwrap()
+                .action_patterns,
+            vec![ActionPattern("pack.publish".into())]
+        );
+
+        pap.delete_role(&RoleId("publisher".into()), at()).unwrap();
+        assert!(pap.get_role(&RoleId("publisher".into())).unwrap().is_none());
+        assert!(matches!(
+            pap.delete_role(&RoleId("publisher".into()), at()),
+            Err(AdminError::NotFound(_))
+        ));
+        // The update and delete events carry their stable action keys and detail.
+        let actions: Vec<_> = pap.events().iter().map(|e| e.action()).collect();
+        assert!(actions.contains(&"role.update"));
+        assert!(actions.contains(&"role.delete"));
+        let update_detail = DomainEvent::RoleUpdated(RoleId("publisher".into())).detail();
+        assert_eq!(update_detail, "role publisher");
+    }
+
+    #[test]
+    fn group_and_grant_reads_and_duplicate_guards() {
+        let mut pap = pap();
+        let group = Group {
+            id: GroupId("eng".into()),
+            org: OrgId("acme".into()),
+            display_name: None,
+            members: Vec::new(),
+            created_at: at(),
+            updated_at: at(),
+        };
+        pap.create_group(group.clone(), at()).unwrap();
+        // A duplicate group id is a conflict.
+        assert_eq!(
+            pap.create_group(group, at()),
+            Err(AdminError::AlreadyExists("group eng".into()))
+        );
+        // Updating a missing group fails closed.
+        let ghost = Group {
+            id: GroupId("ghost".into()),
+            org: OrgId("acme".into()),
+            display_name: None,
+            members: Vec::new(),
+            created_at: at(),
+            updated_at: at(),
+        };
+        assert!(matches!(
+            pap.update_group(ghost, at()),
+            Err(AdminError::NotFound(_))
+        ));
+
+        // get_grant resolves an issued grant and returns None for an absent one.
+        let grant = Grant {
+            id: GrantId("g1".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.read".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        };
+        pap.issue_grant(grant, at()).unwrap();
+        assert_eq!(
+            pap.get_grant(&GrantId("g1".into())).unwrap().unwrap().id,
+            GrantId("g1".into())
+        );
+        assert!(pap.get_grant(&GrantId("absent".into())).unwrap().is_none());
+    }
+
+    #[test]
+    fn repo_errors_map_onto_the_admin_error_surface() {
+        assert_eq!(
+            AdminError::from(RepoError::Conflict("x".into())),
+            AdminError::AlreadyExists("x".into())
+        );
+        assert_eq!(
+            AdminError::from(RepoError::NotFound("x".into())),
+            AdminError::NotFound("x".into())
+        );
+        assert_eq!(
+            AdminError::from(RepoError::Backend("x".into())),
+            AdminError::Backend("x".into())
+        );
+    }
 }
