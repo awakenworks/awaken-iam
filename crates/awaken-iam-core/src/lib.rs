@@ -65,8 +65,8 @@ pub use oauth_provider::{
 };
 pub use ports::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo,
-    LoginFlowRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo,
-    RoleRepo, SessionRepo, external_identity_id_hint,
+    LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo,
+    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,

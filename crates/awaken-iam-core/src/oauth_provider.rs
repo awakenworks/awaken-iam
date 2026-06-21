@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::EntropySource;
 use crate::hash_session_token;
+use crate::ports::{OAuthClientRepo, RepoResult};
 
 /// Bytes of entropy in a freshly minted authorization code.
 const CODE_BYTES: usize = 32;
@@ -63,7 +64,11 @@ pub enum OAuthProviderError {
 }
 
 /// A product client registered to integrate against IAM as an OAuth provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The value is serialisable so a persistence adapter can round-trip it as the
+/// stored shape of a registered client — only the `secret_hash` is retained, the
+/// cleartext secret never is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegisteredClient {
     /// Public client identifier.
     pub client_id: String,
@@ -137,6 +142,20 @@ impl OAuthClientRegistry {
         Self::default()
     }
 
+    /// Build a registry hydrated from every client persisted in `repo`.
+    ///
+    /// This is how a deployment backs the registry with durable storage: the
+    /// admin API writes registered clients through an [`OAuthClientRepo`], and
+    /// the authorization server loads them here rather than holding an in-memory
+    /// seed. The order clients are inserted in does not matter; lookup is by id.
+    pub fn load(repo: &impl OAuthClientRepo) -> RepoResult<Self> {
+        let mut registry = Self::new();
+        for client in repo.list()? {
+            registry.register(client);
+        }
+        Ok(registry)
+    }
+
     /// Register or replace a client.
     pub fn register(&mut self, client: RegisteredClient) {
         self.clients.insert(client.client_id.clone(), client);
@@ -145,6 +164,13 @@ impl OAuthClientRegistry {
     /// Look up a registered client by id.
     pub fn get(&self, client_id: &str) -> Option<&RegisteredClient> {
         self.clients.get(client_id)
+    }
+
+    /// List the registered clients ordered by id for stable iteration.
+    pub fn clients(&self) -> Vec<&RegisteredClient> {
+        let mut clients: Vec<&RegisteredClient> = self.clients.values().collect();
+        clients.sort_by(|left, right| left.client_id.cmp(&right.client_id));
+        clients
     }
 }
 

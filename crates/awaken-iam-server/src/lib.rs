@@ -8,6 +8,7 @@ mod authz_api;
 mod capability_token;
 pub mod http;
 mod op_id_token;
+mod oauth_client_admin;
 mod session;
 mod store;
 mod token_exchange;
@@ -34,6 +35,7 @@ pub use capability_token::{
 pub use op_id_token::{
     ID_TOKEN_TYP, IdTokenError, MintIdToken, OidcIdTokenClaims, mint_id_token, verify_id_token,
 };
+pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
 };

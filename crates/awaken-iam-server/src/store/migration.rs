@@ -437,6 +437,10 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     id: "0002_api_tokens",
                     up_sql: IDENTITY_0002,
                 },
+                Migration {
+                    id: "0003_oauth_clients",
+                    up_sql: IDENTITY_0003,
+                },
             ],
         },
         MigrationBundle {
@@ -531,6 +535,19 @@ CREATE TABLE IF NOT EXISTS {prefix}_api_tokens (\
  revoked_at TEXT);\n\
 CREATE INDEX IF NOT EXISTS {prefix}_api_tokens_principal_idx \
  ON {prefix}_api_tokens (principal);";
+
+// Downstream OAuth provider clients: the product clients allowed to integrate
+// against IAM as an authorization server. The natural key is the public
+// `client_id`. Redirect URIs and allowed scopes are the JSON contract form so
+// the domain owns their shape; `secret_hash` is the hash of a confidential
+// client's secret and is NULL for a public (PKCE-only) client — the cleartext
+// secret is never stored.
+const IDENTITY_0003: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_oauth_clients (\
+ client_id TEXT PRIMARY KEY, \
+ redirect_uris {json} NOT NULL, \
+ allowed_scopes {json} NOT NULL, \
+ secret_hash TEXT);";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //
@@ -637,6 +654,7 @@ mod tests {
         let plan = store.plan();
         assert!(plan.iter().any(|m| m.sql.contains("iam_accounts")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_api_tokens")));
+        assert!(plan.iter().any(|m| m.sql.contains("iam_oauth_clients")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_grants")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_plans")));
         // No unrendered template tokens leak into the executed SQL — neither the
