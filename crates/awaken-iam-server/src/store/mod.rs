@@ -11,6 +11,6 @@ mod migration;
 
 pub use memory::InMemoryStore;
 pub use migration::{
-    BundleScope, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,
+    BundleScope, Dialect, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,
     PlannedMigration, RecordingExecutor, bundles,
 };
