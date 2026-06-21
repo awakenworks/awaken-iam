@@ -30,7 +30,7 @@ pub use api_token::{
 };
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
-    PolicySet, RoleBinding, RoleId, ScopeGraph,
+    GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
 };
 pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
