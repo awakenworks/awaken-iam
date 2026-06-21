@@ -15,8 +15,8 @@
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity, ExternalIdentityId,
-    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId,
-    Timestamp,
+    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session,
+    SessionId, Timestamp,
 };
 
 use crate::{

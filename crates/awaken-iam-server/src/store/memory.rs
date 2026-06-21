@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use awaken_iam_contract::{
-    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity, ExternalIdentityKey,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId, Timestamp,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
+    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session,
+    SessionId, Timestamp,
 };
 use awaken_iam_core::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId,
