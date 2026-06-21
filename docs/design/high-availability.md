@@ -7,6 +7,14 @@ highly available store. IAM adds no consensus, no leader election, and no
 node-to-node messaging to get there — three rules already in the design make
 every node interchangeable, and this document is the argument that they suffice.
 
+This topology requires **Postgres** as the shared store. SQLite — the other
+supported backend ([ADR-0003](../adr/0003-storage-backends.md)) — is a
+single-writer file: it serves the single-node embedded/local band correctly and
+is trivially consistent there, but it is not the *shared* store many nodes
+advance a common fence in (rule 3 below). Configuring SQLite for a multi-node
+deployment is a misconfiguration, not a degraded mode. Everything below assumes
+Postgres.
+
 ## The three rules
 
 1. **All authoritative state lives in the shared store.** Between requests a node
@@ -54,11 +62,12 @@ as a single logical, highly available endpoint and reconnects across a failover.
 
 Concurrent node startup is safe because the
 [migration bundles](deployment.md#principle-bundles-are-split-or-aggregate-safe)
-are append-only, checksum-verified, and idempotent. The Postgres
-`MigrationExecutor` guards startup with an advisory lock so exactly one node
-applies a pending bundle while the others wait and then verify the ledger; no
-bundle hard-couples to another, so a rolling deploy that briefly mixes node
-versions stays safe.
+are append-only, checksum-verified, and idempotent. The `MigrationExecutor`
+honours a backend-neutral **single-applier guard** so exactly one node applies a
+pending bundle while the others wait and then verify the ledger — the Postgres
+adapter implements it with a `pg_advisory_lock`
+([ADR-0003](../adr/0003-storage-backends.md)). No bundle hard-couples to another,
+so a rolling deploy that briefly mixes node versions stays safe.
 
 ## Freshness and revocation across nodes
 
@@ -123,9 +132,11 @@ Closing that — making every node interchangeable per the three rules — is th
 remaining work, all of it edge adapters over existing ports, none of it a change
 to `contract`, `core`, or `client`:
 
-- a Postgres `MigrationExecutor` and repository adapter behind the
-  [migration plan](deployment.md#crate-placement) (only an in-memory adapter
-  exists today);
+- the backend repository adapters and `MigrationExecutor`s behind the
+  [migration plan](deployment.md#crate-placement) — Postgres for this HA
+  topology, SQLite for the single-node band
+  ([ADR-0003](../adr/0003-storage-backends.md)) — with the dialect-token
+  rendering they share (only an in-memory adapter exists today);
 - an HTTP server binding the manifested `/v1` routes (the assembly produces a
   route manifest, not yet a served router);
 - store-backed `version` / `epoch` advancement, written in the same transaction
