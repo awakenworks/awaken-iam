@@ -16,7 +16,7 @@
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    PolicySnapshot,
+    NamespaceId, PolicySnapshot, SignerSetSnapshot,
 };
 
 use crate::IamClient;
@@ -57,6 +57,9 @@ pub trait AuthzTransport {
 
     /// `GET /v1/authz/snapshot`.
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError>;
+
+    /// `GET /v1/namespaces/{namespace_id}/signers`.
+    fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError>;
 }
 
 /// IAM client that resolves decisions over the remote protocol.
@@ -113,6 +116,16 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     /// Fetch the current authorization policy snapshot for local-mode caching.
     pub fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
         self.transport.fetch_snapshot()
+    }
+
+    /// Fetch a namespace's active signer set for trust-root distribution,
+    /// surfacing transport errors. The set carries the same version fence as the
+    /// policy snapshot, so a consumer caches it and re-syncs when the fence moves.
+    pub fn fetch_signers(
+        &self,
+        namespace_id: &NamespaceId,
+    ) -> Result<SignerSetSnapshot, RemoteError> {
+        self.transport.fetch_signers(namespace_id)
     }
 }
 
@@ -269,6 +282,20 @@ mod tests {
                 ..PolicySnapshot::default()
             })
         }
+
+        fn fetch_signers(
+            &self,
+            namespace_id: &NamespaceId,
+        ) -> Result<SignerSetSnapshot, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            Ok(SignerSetSnapshot {
+                namespace_id: namespace_id.clone(),
+                version: 4,
+                signers: Vec::new(),
+            })
+        }
     }
 
     #[test]
@@ -287,6 +314,10 @@ mod tests {
             EntitlementDecision::Allow
         );
         assert_eq!(client.fetch_snapshot().unwrap().version, 4);
+        // The signer set is fetched for the requested namespace under the fence.
+        let signers = client.fetch_signers(&NamespaceId("acme".into())).unwrap();
+        assert_eq!(signers.namespace_id, NamespaceId("acme".into()));
+        assert_eq!(signers.version, 4);
     }
 
     #[test]
@@ -317,6 +348,11 @@ mod tests {
         // The reasoned accessor still surfaces the error for callers that care.
         assert_eq!(
             client.authorize_outcome(&auth_request("pack.read")),
+            Err(RemoteError("boom".into()))
+        );
+        // The signer fetch surfaces the transport error rather than a stale set.
+        assert_eq!(
+            client.fetch_signers(&NamespaceId("acme".into())),
             Err(RemoteError("boom".into()))
         );
     }

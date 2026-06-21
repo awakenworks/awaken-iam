@@ -128,10 +128,15 @@ const AUTH_ROUTES: &[RouteSpec] = &[
 ];
 
 /// The authorization/entitlement protocol routes ([`AuthzApi`]).
+///
+/// `GET /v1/namespaces/{namespace_id}/signers` is the namespace trust-root
+/// lookup a registry consumer (Pack Hub) reads to obtain a namespace's active
+/// signer set under the snapshot version fence.
 const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/authorize"),
     RouteSpec::post("/v1/authorize/batch"),
     RouteSpec::post("/v1/entitlements/check"),
+    RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::get("/v1/authz/snapshot"),
 ];
 
@@ -403,17 +408,16 @@ mod tests {
         assert!(routes.contains(&RouteSpec::get("/v1/session")));
         assert!(routes.contains(&RouteSpec::post("/v1/authorize")));
         assert!(routes.contains(&RouteSpec::get("/v1/authz/snapshot")));
-<<<<<<< HEAD
         // The well-known discovery surface mounts both the OIDC metadata and the
         // JWKS so third parties can verify IAM-signed access tokens.
         assert!(routes.contains(&RouteSpec::get("/.well-known/openid-configuration")));
         assert!(routes.contains(&RouteSpec::get("/.well-known/jwks.json")));
-=======
         // The downstream OpenID Provider endpoints are mounted alongside.
         assert!(routes.contains(&RouteSpec::get("/v1/oauth/authorize")));
         assert!(routes.contains(&RouteSpec::post("/v1/oauth/token")));
         assert!(routes.contains(&RouteSpec::post("/v1/oauth/revoke")));
->>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
+        // The namespace trust-root lookup is mounted alongside the authz routes.
+        assert!(routes.contains(&RouteSpec::get("/v1/namespaces/{namespace_id}/signers")));
         // No path leaks an unrendered template token or omits its version prefix.
         assert!(
             routes
