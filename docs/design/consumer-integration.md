@@ -154,21 +154,40 @@ Rules:
 | Decision | `AuthorizationDecision { Allow, Deny }` | approval workflow execution |
 | Entitlement | `EntitlementRequest`/`EntitlementDecision` | runtime capabilities, credentials |
 | Roles | grant-bundle roles | product workflow/stage roles |
-| Authorization of product domain actions | — | Oversight keeps its own engine |
+| Authorization of product domain actions | `authorize` over a registered `ResourceModel` (ADR-0004) | product action vocabulary, approval workflow execution |
 
 ## Consumption modes
 
 Each consumer delegates a different slice of IAM. These are the three modes the
 contract test pins.
 
-### Oversight Next — authentication only
+### Oversight Next — authentication only (historical baseline)
 
-Oversight Next delegates **authN only**. It resolves the caller through the IAM
-session core (mapping its actor to a `PrincipalRef`), then runs its **own**
-authorization engine over its own domain. It does not consult the IAM grant plane
-for domain decisions — IAM denying `issue.advance` must not change the product
-outcome, because IAM does not own that decision. The boundary: **IAM resolves
-*who*, Oversight decides *what*.**
+Oversight Next originally delegated **authN only**: it resolved the caller through
+the IAM session core (mapping its actor to a `PrincipalRef`), then ran its **own**
+authorization engine over its own domain, without consulting the IAM grant plane.
+This is the strangler-fig *starting point*, superseded by the reuse below.
+
+### Oversight Next — full authorization reuse (ADR-0004)
+
+ADR-0004 changed the product direction: Oversight Next now reuses IAM's **full**
+authorization plane rather than carrying its own engine. Two pieces make that
+work, both pinned by the cutover contract test:
+
+- **ResourceModel registration.** Oversight teaches IAM its resource types
+  (`issue`, `run`, `thread`, `team`), their action catalogs, and their
+  per-instance scope parent edges *as data*. IAM then resolves the product
+  hierarchy (`run -> issue -> project -> workspace`) through the same scope-graph
+  walk it uses for the well-known scopes; the core never learns the product. The
+  rich actor taxonomy resolves down to `Account`/`Service`/`Group` at the call
+  boundary, per the mapping table above, and a `Team` is a `Group` (membership
+  target), never a principal.
+- **Strangler-Fig shadow cutover.** Because Oversight has an incumbent engine, the
+  enforcement point runs both engines through a `ShadowAuthorizer`: the incumbent
+  stays authoritative while the IAM candidate is compared but never enforced.
+  Divergence is burned down to measured parity over a request window, then the
+  flag flips and IAM alone decides — at which point the in-repo engine is retired.
+  (Managed agents integrate greenfield, with no shadow phase.)
 
 ### Oversight Pack Hub — authorize plus namespace/signer checks
 
