@@ -66,6 +66,11 @@ use awaken_iam_core::{
     OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory,
     RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, TokenRedemption,
     parse_presented_refresh_token,
+    AuthorizationUrlRequest, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
+    IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt, MintRefreshToken,
+    OAuthAuthorizationServer, OAuthChallengeService, OAuthProviderError, OsEntropy, ProviderError,
+    RefreshTokenDirectory, RefreshTokenMinter, RotateRefreshToken, SessionDirectory,
+    TokenRedemption, parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -78,6 +83,7 @@ use crate::token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, TrustedIssuer, TrustedIssuerRegistry,
 };
+use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
 use crate::{SessionCookieConfig, SessionGateway};
 
 /// Default key id minted for the bootstrap access-token signing key.
@@ -580,6 +586,49 @@ pub struct TokenGrant {
     pub refresh_token_view: RefreshTokenView,
 }
 
+/// Request to redeem a downstream authorization code at IAM's OIDC token
+/// endpoint (`POST /v1/oauth/token`, `authorization_code`), minting a signed
+/// access token and an OIDC `id_token` from the resolved grant.
+///
+/// The code redemption itself (single-use, expiry, client authentication,
+/// redirect-URI match, PKCE) is carried by [`TokenRedemption`]; this request
+/// supplies only the claim-stamping coordinates layered on top of the grant the
+/// redemption resolves to. `subject`/`scope` are never taken from the request —
+/// the subject is the account the code was issued to and the scopes are the
+/// grant's down-scoped set, so a client can never widen its own authority here.
+#[derive(Debug, Clone)]
+pub struct OpCodeRedemption {
+    /// Issuer stamped into both tokens' `iss` claim.
+    pub issuer: String,
+    /// Audience stamped into the access token (the service it is presented to).
+    /// The `id_token` audience is always the redeeming client's `client_id`.
+    pub access_audience: String,
+    /// Issued-at time for both tokens as a Unix timestamp (seconds).
+    pub issued_at: i64,
+    /// Access-token expiry as a Unix timestamp (seconds); short-lived (≈1h).
+    pub access_expires_at: i64,
+    /// `id_token` expiry as a Unix timestamp (seconds); must be after `issued_at`.
+    pub id_token_expires_at: i64,
+    /// Wall-clock used for the code's single-use/expiry checks (RFC 3339).
+    pub now: Timestamp,
+}
+
+/// Result of redeeming a downstream authorization code: the minted access token
+/// and the OIDC `id_token`, plus the grant coordinates they were stamped from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpTokenGrant {
+    /// Signed compact-JWT access token for IAM's service APIs.
+    pub access_token: String,
+    /// `jti` of the issued access token, enabling later revocation.
+    pub access_token_jti: String,
+    /// Signed compact-JWT OIDC `id_token` asserting the subject to the client.
+    pub id_token: String,
+    /// Account the redeemed code authenticated (the tokens' `sub`).
+    pub account_id: AccountId,
+    /// Granted scopes (the authorization request's down-scoped set).
+    pub scopes: Vec<String>,
+}
+
 /// Hint about which token family an RFC 7009 revoke targets.
 ///
 /// The hint only orders the lookup; revocation falls through to the other family
@@ -731,6 +780,13 @@ pub enum AuthApiError {
     /// request (unknown client, bad redirect URI, PKCE failure, expired code, …).
     #[error(transparent)]
     OAuthProvider(#[from] OAuthProviderError),
+    /// Redeeming a downstream authorization code failed (unknown/expired code,
+    /// client authentication, redirect-URI, or PKCE).
+    #[error(transparent)]
+    OAuthProvider(#[from] OAuthProviderError),
+    /// Assembling the OIDC `id_token` for a redeemed grant failed.
+    #[error(transparent)]
+    IdToken(#[from] IdTokenError),
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -1358,6 +1414,60 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             access_token_jti: jti,
             refresh_token: issued.secret,
             refresh_token_view: RefreshTokenView::from(&issued.token),
+        })
+    }
+
+    /// `POST /v1/oauth/token` (`authorization_code` grant, IAM as OpenID Provider):
+    /// redeem a downstream authorization code for a signed access token and an
+    /// OIDC `id_token`.
+    ///
+    /// The downstream [`OAuthAuthorizationServer`] enforces the security-critical
+    /// redemption (single-use/expiry, client authentication, redirect-URI match,
+    /// PKCE) and resolves the [`AuthorizedGrant`](awaken_iam_core::AuthorizedGrant)
+    /// — the account, its down-scoped scopes, and any bound `nonce`. This method
+    /// joins that grant to the asymmetric signing authority: it mints an access
+    /// token with a fresh `jti` (so it is individually revocable) and assembles an
+    /// `id_token` whose `iss`/`sub`/`aud`/`exp`/`iat`/`nonce` assert the subject to
+    /// the redeeming client. Subject and scope come from the grant, never the
+    /// request, so a client cannot widen its own authority. Both tokens are signed
+    /// by the active key and verify against [`jwks`](Self::jwks).
+    pub fn redeem_authorization_code<C: EntropySource>(
+        &mut self,
+        provider: &mut OAuthAuthorizationServer<C>,
+        redemption: &TokenRedemption,
+        request: OpCodeRedemption,
+    ) -> Result<OpTokenGrant, AuthApiError> {
+        let grant = provider.redeem_code(redemption, request.now)?;
+        let subject = grant.account_id.0.clone();
+
+        let (access_token, access_token_jti) = self.mint_access_with_jti(
+            request.issuer.clone(),
+            subject.clone(),
+            request.access_audience,
+            request.issued_at,
+            request.access_expires_at,
+            grant.scopes.clone(),
+        )?;
+
+        let id_token = mint_id_token(
+            &self.tokens,
+            MintIdToken {
+                iss: request.issuer,
+                sub: subject,
+                // OIDC: the id_token audience is the client it was issued to.
+                aud: redemption.client_id.clone(),
+                iat: request.issued_at,
+                exp: request.id_token_expires_at,
+                nonce: grant.nonce,
+            },
+        )?;
+
+        Ok(OpTokenGrant {
+            access_token,
+            access_token_jti,
+            id_token,
+            account_id: grant.account_id,
+            scopes: grant.scopes,
         })
     }
 
