@@ -745,6 +745,155 @@ fn refresh_grant(presented: &str, now: &str) -> RefreshGrant {
     }
 }
 
+/// A downstream OP registry with one confidential and one public product client.
+fn op_provider() -> OAuthAuthorizationServer<SequentialEntropy> {
+    let mut registry = awaken_iam_core::OAuthClientRegistry::new();
+    registry.register(awaken_iam_core::RegisteredClient::confidential(
+        "packs-web",
+        "client-secret",
+        vec!["https://packs.example/cb".into()],
+        ["pack.read"],
+    ));
+    registry.register(awaken_iam_core::RegisteredClient::public(
+        "packs-spa",
+        vec!["https://packs.example/spa".into()],
+        ["pack.read"],
+    ));
+    OAuthAuthorizationServer::new(registry, SequentialEntropy::default())
+}
+
+#[test]
+fn op_refresh_grant_authenticates_the_client_then_rotates() {
+    let mut api = api();
+    let provider = op_provider();
+    let first = issue_grant(&mut api);
+
+    let rotated = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-web",
+            Some("client-secret"),
+            refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
+        )
+        .unwrap();
+
+    // The presented token is rotated under the same chain and a fresh, verifiable
+    // access token is minted from the chain's stored coordinates.
+    assert_ne!(first.refresh_token, rotated.refresh_token);
+    assert_eq!(
+        first.refresh_token_view.chain_id,
+        rotated.refresh_token_view.chain_id
+    );
+    assert_eq!(rotated.refresh_token_view.subject, "acct_1");
+    api.verify_access_token(&rotated.access_token).unwrap();
+    assert!(
+        api.audit_log()
+            .iter()
+            .any(|event| matches!(event, AuthAuditEvent::RefreshTokenRotated { .. }))
+    );
+}
+
+#[test]
+fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
+    let mut api = api();
+    let provider = op_provider();
+    let first = issue_grant(&mut api);
+
+    let rotated = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-spa",
+            None,
+            refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
+        )
+        .unwrap();
+    assert_ne!(first.refresh_token, rotated.refresh_token);
+}
+
+#[test]
+fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
+    let mut api = api();
+    let provider = op_provider();
+    let first = issue_grant(&mut api);
+
+    let err = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-web",
+            Some("wrong"),
+            refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AuthApiError::OAuthProvider(OAuthProviderError::InvalidClientSecret)
+    ));
+
+    // Failed client authentication never touched the chain: an authenticated
+    // rotation of the still-current token then succeeds.
+    let rotated = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-web",
+            Some("client-secret"),
+            refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
+        )
+        .unwrap();
+    assert_ne!(first.refresh_token, rotated.refresh_token);
+}
+
+#[test]
+fn op_refresh_grant_rejects_an_unknown_client() {
+    let mut api = api();
+    let provider = op_provider();
+    let first = issue_grant(&mut api);
+
+    let err = api
+        .op_refresh_token_grant(
+            &provider,
+            "ghost",
+            Some("anything"),
+            refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AuthApiError::OAuthProvider(OAuthProviderError::UnknownClient)
+    ));
+}
+
+#[test]
+fn op_refresh_grant_revokes_the_chain_on_replay() {
+    let mut api = api();
+    let provider = op_provider();
+    let first = issue_grant(&mut api);
+
+    // Legitimate rotation through the OP endpoint.
+    let _second = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-web",
+            Some("client-secret"),
+            refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
+        )
+        .unwrap();
+
+    // Replaying the retired token — even with valid client auth — is a theft
+    // signal that revokes the whole chain and fails closed.
+    let err = api
+        .op_refresh_token_grant(
+            &provider,
+            "packs-web",
+            Some("client-secret"),
+            refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AuthApiError::Login(awaken_iam_core::IamError::RefreshTokenReuseDetected { .. })
+    ));
+}
+
 #[test]
 fn issuing_a_grant_returns_a_verifiable_access_token_and_a_refresh_token() {
     let mut api = api();
