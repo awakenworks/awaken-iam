@@ -18,7 +18,8 @@ pub use awaken_iam_contract::{
 pub use awaken_iam_core::{
     ActionPattern, BeginLogin, Effect, EntitlementCatalog, EntitlementEngine, EntitlementMode,
     EntitlementOutcome, EntitlementReason, EntitlementResolver, EntropySource, EstablishSession,
-    Grant, GrantId, GrantSubject, IamCore, IamError, IdentityDirectory, IssuedLogin, IssuedSession,
+    GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject, IamCore, IamError,
+    IdentityDirectory, IssuedLogin, IssuedSession,
     LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant, NamespaceTrustDirectory,
     OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, PolicySet,
     Quota, RateLimit, RateWindow, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
