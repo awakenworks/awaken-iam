@@ -15,6 +15,8 @@
 //! | `GET /.well-known/openid-configuration` | [`AuthApi::openid_configuration`] |
 //! | `GET /.well-known/jwks.json` | [`AuthApi::jwks`] |
 //! | `POST /v1/tokens` (access) | [`AuthApi::mint_access_token`] |
+//! | `GET /v1/oauth/authorize` (downstream OP) | [`AuthApi::authorize`] |
+//! | `POST /v1/oauth/token` (`authorization_code`) | [`AuthApi::redeem_authorization_code`] |
 //! | `POST /v1/oauth/token` (initial grant) | [`AuthApi::issue_token_grant`] |
 //! | `POST /v1/oauth/token` (`refresh_token`) | [`AuthApi::refresh_token_grant`] |
 //! | `POST /v1/oauth/revoke` (RFC 7009) | [`AuthApi::revoke_token`] |
@@ -58,10 +60,12 @@ use awaken_iam_contract::{
     UserInfo,
 };
 use awaken_iam_core::{
-    AuthorizationUrlRequest, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
-    IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt, MintRefreshToken,
-    OAuthChallengeService, OsEntropy, ProviderError, RefreshTokenDirectory, RefreshTokenMinter,
-    RotateRefreshToken, SessionDirectory, parse_presented_refresh_token,
+    AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange, EntropySource,
+    EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt,
+    MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
+    OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory,
+    RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, TokenRedemption,
+    parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -333,6 +337,28 @@ pub enum AuthAuditEvent {
         /// When the failure was observed, as unix seconds.
         at: i64,
     },
+    /// IAM (as the downstream OpenID Provider) issued an authorization code to a
+    /// product client for an authenticated end-user (`GET /v1/oauth/authorize`).
+    DownstreamCodeIssued {
+        /// Product client the code was issued to.
+        client_id: String,
+        /// Account the end-user authenticated as.
+        account_id: AccountId,
+        /// When the code was issued.
+        at: Timestamp,
+    },
+    /// A product client redeemed an authorization code for a token grant at the
+    /// token endpoint (`POST /v1/oauth/token`, `authorization_code`).
+    DownstreamCodeRedeemed {
+        /// Product client that redeemed the code.
+        client_id: String,
+        /// Account the resulting grant authenticates.
+        account_id: AccountId,
+        /// `jti` of the access token minted for the grant.
+        access_token_jti: String,
+        /// When the code was redeemed.
+        at: Timestamp,
+    },
 }
 
 /// Stable machine-readable reason a session could not be resolved to an active
@@ -588,6 +614,57 @@ pub struct RevokeOutcome {
     pub revoked: bool,
 }
 
+/// Request to authorize a downstream product client (`GET /v1/oauth/authorize`).
+///
+/// IAM is the OpenID Provider here: the end-user is authenticated by their live
+/// IAM session cookie, and the resolved account becomes the subject the issued
+/// single-use code is bound to. The authorization parameters (client id, redirect
+/// URI, requested scopes, PKCE challenge, OIDC `nonce`, opaque `state`) are
+/// validated by the core [`OAuthAuthorizationServer`].
+#[derive(Debug, Clone)]
+pub struct DownstreamAuthorizeRequest {
+    /// Raw request `Cookie` header carrying the IAM session cookie that
+    /// authenticates the end-user being authorized.
+    pub cookie_header: String,
+    /// The OAuth authorization-request parameters from the query string.
+    pub authorization: OAuthAuthorizationRequest,
+    /// Authorization-time timestamp; the code expiry must be strictly after it.
+    pub now: Timestamp,
+    /// Single-use code expiry; must be strictly after `now`.
+    pub code_expires_at: Timestamp,
+}
+
+/// Result of a successful downstream authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownstreamAuthorizeOutcome {
+    /// Absolute redirect back to the client's registered redirect URI carrying
+    /// the `code` (and the echoed `state`, when present).
+    pub redirect_to: String,
+}
+
+/// Request to redeem an authorization code at the token endpoint
+/// (`POST /v1/oauth/token`, `authorization_code` grant).
+///
+/// The core [`OAuthAuthorizationServer`] validates the redemption (client
+/// authentication, redirect-URI match, single-use/expiry, PKCE) and resolves it
+/// to an [`AuthorizedGrant`]; IAM then mints an opaque access token plus a fresh
+/// refresh-token chain for the granted account and scopes.
+#[derive(Debug, Clone)]
+pub struct RedeemAuthorizationCode {
+    /// The token-endpoint redemption parameters.
+    pub redemption: TokenRedemption,
+    /// Issuer stamped into the minted access token's `iss` claim.
+    pub issuer: String,
+    /// Access-token issued-at (Unix seconds).
+    pub issued_at: i64,
+    /// Access-token expiry (Unix seconds); short-lived (≈1h).
+    pub access_expires_at: i64,
+    /// Refresh-token issue time (RFC 3339).
+    pub now: Timestamp,
+    /// Refresh-token expiry (RFC 3339); must be strictly after `now`.
+    pub refresh_expires_at: Timestamp,
+}
+
 /// Request to link an already-verified external identity to an account.
 #[derive(Debug, Clone)]
 pub struct LinkIdentity {
@@ -647,9 +724,16 @@ pub enum AuthApiError {
     /// Minting an asymmetric access token failed.
     #[error(transparent)]
     AccessToken(#[from] AccessTokenError),
+<<<<<<< HEAD
     /// A federated token exchange (RFC 8693) was rejected.
     #[error(transparent)]
     TokenExchange(#[from] TokenExchangeError),
+=======
+    /// The downstream OAuth provider rejected an authorize or token-redemption
+    /// request (unknown client, bad redirect URI, PKCE failure, expired code, …).
+    #[error(transparent)]
+    OAuthProvider(#[from] OAuthProviderError),
+>>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -666,8 +750,12 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     refresh_tokens: RefreshTokenDirectory,
     refresh_minter: RefreshTokenMinter<E>,
     access_revocations: AccessTokenRevocations,
+<<<<<<< HEAD
     trusted_issuers: TrustedIssuerRegistry,
     iam_issuer: String,
+=======
+    oauth_provider: OAuthAuthorizationServer<E>,
+>>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
     audit: Vec<AuthAuditEvent>,
     ids: E,
 }
@@ -711,8 +799,15 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             refresh_tokens: RefreshTokenDirectory::new(),
             refresh_minter: RefreshTokenMinter::new(entropy.clone()),
             access_revocations: AccessTokenRevocations::new(),
+<<<<<<< HEAD
             trusted_issuers: TrustedIssuerRegistry::new(),
             iam_issuer: String::new(),
+=======
+            oauth_provider: OAuthAuthorizationServer::new(
+                OAuthClientRegistry::new(),
+                entropy.clone(),
+            ),
+>>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
             audit: Vec::new(),
             ids: entropy,
         }
@@ -759,6 +854,17 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             include_nonce: registration.include_nonce,
             include_pkce: registration.include_pkce,
         });
+    }
+
+    /// Register a downstream product client that integrates against IAM as an
+    /// OpenID Provider (the `/v1/oauth/authorize` + `/v1/oauth/token` flow).
+    pub fn register_oauth_client(&mut self, client: RegisteredClient) {
+        self.oauth_provider.register_client(client);
+    }
+
+    /// Borrow the downstream OAuth provider's client registry.
+    pub fn oauth_client_registry(&self) -> &OAuthClientRegistry {
+        self.oauth_provider.registry()
     }
 
     /// Borrow the identity directory backing account/identity reads.
@@ -1403,6 +1509,112 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         true
     }
 
+    /// `GET /v1/oauth/authorize`: issue a single-use authorization code to a
+    /// product client for the authenticated end-user.
+    ///
+    /// IAM is the OpenID Provider: the end-user is authenticated by their live
+    /// IAM session cookie (resolution fails closed with
+    /// [`AuthApiError::Unauthenticated`] when the cookie does not back a live
+    /// session), and the resolved account is bound to the code the core
+    /// [`OAuthAuthorizationServer`] mints after validating the registered client,
+    /// redirect-URI allowlist, down-scoping, and PKCE. The returned
+    /// [`DownstreamAuthorizeOutcome::redirect_to`] is the client's registered
+    /// redirect URI carrying the `code` and the echoed `state`.
+    pub fn authorize(
+        &mut self,
+        request: DownstreamAuthorizeRequest,
+    ) -> Result<DownstreamAuthorizeOutcome, AuthApiError> {
+        let view = self.current_session(&request.cookie_header, request.now.clone())?;
+        let account_id = view.account_id;
+
+        let issued = self.oauth_provider.issue_code(
+            account_id.clone(),
+            &request.authorization,
+            request.now.clone(),
+            request.code_expires_at,
+        )?;
+
+        let redirect_to = build_authorize_redirect(
+            &request.authorization.redirect_uri,
+            &issued.code,
+            issued.state.as_deref(),
+        );
+
+        self.audit.push(AuthAuditEvent::DownstreamCodeIssued {
+            client_id: request.authorization.client_id,
+            account_id,
+            at: request.now,
+        });
+
+        Ok(DownstreamAuthorizeOutcome { redirect_to })
+    }
+
+    /// `POST /v1/oauth/token` (`authorization_code` grant): redeem a code for a
+    /// fresh access token and refresh-token chain.
+    ///
+    /// The core [`OAuthAuthorizationServer`] validates the redemption — client
+    /// authentication, redirect-URI match, single-use/expiry, and PKCE — and
+    /// resolves it to an [`AuthorizedGrant`]. IAM then mints an opaque access
+    /// token (with a fresh `jti`, so it is individually revocable) and opens a new
+    /// refresh-token chain for the granted account and scopes; the access token's
+    /// audience is the redeeming client. Both secrets are returned once.
+    pub fn redeem_authorization_code(
+        &mut self,
+        request: RedeemAuthorizationCode,
+    ) -> Result<TokenGrant, AuthApiError> {
+        let AuthorizedGrant {
+            account_id, scopes, ..
+        } = self
+            .oauth_provider
+            .redeem_code(&request.redemption, request.now.clone())?;
+
+        let audience = request.redemption.client_id.clone();
+        let chain_id = RefreshTokenChainId(self.mint_id("rtc"));
+        let refresh_token_id = RefreshTokenId(self.mint_id("rt"));
+        let issued = self.refresh_minter.issue(
+            &mut self.refresh_tokens,
+            MintRefreshToken {
+                id: refresh_token_id.clone(),
+                chain_id: chain_id.clone(),
+                account_id: account_id.clone(),
+                subject: account_id.0.clone(),
+                audience: audience.clone(),
+                scope: scopes.clone(),
+                created_at: request.now.clone(),
+                expires_at: request.refresh_expires_at,
+            },
+        )?;
+
+        let (access_token, jti) = self.mint_access_with_jti(
+            request.issuer,
+            account_id.0.clone(),
+            audience,
+            request.issued_at,
+            request.access_expires_at,
+            scopes,
+        )?;
+
+        self.audit.push(AuthAuditEvent::RefreshTokenIssued {
+            account_id: account_id.clone(),
+            chain_id,
+            refresh_token_id,
+            at: request.now.clone(),
+        });
+        self.audit.push(AuthAuditEvent::DownstreamCodeRedeemed {
+            client_id: request.redemption.client_id,
+            account_id,
+            access_token_jti: jti.clone(),
+            at: request.now,
+        });
+
+        Ok(TokenGrant {
+            access_token,
+            access_token_jti: jti,
+            refresh_token: issued.secret,
+            refresh_token_view: RefreshTokenView::from(&issued.token),
+        })
+    }
+
     /// Mint a signed access token and return it alongside its minted `jti`.
     fn mint_access_with_jti(
         &mut self,
@@ -1611,6 +1823,36 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self.ids.fill_bytes(&mut buf);
         format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(buf))
     }
+}
+
+/// Build the `authorization_code` redirect back to a client's registered
+/// redirect URI, appending the `code` and the echoed `state`.
+///
+/// The separator adapts to whether the registered redirect URI already carries a
+/// query string, and both values are percent-encoded so an opaque `state` can
+/// never break out of the query.
+fn build_authorize_redirect(redirect_uri: &str, code: &str, state: Option<&str>) -> String {
+    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+    let mut url = format!("{redirect_uri}{separator}code={}", percent_encode(code));
+    if let Some(state) = state {
+        url.push_str(&format!("&state={}", percent_encode(state)));
+    }
+    url
+}
+
+/// Percent-encode a query value, escaping everything outside the unreserved set
+/// (`ALPHA` / `DIGIT` / `-` `.` `_` `~`) per RFC 3986.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
