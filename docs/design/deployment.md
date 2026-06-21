@@ -11,6 +11,10 @@ migration bundles** with no cross-component coupling, adopting the
 `awaken-sql-migration` pattern. The deployment choice is then just *which pool
 and router host IAM*, not a code fork.
 
+Running either mode highly available is the operational reading of this same
+assembly — N stateless nodes against one HA store. See
+[high availability](high-availability.md).
+
 > "Migration" here means **schema** migration (owning IAM's tables). It is
 > unrelated to the capability [migration plan](migration-strategy.md) (moving IAM
 > capability in from other services). Two different migrations.
