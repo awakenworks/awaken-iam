@@ -20,6 +20,8 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 postgres = "0.19.14"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
 
 [dev-dependencies]
 awaken-iam-contract.workspace = true
@@ -27,6 +29,12 @@ awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "iam-daemon"
+path = "src/bin/iam-daemon.rs"
 
 [lints]
 workspace = true

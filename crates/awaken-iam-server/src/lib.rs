@@ -6,6 +6,7 @@ mod assembly;
 mod auth_api;
 mod authz_api;
 mod capability_token;
+pub mod http;
 mod session;
 mod store;
 mod token_exchange;
