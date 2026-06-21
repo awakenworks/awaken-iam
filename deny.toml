@@ -23,6 +23,12 @@ version = 2
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
+    # ISC and CDLA-Permissive-2.0 enter with the reqwest/rustls HTTP transport
+    # stack behind `awaken-iam-client`'s `http` feature: ISC covers rustls-webpki
+    # and the ring-derived crypto, CDLA-Permissive-2.0 covers the webpki-roots CA
+    # bundle. Both are permissive and OSI/SPDX-recognised.
+    "CDLA-Permissive-2.0",
+    "ISC",
     "MIT",
     "Unicode-3.0",
     # Introduced transitively by the SQLite and Postgres repository drivers
