@@ -12,6 +12,7 @@
 //! | `POST /v1/authorize` | [`AuthzApi::authorize`] |
 //! | `POST /v1/authorize/batch` | [`AuthzApi::authorize_batch`] |
 //! | `POST /v1/entitlements/check` | [`AuthzApi::check_entitlement`] |
+//! | `POST /v1/authz/resource-model` | [`AuthzApi::register_resource_model`] |
 //! | `GET /v1/authz/snapshot` | [`AuthzApi::snapshot`] |
 //!
 //! Authorization and entitlement are held as independent planes: grant
@@ -27,6 +28,9 @@ use awaken_iam_contract::{
     NamespaceId, PolicySnapshot, SignerSetSnapshot,
 };
 use awaken_iam_core::{EntitlementEngine, IamCore, NamespaceTrustDirectory, PolicySet};
+    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+};
+use awaken_iam_core::{EntitlementEngine, IamCore, PolicySet, ResourceModel};
 
 /// Authorization/entitlement protocol surface over an in-process [`IamCore`],
 /// [`EntitlementEngine`], and namespace [`NamespaceTrustDirectory`].
@@ -113,6 +117,28 @@ impl AuthzApi {
     /// against the entitlement plane.
     pub fn check_entitlement(&self, request: &EntitlementRequest) -> EntitlementCheckResponse {
         self.entitlements.evaluate(request).to_response()
+    }
+
+    /// `POST /v1/authz/resource-model`: register a consumer's
+    /// [`ResourceModel`](awaken_iam_core::ResourceModel) — its resource types,
+    /// action catalog, and per-instance scope parent edges — so the evaluator
+    /// resolves the product's open [`ScopeRef::Resource`](awaken_iam_contract::ScopeRef::Resource)
+    /// scopes through the same ancestor walk used for the well-known scopes.
+    ///
+    /// Registration folds the model's parent edges into the policy's scope graph
+    /// and bumps the snapshot version, so a local-mode consumer re-syncs and
+    /// resolves the same ancestry in-process on its next poll. Re-registering is
+    /// additive and idempotent (a repeated instance edge replaces that instance's
+    /// parent). Returns the policy version the registration advanced to.
+    pub fn register_resource_model(
+        &mut self,
+        registration: &ResourceModelRegistration,
+    ) -> ResourceModelRegistered {
+        let model = ResourceModel::from_registration(registration);
+        self.policy_mut().register_resource_model(&model);
+        ResourceModelRegistered {
+            version: self.policy_version,
+        }
     }
 
     /// `GET /v1/authz/snapshot`: capture the authorization policy as a versioned
@@ -306,6 +332,75 @@ mod tests {
         });
         assert_eq!(denied.decision, EntitlementDecision::Deny);
         assert_eq!(denied.reason, "plan_lacks_feature");
+    }
+
+    #[test]
+    fn registering_a_resource_model_lets_authorize_resolve_open_scopes() {
+        use awaken_iam_contract::{
+            ProjectId, ResourceId, ResourceModelRegistration, ResourceParentEdge, ResourceType,
+            ResourceTypeRegistration, WorkspaceId,
+        };
+
+        let mut api = AuthzApi::new();
+        let before = api.policy_version();
+
+        // A consumer teaches IAM its hierarchy as data: issue:42 nests under a
+        // project. The registration advances the snapshot version.
+        let registered = api.register_resource_model(&ResourceModelRegistration {
+            resource_types: vec![ResourceTypeRegistration {
+                resource_type: ResourceType("issue".into()),
+                parent_type: None,
+                actions: vec![ActionKey("issue.close".into())],
+            }],
+            actions: Vec::new(),
+            edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Project {
+                    workspace_id: WorkspaceId("ws_main".into()),
+                    project_id: ProjectId("proj_web".into()),
+                },
+            }],
+        });
+        assert_eq!(registered.version, before + 1);
+        assert_eq!(api.policy_version(), before + 1);
+
+        // A grant anchored at the project now covers the issue resource through
+        // the registered edge — the open scope resolves up to its ancestor.
+        api.policy_mut().add_grant(Grant {
+            id: GrantId("g_proj".into()),
+            subject: GrantSubject::Principal(service("svc")),
+            action_pattern: ActionPattern("issue.*".into()),
+            scope: ScopeRef::Project {
+                workspace_id: WorkspaceId("ws_main".into()),
+                project_id: ProjectId("proj_web".into()),
+            },
+            effect: Effect::Allow,
+        });
+        let outcome = api.authorize(&request(
+            service("svc"),
+            "issue.close",
+            ScopeRef::Resource {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+            },
+        ));
+        assert_eq!(outcome.decision, AuthorizationDecision::Allow);
+
+        // The registered edge rides the snapshot so a synced consumer resolves
+        // the same ancestry in-process.
+        let snapshot = api.snapshot();
+        assert_eq!(
+            snapshot.scope_graph.resource_parents,
+            vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Project {
+                    workspace_id: WorkspaceId("ws_main".into()),
+                    project_id: ProjectId("proj_web".into()),
+                },
+            }]
+        );
     }
 
     #[test]

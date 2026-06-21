@@ -19,7 +19,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use awaken_iam_contract::{ActionKey, ResourceId, ResourceType, ScopeRef};
+use awaken_iam_contract::{
+    ActionKey, ResourceId, ResourceModelRegistration, ResourceParentEdge, ResourceType, ScopeRef,
+};
 
 use crate::authorization::ScopeGraph;
 
@@ -51,6 +53,37 @@ pub struct ResourceEdge {
     pub parent: ScopeRef,
 }
 
+impl ResourceEdge {
+    /// Project this edge onto its wire shape for a snapshot or registration.
+    pub fn to_parent_edge(&self) -> ResourceParentEdge {
+        ResourceParentEdge {
+            resource_type: self.resource_type.clone(),
+            resource_id: self.resource_id.clone(),
+            parent: self.parent.clone(),
+        }
+    }
+}
+
+impl From<ResourceParentEdge> for ResourceEdge {
+    fn from(edge: ResourceParentEdge) -> Self {
+        Self {
+            resource_type: edge.resource_type,
+            resource_id: edge.resource_id,
+            parent: edge.parent,
+        }
+    }
+}
+
+impl From<ResourceEdge> for ResourceParentEdge {
+    fn from(edge: ResourceEdge) -> Self {
+        ResourceParentEdge {
+            resource_type: edge.resource_type,
+            resource_id: edge.resource_id,
+            parent: edge.parent,
+        }
+    }
+}
+
 /// A product's registered resource types, action catalog, and scope edges.
 ///
 /// Apply it to a [`ScopeGraph`] (or a [`PolicySet`](crate::PolicySet) via
@@ -67,6 +100,35 @@ impl ResourceModel {
     /// Create an empty resource model.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a model from a wire [`ResourceModelRegistration`].
+    ///
+    /// This is the seam a consumer registers across the boundary: each wire
+    /// resource type folds its actions into the catalog, standalone actions are
+    /// added, and each per-instance parent edge is registered. The resulting
+    /// model applies to a [`ScopeGraph`] exactly like one built in-process, so a
+    /// remote registration and a local one resolve identically.
+    pub fn from_registration(registration: &ResourceModelRegistration) -> Self {
+        let mut model = Self::new();
+        for type_def in &registration.resource_types {
+            model.register_resource_type(ResourceTypeDef {
+                resource_type: type_def.resource_type.clone(),
+                parent_type: type_def.parent_type.clone(),
+                actions: type_def.actions.clone(),
+            });
+        }
+        for action in &registration.actions {
+            model.register_action(action.clone());
+        }
+        for edge in &registration.edges {
+            model.register_parent(
+                edge.resource_type.clone(),
+                edge.resource_id.clone(),
+                edge.parent.clone(),
+            );
+        }
+        model
     }
 
     /// Register a resource type, folding its actions into the catalog.
@@ -291,6 +353,71 @@ mod tests {
         });
         assert_eq!(trace.decision, AuthorizationDecision::Allow);
         assert_eq!(trace.matched_grants, vec![GrantId("g_proj".into())]);
+    }
+
+    #[test]
+    fn a_registration_rebuilds_a_model_that_resolves_the_hierarchy() {
+        use awaken_iam_contract::{
+            ResourceModelRegistration, ResourceParentEdge, ResourceTypeRegistration,
+        };
+
+        // The wire shape a consumer registers across the boundary rebuilds a
+        // model equivalent to one assembled in-process: the actions land in the
+        // catalog and the edge anchors the resource so a project grant covers it.
+        let registration = ResourceModelRegistration {
+            resource_types: vec![ResourceTypeRegistration {
+                resource_type: ResourceType("issue".into()),
+                parent_type: None,
+                actions: vec![
+                    ActionKey("issue.read".into()),
+                    ActionKey("issue.close".into()),
+                ],
+            }],
+            actions: vec![ActionKey("issue.assign".into())],
+            edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Project {
+                    workspace_id: WorkspaceId("ws_main".into()),
+                    project_id: ProjectId("proj_web".into()),
+                },
+            }],
+        };
+        let model = ResourceModel::from_registration(&registration);
+        assert!(model.knows_action(&ActionKey("issue.close".into())));
+        assert!(model.knows_action(&ActionKey("issue.assign".into())));
+        assert_eq!(model.edges().len(), 1);
+        assert_eq!(
+            model.edges()[0].to_parent_edge(),
+            registration.edges[0].clone()
+        );
+
+        let mut policy = PolicySet::new();
+        policy.register_resource_model(&model);
+        policy.add_grant(Grant {
+            id: GrantId("g_proj".into()),
+            subject: GrantSubject::Principal(PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            }),
+            action_pattern: ActionPattern("issue.*".into()),
+            scope: ScopeRef::Project {
+                workspace_id: WorkspaceId("ws_main".into()),
+                project_id: ProjectId("proj_web".into()),
+            },
+            effect: Effect::Allow,
+        });
+        let trace = policy.evaluate(&AuthorizationRequest {
+            principal: PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            },
+            on_behalf_of: Vec::new(),
+            action: ActionKey("issue.close".into()),
+            scope: ScopeRef::Resource {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+            },
+        });
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
     }
 
     #[test]

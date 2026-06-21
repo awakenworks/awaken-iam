@@ -17,6 +17,7 @@ use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
     NamespaceId, PolicySnapshot, SignerSetSnapshot,
+    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
 };
 
 use crate::IamClient;
@@ -54,6 +55,12 @@ pub trait AuthzTransport {
         &self,
         request: &EntitlementRequest,
     ) -> Result<EntitlementCheckResponse, RemoteError>;
+
+    /// `POST /v1/authz/resource-model`.
+    fn register_resource_model(
+        &self,
+        registration: &ResourceModelRegistration,
+    ) -> Result<ResourceModelRegistered, RemoteError>;
 
     /// `GET /v1/authz/snapshot`.
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError>;
@@ -111,6 +118,16 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         request: &EntitlementRequest,
     ) -> Result<EntitlementCheckResponse, RemoteError> {
         self.transport.check_entitlement(request)
+    }
+
+    /// Register a consumer's resource model so the server resolves its open
+    /// resource scopes, surfacing transport errors. Returns the policy version
+    /// the registration advanced to.
+    pub fn register_resource_model(
+        &self,
+        registration: &ResourceModelRegistration,
+    ) -> Result<ResourceModelRegistered, RemoteError> {
+        self.transport.register_resource_model(registration)
     }
 
     /// Fetch the current authorization policy snapshot for local-mode caching.
@@ -274,6 +291,16 @@ mod tests {
             })
         }
 
+        fn register_resource_model(
+            &self,
+            _registration: &ResourceModelRegistration,
+        ) -> Result<ResourceModelRegistered, RemoteError> {
+            if self.fail {
+                return Err(RemoteError("boom".into()));
+            }
+            Ok(ResourceModelRegistered { version: 5 })
+        }
+
         fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
             if self.fail {
                 return Err(RemoteError("boom".into()));
@@ -319,6 +346,25 @@ mod tests {
         let signers = client.fetch_signers(&NamespaceId("acme".into())).unwrap();
         assert_eq!(signers.namespace_id, NamespaceId("acme".into()));
         assert_eq!(signers.version, 4);
+    }
+
+    #[test]
+    fn remote_client_registers_resource_model_and_surfaces_errors() {
+        use awaken_iam_contract::ResourceModelRegistration;
+
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        let registered = client
+            .register_resource_model(&ResourceModelRegistration::default())
+            .unwrap();
+        assert_eq!(registered.version, 5);
+
+        // Registration is not a decision: a transport outage surfaces the error
+        // to the caller rather than failing closed to a deny.
+        let down = RemoteIamClient::new(StubTransport { fail: true });
+        assert_eq!(
+            down.register_resource_model(&ResourceModelRegistration::default()),
+            Err(RemoteError("boom".into()))
+        );
     }
 
     #[test]

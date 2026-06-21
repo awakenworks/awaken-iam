@@ -15,6 +15,8 @@ use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
     PolicySnapshot, SignerSetSnapshot,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
+    ResourceModelRegistered, ResourceModelRegistration,
 };
 use awaken_iam_server::{
     AuthzApi, Deployment, IamAssembly, IamDaemon, RecordingExecutor, RouteSpec,
@@ -78,6 +80,18 @@ impl AuthzTransport for DaemonTransport<'_> {
         let body = serde_json::to_string(request).map_err(|e| RemoteError(e.to_string()))?;
         let parsed = serde_json::from_str(&body).map_err(|e| RemoteError(e.to_string()))?;
         Ok(self.api.check_entitlement(&parsed))
+    }
+
+    fn register_resource_model(
+        &self,
+        _registration: &ResourceModelRegistration,
+    ) -> Result<ResourceModelRegistered, RemoteError> {
+        // This parity fixture borrows the daemon's API immutably to compare
+        // decisions; registration is a mutating endpoint exercised in the remote
+        // protocol e2e instead.
+        Err(RemoteError(
+            "registration not exercised by this fixture".into(),
+        ))
     }
 
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
