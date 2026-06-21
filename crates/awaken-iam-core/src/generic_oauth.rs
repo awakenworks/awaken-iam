@@ -11,6 +11,13 @@
 //! client id and it logs in through the same loop. This is the ACL over arbitrary
 //! upstream IdPs, complementing the per-vendor adapters.
 //!
+//! For a compliant OIDC provider the endpoints need not even be configured: when
+//! the authorization, token, or userinfo endpoint is absent the adapter resolves
+//! it from the provider's
+//! [`/.well-known/openid-configuration`](https://openid.net/specs/openid-connect-discovery-1_0.html)
+//! discovery document, derived from the single `issuer_url`. A new OIDC IdP is
+//! then onboarded with nothing but its issuer URL and client credentials.
+//!
 //! Flow:
 //! 1. *Authorization URL* — a standard `response_type=code` request carrying the
 //!    client id, redirect, scopes, `state`, and (when the login minted them) an
@@ -49,18 +56,34 @@ pub struct GenericOAuthSecrets {
     /// OAuth client secret used at the token endpoint.
     pub client_secret: String,
     /// OIDC `userinfo` endpoint read for the authenticated subject and claims.
-    pub userinfo_endpoint: String,
+    ///
+    /// `None` defers to OIDC discovery: the endpoint is read from the provider's
+    /// `/.well-known/openid-configuration` document at exchange time.
+    pub userinfo_endpoint: Option<String>,
     /// Scopes requested when a login does not specify its own.
     pub default_scopes: Vec<String>,
 }
 
 impl GenericOAuthSecrets {
-    /// Build secrets with the standard OIDC default scopes
-    /// (`openid email profile`).
+    /// Build secrets with an explicit userinfo endpoint and the standard OIDC
+    /// default scopes (`openid email profile`).
     pub fn new(client_secret: impl Into<String>, userinfo_endpoint: impl Into<String>) -> Self {
         Self {
             client_secret: client_secret.into(),
-            userinfo_endpoint: userinfo_endpoint.into(),
+            userinfo_endpoint: Some(userinfo_endpoint.into()),
+            default_scopes: vec!["openid".into(), "email".into(), "profile".into()],
+        }
+    }
+
+    /// Build secrets for a discovery-driven provider, leaving the userinfo
+    /// endpoint to be resolved from the provider's discovery document.
+    ///
+    /// Paired with a config that carries only `issuer_url`, this onboards an
+    /// OIDC provider with no endpoint configuration at all.
+    pub fn discovered(client_secret: impl Into<String>) -> Self {
+        Self {
+            client_secret: client_secret.into(),
+            userinfo_endpoint: None,
             default_scopes: vec!["openid".into(), "email".into(), "profile".into()],
         }
     }
@@ -126,11 +149,8 @@ impl<T: HttpTransport> IdentityProviderAdapter for GenericOAuthProvider<T> {
         request: &AuthorizationUrlRequest,
     ) -> Result<AuthorizationRedirect, ProviderError> {
         self.ensure_kind(config)?;
-        let endpoint = config.authorization_endpoint.as_deref().ok_or(
-            ProviderError::MissingConfiguration {
-                field: "authorization_endpoint",
-            },
-        )?;
+        let endpoint = self.authorization_endpoint(config)?;
+        let endpoint = endpoint.as_str();
         let client_id = self.client_id(config)?;
         let scopes = if request.scopes.is_empty() {
             self.secrets.default_scopes.clone()
@@ -165,8 +185,9 @@ impl<T: HttpTransport> IdentityProviderAdapter for GenericOAuthProvider<T> {
                 reason: "empty authorization code".to_owned(),
             });
         }
-        let access_token = self.redeem_code(config, callback)?;
-        let info = self.fetch_userinfo(&access_token)?;
+        let (token_endpoint, userinfo_endpoint) = self.exchange_endpoints(config)?;
+        let access_token = self.redeem_code(config, callback, &token_endpoint)?;
+        let info = self.fetch_userinfo(&access_token, &userinfo_endpoint)?;
         if info.sub.is_empty() {
             return Err(ProviderError::MalformedClaims {
                 reason: "userinfo response did not include a subject".to_owned(),
@@ -185,20 +206,85 @@ impl<T: HttpTransport> IdentityProviderAdapter for GenericOAuthProvider<T> {
 }
 
 impl<T: HttpTransport> GenericOAuthProvider<T> {
+    /// Resolve the authorization endpoint, preferring the explicit config value
+    /// and falling back to the provider's OIDC discovery document.
+    fn authorization_endpoint(
+        &self,
+        config: &IdentityProviderConfig,
+    ) -> Result<String, ProviderError> {
+        if let Some(endpoint) = nonempty(config.authorization_endpoint.as_deref()) {
+            return Ok(endpoint.to_owned());
+        }
+        let doc = self.discover(config)?;
+        nonempty(doc.authorization_endpoint.as_deref())
+            .map(str::to_owned)
+            .ok_or(ProviderError::MissingConfiguration {
+                field: "authorization_endpoint",
+            })
+    }
+
+    /// Resolve the token and userinfo endpoints the code exchange needs.
+    ///
+    /// Each prefers its explicit value (config `token_endpoint`, secrets
+    /// `userinfo_endpoint`); when either is missing the provider's discovery
+    /// document is fetched once and supplies both.
+    fn exchange_endpoints(
+        &self,
+        config: &IdentityProviderConfig,
+    ) -> Result<(String, String), ProviderError> {
+        let token = nonempty(config.token_endpoint.as_deref()).map(str::to_owned);
+        let userinfo = nonempty(self.secrets.userinfo_endpoint.as_deref()).map(str::to_owned);
+        if let (Some(token), Some(userinfo)) = (&token, &userinfo) {
+            return Ok((token.clone(), userinfo.clone()));
+        }
+        let doc = self.discover(config)?;
+        let token = token
+            .or_else(|| nonempty(doc.token_endpoint.as_deref()).map(str::to_owned))
+            .ok_or(ProviderError::MissingConfiguration {
+                field: "token_endpoint",
+            })?;
+        let userinfo = userinfo
+            .or_else(|| nonempty(doc.userinfo_endpoint.as_deref()).map(str::to_owned))
+            .ok_or(ProviderError::MissingConfiguration {
+                field: "userinfo_endpoint",
+            })?;
+        Ok((token, userinfo))
+    }
+
+    /// Fetch and parse the provider's `/.well-known/openid-configuration`
+    /// discovery document, derived from the configured `issuer_url`.
+    fn discover(
+        &self,
+        config: &IdentityProviderConfig,
+    ) -> Result<DiscoveryDocument, ProviderError> {
+        let issuer =
+            nonempty(config.issuer_url.as_deref()).ok_or(ProviderError::MissingConfiguration {
+                field: "issuer_url",
+            })?;
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let request = HttpRequest::get(url).with_header("accept", "application/json");
+        let body =
+            self.transport
+                .execute(&request)
+                .map_err(|reason| ProviderError::ExchangeRejected {
+                    reason: format!("discovery request failed: {reason}"),
+                })?;
+        serde_json::from_slice(&body).map_err(|err| ProviderError::MalformedClaims {
+            reason: format!("discovery document was not valid JSON: {err}"),
+        })
+    }
+
     /// Redeem the authorization `code` for an access token at the token endpoint.
     fn redeem_code(
         &self,
         config: &IdentityProviderConfig,
         callback: &CallbackExchange,
+        token_endpoint: &str,
     ) -> Result<String, ProviderError> {
         let client_id = self.client_id(config)?;
-        let token_endpoint =
-            config
-                .token_endpoint
-                .as_deref()
-                .ok_or(ProviderError::MissingConfiguration {
-                    field: "token_endpoint",
-                })?;
         let mut form = format!(
             "grant_type=authorization_code&code={code}&client_id={client_id}\
              &client_secret={secret}&redirect_uri={redirect}",
@@ -233,8 +319,12 @@ impl<T: HttpTransport> GenericOAuthProvider<T> {
     }
 
     /// Read the authenticated subject and profile from the userinfo endpoint.
-    fn fetch_userinfo(&self, access_token: &str) -> Result<UserInfo, ProviderError> {
-        let request = HttpRequest::get(self.secrets.userinfo_endpoint.clone())
+    fn fetch_userinfo(
+        &self,
+        access_token: &str,
+        userinfo_endpoint: &str,
+    ) -> Result<UserInfo, ProviderError> {
+        let request = HttpRequest::get(userinfo_endpoint.to_owned())
             .with_header("authorization", &format!("Bearer {access_token}"))
             .with_header("accept", "application/json");
         let body =
@@ -254,6 +344,23 @@ impl<T: HttpTransport> GenericOAuthProvider<T> {
 struct TokenResponse {
     #[serde(default)]
     access_token: Option<String>,
+}
+
+/// The subset of an OIDC `/.well-known/openid-configuration` document this
+/// adapter resolves endpoints from; all other metadata fields are ignored.
+#[derive(Debug, Deserialize)]
+struct DiscoveryDocument {
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint: Option<String>,
+    #[serde(default)]
+    userinfo_endpoint: Option<String>,
+}
+
+/// Treat a present-but-empty configuration string as absent.
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|candidate| !candidate.is_empty())
 }
 
 /// Standard OIDC userinfo claims this adapter normalizes.
@@ -332,9 +439,10 @@ mod tests {
         }
     }
 
-    /// A transport that routes by URL: the token endpoint and the userinfo
-    /// endpoint each return their canned body, or a failure when set.
+    /// A transport that routes by URL: the discovery, token, and userinfo
+    /// endpoints each return their canned body, or a failure when set.
     struct RoutingTransport {
+        discovery_body: Vec<u8>,
         token_body: Vec<u8>,
         userinfo_body: Vec<u8>,
         fail: Option<String>,
@@ -345,7 +453,9 @@ mod tests {
             if let Some(reason) = &self.fail {
                 return Err(reason.clone());
             }
-            if request.url.contains("/token") {
+            if request.url.contains("/.well-known/openid-configuration") {
+                Ok(self.discovery_body.clone())
+            } else if request.url.contains("/token") {
                 Ok(self.token_body.clone())
             } else if request.url.contains("/userinfo") {
                 Ok(self.userinfo_body.clone())
@@ -364,6 +474,7 @@ mod tests {
 
     fn ok_transport() -> RoutingTransport {
         RoutingTransport {
+            discovery_body: discovery_body(),
             token_body: br#"{"access_token":"at-789","token_type":"bearer"}"#.to_vec(),
             userinfo_body: br#"{
                 "sub":"idp-sub-001",
@@ -377,6 +488,126 @@ mod tests {
             .to_vec(),
             fail: None,
         }
+    }
+
+    /// A standard discovery document whose endpoints sit under the issuer host.
+    fn discovery_body() -> Vec<u8> {
+        br#"{
+            "issuer":"https://idp.acme.example",
+            "authorization_endpoint":"https://idp.acme.example/authorize",
+            "token_endpoint":"https://idp.acme.example/token",
+            "userinfo_endpoint":"https://idp.acme.example/userinfo"
+        }"#
+        .to_vec()
+    }
+
+    /// A config that supplies only `issuer_url`, forcing endpoint discovery.
+    fn discovery_only_config(kind: IdentityProviderKind) -> IdentityProviderConfig {
+        let mut cfg = config(kind);
+        cfg.authorization_endpoint = None;
+        cfg.token_endpoint = None;
+        cfg
+    }
+
+    /// A provider whose userinfo endpoint is also resolved via discovery.
+    fn discovered_provider(transport: RoutingTransport) -> GenericOAuthProvider<RoutingTransport> {
+        GenericOAuthProvider::new(GenericOAuthSecrets::discovered("topsecret"), transport)
+    }
+
+    #[test]
+    fn authorization_url_resolves_endpoint_via_discovery() {
+        let provider = discovered_provider(ok_transport());
+        let redirect = provider
+            .authorization_url(
+                &discovery_only_config(IdentityProviderKind::Oidc),
+                &auth_request(),
+            )
+            .expect("authorization url from discovery");
+        // The authorization endpoint came from the discovery document, not config.
+        assert!(
+            redirect
+                .url
+                .starts_with("https://idp.acme.example/authorize?")
+        );
+        assert!(redirect.url.contains("client_id=client-123"));
+    }
+
+    #[test]
+    fn exchange_callback_resolves_token_and_userinfo_via_discovery() {
+        let provider = discovered_provider(ok_transport());
+        let callback = CallbackExchange {
+            redirect_uri: "https://app.example/v1/auth/callback/acme-idp".into(),
+            code: "auth-code-disc".into(),
+            pkce_verifier: Some("verifier-disc".into()),
+        };
+        let claims = provider
+            .exchange_callback(
+                &discovery_only_config(IdentityProviderKind::Oidc),
+                &callback,
+            )
+            .expect("claims via discovery");
+        // Token and userinfo endpoints both resolved from the discovery document.
+        assert_eq!(claims.subject, ExternalSubject("idp-sub-001".into()));
+        assert_eq!(claims.email.as_deref(), Some("ada@acme.example"));
+    }
+
+    #[test]
+    fn discovery_requires_an_issuer_url() {
+        let provider = discovered_provider(ok_transport());
+        let mut cfg = discovery_only_config(IdentityProviderKind::Oidc);
+        cfg.issuer_url = None;
+        let err = provider
+            .authorization_url(&cfg, &auth_request())
+            .expect_err("missing issuer url");
+        assert_eq!(
+            err,
+            ProviderError::MissingConfiguration {
+                field: "issuer_url"
+            }
+        );
+    }
+
+    #[test]
+    fn discovery_document_missing_endpoint_is_reported() {
+        // A discovery document that omits the authorization endpoint surfaces the
+        // same MissingConfiguration error as an unconfigured one.
+        let transport = RoutingTransport {
+            discovery_body: br#"{"issuer":"https://idp.acme.example"}"#.to_vec(),
+            ..ok_transport()
+        };
+        let provider = discovered_provider(transport);
+        let err = provider
+            .authorization_url(
+                &discovery_only_config(IdentityProviderKind::Oidc),
+                &auth_request(),
+            )
+            .expect_err("discovery without authorization endpoint");
+        assert_eq!(
+            err,
+            ProviderError::MissingConfiguration {
+                field: "authorization_endpoint"
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_endpoints_skip_discovery() {
+        // With endpoints configured and a userinfo secret, no discovery call is
+        // made — proven by a transport whose discovery branch would error.
+        let transport = RoutingTransport {
+            discovery_body: b"not-json".to_vec(),
+            ..ok_transport()
+        };
+        let provider = provider(transport);
+        let callback = CallbackExchange {
+            redirect_uri: "https://app.example/v1/auth/callback/acme-idp".into(),
+            code: "auth-code-1".into(),
+            pkce_verifier: None,
+        };
+        let claims = provider
+            .exchange_callback(&config(IdentityProviderKind::Oidc), &callback)
+            .expect("claims without discovery");
+        assert_eq!(claims.subject, ExternalSubject("idp-sub-001".into()));
     }
 
     #[test]
@@ -479,6 +710,7 @@ mod tests {
     #[test]
     fn exchange_callback_surfaces_transport_failure() {
         let provider = provider(RoutingTransport {
+            discovery_body: Vec::new(),
             token_body: Vec::new(),
             userinfo_body: Vec::new(),
             fail: Some("boom".into()),
