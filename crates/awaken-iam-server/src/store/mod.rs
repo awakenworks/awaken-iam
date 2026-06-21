@@ -6,12 +6,16 @@
 //! `core`, and `client` storage-free. See
 //! [deployment](../../../../docs/design/deployment.md).
 
+mod fence;
+mod health;
 mod memory;
 mod migration;
 mod postgres;
 mod sql;
 mod sqlite;
 
+pub use fence::{Fence, FenceStore};
+pub use health::{Liveness, Readiness};
 pub use memory::InMemoryStore;
 pub use migration::{
     BundleScope, Dialect, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,

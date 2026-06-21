@@ -227,6 +227,11 @@ impl<Pool> IamStore<Pool> {
         &self.pool
     }
 
+    /// Mutably borrow the underlying pool/executor handle.
+    pub fn pool_mut(&mut self) -> &mut Pool {
+        &mut self.pool
+    }
+
     /// The ledger table name: `<prefix>_schema_migrations`.
     ///
     /// Each component keeps its own ledger so siblings sharing a database never
@@ -279,7 +284,25 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
     /// Idempotent: a step whose ledger checksum matches is skipped. A step whose
     /// recorded checksum differs from the shipped template is a drift error —
     /// bundles are append-only, so an applied step must never change.
+    ///
+    /// Concurrent node startup is safe: the run is wrapped in the executor's
+    /// backend-neutral [single-applier guard](MigrationExecutor::acquire_applier_guard)
+    /// so exactly one node applies a pending bundle while the others wait and then
+    /// verify the ledger (the Postgres adapter holds a `pg_advisory_lock`; SQLite
+    /// is a single writer). The guard is always released — including on a drift or
+    /// apply error — so a failed run never strands the lock.
     pub fn migrate(&mut self) -> RepoResult<MigrateReport> {
+        self.pool.acquire_applier_guard()?;
+        let result = self.migrate_guarded();
+        let released = self.pool.release_applier_guard();
+        match result {
+            Ok(report) => released.map(|()| report),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The migration body run while the single-applier guard is held.
+    fn migrate_guarded(&mut self) -> RepoResult<MigrateReport> {
         let ledger = self.ledger_table();
         let ledger_ddl = self.ledger_ddl();
         self.pool.ensure_ledger(&ledger_ddl)?;
@@ -304,6 +327,23 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
             }
         }
         Ok(MigrateReport { applied, skipped })
+    }
+
+    /// Whether every planned migration is recorded with a matching checksum.
+    ///
+    /// The readiness ([`/readyz`](crate::Readiness)) probe behind it: it both
+    /// confirms the node's own migrations are applied and, because it reads the
+    /// ledger, proves the store is reachable. A pending step, a drifted checksum,
+    /// or an unreadable ledger all report *not applied* — readiness fails closed.
+    pub fn migrations_applied(&self) -> RepoResult<bool> {
+        let ledger = self.ledger_table();
+        for step in self.plan() {
+            match self.pool.recorded_checksum(&ledger, step.bundle, step.id)? {
+                Some(existing) if existing == step.checksum => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -331,6 +371,28 @@ pub trait MigrationExecutor {
         Dialect::Postgres
     }
 
+    /// Acquire the backend-neutral single-applier guard before applying pending
+    /// migrations, blocking until it is held.
+    ///
+    /// HA runs N identical nodes that may start concurrently against one shared
+    /// store; the guard ensures exactly one applies a pending bundle while the
+    /// others wait and then verify the ledger
+    /// (see [high availability](../../../../docs/design/high-availability.md)).
+    /// The Postgres adapter implements it with a `pg_advisory_lock`; SQLite is a
+    /// single writer and the in-memory adapter is single-process, so the default
+    /// is a no-op. Always paired with [`release_applier_guard`](Self::release_applier_guard).
+    fn acquire_applier_guard(&mut self) -> RepoResult<()> {
+        Ok(())
+    }
+
+    /// Release the single-applier guard once the migration run completes.
+    ///
+    /// Called after every run — success *or* failure — so a drift or apply error
+    /// never strands the lock for the other waiting nodes.
+    fn release_applier_guard(&mut self) -> RepoResult<()> {
+        Ok(())
+    }
+
     /// Create the ledger table if absent.
     fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()>;
     /// Return the recorded checksum for an applied `(bundle, id)`, if any.
@@ -354,6 +416,12 @@ pub struct RecordingExecutor {
     dialect: Dialect,
     /// DDL statements executed in order.
     pub executed: Vec<String>,
+    /// Times the single-applier guard was acquired.
+    pub guard_acquired: usize,
+    /// Times the single-applier guard was released.
+    pub guard_released: usize,
+    /// Whether the guard is currently held; asserts apply happens under it.
+    guard_held: bool,
 }
 
 impl RecordingExecutor {
@@ -391,6 +459,23 @@ impl MigrationExecutor for RecordingExecutor {
         self.dialect
     }
 
+    fn acquire_applier_guard(&mut self) -> RepoResult<()> {
+        if self.guard_held {
+            return Err(RepoError::Backend(
+                "single-applier guard re-entered while held".into(),
+            ));
+        }
+        self.guard_held = true;
+        self.guard_acquired += 1;
+        Ok(())
+    }
+
+    fn release_applier_guard(&mut self) -> RepoResult<()> {
+        self.guard_held = false;
+        self.guard_released += 1;
+        Ok(())
+    }
+
     fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()> {
         if !self.ledger_created {
             self.executed.push(ledger_ddl.to_owned());
@@ -413,6 +498,10 @@ impl MigrationExecutor for RecordingExecutor {
     }
 
     fn apply(&mut self, _ledger: &str, migration: &PlannedMigration) -> RepoResult<()> {
+        debug_assert!(
+            self.guard_held,
+            "migration applied without holding the single-applier guard"
+        );
         self.executed.push(migration.sql.clone());
         self.ledger.push((
             migration.bundle.to_owned(),
@@ -452,6 +541,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 },
                 Migration {
                     id: "0002_directory",
+                    id: "0002_fence",
                     up_sql: AUTHZ_0002,
                 },
             ],
@@ -599,6 +689,18 @@ CREATE TABLE IF NOT EXISTS {prefix}_roles (\
  action_patterns {json} NOT NULL, \
  created_at TEXT NOT NULL, \
  updated_at TEXT NOT NULL);";
+// The shared-store freshness fence: the policy `version` and token `epoch` that
+// HA advances in the store (rule 3) instead of per-node memory, so a bump on one
+// node is visible to every node on the next read. A single pinned row (id = 1)
+// holds both counters; a grant/role/membership change bumps `version` and a
+// revoke bumps `epoch`, each in the same transaction as the write it fences. No
+// FK crosses into another bundle. See high-availability.md.
+const AUTHZ_0002: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_fence (\
+ id INTEGER PRIMARY KEY, \
+ version BIGINT NOT NULL DEFAULT 1, \
+ epoch BIGINT NOT NULL DEFAULT 0, \
+ updated_at {timestamptz} NOT NULL DEFAULT {now});";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //
@@ -801,5 +903,51 @@ mod tests {
         let mut store = IamStore::with_prefix(executor, "iam").expect("valid prefix");
         let err = store.migrate().expect_err("drift must fail closed");
         assert!(matches!(err, RepoError::Backend(msg) if msg.contains("drifted")));
+    }
+
+    #[test]
+    fn migrate_holds_the_single_applier_guard_around_the_run() {
+        let mut store = store("iam");
+        store.migrate().expect("migrate");
+        // The guard wrapped the whole run: acquired once, released once, balanced.
+        assert_eq!(store.pool().guard_acquired, 1);
+        assert_eq!(store.pool().guard_released, 1);
+        // A second (idempotent) run takes and releases the guard again.
+        store.migrate().expect("second migrate");
+        assert_eq!(store.pool().guard_acquired, 2);
+        assert_eq!(store.pool().guard_released, 2);
+    }
+
+    #[test]
+    fn migrate_releases_the_guard_even_when_a_step_drifts() {
+        // A failed run must never strand the lock, or every other node deadlocks
+        // waiting on a guard the failed applier never released.
+        let mut executor = RecordingExecutor::new();
+        executor.force_checksum("iam.identity", "0001_identity", "deadbeef");
+        let mut store = IamStore::with_prefix(executor, "iam").expect("valid prefix");
+        store.migrate().expect_err("drift fails");
+        assert_eq!(store.pool().guard_acquired, 1);
+        assert_eq!(store.pool().guard_released, 1);
+    }
+
+    #[test]
+    fn migrations_applied_is_false_before_and_true_after_migrate() {
+        let mut store = store("iam");
+        // Readiness fences on this: an un-migrated store is not applied.
+        assert!(!store.migrations_applied().expect("probe"));
+        store.migrate().expect("migrate");
+        assert!(store.migrations_applied().expect("probe"));
+    }
+
+    #[test]
+    fn migrations_applied_is_false_when_a_recorded_step_drifts() {
+        let mut store = store("iam");
+        store.migrate().expect("migrate");
+        // Corrupt one recorded checksum: readiness must report not-applied, never
+        // a hopeful ready over a ledger it can no longer trust.
+        store
+            .pool_mut()
+            .force_checksum("iam.authz", "0002_fence", "deadbeef");
+        assert!(!store.migrations_applied().expect("probe"));
     }
 }

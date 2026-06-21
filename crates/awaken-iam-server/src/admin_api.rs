@@ -37,6 +37,8 @@ use awaken_iam_core::{
     RoleDef, RoleId, RoleInvariant, RoleRepo,
 };
 
+use crate::FenceStore;
+
 /// A policy-administration domain event.
 ///
 /// Each variant records one state change applied through the
@@ -186,11 +188,18 @@ pub type AdminResult<T> = Result<T, AdminError>;
 
 /// Policy Administration Point over a set of repository ports.
 ///
-/// `S` is any store implementing the policy repository ports and the audit sink;
-/// the in-memory [`InMemoryStore`](crate::InMemoryStore) backs tests and local
-/// mode, and a database adapter backs the service. Mutating methods append a
-/// [`DomainEvent`] and advance the [snapshot version](PolicyAdminApi::version);
-/// read methods never advance it.
+/// `S` is any store implementing the policy repository ports, the audit sink,
+/// and the [`FenceStore`]; the in-memory [`InMemoryStore`](crate::InMemoryStore)
+/// backs tests and local mode, and a database adapter backs the service.
+/// Mutating methods append a [`DomainEvent`] and advance the
+/// [snapshot version](PolicyAdminApi::version) **in the shared store**; read
+/// methods never advance it.
+///
+/// The version is store-backed (HA rule 3): a bump is written in the same
+/// transaction as the change it fences, so every node that shares the store sees
+/// it on the next read. The in-memory `version` field caches the value this node
+/// last observed; [`store_version`](PolicyAdminApi::store_version) reads the
+/// authoritative counter fresh.
 #[derive(Debug)]
 pub struct PolicyAdminApi<S> {
     store: S,
@@ -201,20 +210,33 @@ pub struct PolicyAdminApi<S> {
 impl<S> PolicyAdminApi<S>
 where
     S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + ResourceModelRepo + AuditSink,
+    S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + AuditSink + FenceStore,
 {
-    /// Build a PAP over `store` at initial snapshot version 1.
+    /// Build a PAP over `store`, seeding the cached snapshot version from the
+    /// store's fence (a fresh store starts at version 1).
     pub fn new(store: S) -> Self {
+        let version = store.fence().map(|fence| fence.version).unwrap_or(1);
         Self {
             store,
-            version: 1,
+            version,
             events: Vec::new(),
         }
     }
 
-    /// The current monotonic snapshot version. It advances by one on every
-    /// successful mutation and is the value a synced consumer fences against.
+    /// The snapshot version this node last observed. It advances on every
+    /// successful mutation and is the value a synced consumer fences against; for
+    /// the authoritative cross-node value read [`store_version`](Self::store_version).
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Read the authoritative snapshot version fresh from the shared store.
+    ///
+    /// On a multi-node deployment this reflects bumps made by *other* nodes,
+    /// which the cached [`version`](Self::version) does not — it is the read a
+    /// consumer's freshness check fences against.
+    pub fn store_version(&self) -> AdminResult<u64> {
+        Ok(self.store.fence()?.version)
     }
 
     /// The domain events emitted so far, in application order.
@@ -227,11 +249,15 @@ where
         &self.store
     }
 
-    /// Append `event` to the audit trail and advance the snapshot version.
+    /// Append `event` to the audit trail and advance the snapshot version in the
+    /// shared store.
     ///
-    /// The audit record is written first; only once it is durable is the version
-    /// bumped and the event retained, so a failed audit write leaves the snapshot
-    /// version unchanged.
+    /// The audit record is written first; only once it is durable is the store
+    /// fence advanced and the event retained, so a failed audit write leaves the
+    /// snapshot version unchanged. The bump rides the store (HA rule 3), so a
+    /// change made on this node is visible to every node fencing on the same
+    /// store; the cached [`version`](Self::version) is refreshed to the value the
+    /// store returned.
     fn commit(&mut self, event: DomainEvent, at: Timestamp) -> AdminResult<u64> {
         self.store.record(AuditEvent {
             at,
@@ -239,7 +265,7 @@ where
             action: event.action().to_owned(),
             detail: event.detail(),
         })?;
-        self.version += 1;
+        self.version = self.store.advance_version()?;
         self.events.push(event);
         Ok(self.version)
     }
@@ -681,6 +707,28 @@ mod tests {
         ));
         let audit = AuditSink::events(pap.store()).unwrap();
         assert_eq!(audit[0].action, "resource_model.register");
+    fn version_is_backed_by_the_store_fence() {
+        let mut pap = pap();
+        // Each successful mutation advances the store fence, and the cached
+        // version mirrors the authoritative store value read fresh.
+        assert_eq!(pap.version(), 1);
+        assert_eq!(pap.store_version().unwrap(), 1);
+        let after = pap.create_org(org("acme"), at()).unwrap();
+        assert_eq!(after, 2);
+        assert_eq!(pap.version(), 2);
+        assert_eq!(pap.store_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn new_pap_seeds_its_version_from_an_existing_store_fence() {
+        // A node joining a deployment whose store already advanced (other nodes
+        // made changes) must resume from the store's version, not restart at 1.
+        let store = InMemoryStore::new();
+        store.advance_version().unwrap();
+        store.advance_version().unwrap();
+        let pap = PolicyAdminApi::new(store);
+        assert_eq!(pap.version(), 3);
+        assert_eq!(pap.store_version().unwrap(), 3);
     }
 
     #[test]
