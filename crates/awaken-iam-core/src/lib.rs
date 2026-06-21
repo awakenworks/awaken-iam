@@ -10,6 +10,7 @@ mod github;
 mod google;
 mod linking;
 mod login;
+mod oauth_provider;
 mod ports;
 mod provider;
 mod refresh_token;
@@ -54,6 +55,11 @@ pub use linking::{AccountLinker, LoginResolution, ResolveLogin};
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
     OsEntropy, PkceChallenge, PkceMethod,
+};
+pub use oauth_provider::{
+    AuthorizationRequest as OAuthAuthorizationRequest, AuthorizedGrant, IssuedAuthorizationCode,
+    OAuthAuthorizationServer, OAuthClientRegistry, OAuthProviderError, RegisteredClient,
+    TokenRedemption,
 };
 pub use ports::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo,

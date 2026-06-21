@@ -16,14 +16,16 @@ pub use awaken_iam_contract::{
     SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
-    ActionPattern, BeginLogin, Effect, EntitlementCatalog, EntitlementEngine, EntitlementMode,
-    EntitlementOutcome, EntitlementReason, EntitlementResolver, EntropySource, EstablishSession,
-    GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject, IamCore, IamError,
-    IdentityDirectory, IssuedLogin, IssuedSession,
+    ActionPattern, AuthorizedGrant, BeginLogin, Effect, EntitlementCatalog, EntitlementEngine,
+    EntitlementMode, EntitlementOutcome, EntitlementReason, EntitlementResolver, EntropySource,
+    EstablishSession, GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject,
+    IamCore, IamError, IdentityDirectory, IssuedAuthorizationCode, IssuedLogin, IssuedSession,
     LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant, NamespaceTrustDirectory,
-    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, PolicySet,
-    Quota, RateLimit, RateWindow, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
-    SessionMinter, TrustError, hash_session_token,
+    OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
+    OAuthClientRegistry, OAuthProviderError, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId,
+    PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient, ResourceEdge,
+    ResourceModel, ResourceTypeDef, SessionDirectory, SessionMinter, TokenRedemption, TrustError,
+    hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
