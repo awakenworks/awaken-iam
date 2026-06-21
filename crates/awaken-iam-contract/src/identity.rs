@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::AccountId;
+use crate::{AccountId, ActionKey, PrincipalRef};
 
 /// Identity provider configuration identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -363,4 +363,110 @@ pub struct Session {
     pub expires_at: Timestamp,
     /// Logout/revocation timestamp.
     pub revoked_at: Option<Timestamp>,
+}
+
+/// API token row identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApiTokenId(pub String);
+
+/// Public, non-secret lookup prefix of an API token.
+///
+/// A presented token carries this prefix in cleartext so the row can be located
+/// without scanning, while the secret half is verified against the stored
+/// argon2id hash. The prefix is safe to display in token-management UIs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApiTokenPrefix(pub String);
+
+/// A long-lived, principal-scoped API token, persisted only as a hash.
+///
+/// API tokens authenticate machine and automation callers
+/// ([`PrincipalRef::Service`] / [`PrincipalRef::ApiToken`]) whose authority is a
+/// fixed [`scope`](ApiToken::scope) set of [`ActionKey`]s. Only the public
+/// [`prefix`](ApiToken::prefix) and the argon2id [`secret_hash`](ApiToken::secret_hash)
+/// are stored; the cleartext token is shown exactly once at mint time and never
+/// again. Liveness is the conjunction of "not revoked" and "not past
+/// `expires_at`"; a token with no `expires_at` never expires and lives until it
+/// is revoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiToken {
+    /// Stable token row id.
+    pub id: ApiTokenId,
+    /// Public lookup prefix presented alongside the secret.
+    pub prefix: ApiTokenPrefix,
+    /// Principal this token authenticates as.
+    pub principal: PrincipalRef,
+    /// Argon2id PHC hash of the token's secret half.
+    pub secret_hash: String,
+    /// Action scope this token may exercise; an empty set authorizes nothing.
+    pub scope: Vec<ActionKey>,
+    /// Token mint timestamp.
+    pub created_at: Timestamp,
+    /// Optional expiration timestamp; `None` never expires.
+    pub expires_at: Option<Timestamp>,
+    /// Revocation timestamp; once set the token can no longer authenticate.
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl ApiToken {
+    /// Whether the token authenticates at `now`: unrevoked and, when an
+    /// expiration is set, strictly before it. Timestamps compare as canonical
+    /// RFC 3339 UTC strings, whose lexical order matches chronological order.
+    pub fn is_live(&self, now: &Timestamp) -> bool {
+        if self.revoked_at.is_some() {
+            return false;
+        }
+        match &self.expires_at {
+            Some(expires_at) => now.0 < expires_at.0,
+            None => true,
+        }
+    }
+
+    /// Whether `action` is within this token's scope set (exact match).
+    pub fn authorizes(&self, action: &ActionKey) -> bool {
+        self.scope.contains(action)
+    }
+}
+
+/// Public view of an [`ApiToken`] safe to return to clients.
+///
+/// It exposes the token's coordinates, scope, and lifecycle timestamps but never
+/// the `secret_hash`. The cleartext token itself is only ever returned once, at
+/// mint time, and is not part of this view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiTokenView {
+    /// Stable token row id.
+    pub id: ApiTokenId,
+    /// Public lookup prefix.
+    pub prefix: ApiTokenPrefix,
+    /// Principal this token authenticates as.
+    pub principal: PrincipalRef,
+    /// Action scope this token may exercise.
+    pub scope: Vec<ActionKey>,
+    /// Token mint timestamp.
+    pub created_at: Timestamp,
+    /// Optional expiration timestamp.
+    pub expires_at: Option<Timestamp>,
+    /// Revocation timestamp, when revoked.
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl ApiTokenView {
+    /// Project a stored [`ApiToken`] into its public, hash-free view.
+    pub fn from_token(token: &ApiToken) -> Self {
+        Self {
+            id: token.id.clone(),
+            prefix: token.prefix.clone(),
+            principal: token.principal.clone(),
+            scope: token.scope.clone(),
+            created_at: token.created_at.clone(),
+            expires_at: token.expires_at.clone(),
+            revoked_at: token.revoked_at.clone(),
+        }
+    }
+}
+
+impl From<&ApiToken> for ApiTokenView {
+    fn from(token: &ApiToken) -> Self {
+        Self::from_token(token)
+    }
 }

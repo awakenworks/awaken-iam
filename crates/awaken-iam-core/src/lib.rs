@@ -1,5 +1,6 @@
 //! Core IAM evaluation primitives.
 
+mod api_token;
 mod authorization;
 mod directory;
 mod entitlement;
@@ -17,6 +18,9 @@ mod trust;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+pub use api_token::{
+    ApiTokenDirectory, ApiTokenMinter, IssuedApiToken, MintApiToken, parse_presented_token,
+};
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
     PolicySet, RoleBinding, RoleId, ScopeGraph,
@@ -46,9 +50,9 @@ pub use login::{
     OsEntropy, PkceChallenge, PkceMethod,
 };
 pub use ports::{
-    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo, LoginFlowRepo,
-    OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo,
-    SessionRepo, external_identity_id_hint,
+    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo,
+    LoginFlowRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo,
+    RoleRepo, SessionRepo, external_identity_id_hint,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
@@ -60,9 +64,10 @@ pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, Sh
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
 
 use awaken_iam_contract::{
-    Account, AccountId, AuthorizationDecision, AuthorizationRequest, ExternalIdentity,
-    ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject, IdentityProviderKey,
-    OAuthLoginState, OAuthLoginStateId, Session, SessionId, Timestamp,
+    Account, AccountId, ActionKey, ApiTokenId, ApiTokenPrefix, AuthorizationDecision,
+    AuthorizationRequest, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey,
+    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, Session, SessionId,
+    Timestamp,
 };
 
 /// Identifies which bound login value failed verification on callback.
@@ -180,6 +185,62 @@ pub enum IamError {
     SessionExpired {
         /// Expired session id.
         id: SessionId,
+    },
+    /// The requested API-token expiry was not strictly after creation.
+    #[error("api token window is invalid")]
+    InvalidApiTokenWindow {
+        /// API-token id with the rejected window.
+        id: ApiTokenId,
+    },
+    /// An API token with this id already exists.
+    #[error("api token already exists")]
+    DuplicateApiToken {
+        /// Conflicting API-token id.
+        id: ApiTokenId,
+    },
+    /// An API token with this public prefix already exists.
+    #[error("api token prefix already exists")]
+    DuplicateApiTokenPrefix {
+        /// Conflicting API-token prefix.
+        prefix: ApiTokenPrefix,
+    },
+    /// The referenced API token does not exist.
+    #[error("api token was not found")]
+    ApiTokenNotFound {
+        /// Missing API-token id.
+        id: ApiTokenId,
+    },
+    /// A presented API token could not be authenticated.
+    ///
+    /// An unparseable token, an unknown prefix, and a wrong secret all collapse
+    /// to this single opaque error so a caller cannot probe which tokens exist.
+    #[error("api token is invalid")]
+    ApiTokenInvalid,
+    /// The API token was revoked and can no longer authenticate.
+    #[error("api token was revoked")]
+    ApiTokenRevoked {
+        /// Revoked API-token id.
+        id: ApiTokenId,
+    },
+    /// The API token expired and can no longer authenticate.
+    #[error("api token has expired")]
+    ApiTokenExpired {
+        /// Expired API-token id.
+        id: ApiTokenId,
+    },
+    /// The API token authenticated but its scope does not cover the action.
+    #[error("api token scope does not cover the action")]
+    ApiTokenInsufficientScope {
+        /// API-token id whose scope was insufficient.
+        id: ApiTokenId,
+        /// Action that fell outside the token's scope set.
+        action: ActionKey,
+    },
+    /// Hashing or verifying an API-token secret failed.
+    #[error("api token hashing failed: {detail}")]
+    ApiTokenHashFailure {
+        /// Underlying argon2 error detail.
+        detail: String,
     },
 }
 

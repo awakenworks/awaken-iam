@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use awaken_iam_contract::{
-    Account, AccountId, ExternalIdentity, ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId,
-    OrgId, PrincipalRef, Session, SessionId, Timestamp,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity, ExternalIdentityKey,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId, Timestamp,
 };
 use awaken_iam_core::{
-    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group,
-    GroupId, GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, RepoError,
-    RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
-    RoleRepo, SessionRepo,
+    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId,
+    GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId,
+    PlanRepo, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo,
+    RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 
 /// JSON-serializable key used to index rows whose natural key is a contract
@@ -33,6 +33,8 @@ struct Identity {
     sessions: BTreeMap<String, Session>,
     sessions_by_token: BTreeMap<String, String>,
     login_flows: BTreeMap<String, OAuthLoginState>,
+    api_tokens: BTreeMap<String, ApiToken>,
+    api_tokens_by_prefix: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -232,6 +234,69 @@ impl LoginFlowRepo for InMemoryStore {
             )));
         }
         flow.consumed_at = Some(at);
+        Ok(())
+    }
+}
+
+impl ApiTokenRepo for InMemoryStore {
+    fn create(&self, token: ApiToken) -> RepoResult<()> {
+        let mut guard = self.identity.lock().unwrap();
+        if guard.api_tokens.contains_key(&token.id.0) {
+            return Err(RepoError::Conflict(format!(
+                "api token {} already exists",
+                token.id.0
+            )));
+        }
+        if guard.api_tokens_by_prefix.contains_key(&token.prefix.0) {
+            return Err(RepoError::Conflict(format!(
+                "api token prefix {} already exists",
+                token.prefix.0
+            )));
+        }
+        guard
+            .api_tokens_by_prefix
+            .insert(token.prefix.0.clone(), token.id.0.clone());
+        guard.api_tokens.insert(token.id.0.clone(), token);
+        Ok(())
+    }
+
+    fn get(&self, id: &ApiTokenId) -> RepoResult<Option<ApiToken>> {
+        Ok(self.identity.lock().unwrap().api_tokens.get(&id.0).cloned())
+    }
+
+    fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepoResult<Option<ApiToken>> {
+        let guard = self.identity.lock().unwrap();
+        Ok(guard
+            .api_tokens_by_prefix
+            .get(&prefix.0)
+            .and_then(|id| guard.api_tokens.get(id))
+            .cloned())
+    }
+
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<ApiToken>> {
+        let guard = self.identity.lock().unwrap();
+        let mut found: Vec<ApiToken> = guard
+            .api_tokens
+            .values()
+            .filter(|token| &token.principal == principal)
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        Ok(found)
+    }
+
+    fn update(&self, token: ApiToken) -> RepoResult<()> {
+        let mut guard = self.identity.lock().unwrap();
+        if !guard.api_tokens.contains_key(&token.id.0) {
+            return Err(RepoError::NotFound(format!(
+                "api token {} does not exist",
+                token.id.0
+            )));
+        }
+        guard
+            .api_tokens_by_prefix
+            .insert(token.prefix.0.clone(), token.id.0.clone());
+        guard.api_tokens.insert(token.id.0.clone(), token);
         Ok(())
     }
 }
@@ -588,16 +653,16 @@ mod tests {
             expires_at: ts("2026-06-20T00:00:00Z"),
             revoked_at: None,
         };
-        store.create(session.clone()).unwrap();
+        SessionRepo::create(&store, session.clone()).unwrap();
         assert!(matches!(
-            store.create(session.clone()),
+            SessionRepo::create(&store, session.clone()),
             Err(RepoError::Conflict(_))
         ));
         assert_eq!(store.get_by_token_hash("hash").unwrap().unwrap().id.0, "s1");
 
         let mut revoked = session;
         revoked.revoked_at = Some(ts("2026-06-19T01:00:00Z"));
-        store.update(revoked).unwrap();
+        SessionRepo::update(&store, revoked).unwrap();
         assert!(
             SessionRepo::get(&store, &SessionId("s1".into()))
                 .unwrap()
@@ -629,6 +694,58 @@ mod tests {
         let reuse =
             store.mark_consumed(&OAuthLoginStateId("l1".into()), ts("2026-06-19T00:06:00Z"));
         assert!(matches!(reuse, Err(RepoError::Conflict(_))));
+    }
+
+    #[test]
+    fn api_tokens_resolve_by_id_and_prefix_and_revoke_in_place() {
+        let store = InMemoryStore::new();
+        let token = ApiToken {
+            id: ApiTokenId("tok_1".into()),
+            prefix: ApiTokenPrefix("pfx".into()),
+            principal: PrincipalRef::Service {
+                service_id: "ci".into(),
+            },
+            secret_hash: "$argon2id$hash".into(),
+            scope: vec![awaken_iam_contract::ActionKey("pack.publish".into())],
+            created_at: ts("2026-06-19T00:00:00Z"),
+            expires_at: None,
+            revoked_at: None,
+        };
+        ApiTokenRepo::create(&store, token.clone()).unwrap();
+        // Duplicate id and duplicate prefix both fail closed.
+        assert!(matches!(
+            ApiTokenRepo::create(&store, token.clone()),
+            Err(RepoError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .get_by_prefix(&ApiTokenPrefix("pfx".into()))
+                .unwrap()
+                .unwrap()
+                .id
+                .0,
+            "tok_1"
+        );
+        let principal = PrincipalRef::Service {
+            service_id: "ci".into(),
+        };
+        assert_eq!(
+            ApiTokenRepo::list_for_principal(&store, &principal)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut revoked = token;
+        revoked.revoked_at = Some(ts("2026-06-19T01:00:00Z"));
+        ApiTokenRepo::update(&store, revoked).unwrap();
+        assert!(
+            ApiTokenRepo::get(&store, &ApiTokenId("tok_1".into()))
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
     }
 
     #[test]
@@ -670,7 +787,12 @@ mod tests {
                 scope: ScopeRef::Global,
             })
             .unwrap();
-        assert_eq!(store.list_for_principal(&principal).unwrap().len(), 1);
+        assert_eq!(
+            RoleBindingRepo::list_for_principal(&store, &principal)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(RoleBindingRepo::list(&store).unwrap().len(), 1);
 
         let binding = RoleBinding {

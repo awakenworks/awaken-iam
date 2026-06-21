@@ -10,10 +10,11 @@ mod trust;
 use serde::{Deserialize, Serialize};
 
 pub use identity::{
-    Account, AccountStatus, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
-    ExternalIdentityKey, ExternalSubject, IdentityProviderConfig, IdentityProviderConfigId,
-    IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId,
-    OpenIdProviderMetadata, Session, SessionId, SessionView, Timestamp, UserInfo,
+    Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,
+    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,
+    IdentityProviderConfig, IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind,
+    OAuthLoginState, OAuthLoginStateId, OpenIdProviderMetadata, Session, SessionId, SessionView,
+    Timestamp, UserInfo,
 };
 pub use protocol::{
     AuthorizationOutcome, BatchAuthorizationRequest, BatchAuthorizationResponse,
@@ -284,6 +285,59 @@ mod tests {
         assert!(!json.contains("secret-token-hash"));
         assert!(!json.contains("token_hash"));
         assert!(json.contains("sess_1"));
+    }
+
+    #[test]
+    fn api_token_view_omits_the_secret_hash() {
+        let token = ApiToken {
+            id: ApiTokenId("tok_1".into()),
+            prefix: ApiTokenPrefix("pfx_abc".into()),
+            principal: PrincipalRef::Service {
+                service_id: "ci".into(),
+            },
+            secret_hash: "argon2id$secret-hash".into(),
+            scope: vec![ActionKey("pack.publish".into())],
+            created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            expires_at: Some(Timestamp("2026-07-19T00:00:00Z".into())),
+            revoked_at: None,
+        };
+        let view = ApiTokenView::from(&token);
+        assert_eq!(view.id, token.id);
+        assert_eq!(view.prefix, token.prefix);
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("argon2id$secret-hash"));
+        assert!(!json.contains("secret_hash"));
+        assert!(json.contains("pfx_abc"));
+    }
+
+    #[test]
+    fn api_token_liveness_tracks_revocation_and_expiry() {
+        let mut token = ApiToken {
+            id: ApiTokenId("tok_1".into()),
+            prefix: ApiTokenPrefix("pfx_abc".into()),
+            principal: PrincipalRef::Service {
+                service_id: "ci".into(),
+            },
+            secret_hash: "hash".into(),
+            scope: vec![ActionKey("pack.publish".into())],
+            created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            expires_at: Some(Timestamp("2026-06-20T00:00:00Z".into())),
+            revoked_at: None,
+        };
+        assert!(token.is_live(&Timestamp("2026-06-19T12:00:00Z".into())));
+        // At or past expiry the token is no longer live.
+        assert!(!token.is_live(&Timestamp("2026-06-20T00:00:00Z".into())));
+
+        // A token without an expiry only dies on revocation.
+        token.expires_at = None;
+        assert!(token.is_live(&Timestamp("2030-01-01T00:00:00Z".into())));
+        token.revoked_at = Some(Timestamp("2026-06-19T06:00:00Z".into()));
+        assert!(!token.is_live(&Timestamp("2026-06-19T12:00:00Z".into())));
+
+        // Scope membership is an exact action match.
+        assert!(token.authorizes(&ActionKey("pack.publish".into())));
+        assert!(!token.authorizes(&ActionKey("pack.yank".into())));
     }
 
     #[test]
