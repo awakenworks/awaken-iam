@@ -96,6 +96,7 @@ Two token families, mirroring the reference design:
 | Access token | JWT, asymmetric (RS256/EdDSA), `kid` in header | short (≈1h) | bearer for service APIs |
 | Refresh token | opaque, stored, **rotated** | long | renew access token |
 | API token | opaque, hashed, principal-scoped | until revoked | service / automation principals |
+| Capability token | JWT, asymmetric, scope-narrowed, epoch-fenced | short, bounded | sub-process / sandbox delegation |
 
 Rules adopted from the reference's hard-won lessons:
 
@@ -109,6 +110,13 @@ Rules adopted from the reference's hard-won lessons:
   versioning and rotation — never in plain env.
 - **No information leak.** Auth errors are uniform (a wrong provider subject and
   an unknown account look the same); 401 vs 403 vs 422 are used consistently.
+- **Capabilities attenuate, never widen.** A capability token is signed by the
+  same key as an access token but carries a distinct `typ`, a lease `epoch`, and
+  a scope set. A holder derives a child only by *narrowing* — subset scope,
+  inherited audience and epoch, no later expiry — so a parent hands a sandbox
+  strictly less authority for a bounded time. Verification checks signature,
+  audience, and epoch, so advancing the lease epoch invalidates every outstanding
+  token at once. This realizes permission mechanism 7.
 
 ## Canonical API paths
 

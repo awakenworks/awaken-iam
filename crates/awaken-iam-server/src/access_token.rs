@@ -24,6 +24,10 @@ use serde::de::DeserializeOwned;
 
 /// JOSE `alg` of issued access tokens: Edwards-curve digital signatures.
 pub const ACCESS_TOKEN_ALG: &str = "EdDSA";
+/// JOSE `typ` header fencing the access-token family apart from other JWTs IAM
+/// signs with the same key (e.g. capability tokens), so one cannot be replayed
+/// where the other is expected.
+pub(crate) const ACCESS_TOKEN_TYP: &str = "JWT";
 /// JWK `kty` for the Ed25519 octet key pair.
 const JWK_KTY: &str = "OKP";
 /// JWK `crv` for the Ed25519 signing curve.
@@ -102,6 +106,14 @@ pub enum AccessTokenError {
     /// The signature did not verify against the published key.
     #[error("token signature verification failed")]
     SignatureInvalid,
+    /// The token's `typ` header did not match the expected token family.
+    #[error("unexpected token type: expected {expected}, found {found}")]
+    UnexpectedType {
+        /// The `typ` the verifier required.
+        expected: String,
+        /// The `typ` the presented token actually carried.
+        found: String,
+    },
 }
 
 /// JOSE header of an issued access token.
@@ -195,10 +207,25 @@ impl AccessTokenAuthority {
 
     /// Mint a signed access token for `claims` using the active key.
     pub fn mint(&self, claims: &AccessTokenClaims) -> Result<String, AccessTokenError> {
+        self.sign_jwt(ACCESS_TOKEN_TYP, claims)
+    }
+
+    /// Sign an arbitrary claim set as a compact JWT under the active key.
+    ///
+    /// The `typ` header fences token families apart: a verifier that expects one
+    /// `typ` rejects a token minted under another (see [`verify_jwt`]), so an
+    /// access token cannot be replayed where a capability token is expected and
+    /// vice versa. Both families share the active signing key and JWKS so a single
+    /// rotation/prune covers every token IAM issues.
+    pub(crate) fn sign_jwt<T: Serialize>(
+        &self,
+        typ: &str,
+        claims: &T,
+    ) -> Result<String, AccessTokenError> {
         let active = self.keys.last().ok_or(AccessTokenError::NoSigningKey)?;
         let header = JwtHeader {
             alg: ACCESS_TOKEN_ALG.to_owned(),
-            typ: "JWT".to_owned(),
+            typ: typ.to_owned(),
             kid: active.kid.clone(),
         };
         let signing_input = format!("{}.{}", encode_part(&header)?, encode_part(claims)?);
@@ -218,6 +245,22 @@ pub fn verify_access_token(
     token: &str,
     jwks: &Jwks,
 ) -> Result<AccessTokenClaims, AccessTokenError> {
+    verify_jwt(token, jwks, ACCESS_TOKEN_TYP)
+}
+
+/// Verify the signature of any IAM-issued JWT against a published [`Jwks`] and
+/// decode its claims, requiring the `typ` header to equal `expected_typ`.
+///
+/// This is the shared crypto path behind [`verify_access_token`] and capability
+/// tokens: the `kid` selects the published key, the `typ` fences the token family
+/// apart, and an unknown `kid`, a foreign algorithm, a wrong `typ`, or a bad
+/// signature all fail closed. It never decides epoch/audience/expiry — those are
+/// the caller's policy checks layered on the recovered claims.
+pub(crate) fn verify_jwt<T: DeserializeOwned>(
+    token: &str,
+    jwks: &Jwks,
+    expected_typ: &str,
+) -> Result<T, AccessTokenError> {
     let mut parts = token.split('.');
     let header_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
     let payload_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
@@ -229,6 +272,12 @@ pub fn verify_access_token(
     let header: JwtHeader = decode_part(header_b64)?;
     if header.alg != ACCESS_TOKEN_ALG {
         return Err(AccessTokenError::UnsupportedAlg(header.alg));
+    }
+    if header.typ != expected_typ {
+        return Err(AccessTokenError::UnexpectedType {
+            expected: expected_typ.to_owned(),
+            found: header.typ,
+        });
     }
 
     let jwk = jwks
