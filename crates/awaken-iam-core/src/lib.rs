@@ -11,6 +11,7 @@ mod linking;
 mod login;
 mod ports;
 mod provider;
+mod refresh_token;
 mod resource_model;
 mod session;
 mod shadow;
@@ -61,6 +62,10 @@ pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,
 };
+pub use refresh_token::{
+    IssuedRefreshToken, MintRefreshToken, RefreshTokenDirectory, RefreshTokenMinter,
+    RotateRefreshToken, parse_presented_refresh_token,
+};
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, ShadowReport};
@@ -69,8 +74,8 @@ pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
 use awaken_iam_contract::{
     Account, AccountId, ActionKey, ApiTokenId, ApiTokenPrefix, AuthorizationDecision,
     AuthorizationRequest, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey,
-    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, Session, SessionId,
-    Timestamp,
+    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, RefreshTokenChainId,
+    RefreshTokenId, Session, SessionId, Timestamp,
 };
 
 /// Identifies which bound login value failed verification on callback.
@@ -268,6 +273,40 @@ pub enum IamError {
     ApiTokenHashFailure {
         /// Underlying argon2 error detail.
         detail: String,
+    },
+    /// The requested refresh-token expiry was not strictly after creation.
+    #[error("refresh token window is invalid")]
+    InvalidRefreshTokenWindow {
+        /// Refresh-token id with the rejected window.
+        id: RefreshTokenId,
+    },
+    /// A refresh token with this id already exists.
+    #[error("refresh token already exists")]
+    DuplicateRefreshToken {
+        /// Conflicting refresh-token id.
+        id: RefreshTokenId,
+    },
+    /// Two refresh tokens hashed to the same stored value (entropy collision).
+    #[error("refresh token hash already exists")]
+    DuplicateRefreshTokenHash,
+    /// A presented refresh token could not be matched to a live chain.
+    ///
+    /// An unparseable token, an unknown hash, and a revoked chain all collapse to
+    /// this single opaque error so a caller cannot probe which tokens exist.
+    #[error("refresh token is invalid")]
+    RefreshTokenInvalid,
+    /// The refresh token expired and can no longer be rotated.
+    #[error("refresh token has expired")]
+    RefreshTokenExpired {
+        /// Expired refresh-token id.
+        id: RefreshTokenId,
+    },
+    /// A retired refresh token was replayed — a theft signal. The whole chain is
+    /// revoked as a side effect.
+    #[error("refresh token was reused; the chain has been revoked")]
+    RefreshTokenReuseDetected {
+        /// Chain revoked in response to the replay.
+        chain_id: RefreshTokenChainId,
     },
 }
 

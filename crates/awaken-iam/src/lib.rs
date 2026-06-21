@@ -10,7 +10,8 @@ pub use awaken_iam_contract::{
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject, GrantEffect,
     GrantSnapshot, GrantSubjectRef, IdentityProviderConfig, IdentityProviderConfigId,
     IdentityProviderKey, IdentityProviderKind, NamespaceId, NamespaceOwner, OAuthLoginState,
-    OAuthLoginStateId, OrgId, PolicySnapshot, PrincipalRef, ProjectId, ResourceId, ResourceType,
+    OAuthLoginStateId, OrgId, PolicySnapshot, PrincipalRef, ProjectId, RefreshToken,
+    RefreshTokenChainId, RefreshTokenId, RefreshTokenView, ResourceId, ResourceType,
     RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, Session, SessionId, SessionView, SignerKey,
     SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp, WorkspaceId,
 };
@@ -26,9 +27,10 @@ pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
     CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, Deployment,
     EstablishedSession, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, IamServer,
-    LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration, ProviderSummary,
-    ReturnToDecision, ReturnToPolicy, RouteSpec, SameSite, SessionCookieConfig, SessionGateway,
-    StartLogin, StartLoginOutcome, UnlinkIdentity,
+    IssueTokenGrant, LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration,
+    ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
+    RevokeTokenHint, RouteSpec, SameSite, SessionCookieConfig, SessionGateway, StartLogin,
+    StartLoginOutcome, TokenGrant, UnlinkIdentity,
 };
 
 #[cfg(test)]

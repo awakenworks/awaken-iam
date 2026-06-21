@@ -15,6 +15,8 @@
 //! is explicitly [pruned](AccessTokenAuthority::prune), which retires every token
 //! it signed.
 
+use std::collections::HashSet;
+
 use awaken_iam_contract::{JsonWebKey, Jwks};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -114,6 +116,10 @@ pub enum AccessTokenError {
         /// The `typ` the presented token actually carried.
         found: String,
     },
+    /// The token's `jti` was revoked, so it no longer authenticates even though
+    /// its signature is still valid and unexpired.
+    #[error("access token was revoked: {0}")]
+    Revoked(String),
 }
 
 /// JOSE header of an issued access token.
@@ -296,6 +302,71 @@ pub(crate) fn verify_jwt<T: DeserializeOwned>(
     decode_part(payload_b64)
 }
 
+/// A denylist of revoked access-token `jti`s.
+///
+/// Access tokens are stateless JWTs a verifier checks against the published
+/// [`Jwks`] without calling IAM, so a token stays cryptographically valid until
+/// it expires. The `jti` claim is what makes a token *individually revocable*
+/// before then: IAM records a revoked `jti` here, and any verification routed
+/// through IAM (or a verifier that consults this denylist) rejects it. A token
+/// naturally falls out of relevance once it expires; an operator prunes the
+/// denylist on that cadence.
+#[derive(Debug, Default, Clone)]
+pub struct AccessTokenRevocations {
+    revoked: HashSet<String>,
+}
+
+impl AccessTokenRevocations {
+    /// Create an empty revocation denylist.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Revoke a `jti`. Returns whether it was newly added (idempotent).
+    pub fn revoke(&mut self, jti: impl Into<String>) -> bool {
+        self.revoked.insert(jti.into())
+    }
+
+    /// Whether a `jti` has been revoked.
+    pub fn is_revoked(&self, jti: &str) -> bool {
+        self.revoked.contains(jti)
+    }
+
+    /// Number of revoked `jti`s currently held.
+    pub fn len(&self) -> usize {
+        self.revoked.len()
+    }
+
+    /// Whether the denylist is empty.
+    pub fn is_empty(&self) -> bool {
+        self.revoked.is_empty()
+    }
+
+    /// Drop a `jti` from the denylist (e.g. once the token it named has expired).
+    /// Returns whether it was present.
+    pub fn forget(&mut self, jti: &str) -> bool {
+        self.revoked.remove(jti)
+    }
+}
+
+/// Verify an access token against `jwks` *and* the `revocations` denylist.
+///
+/// This is the full IAM-side check: a token that verifies cryptographically but
+/// whose `jti` has been revoked fails closed with [`AccessTokenError::Revoked`].
+/// Verifiers that hold the denylist get real per-token revocation on top of the
+/// stateless signature check.
+pub fn verify_active_access_token(
+    token: &str,
+    jwks: &Jwks,
+    revocations: &AccessTokenRevocations,
+) -> Result<AccessTokenClaims, AccessTokenError> {
+    let claims = verify_access_token(token, jwks)?;
+    if revocations.is_revoked(&claims.jti) {
+        return Err(AccessTokenError::Revoked(claims.jti));
+    }
+    Ok(claims)
+}
+
 fn encode_part<T: Serialize>(value: &T) -> Result<String, AccessTokenError> {
     let json = serde_json::to_vec(value).map_err(|_| AccessTokenError::Malformed)?;
     Ok(URL_SAFE_NO_PAD.encode(json))
@@ -436,6 +507,33 @@ mod tests {
         assert_eq!(err, AccessTokenError::UnknownKid("key-1".into()));
         // The current token still verifies after the prune.
         verify_access_token(&new_token, &pruned).unwrap();
+    }
+
+    #[test]
+    fn a_revoked_jti_fails_closed_even_with_a_valid_signature() {
+        let authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(9)));
+        let token = authority.mint(&claims("jti-1")).unwrap();
+        let jwks = authority.jwks();
+
+        // Unrevoked: the token verifies against the denylist-aware path.
+        let mut revocations = AccessTokenRevocations::new();
+        verify_active_access_token(&token, &jwks, &revocations).unwrap();
+
+        // Revoking the jti retires the still-valid token.
+        assert!(revocations.revoke("jti-1"));
+        // Revocation is idempotent.
+        assert!(!revocations.revoke("jti-1"));
+        assert!(revocations.is_revoked("jti-1"));
+        let err = verify_active_access_token(&token, &jwks, &revocations).unwrap_err();
+        assert_eq!(err, AccessTokenError::Revoked("jti-1".into()));
+
+        // The bare signature check is unaffected — revocation is the IAM-side
+        // layer over the stateless verification.
+        verify_access_token(&token, &jwks).unwrap();
+
+        // Forgetting the jti (e.g. after expiry) restores the token.
+        assert!(revocations.forget("jti-1"));
+        verify_active_access_token(&token, &jwks, &revocations).unwrap();
     }
 
     #[test]

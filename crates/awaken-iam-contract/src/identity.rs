@@ -507,3 +507,130 @@ impl From<&ApiToken> for ApiTokenView {
         Self::from_token(token)
     }
 }
+
+/// Refresh-token row identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RefreshTokenId(pub String);
+
+/// Identifier of a refresh-token *chain*: the lineage of tokens produced by
+/// rotating one original refresh token across successive uses.
+///
+/// Every rotation issues a fresh [`RefreshToken`] under the same chain id, so a
+/// theft signal (replay of a retired token) can revoke the entire lineage in one
+/// step rather than chasing individual rows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RefreshTokenChainId(pub String);
+
+/// A long-lived, rotated refresh token, persisted only as a hash.
+///
+/// A refresh token renews short-lived access tokens. It is opaque and high
+/// entropy; only its SHA-256 [`token_hash`](RefreshToken::token_hash) is stored,
+/// and the cleartext is returned exactly once at issue/rotation time. Each use
+/// **rotates** the token: the presented token is stamped
+/// [`rotated_at`](RefreshToken::rotated_at) (retired) and a successor is issued
+/// under the same [`chain_id`](RefreshToken::chain_id). Presenting an
+/// already-retired token is a reuse (theft) signal that revokes the whole chain.
+///
+/// The grant coordinates needed to mint a new access token on rotation —
+/// [`subject`](RefreshToken::subject), [`audience`](RefreshToken::audience), and
+/// [`scope`](RefreshToken::scope) — travel with the token so a refresh never
+/// trusts client-supplied claims. Liveness is the conjunction of "not revoked",
+/// "not rotated", and "before `expires_at`".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshToken {
+    /// Stable token row id.
+    pub id: RefreshTokenId,
+    /// Chain this token belongs to; shared across every rotation.
+    pub chain_id: RefreshTokenChainId,
+    /// Account the refreshed access tokens authenticate.
+    pub account_id: AccountId,
+    /// SHA-256 hash of the opaque token secret; never the cleartext.
+    pub token_hash: String,
+    /// Subject stamped into access tokens minted from this chain.
+    pub subject: String,
+    /// Audience stamped into access tokens minted from this chain.
+    pub audience: String,
+    /// Scopes carried by access tokens minted from this chain.
+    pub scope: Vec<String>,
+    /// Issue timestamp.
+    pub created_at: Timestamp,
+    /// Expiration timestamp; must be strictly after `created_at`.
+    pub expires_at: Timestamp,
+    /// Rotation timestamp: once set the token is retired and replay is a reuse
+    /// signal.
+    pub rotated_at: Option<Timestamp>,
+    /// Revocation timestamp; once set the token can no longer be rotated.
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl RefreshToken {
+    /// Whether the token may still be rotated at `now`: not revoked, not already
+    /// rotated, and strictly before `expires_at`. Timestamps compare as canonical
+    /// RFC 3339 UTC strings, whose lexical order matches chronological order.
+    pub fn is_live(&self, now: &Timestamp) -> bool {
+        !self.is_revoked() && !self.is_retired() && now.0 < self.expires_at.0
+    }
+
+    /// Whether the token has been rotated (superseded by a successor).
+    pub fn is_retired(&self) -> bool {
+        self.rotated_at.is_some()
+    }
+
+    /// Whether the token has been explicitly revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
+    }
+}
+
+/// Public view of a [`RefreshToken`] safe to return to clients.
+///
+/// It exposes the token's coordinates, scope, and lifecycle timestamps but never
+/// the `token_hash`. The cleartext token itself is only ever returned once, at
+/// issue/rotation time, and is not part of this view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshTokenView {
+    /// Stable token row id.
+    pub id: RefreshTokenId,
+    /// Chain this token belongs to.
+    pub chain_id: RefreshTokenChainId,
+    /// Account the refreshed access tokens authenticate.
+    pub account_id: AccountId,
+    /// Subject stamped into access tokens minted from this chain.
+    pub subject: String,
+    /// Audience stamped into access tokens minted from this chain.
+    pub audience: String,
+    /// Scopes carried by access tokens minted from this chain.
+    pub scope: Vec<String>,
+    /// Issue timestamp.
+    pub created_at: Timestamp,
+    /// Expiration timestamp.
+    pub expires_at: Timestamp,
+    /// Rotation timestamp, when retired.
+    pub rotated_at: Option<Timestamp>,
+    /// Revocation timestamp, when revoked.
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl RefreshTokenView {
+    /// Project a stored [`RefreshToken`] into its public, hash-free view.
+    pub fn from_token(token: &RefreshToken) -> Self {
+        Self {
+            id: token.id.clone(),
+            chain_id: token.chain_id.clone(),
+            account_id: token.account_id.clone(),
+            subject: token.subject.clone(),
+            audience: token.audience.clone(),
+            scope: token.scope.clone(),
+            created_at: token.created_at.clone(),
+            expires_at: token.expires_at.clone(),
+            rotated_at: token.rotated_at.clone(),
+            revoked_at: token.revoked_at.clone(),
+        }
+    }
+}
+
+impl From<&RefreshToken> for RefreshTokenView {
+    fn from(token: &RefreshToken) -> Self {
+        Self::from_token(token)
+    }
+}
