@@ -1,0 +1,1115 @@
+//! Backend-neutral SQL adapter implementing every IAM repository port.
+//!
+//! The two real database backends — Postgres and SQLite — differ only in the
+//! driver edge: how a parameterized statement is rendered (placeholder syntax,
+//! `jsonb` casts) and executed. Everything above that — the table layout, the
+//! column encoding of contract value objects, the uniqueness and lifecycle
+//! invariants the ports require — is identical, so it lives here once over a
+//! small [`SqlConn`] seam. [`super::sqlite`] and [`super::postgres`] each provide
+//! a `SqlConn`; mounting either behind [`SqlStore`] is what makes the backend a
+//! configuration choice rather than a code fork (see
+//! [ADR-0003](../../../../docs/adr/0003-storage-backends.md)).
+//!
+//! Statements are authored against a tiny portable placeholder dialect: `?` is a
+//! plain bound parameter and `?j` is a parameter bound into a JSON column. Each
+//! backend rewrites those markers to its own form (`$1` / `$1::jsonb` for
+//! Postgres, `?` for SQLite), so the shared SQL never names a dialect. JSON
+//! columns are read back with `CAST(col AS TEXT)`, portable across both.
+
+use awaken_iam_contract::{
+    Account, AccountId, ActionKey, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
+    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, GrantSubjectRef,
+    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
+    ResourceType, Session, SessionId, Timestamp,
+};
+use awaken_iam_core::{
+    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
+    Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo, LoginFlowRepo, OrgRepo,
+    Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit, RepoError, RepoResult,
+    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo,
+    SessionRepo,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::migration::Dialect;
+
+/// A bound parameter value. Every IAM column is text or JSON-as-text, so a
+/// nullable string is the only shape a backend has to bind.
+pub type SqlParam = Option<String>;
+
+/// A materialized result row: one nullable string per selected column, in select
+/// order. JSON columns arrive already rendered to text by the backend.
+pub type SqlRow = Vec<Option<String>>;
+
+/// The driver seam each backend implements: render the portable placeholder
+/// dialect, bind parameters, and run a statement against its connection.
+///
+/// Implementations map a uniqueness-constraint violation to
+/// [`RepoError::Conflict`] and any other backend failure to [`RepoError::Backend`]
+/// so the shared store logic stays dialect-free.
+pub trait SqlConn: Send + Sync {
+    /// The backend dialect, mirroring the migration executor's choice.
+    fn dialect(&self) -> Dialect;
+    /// Execute a write, returning the number of rows affected.
+    fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64>;
+    /// Execute a read, returning every matching row.
+    fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>>;
+}
+
+/// A storage adapter that serves every IAM repository port from a real database.
+///
+/// Generic over the [`SqlConn`] backend so the same logic backs Postgres and
+/// SQLite. The table `prefix` matches the one the migration plan rendered, so the
+/// adapter reads and writes exactly the tables [`super::IamStore`] created.
+#[derive(Debug, Clone)]
+pub struct SqlStore<B> {
+    backend: B,
+    prefix: String,
+}
+
+impl<B: SqlConn> SqlStore<B> {
+    /// Build a store over `backend` for tables under `prefix`.
+    ///
+    /// The prefix must be the same bare identifier the migration store used; it
+    /// is validated the same way to keep interpolated table names injection-free.
+    pub fn with_prefix(backend: B, prefix: impl Into<String>) -> RepoResult<Self> {
+        let prefix = prefix.into();
+        if prefix.is_empty()
+            || !prefix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(RepoError::Backend(format!(
+                "invalid table prefix {prefix:?}: expected [a-z0-9_]+"
+            )));
+        }
+        Ok(Self { backend, prefix })
+    }
+
+    /// Borrow the underlying backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Fully-qualified table name `<prefix>_<name>`.
+    fn table(&self, name: &str) -> String {
+        format!("{}_{}", self.prefix, name)
+    }
+}
+
+// --- column encoding -------------------------------------------------------
+
+fn json_encode<T: serde::Serialize>(value: &T, what: &str) -> RepoResult<String> {
+    serde_json::to_string(value).map_err(|err| RepoError::Backend(format!("encode {what}: {err}")))
+}
+
+fn json_decode<T: serde::de::DeserializeOwned>(raw: &str, what: &str) -> RepoResult<T> {
+    serde_json::from_str(raw).map_err(|err| RepoError::Backend(format!("decode {what}: {err}")))
+}
+
+/// A non-null string column, or a backend error when the column was unexpectedly
+/// absent or null.
+fn req(row: &SqlRow, idx: usize, what: &str) -> RepoResult<String> {
+    row.get(idx)
+        .and_then(|cell| cell.clone())
+        .ok_or_else(|| RepoError::Backend(format!("missing column {idx} ({what})")))
+}
+
+/// A nullable string column.
+fn opt(row: &SqlRow, idx: usize) -> Option<String> {
+    row.get(idx).and_then(|cell| cell.clone())
+}
+
+fn encode_effect(effect: Effect) -> &'static str {
+    match effect {
+        Effect::Allow => "allow",
+        Effect::RequireApproval => "require_approval",
+        Effect::Deny => "deny",
+    }
+}
+
+fn decode_effect(raw: &str) -> RepoResult<Effect> {
+    match raw {
+        "allow" => Ok(Effect::Allow),
+        "require_approval" => Ok(Effect::RequireApproval),
+        "deny" => Ok(Effect::Deny),
+        other => Err(RepoError::Backend(format!("unknown effect {other:?}"))),
+    }
+}
+
+fn encode_tier(tier: PlanTier) -> &'static str {
+    match tier {
+        PlanTier::Free => "free",
+        PlanTier::Pro => "pro",
+        PlanTier::Team => "team",
+        PlanTier::Enterprise => "enterprise",
+    }
+}
+
+fn decode_tier(raw: &str) -> RepoResult<PlanTier> {
+    match raw {
+        "free" => Ok(PlanTier::Free),
+        "pro" => Ok(PlanTier::Pro),
+        "team" => Ok(PlanTier::Team),
+        "enterprise" => Ok(PlanTier::Enterprise),
+        other => Err(RepoError::Backend(format!("unknown plan tier {other:?}"))),
+    }
+}
+
+fn encode_grant_subject(subject: &GrantSubject) -> RepoResult<String> {
+    let dto = match subject {
+        GrantSubject::Principal(principal) => GrantSubjectRef::Principal {
+            principal: principal.clone(),
+        },
+        GrantSubject::Role(role) => GrantSubjectRef::Role {
+            role_id: role.0.clone(),
+        },
+    };
+    json_encode(&dto, "grant subject")
+}
+
+fn decode_grant_subject(raw: &str) -> RepoResult<GrantSubject> {
+    let dto: GrantSubjectRef = json_decode(raw, "grant subject")?;
+    Ok(match dto {
+        GrantSubjectRef::Principal { principal } => GrantSubject::Principal(principal),
+        GrantSubjectRef::Role { role_id } => GrantSubject::Role(RoleId(role_id)),
+    })
+}
+
+/// Convenience: a `Some(String)` text parameter.
+fn p(value: impl Into<String>) -> SqlParam {
+    Some(value.into())
+}
+
+// --- row decoders ----------------------------------------------------------
+
+fn decode_account(row: &SqlRow) -> RepoResult<Account> {
+    Ok(Account {
+        id: AccountId(req(row, 0, "account.id")?),
+        status: json_decode(
+            &format!("\"{}\"", req(row, 1, "account.status")?),
+            "account status",
+        )?,
+        display_name: opt(row, 2),
+        created_at: Timestamp(req(row, 3, "account.created_at")?),
+        updated_at: Timestamp(req(row, 4, "account.updated_at")?),
+    })
+}
+
+fn decode_external(row: &SqlRow) -> RepoResult<ExternalIdentity> {
+    let claims: ExternalIdentityClaims = json_decode(&req(row, 3, "identity.claims")?, "claims")?;
+    Ok(ExternalIdentity {
+        id: ExternalIdentityId(req(row, 0, "identity.id")?),
+        account_id: AccountId(req(row, 1, "identity.account_id")?),
+        provider_key: IdentityProviderKey(req(row, 2, "identity.provider_key")?),
+        claims,
+        first_seen_at: Timestamp(req(row, 4, "identity.first_seen_at")?),
+        last_seen_at: Timestamp(req(row, 5, "identity.last_seen_at")?),
+    })
+}
+
+fn decode_session(row: &SqlRow) -> RepoResult<Session> {
+    Ok(Session {
+        id: SessionId(req(row, 0, "session.id")?),
+        account_id: AccountId(req(row, 1, "session.account_id")?),
+        token_hash: req(row, 2, "session.token_hash")?,
+        external_identity_id: opt(row, 3).map(ExternalIdentityId),
+        created_at: Timestamp(req(row, 4, "session.created_at")?),
+        last_seen_at: Timestamp(req(row, 5, "session.last_seen_at")?),
+        expires_at: Timestamp(req(row, 6, "session.expires_at")?),
+        revoked_at: opt(row, 7).map(Timestamp),
+    })
+}
+
+fn decode_login_flow(row: &SqlRow) -> RepoResult<OAuthLoginState> {
+    Ok(OAuthLoginState {
+        id: OAuthLoginStateId(req(row, 0, "login_flow.id")?),
+        provider_key: IdentityProviderKey(req(row, 1, "login_flow.provider_key")?),
+        state_hash: req(row, 2, "login_flow.state_hash")?,
+        nonce_hash: opt(row, 3),
+        pkce_verifier_hash: opt(row, 4),
+        return_to: opt(row, 5),
+        created_at: Timestamp(req(row, 6, "login_flow.created_at")?),
+        expires_at: Timestamp(req(row, 7, "login_flow.expires_at")?),
+        consumed_at: opt(row, 8).map(Timestamp),
+    })
+}
+
+fn decode_api_token(row: &SqlRow) -> RepoResult<ApiToken> {
+    Ok(ApiToken {
+        id: ApiTokenId(req(row, 0, "api_token.id")?),
+        prefix: ApiTokenPrefix(req(row, 1, "api_token.prefix")?),
+        principal: json_decode(&req(row, 2, "api_token.principal")?, "principal")?,
+        secret_hash: req(row, 3, "api_token.secret_hash")?,
+        scope: json_decode::<Vec<ActionKey>>(&req(row, 4, "api_token.scope")?, "token scope")?,
+        created_at: Timestamp(req(row, 5, "api_token.created_at")?),
+        expires_at: opt(row, 6).map(Timestamp),
+        revoked_at: opt(row, 7).map(Timestamp),
+    })
+}
+
+fn decode_grant(row: &SqlRow) -> RepoResult<Grant> {
+    Ok(Grant {
+        id: GrantId(req(row, 0, "grant.id")?),
+        subject: decode_grant_subject(&req(row, 1, "grant.subject")?)?,
+        action_pattern: ActionPattern(req(row, 2, "grant.action_pattern")?),
+        scope: json_decode(&req(row, 3, "grant.scope")?, "grant scope")?,
+        effect: decode_effect(&req(row, 4, "grant.effect")?)?,
+    })
+}
+
+fn decode_role_binding(row: &SqlRow) -> RepoResult<RoleBinding> {
+    Ok(RoleBinding {
+        principal: json_decode(&req(row, 0, "binding.principal")?, "principal")?,
+        role: RoleId(req(row, 1, "binding.role")?),
+        scope: json_decode(&req(row, 2, "binding.scope")?, "binding scope")?,
+    })
+}
+
+fn decode_resource_edge(row: &SqlRow) -> RepoResult<ResourceEdge> {
+    Ok(ResourceEdge {
+        resource_type: ResourceType(req(row, 0, "edge.resource_type")?),
+        resource_id: ResourceId(req(row, 1, "edge.resource_id")?),
+        parent: json_decode(&req(row, 2, "edge.parent")?, "edge parent")?,
+    })
+}
+
+fn decode_plan(row: &SqlRow) -> RepoResult<Plan> {
+    Ok(Plan {
+        id: PlanId(req(row, 0, "plan.id")?),
+        tier: decode_tier(&req(row, 1, "plan.tier")?)?,
+        features: json_decode::<BTreeSet<String>>(&req(row, 2, "plan.features")?, "plan features")?,
+        limits: json_decode::<BTreeMap<String, Quota>>(
+            &req(row, 3, "plan.limits")?,
+            "plan limits",
+        )?,
+        rates: json_decode::<BTreeMap<String, RateLimit>>(
+            &req(row, 4, "plan.rates")?,
+            "plan rates",
+        )?,
+    })
+}
+
+fn decode_org(row: &SqlRow) -> RepoResult<Organization> {
+    Ok(Organization {
+        id: OrgId(req(row, 0, "org.id")?),
+        display_name: opt(row, 1),
+        owner: json_decode(&req(row, 2, "org.owner")?, "org owner")?,
+        created_at: Timestamp(req(row, 3, "org.created_at")?),
+        updated_at: Timestamp(req(row, 4, "org.updated_at")?),
+    })
+}
+
+fn decode_group(row: &SqlRow) -> RepoResult<Group> {
+    Ok(Group {
+        id: GroupId(req(row, 0, "group.id")?),
+        org: OrgId(req(row, 1, "group.org_id")?),
+        display_name: opt(row, 2),
+        members: json_decode(&req(row, 3, "group.members")?, "group members")?,
+        created_at: Timestamp(req(row, 4, "group.created_at")?),
+        updated_at: Timestamp(req(row, 5, "group.updated_at")?),
+    })
+}
+
+fn decode_role(row: &SqlRow) -> RepoResult<RoleDef> {
+    let patterns: Vec<String> =
+        json_decode(&req(row, 2, "role.action_patterns")?, "role patterns")?;
+    Ok(RoleDef {
+        id: RoleId(req(row, 0, "role.id")?),
+        display_name: opt(row, 1),
+        action_patterns: patterns.into_iter().map(ActionPattern).collect(),
+        created_at: Timestamp(req(row, 3, "role.created_at")?),
+        updated_at: Timestamp(req(row, 4, "role.updated_at")?),
+    })
+}
+
+fn decode_audit(row: &SqlRow) -> RepoResult<AuditEvent> {
+    let actor = match opt(row, 1) {
+        Some(raw) => Some(json_decode::<PrincipalRef>(&raw, "audit actor")?),
+        None => None,
+    };
+    Ok(AuditEvent {
+        at: Timestamp(req(row, 0, "audit.at")?),
+        actor,
+        action: req(row, 2, "audit.action")?,
+        detail: req(row, 3, "audit.detail")?,
+    })
+}
+
+// --- iam.identity ----------------------------------------------------------
+
+impl<B: SqlConn> AccountRepo for SqlStore<B> {
+    fn get(&self, id: &AccountId) -> RepoResult<Option<Account>> {
+        let sql = format!(
+            "SELECT id, status, display_name, created_at, updated_at FROM {} WHERE id = ?",
+            self.table("accounts")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_account).transpose()
+    }
+
+    fn upsert(&self, account: Account) -> RepoResult<()> {
+        let status = json_encode(&account.status, "account status")?;
+        let status = status.trim_matches('"').to_owned();
+        let sql = format!(
+            "INSERT INTO {t} (id, status, display_name, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET \
+             status = excluded.status, display_name = excluded.display_name, \
+             created_at = excluded.created_at, updated_at = excluded.updated_at",
+            t = self.table("accounts")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(account.id.0),
+                p(status),
+                account.display_name,
+                p(account.created_at.0),
+                p(account.updated_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<Account>> {
+        let sql = format!(
+            "SELECT id, status, display_name, created_at, updated_at FROM {} ORDER BY id",
+            self.table("accounts")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_account)
+            .collect()
+    }
+}
+
+impl<B: SqlConn> ExternalIdentityRepo for SqlStore<B> {
+    fn get_by_key(&self, key: &ExternalIdentityKey) -> RepoResult<Option<ExternalIdentity>> {
+        let sql = format!(
+            "SELECT id, account_id, provider_key, CAST(claims AS TEXT), first_seen_at, last_seen_at \
+             FROM {} WHERE provider_key = ? AND subject = ?",
+            self.table("external_identities")
+        );
+        let rows = self.backend.query(
+            &sql,
+            &[p(key.provider_key.0.clone()), p(key.subject.0.clone())],
+        )?;
+        rows.first().map(decode_external).transpose()
+    }
+
+    fn link(&self, identity: ExternalIdentity) -> RepoResult<()> {
+        let key = identity.key();
+        let claims = json_encode(&identity.claims, "claims")?;
+        let sql = format!(
+            "INSERT INTO {t} \
+             (id, account_id, provider_key, subject, claims, first_seen_at, last_seen_at) \
+             VALUES (?, ?, ?, ?, ?j, ?, ?)",
+            t = self.table("external_identities")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(identity.id.0),
+                p(identity.account_id.0),
+                p(key.provider_key.0),
+                p(key.subject.0),
+                p(claims),
+                p(identity.first_seen_at.0),
+                p(identity.last_seen_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_claims(&self, identity: ExternalIdentity) -> RepoResult<()> {
+        let key = identity.key();
+        let claims = json_encode(&identity.claims, "claims")?;
+        let sql = format!(
+            "UPDATE {t} SET claims = ?j, last_seen_at = ? \
+             WHERE provider_key = ? AND subject = ?",
+            t = self.table("external_identities")
+        );
+        let affected = self.backend.execute(
+            &sql,
+            &[
+                p(claims),
+                p(identity.last_seen_at.0),
+                p(key.provider_key.0.clone()),
+                p(key.subject.0.clone()),
+            ],
+        )?;
+        if affected == 0 {
+            return Err(RepoError::NotFound(format!(
+                "external identity {}:{} is not linked",
+                key.provider_key.0, key.subject.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn list_for_account(&self, account_id: &AccountId) -> RepoResult<Vec<ExternalIdentity>> {
+        let sql = format!(
+            "SELECT id, account_id, provider_key, CAST(claims AS TEXT), first_seen_at, last_seen_at \
+             FROM {} WHERE account_id = ? ORDER BY id",
+            self.table("external_identities")
+        );
+        self.backend
+            .query(&sql, &[p(account_id.0.clone())])?
+            .iter()
+            .map(decode_external)
+            .collect()
+    }
+}
+
+impl<B: SqlConn> SessionRepo for SqlStore<B> {
+    fn get(&self, id: &SessionId) -> RepoResult<Option<Session>> {
+        let sql = format!(
+            "SELECT id, account_id, token_hash, external_identity_id, created_at, last_seen_at, \
+             expires_at, revoked_at FROM {} WHERE id = ?",
+            self.table("sessions")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_session).transpose()
+    }
+
+    fn get_by_token_hash(&self, token_hash: &str) -> RepoResult<Option<Session>> {
+        let sql = format!(
+            "SELECT id, account_id, token_hash, external_identity_id, created_at, last_seen_at, \
+             expires_at, revoked_at FROM {} WHERE token_hash = ?",
+            self.table("sessions")
+        );
+        let rows = self.backend.query(&sql, &[p(token_hash)])?;
+        rows.first().map(decode_session).transpose()
+    }
+
+    fn create(&self, session: Session) -> RepoResult<()> {
+        let sql = format!(
+            "INSERT INTO {t} \
+             (id, account_id, token_hash, external_identity_id, created_at, last_seen_at, \
+             expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            t = self.table("sessions")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(session.id.0),
+                p(session.account_id.0),
+                p(session.token_hash),
+                session.external_identity_id.map(|i| i.0),
+                p(session.created_at.0),
+                p(session.last_seen_at.0),
+                p(session.expires_at.0),
+                session.revoked_at.map(|t| t.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update(&self, session: Session) -> RepoResult<()> {
+        let sql = format!(
+            "UPDATE {t} SET account_id = ?, token_hash = ?, external_identity_id = ?, \
+             created_at = ?, last_seen_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
+            t = self.table("sessions")
+        );
+        let affected = self.backend.execute(
+            &sql,
+            &[
+                p(session.account_id.0),
+                p(session.token_hash),
+                session.external_identity_id.map(|i| i.0),
+                p(session.created_at.0),
+                p(session.last_seen_at.0),
+                p(session.expires_at.0),
+                session.revoked_at.map(|t| t.0),
+                p(session.id.0.clone()),
+            ],
+        )?;
+        if affected == 0 {
+            return Err(RepoError::NotFound(format!(
+                "session {} does not exist",
+                session.id.0
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> LoginFlowRepo for SqlStore<B> {
+    fn start(&self, state: OAuthLoginState) -> RepoResult<()> {
+        let sql = format!(
+            "INSERT INTO {t} \
+             (id, provider_key, state_hash, nonce_hash, pkce_verifier_hash, return_to, \
+             created_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            t = self.table("login_flows")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(state.id.0),
+                p(state.provider_key.0),
+                p(state.state_hash),
+                state.nonce_hash,
+                state.pkce_verifier_hash,
+                state.return_to,
+                p(state.created_at.0),
+                p(state.expires_at.0),
+                state.consumed_at.map(|t| t.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, id: &OAuthLoginStateId) -> RepoResult<Option<OAuthLoginState>> {
+        let sql = format!(
+            "SELECT id, provider_key, state_hash, nonce_hash, pkce_verifier_hash, return_to, \
+             created_at, expires_at, consumed_at FROM {} WHERE id = ?",
+            self.table("login_flows")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_login_flow).transpose()
+    }
+
+    fn mark_consumed(&self, id: &OAuthLoginStateId, at: Timestamp) -> RepoResult<()> {
+        let sql = format!(
+            "UPDATE {t} SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+            t = self.table("login_flows")
+        );
+        let affected = self.backend.execute(&sql, &[p(at.0), p(id.0.clone())])?;
+        if affected == 0 {
+            // Distinguish "no such flow" (NotFound) from "already consumed"
+            // (Conflict), matching the in-memory adapter's fail-closed reuse
+            // detection.
+            let exists = format!("SELECT id FROM {} WHERE id = ?", self.table("login_flows"));
+            if self.backend.query(&exists, &[p(id.0.clone())])?.is_empty() {
+                return Err(RepoError::NotFound(format!(
+                    "login flow {} not found",
+                    id.0
+                )));
+            }
+            return Err(RepoError::Conflict(format!(
+                "login flow {} already consumed",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
+    fn create(&self, token: ApiToken) -> RepoResult<()> {
+        let principal = json_encode(&token.principal, "principal")?;
+        let scope = json_encode(&token.scope, "token scope")?;
+        let sql = format!(
+            "INSERT INTO {t} \
+             (id, prefix, principal, secret_hash, scope, created_at, expires_at, revoked_at) \
+             VALUES (?, ?, ?j, ?, ?j, ?, ?, ?)",
+            t = self.table("api_tokens")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(token.id.0),
+                p(token.prefix.0),
+                p(principal),
+                p(token.secret_hash),
+                p(scope),
+                p(token.created_at.0),
+                token.expires_at.map(|t| t.0),
+                token.revoked_at.map(|t| t.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, id: &ApiTokenId) -> RepoResult<Option<ApiToken>> {
+        let sql = format!(
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+             created_at, expires_at, revoked_at FROM {} WHERE id = ?",
+            self.table("api_tokens")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_api_token).transpose()
+    }
+
+    fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepoResult<Option<ApiToken>> {
+        let sql = format!(
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+             created_at, expires_at, revoked_at FROM {} WHERE prefix = ?",
+            self.table("api_tokens")
+        );
+        let rows = self.backend.query(&sql, &[p(prefix.0.clone())])?;
+        rows.first().map(decode_api_token).transpose()
+    }
+
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<ApiToken>> {
+        let principal_json = json_encode(principal, "principal")?;
+        let sql = format!(
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+             created_at, expires_at, revoked_at FROM {} WHERE principal = ?j ORDER BY id",
+            self.table("api_tokens")
+        );
+        self.backend
+            .query(&sql, &[p(principal_json)])?
+            .iter()
+            .map(decode_api_token)
+            .collect()
+    }
+
+    fn update(&self, token: ApiToken) -> RepoResult<()> {
+        let principal = json_encode(&token.principal, "principal")?;
+        let scope = json_encode(&token.scope, "token scope")?;
+        let sql = format!(
+            "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, scope = ?j, \
+             created_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
+            t = self.table("api_tokens")
+        );
+        let affected = self.backend.execute(
+            &sql,
+            &[
+                p(token.prefix.0),
+                p(principal),
+                p(token.secret_hash),
+                p(scope),
+                p(token.created_at.0),
+                token.expires_at.map(|t| t.0),
+                token.revoked_at.map(|t| t.0),
+                p(token.id.0.clone()),
+            ],
+        )?;
+        if affected == 0 {
+            return Err(RepoError::NotFound(format!(
+                "api token {} does not exist",
+                token.id.0
+            )));
+        }
+        Ok(())
+    }
+}
+
+// --- iam.authz -------------------------------------------------------------
+
+impl<B: SqlConn> OrgRepo for SqlStore<B> {
+    fn get(&self, id: &OrgId) -> RepoResult<Option<Organization>> {
+        let sql = format!(
+            "SELECT id, display_name, CAST(owner AS TEXT), created_at, updated_at \
+             FROM {} WHERE id = ?",
+            self.table("orgs")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_org).transpose()
+    }
+
+    fn upsert(&self, org: Organization) -> RepoResult<()> {
+        let owner = json_encode(&org.owner, "org owner")?;
+        let sql = format!(
+            "INSERT INTO {t} (id, display_name, owner, created_at, updated_at) \
+             VALUES (?, ?, ?j, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, \
+             owner = excluded.owner, created_at = excluded.created_at, \
+             updated_at = excluded.updated_at",
+            t = self.table("orgs")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(org.id.0),
+                org.display_name,
+                p(owner),
+                p(org.created_at.0),
+                p(org.updated_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<Organization>> {
+        let sql = format!(
+            "SELECT id, display_name, CAST(owner AS TEXT), created_at, updated_at \
+             FROM {} ORDER BY id",
+            self.table("orgs")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_org)
+            .collect()
+    }
+
+    fn remove(&self, id: &OrgId) -> RepoResult<()> {
+        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("orgs"));
+        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
+            return Err(RepoError::NotFound(format!(
+                "organization {} not found",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> GroupRepo for SqlStore<B> {
+    fn get(&self, id: &GroupId) -> RepoResult<Option<Group>> {
+        let sql = format!(
+            "SELECT id, org_id, display_name, CAST(members AS TEXT), created_at, updated_at \
+             FROM {} WHERE id = ?",
+            self.table("groups")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_group).transpose()
+    }
+
+    fn upsert(&self, group: Group) -> RepoResult<()> {
+        let members = json_encode(&group.members, "group members")?;
+        let sql = format!(
+            "INSERT INTO {t} (id, org_id, display_name, members, created_at, updated_at) \
+             VALUES (?, ?, ?, ?j, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET org_id = excluded.org_id, \
+             display_name = excluded.display_name, members = excluded.members, \
+             created_at = excluded.created_at, updated_at = excluded.updated_at",
+            t = self.table("groups")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(group.id.0),
+                p(group.org.0),
+                group.display_name,
+                p(members),
+                p(group.created_at.0),
+                p(group.updated_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<Group>> {
+        let sql = format!(
+            "SELECT id, org_id, display_name, CAST(members AS TEXT), created_at, updated_at \
+             FROM {} ORDER BY id",
+            self.table("groups")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_group)
+            .collect()
+    }
+
+    fn remove(&self, id: &GroupId) -> RepoResult<()> {
+        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("groups"));
+        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
+            return Err(RepoError::NotFound(format!("group {} not found", id.0)));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> RoleRepo for SqlStore<B> {
+    fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
+        let sql = format!(
+            "SELECT id, display_name, CAST(action_patterns AS TEXT), created_at, updated_at \
+             FROM {} WHERE id = ?",
+            self.table("roles")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_role).transpose()
+    }
+
+    fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+        let patterns: Vec<String> = role.action_patterns.iter().map(|p| p.0.clone()).collect();
+        let patterns = json_encode(&patterns, "role patterns")?;
+        let sql = format!(
+            "INSERT INTO {t} (id, display_name, action_patterns, created_at, updated_at) \
+             VALUES (?, ?, ?j, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, \
+             action_patterns = excluded.action_patterns, created_at = excluded.created_at, \
+             updated_at = excluded.updated_at",
+            t = self.table("roles")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(role.id.0),
+                role.display_name,
+                p(patterns),
+                p(role.created_at.0),
+                p(role.updated_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<RoleDef>> {
+        let sql = format!(
+            "SELECT id, display_name, CAST(action_patterns AS TEXT), created_at, updated_at \
+             FROM {} ORDER BY id",
+            self.table("roles")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_role)
+            .collect()
+    }
+
+    fn remove(&self, id: &RoleId) -> RepoResult<()> {
+        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("roles"));
+        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
+            return Err(RepoError::NotFound(format!("role {} not found", id.0)));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> GrantRepo for SqlStore<B> {
+    fn put(&self, grant: Grant) -> RepoResult<()> {
+        let subject = encode_grant_subject(&grant.subject)?;
+        let scope = json_encode(&grant.scope, "grant scope")?;
+        let sql = format!(
+            "INSERT INTO {t} (id, subject, action_pattern, scope, effect) \
+             VALUES (?, ?j, ?, ?j, ?) \
+             ON CONFLICT (id) DO UPDATE SET subject = excluded.subject, \
+             action_pattern = excluded.action_pattern, scope = excluded.scope, \
+             effect = excluded.effect",
+            t = self.table("grants")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(grant.id.0),
+                p(subject),
+                p(grant.action_pattern.0),
+                p(scope),
+                p(encode_effect(grant.effect)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, id: &GrantId) -> RepoResult<Option<Grant>> {
+        let sql = format!(
+            "SELECT id, CAST(subject AS TEXT), action_pattern, CAST(scope AS TEXT), effect \
+             FROM {} WHERE id = ?",
+            self.table("grants")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_grant).transpose()
+    }
+
+    fn list(&self) -> RepoResult<Vec<Grant>> {
+        let sql = format!(
+            "SELECT id, CAST(subject AS TEXT), action_pattern, CAST(scope AS TEXT), effect \
+             FROM {} ORDER BY id",
+            self.table("grants")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_grant)
+            .collect()
+    }
+
+    fn remove(&self, id: &GrantId) -> RepoResult<()> {
+        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("grants"));
+        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
+            return Err(RepoError::NotFound(format!("grant {} not found", id.0)));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> RoleBindingRepo for SqlStore<B> {
+    fn add(&self, binding: RoleBinding) -> RepoResult<()> {
+        let principal = json_encode(&binding.principal, "principal")?;
+        let scope = json_encode(&binding.scope, "binding scope")?;
+        let sql = format!(
+            "INSERT INTO {t} (principal, role, scope) VALUES (?j, ?, ?j) \
+             ON CONFLICT (principal, role, scope) DO NOTHING",
+            t = self.table("role_bindings")
+        );
+        self.backend
+            .execute(&sql, &[p(principal), p(binding.role.0), p(scope)])?;
+        Ok(())
+    }
+
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<RoleBinding>> {
+        let principal_json = json_encode(principal, "principal")?;
+        let sql = format!(
+            "SELECT CAST(principal AS TEXT), role, CAST(scope AS TEXT) FROM {} \
+             WHERE principal = ?j ORDER BY role, scope",
+            self.table("role_bindings")
+        );
+        self.backend
+            .query(&sql, &[p(principal_json)])?
+            .iter()
+            .map(decode_role_binding)
+            .collect()
+    }
+
+    fn list(&self) -> RepoResult<Vec<RoleBinding>> {
+        let sql = format!(
+            "SELECT CAST(principal AS TEXT), role, CAST(scope AS TEXT) FROM {} \
+             ORDER BY principal, role, scope",
+            self.table("role_bindings")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_role_binding)
+            .collect()
+    }
+
+    fn remove(&self, binding: &RoleBinding) -> RepoResult<()> {
+        let principal = json_encode(&binding.principal, "principal")?;
+        let scope = json_encode(&binding.scope, "binding scope")?;
+        let sql = format!(
+            "DELETE FROM {} WHERE principal = ?j AND role = ? AND scope = ?j",
+            self.table("role_bindings")
+        );
+        let affected = self
+            .backend
+            .execute(&sql, &[p(principal), p(binding.role.0.clone()), p(scope)])?;
+        if affected == 0 {
+            return Err(RepoError::NotFound("role binding not found".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> ResourceModelRepo for SqlStore<B> {
+    fn put_edge(&self, edge: ResourceEdge) -> RepoResult<()> {
+        let parent = json_encode(&edge.parent, "edge parent")?;
+        let sql = format!(
+            "INSERT INTO {t} (resource_type, resource_id, parent) VALUES (?, ?, ?j) \
+             ON CONFLICT (resource_type, resource_id) DO UPDATE SET parent = excluded.parent",
+            t = self.table("resource_edges")
+        );
+        self.backend.execute(
+            &sql,
+            &[p(edge.resource_type.0), p(edge.resource_id.0), p(parent)],
+        )?;
+        Ok(())
+    }
+
+    fn list_edges(&self) -> RepoResult<Vec<ResourceEdge>> {
+        let sql = format!(
+            "SELECT resource_type, resource_id, CAST(parent AS TEXT) FROM {} \
+             ORDER BY resource_type, resource_id",
+            self.table("resource_edges")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_resource_edge)
+            .collect()
+    }
+}
+
+// --- iam.entitlement -------------------------------------------------------
+
+impl<B: SqlConn> PlanRepo for SqlStore<B> {
+    fn put(&self, plan: Plan) -> RepoResult<()> {
+        let features = json_encode(&plan.features, "plan features")?;
+        let limits = json_encode(&plan.limits, "plan limits")?;
+        let rates = json_encode(&plan.rates, "plan rates")?;
+        let sql = format!(
+            "INSERT INTO {t} (id, tier, features, limits, rates) VALUES (?, ?, ?j, ?j, ?j) \
+             ON CONFLICT (id) DO UPDATE SET tier = excluded.tier, features = excluded.features, \
+             limits = excluded.limits, rates = excluded.rates",
+            t = self.table("plans")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(plan.id.0),
+                p(encode_tier(plan.tier)),
+                p(features),
+                p(limits),
+                p(rates),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, id: &PlanId) -> RepoResult<Option<Plan>> {
+        let sql = format!(
+            "SELECT id, tier, CAST(features AS TEXT), CAST(limits AS TEXT), CAST(rates AS TEXT) \
+             FROM {} WHERE id = ?",
+            self.table("plans")
+        );
+        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
+        rows.first().map(decode_plan).transpose()
+    }
+
+    fn list(&self) -> RepoResult<Vec<Plan>> {
+        let sql = format!(
+            "SELECT id, tier, CAST(features AS TEXT), CAST(limits AS TEXT), CAST(rates AS TEXT) \
+             FROM {} ORDER BY id",
+            self.table("plans")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_plan)
+            .collect()
+    }
+
+    fn subscribe(&self, principal: PrincipalRef, plan: PlanId) -> RepoResult<()> {
+        let principal_json = json_encode(&principal, "principal")?;
+        let sql = format!(
+            "INSERT INTO {t} (principal, plan_id) VALUES (?j, ?) \
+             ON CONFLICT (principal) DO UPDATE SET plan_id = excluded.plan_id",
+            t = self.table("subscriptions")
+        );
+        self.backend
+            .execute(&sql, &[p(principal_json), p(plan.0)])?;
+        Ok(())
+    }
+
+    fn subscription(&self, principal: &PrincipalRef) -> RepoResult<Option<PlanId>> {
+        let principal_json = json_encode(principal, "principal")?;
+        let sql = format!(
+            "SELECT plan_id FROM {} WHERE principal = ?j",
+            self.table("subscriptions")
+        );
+        let rows = self.backend.query(&sql, &[p(principal_json)])?;
+        match rows.first() {
+            Some(row) => Ok(Some(PlanId(req(row, 0, "subscription.plan_id")?))),
+            None => Ok(None),
+        }
+    }
+}
+
+// --- audit -----------------------------------------------------------------
+
+impl<B: SqlConn> AuditSink for SqlStore<B> {
+    fn record(&self, event: AuditEvent) -> RepoResult<()> {
+        let actor = match &event.actor {
+            Some(principal) => Some(json_encode(principal, "audit actor")?),
+            None => None,
+        };
+        let sql = format!(
+            "INSERT INTO {t} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+            t = self.table("audit_events")
+        );
+        self.backend.execute(
+            &sql,
+            &[p(event.at.0), actor, p(event.action), p(event.detail)],
+        )?;
+        Ok(())
+    }
+
+    fn events(&self) -> RepoResult<Vec<AuditEvent>> {
+        let sql = format!(
+            "SELECT at, CAST(actor AS TEXT), action, detail FROM {} ORDER BY seq",
+            self.table("audit_events")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_audit)
+            .collect()
+    }
+}

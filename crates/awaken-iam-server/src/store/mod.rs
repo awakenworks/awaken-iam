@@ -8,9 +8,18 @@
 
 mod memory;
 mod migration;
+mod postgres;
+mod sql;
+mod sqlite;
 
 pub use memory::InMemoryStore;
 pub use migration::{
     BundleScope, Dialect, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,
     PlannedMigration, RecordingExecutor, bundles,
+};
+pub use postgres::{PostgresBackend, migrated_store as postgres_migrated_store};
+pub use sql::{SqlConn, SqlParam, SqlRow, SqlStore};
+pub use sqlite::{
+    SqliteBackend, in_memory_store as sqlite_in_memory_store,
+    migrated_store as sqlite_migrated_store,
 };

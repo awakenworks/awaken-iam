@@ -95,10 +95,13 @@ impl Dialect {
 pub enum BundleScope {
     /// `iam.identity` — accounts, external identities, sessions, login flows.
     Identity,
-    /// `iam.authz` — grants, role memberships, resource-model registry.
+    /// `iam.authz` — directory (orgs, groups, roles), grants, role memberships,
+    /// resource-model registry.
     Authz,
     /// `iam.entitlement` — plans and subscriptions.
     Entitlement,
+    /// `iam.audit` — the append-only audit event log.
+    Audit,
 }
 
 impl BundleScope {
@@ -108,15 +111,17 @@ impl BundleScope {
             BundleScope::Identity => "iam.identity",
             BundleScope::Authz => "iam.authz",
             BundleScope::Entitlement => "iam.entitlement",
+            BundleScope::Audit => "iam.audit",
         }
     }
 
     /// Every scope, in canonical apply order.
-    pub const fn all() -> [BundleScope; 3] {
+    pub const fn all() -> [BundleScope; 4] {
         [
             BundleScope::Identity,
             BundleScope::Authz,
             BundleScope::Entitlement,
+            BundleScope::Audit,
         ]
     }
 }
@@ -436,16 +441,29 @@ pub fn bundles() -> Vec<MigrationBundle> {
         },
         MigrationBundle {
             scope: BundleScope::Authz,
-            migrations: vec![Migration {
-                id: "0001_authz",
-                up_sql: AUTHZ_0001,
-            }],
+            migrations: vec![
+                Migration {
+                    id: "0001_authz",
+                    up_sql: AUTHZ_0001,
+                },
+                Migration {
+                    id: "0002_directory",
+                    up_sql: AUTHZ_0002,
+                },
+            ],
         },
         MigrationBundle {
             scope: BundleScope::Entitlement,
             migrations: vec![Migration {
                 id: "0001_entitlement",
                 up_sql: ENTITLEMENT_0001,
+            }],
+        },
+        MigrationBundle {
+            scope: BundleScope::Audit,
+            migrations: vec![Migration {
+                id: "0001_audit",
+                up_sql: AUDIT_0001,
             }],
         },
     ]
@@ -537,6 +555,34 @@ CREATE TABLE IF NOT EXISTS {prefix}_resource_edges (\
  parent {json} NOT NULL, \
  PRIMARY KEY (resource_type, resource_id));";
 
+// The directory: organizations, groups, and reusable role definitions. Owners
+// and members are stored as their JSON principal form so the domain owns their
+// shape; an org/group reference is by id resolved in the domain, never a DB-level
+// FK across rows. Appended as a second authz step, leaving 0001 untouched so its
+// recorded identity never drifts.
+const AUTHZ_0002: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_orgs (\
+ id TEXT PRIMARY KEY, \
+ display_name TEXT, \
+ owner {json} NOT NULL, \
+ created_at TEXT NOT NULL, \
+ updated_at TEXT NOT NULL);\n\
+CREATE TABLE IF NOT EXISTS {prefix}_groups (\
+ id TEXT PRIMARY KEY, \
+ org_id TEXT NOT NULL, \
+ display_name TEXT, \
+ members {json} NOT NULL, \
+ created_at TEXT NOT NULL, \
+ updated_at TEXT NOT NULL);\n\
+CREATE INDEX IF NOT EXISTS {prefix}_groups_org_idx \
+ ON {prefix}_groups (org_id);\n\
+CREATE TABLE IF NOT EXISTS {prefix}_roles (\
+ id TEXT PRIMARY KEY, \
+ display_name TEXT, \
+ action_patterns {json} NOT NULL, \
+ created_at TEXT NOT NULL, \
+ updated_at TEXT NOT NULL);";
+
 // --- iam.entitlement DDL ---------------------------------------------------
 //
 // Plans and the per-principal subscription assignment. A subscription names a
@@ -553,6 +599,20 @@ CREATE TABLE IF NOT EXISTS {prefix}_subscriptions (\
  principal {json} NOT NULL PRIMARY KEY, \
  plan_id TEXT NOT NULL);";
 
+// --- iam.audit DDL ---------------------------------------------------------
+//
+// The append-only audit event log. `seq` is a backend-assigned autoincrement
+// surrogate so events read back in exact append order on either dialect; the
+// actor is the optional JSON principal form, absent when no principal is
+// attributable. Audit references nothing by FK — it is a flat, write-once log.
+const AUDIT_0001: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_audit_events (\
+ seq {pk_autoinc}, \
+ at TEXT NOT NULL, \
+ actor {json}, \
+ action TEXT NOT NULL, \
+ detail TEXT NOT NULL);";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,9 +622,12 @@ mod tests {
     }
 
     #[test]
-    fn bundles_partition_by_the_three_subdomain_scopes() {
+    fn bundles_partition_by_the_subdomain_scopes() {
         let scopes: Vec<&str> = bundles().iter().map(|b| b.scope.id()).collect();
-        assert_eq!(scopes, ["iam.identity", "iam.authz", "iam.entitlement"]);
+        assert_eq!(
+            scopes,
+            ["iam.identity", "iam.authz", "iam.entitlement", "iam.audit"]
+        );
     }
 
     #[test]
