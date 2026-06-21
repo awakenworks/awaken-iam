@@ -85,6 +85,13 @@ pub struct CapabilityClaims {
     /// `jti` of the parent this token was attenuated from; absent for a root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// `obligation_id` this capability discharges, when it was minted to satisfy
+    /// a `RequireApproval` decision. Absent for a capability not tied to an
+    /// approval. It binds the token to one obligation so the approval is
+    /// discharged by presenting the token — never by re-querying authorize — and
+    /// it is inherited unchanged by any attenuated child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation: Option<String>,
 }
 
 /// Request to mint a **root** capability token directly from the authority.
@@ -106,6 +113,9 @@ pub struct MintCapability {
     pub epoch: LeaseEpoch,
     /// Granted action scopes.
     pub scope: Vec<String>,
+    /// `obligation_id` this capability discharges, when minted to satisfy a
+    /// `RequireApproval` decision; `None` for a capability not tied to one.
+    pub obligation: Option<String>,
 }
 
 /// Request to derive an attenuated **child** capability from a parent token.
@@ -183,6 +193,7 @@ pub fn mint_capability(
         epoch: request.epoch,
         scope: request.scope,
         parent: None,
+        obligation: request.obligation,
     };
     Ok(authority.sign_jwt(CAPABILITY_TYP, &claims)?)
 }
@@ -235,6 +246,9 @@ pub fn attenuate(
         epoch: parent.epoch,
         scope: request.scope,
         parent: Some(parent.jti),
+        // A child cannot retarget the obligation it was minted under; the
+        // approval binding is inherited unchanged down the delegation chain.
+        obligation: parent.obligation,
     };
     Ok(authority.sign_jwt(CAPABILITY_TYP, &child)?)
 }
@@ -282,6 +296,7 @@ mod tests {
             exp: 1_900_003_600,
             epoch: LeaseEpoch::initial(),
             scope: vec!["fs.read".into(), "fs.write".into(), "net.fetch".into()],
+            obligation: None,
         }
     }
 
@@ -341,6 +356,61 @@ mod tests {
         assert_eq!(claims.parent.as_deref(), Some("cap-root"));
         // The child never outlasts the parent.
         assert!(claims.exp <= root_request().exp);
+    }
+
+    #[test]
+    fn capability_binds_to_an_obligation_and_a_child_inherits_it() {
+        let authority = authority();
+        // A capability minted to discharge a RequireApproval decision carries the
+        // obligation id, so presenting the token is the approval — no re-query.
+        let bound = mint_capability(
+            &authority,
+            MintCapability {
+                obligation: Some("obl_2f9c1a".into()),
+                ..root_request()
+            },
+        )
+        .unwrap();
+        let claims = verify_capability(
+            &bound,
+            &authority.jwks(),
+            check_at(LeaseEpoch::initial(), 1_900_000_001),
+        )
+        .unwrap();
+        assert_eq!(claims.obligation.as_deref(), Some("obl_2f9c1a"));
+
+        // A delegated child inherits the same obligation binding unchanged.
+        let child = attenuate(
+            &authority,
+            &bound,
+            LeaseEpoch::initial(),
+            1_900_000_001,
+            AttenuateCapability {
+                jti: "cap-child".into(),
+                iat: 1_900_000_001,
+                exp: 1_900_001_000,
+                scope: vec!["fs.read".into()],
+                sub: None,
+            },
+        )
+        .unwrap();
+        let child_claims = verify_capability(
+            &child,
+            &authority.jwks(),
+            check_at(LeaseEpoch::initial(), 1_900_000_002),
+        )
+        .unwrap();
+        assert_eq!(child_claims.obligation.as_deref(), Some("obl_2f9c1a"));
+
+        // A capability not tied to an approval carries no obligation binding.
+        let unbound = mint_capability(&authority, root_request()).unwrap();
+        let unbound_claims = verify_capability(
+            &unbound,
+            &authority.jwks(),
+            check_at(LeaseEpoch::initial(), 1_900_000_001),
+        )
+        .unwrap();
+        assert!(unbound_claims.obligation.is_none());
     }
 
     #[test]

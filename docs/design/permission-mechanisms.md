@@ -38,7 +38,12 @@ dispatch (`[human, agent]`) authorize correctly — every link must pass.
 ### 5. Three-valued decision
 `Allow | Deny | RequireApproval`. The approval *decision* is IAM's; the approval
 *execution* (prompting, pausing, resuming) belongs to the caller. Covers
-human-in-the-loop gates without IAM running a workflow.
+human-in-the-loop gates without IAM running a workflow. A `RequireApproval`
+outcome carries an **obligation envelope** (`obligation_id`, `policy_id`,
+approval authority); the approval is discharged product-side or as a capability
+token bound to `obligation_id`, never by re-querying authorize. See
+[authorization engine](authorization-engine.md#approval-obligation) and
+[ADR-0004](../adr/0004-consumers-reuse-iam-authz.md) #3.
 
 ### 6. Visibility filtering
 A batch query returns the subset of candidate scopes a principal may act on, in

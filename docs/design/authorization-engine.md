@@ -124,10 +124,33 @@ Decision {
   matched_grant_id?, # the grant that decided it
   matched_role_id?,
   scope_anchor?,     # which scope on the chain the grant was anchored at
+  obligation?,       # present iff outcome = require_approval (see below)
 }
 ```
 
 The trace never includes secrets. It is safe to return over the wire and to log.
+
+### Approval obligation
+
+A `require_approval` outcome carries an **obligation envelope** — the single
+hand-off seam between IAM's decision and the caller's approval execution
+([ADR-0004](../adr/0004-consumers-reuse-iam-authz.md) #3):
+
+```text
+Obligation {
+  obligation_id,     # content hash of (principal chain, action, scope, policy_id)
+  policy_id,         # the require-approval grant that imposed it
+  authority { scope }# scope the approval is anchored at (approved at or above)
+}
+```
+
+`obligation_id` is content-addressed, so re-querying authorize for the same
+question yields the same id and an approval discharged against it is idempotent
+— identical whether computed by the server or by a consumer over a synced
+snapshot. The approval is discharged **product-side** (a recorded approval keyed
+by `obligation_id`) or as a **capability token bound to `obligation_id`**; it is
+never discharged by re-querying authorize and never by minting a per-instance
+grant, so the decision stays a pure function of policy.
 
 ## Core API additions
 

@@ -22,6 +22,10 @@ pub use protocol::{
     EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceOrgEdge,
     PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, SignerSetSnapshot,
     WorkspaceOrgEdge,
+    ApprovalAuthority, ApprovalObligation, AuthorizationOutcome, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect, GrantSnapshot,
+    GrantSubjectRef, NamespaceOrgEdge, PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot,
+    ScopeGraphSnapshot, WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
