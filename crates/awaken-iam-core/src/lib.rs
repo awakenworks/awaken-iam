@@ -1,6 +1,7 @@
 //! Core IAM evaluation primitives.
 
 mod authorization;
+mod directory;
 mod entitlement;
 mod fake_provider;
 mod github;
@@ -20,6 +21,7 @@ pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
     PolicySet, RoleBinding, RoleId, ScopeGraph,
 };
+pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
     EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome, EntitlementReason,
     EntitlementResolver, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow,
@@ -44,9 +46,9 @@ pub use login::{
     OsEntropy, PkceChallenge, PkceMethod,
 };
 pub use ports::{
-    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, LoginFlowRepo, PlanRepo,
-    RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, SessionRepo,
-    external_identity_id_hint,
+    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo, LoginFlowRepo,
+    OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo,
+    SessionRepo, external_identity_id_hint,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
