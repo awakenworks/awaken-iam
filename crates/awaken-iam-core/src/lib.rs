@@ -5,6 +5,7 @@ mod entitlement;
 mod fake_provider;
 mod github;
 mod login;
+mod ports;
 mod provider;
 mod resource_model;
 mod session;
@@ -34,6 +35,11 @@ pub use github::{
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
     OsEntropy, PkceChallenge, PkceMethod,
+};
+pub use ports::{
+    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, LoginFlowRepo, PlanRepo,
+    RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, SessionRepo,
+    external_identity_id_hint,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
