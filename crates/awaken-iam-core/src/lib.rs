@@ -14,6 +14,7 @@ mod provider;
 mod resource_model;
 mod session;
 mod shadow;
+pub mod smoke;
 mod trust;
 
 use std::collections::HashMap;

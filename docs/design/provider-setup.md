@@ -157,3 +157,31 @@ secret never touches production.
 For login flows that need no upstream provider at all — local smoke tests, CI —
 use the deterministic [fake provider](auth-server.md#provider-adapter-genericity)
 keyed `fake`, which requires no secrets.
+
+## Real provider smoke tests
+
+CI exercises the fake provider by default and never depends on a live Google or
+GitHub app. Smoke tests against a *real* provider are **opt-in** and gated on two
+conditions, so they stay dormant unless an operator deliberately enables them:
+
+1. the provider's opt-in flag is set to a truthy value, and
+2. that provider's client id, client secret, and redirect URI are all present in
+   the environment (the same variables documented above).
+
+| Provider | Opt-in flag | Required configuration |
+|---|---|---|
+| Google | `IAM_E2E_REAL_GOOGLE` | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` |
+| GitHub | `IAM_E2E_REAL_GITHUB` | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI` |
+
+A truthy flag is any non-empty value other than `0`, `false`, `no`, or `off`
+(case-insensitive). With the flag unset — the CI default — the smoke test reports
+why it skipped and passes without touching provider configuration. When enabled,
+it builds the real provider adapter from the environment and asserts the
+authorization redirect targets the upstream endpoint and round-trips the
+configured client id, redirect URI, and scopes — catching the misconfigured
+client id or `redirect_uri_mismatch` that breaks a real login, without standing
+up a browser or reaching a live endpoint.
+
+Opt in for a single run by exporting the flag alongside an already-configured
+[`.env`](../../.env.example) (never commit the flag or secrets), for example
+`IAM_E2E_REAL_GOOGLE=1 cargo test -p awaken-iam-core --test provider_smoke`.
