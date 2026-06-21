@@ -296,6 +296,38 @@ pub struct SignerSetSnapshot {
     pub version: u64,
     /// Active signer keys, ordered by key id for a deterministic sequence.
     pub signers: Vec<SignerKey>,
+/// The grant/edge effect of creating one product resource, propagated to IAM so
+/// the authorization plane stays consistent with the consumer's domain row.
+///
+/// When a remote consumer creates a Workspace/Project/Issue it must also write
+/// the scope edges and grants that make the new resource authorizable. The
+/// consumer cannot write both its own database and IAM's atomically, so it
+/// records this payload in a **transactional outbox** alongside the domain row
+/// (one local transaction) and propagates it asynchronously (see
+/// [ADR-0004](../adr/0004-consumers-reuse-iam-authz.md) #4). An embedded
+/// consumer applies the same payload directly inside the single shared-database
+/// transaction instead.
+///
+/// Propagation is **idempotent**: the `idempotency_key` (a deterministic
+/// function of the created resource, e.g. its id) lets IAM collapse a redelivery
+/// — inevitable under at-least-once relay — to a no-op, and the carried grants
+/// upsert by their own ids regardless. The `epoch` is the consumer's monotonic
+/// resource epoch at mint time; it rides the `version`/`epoch` fence so a stale
+/// redelivery can never resurrect a grant a later revocation already retired.
+/// Eventual consistency is safe because authorization fails closed: until this
+/// payload lands, a request against the new resource simply matches no grant and
+/// is denied — it never over-permits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceProvision {
+    /// Deterministic dedup key for the resource-create event (e.g. the resource
+    /// id), so an at-least-once redelivery collapses to a no-op.
+    pub idempotency_key: String,
+    /// Consumer's monotonic resource epoch at mint time, fencing stale replays.
+    pub epoch: u64,
+    /// Grants that make the new resource authorizable, upserted by grant id.
+    pub grants: Vec<GrantSnapshot>,
+    /// Scope-graph parent edges anchoring the new resource in the hierarchy.
+    pub scope_edges: Vec<ResourceParentEdge>,
 }
 
 #[cfg(test)]
@@ -464,6 +496,25 @@ mod tests {
             }],
             actions: vec![ActionKey("issue.assign".into())],
             edges: vec![ResourceParentEdge {
+    fn resource_provision_round_trips_through_json() {
+        let provision = ResourceProvision {
+            idempotency_key: "issue:42".into(),
+            epoch: 9,
+            grants: vec![GrantSnapshot {
+                id: "g_issue_42_owner".into(),
+                subject: GrantSubjectRef::Principal {
+                    principal: PrincipalRef::Account {
+                        account_id: AccountId("ada".into()),
+                    },
+                },
+                action_pattern: "issue.*".into(),
+                scope: ScopeRef::Resource {
+                    resource_type: ResourceType("issue".into()),
+                    resource_id: ResourceId("42".into()),
+                },
+                effect: GrantEffect::Allow,
+            }],
+            scope_edges: vec![ResourceParentEdge {
                 resource_type: ResourceType("issue".into()),
                 resource_id: ResourceId("42".into()),
                 parent: ScopeRef::Namespace {
@@ -489,5 +540,8 @@ mod tests {
         // default to empty rather than failing to deserialize.
         let parsed: ResourceModelRegistration = serde_json::from_str(r#"{"edges":[]}"#).unwrap();
         assert_eq!(parsed, ResourceModelRegistration::default());
+        let json = serde_json::to_string(&provision).unwrap();
+        let parsed: ResourceProvision = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, provision);
     }
 }

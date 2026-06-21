@@ -28,6 +28,8 @@ pub use protocol::{
     ScopeGraphSnapshot, WorkspaceOrgEdge,
     PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, ResourceParentEdge,
     ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
+    PolicySnapshot, ResourceParentEdge, ResourceProvision, RoleBindingSnapshot, ScopeGraphSnapshot,
+    WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,

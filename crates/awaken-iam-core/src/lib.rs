@@ -14,6 +14,7 @@ mod login;
 mod oauth_provider;
 mod ports;
 mod provider;
+mod provision;
 mod refresh_token;
 mod resource_model;
 mod session;
@@ -72,6 +73,7 @@ pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,
 };
+pub use provision::apply_resource_provision;
 pub use refresh_token::{
     IssuedRefreshToken, MintRefreshToken, RefreshTokenDirectory, RefreshTokenMinter,
     RotateRefreshToken, parse_presented_refresh_token,
