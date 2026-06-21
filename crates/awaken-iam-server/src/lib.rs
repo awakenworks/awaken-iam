@@ -53,6 +53,7 @@ pub use token_exchange::{
     SUBJECT_TOKEN_TYPE_ID_TOKEN, SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE,
     TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, TrustedIssuer,
     TrustedIssuerRegistry, WorkloadBinding,
+    MigrationExecutor, PlannedMigration, RecordingExecutor, SqliteExecutor, bundles,
 };
 
 use awaken_iam_client::IamClient;

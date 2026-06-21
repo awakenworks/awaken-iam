@@ -35,6 +35,8 @@ allow = [
     # (rusqlite, postgres). `Zlib` is the only license some of their dependencies
     # offer, so it must be allowed explicitly rather than satisfied by an
     # alternative in a dual-licensed crate.
+    # Pulled in transitively by the SQLite backend driver (foldhash, via
+    # hashbrown/hashlink under rusqlite). Permissive, OSI-approved, FSF-free.
     "Zlib",
 ]
 confidence-threshold = 0.9

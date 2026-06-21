@@ -3,7 +3,8 @@
 //!
 //! The core declares the [repository ports](awaken_iam_core); this module is
 //! the server-owned edge that provides adapters for them, keeping `contract`,
-//! `core`, and `client` storage-free. See
+//! `core`, and `client` storage-free. The SQLite executor is the first concrete
+//! database edge over the migration plan. See
 //! [deployment](../../../../docs/design/deployment.md).
 
 mod fence;
@@ -27,3 +28,4 @@ pub use sqlite::{
     SqliteBackend, in_memory_store as sqlite_in_memory_store,
     migrated_store as sqlite_migrated_store,
 };
+pub use sqlite::SqliteExecutor;
