@@ -7,6 +7,7 @@ mod entitlement;
 mod fake_provider;
 mod github;
 mod google;
+mod linking;
 mod login;
 mod ports;
 mod provider;
@@ -45,6 +46,7 @@ pub use google::{
     GOOGLE_TOKEN_ENDPOINT, GoogleOidcProvider, GoogleProviderSecrets, HttpRequest, HttpTransport,
     IdTokenVerification, Jwk, JwkSet, JwsVerifier, SystemClock, verify_id_token,
 };
+pub use linking::{AccountLinker, LoginResolution, ResolveLogin};
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
     OsEntropy, PkceChallenge, PkceMethod,
@@ -104,6 +106,30 @@ pub enum IamError {
         provider_key: IdentityProviderKey,
         /// Provider-scoped subject.
         subject: ExternalSubject,
+    },
+    /// The external identity exists but is linked to a different account than the
+    /// one the unlink was requested for.
+    #[error("external identity is linked to a different account")]
+    ExternalIdentityNotLinkedToAccount {
+        /// Provider key that issued the subject.
+        provider_key: IdentityProviderKey,
+        /// Provider-scoped subject.
+        subject: ExternalSubject,
+        /// Account the unlink was requested for.
+        account_id: AccountId,
+    },
+    /// Unlinking the requested identity would orphan the account from its last
+    /// remaining sign-in method, so it is refused.
+    #[error("cannot unlink the account's last external identity")]
+    CannotUnlinkLastIdentity {
+        /// Account that would be left with no external identity.
+        account_id: AccountId,
+    },
+    /// A new account could not be created because the id is already in use.
+    #[error("account already exists")]
+    DuplicateAccount {
+        /// Conflicting account id.
+        id: AccountId,
     },
     /// A login-state challenge with this id was already started.
     #[error("login state is already started")]
@@ -368,6 +394,39 @@ impl IdentityDirectory {
         identity.claims = claims;
         identity.last_seen_at = last_seen_at;
         Ok(identity)
+    }
+
+    /// Resolve an account already linked to a verified copy of `email`.
+    ///
+    /// This backs the email-match confirmation policy: a login whose
+    /// `(provider, subject)` is unknown may still belong to a person who already
+    /// holds an account under the same verified email through another provider.
+    /// Matching is case-insensitive and considers only identities whose provider
+    /// asserted the email *verified* — an unverified claim can never select an
+    /// account, so a forged or unconfirmed email cannot reach someone else's
+    /// account. The owning account of the lexicographically-smallest matching
+    /// external identity id is returned for a deterministic candidate.
+    pub fn account_for_verified_email(&self, email: &str) -> Option<AccountId> {
+        let needle = email.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        let mut matches: Vec<&ExternalIdentity> = self
+            .external_identities
+            .values()
+            .filter(|identity| identity.claims.email_verified == Some(true))
+            .filter(|identity| {
+                identity
+                    .claims
+                    .email
+                    .as_deref()
+                    .map(|email| email.trim().to_ascii_lowercase())
+                    .as_deref()
+                    == Some(needle.as_str())
+            })
+            .collect();
+        matches.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        matches.first().map(|identity| identity.account_id.clone())
     }
 
     /// Resolve an external identity by provider and subject.

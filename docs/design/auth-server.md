@@ -57,16 +57,34 @@ IdPs.
 3. GET  /v1/auth/callback/{provider}?code&state
         IAM consumes the LoginFlow (once, unexpired), exchanges code, fetches and
         normalizes claims.
-4.      LoginService resolves (provider, subject):
-          found        -> refresh the link, select the Account
-          not found    -> create Account + ExternalIdentity (linking policy)
+4.      LoginService resolves (provider, subject) by the linking policy below,
+        mutating the directory at most once:
+          a. existing link        -> select its Account, refresh mutable claims
+          b. existing link, but a *different* session is live
+                                  -> fail closed (duplicate-subject protection)
+          c. unknown subject, session live
+                                  -> link the subject to the session's Account
+          d. unknown subject, no session, verified email already on an Account
+                                  -> EmailMatchPending; re-resolve with explicit
+                                     confirmation to link, else nothing changes
+          e. otherwise            -> create Account + ExternalIdentity
 5.      IAM establishes a Session and returns to the product redirect_uri.
 ```
 
-Account linking is by `(provider, subject)` only. Email is a mutable claim: a
-later login with a changed email selects the same account and never forks one.
-The single-use challenge and the unexpired/unrevoked session are the two login
-invariants the core already enforces.
+Identity is keyed by `(provider, subject)` only; email is never an identity key.
+A later login with a changed email selects the same account by its subject and
+never forks one. A verified email **never silently selects an account** — path
+(d) surfaces the candidate and links it only after explicit user confirmation;
+an unverified email never reaches an existing account. Current-session linking
+(c) lets a signed-in user attach a second provider to their account, while
+duplicate-subject protection (b) refuses to re-point an already-owned subject at
+a different account. The single-use challenge and the unexpired/unrevoked session
+are the two login invariants the core already enforces.
+
+**Unlink.** Detaching an external identity requires that the link exist and
+belong to the account being unlinked, and it may not remove an account's *last*
+sign-in method — unlinking the last identity would orphan the account, so it
+fails closed. Both ownership and last-identity checks are enforced by the core.
 
 ## Sessions and tokens
 
