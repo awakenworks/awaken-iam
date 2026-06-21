@@ -4,6 +4,7 @@ mod api_token;
 mod authorization;
 mod directory;
 mod entitlement;
+mod events;
 mod fake_provider;
 mod generic_oauth;
 mod github;
@@ -35,6 +36,7 @@ pub use entitlement::{
     EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome, EntitlementReason,
     EntitlementResolver, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow,
 };
+pub use events::{AuditLedger, DecisionTrace, DomainEvent};
 pub use fake_provider::{
     AuthorizeRedirect, AuthorizeRequest, FailureMode, FakeOidcProvider, FakeUser, IdTokenClaims,
     JsonWebKey, JsonWebKeySet, OidcDiscoveryDocument, OidcError, TokenRequest, TokenResponse,
