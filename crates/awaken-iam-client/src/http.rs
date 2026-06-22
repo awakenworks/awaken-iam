@@ -236,10 +236,7 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
-    fn fetch_signers(
-        &self,
-        namespace_id: &NamespaceId,
-    ) -> Result<SignerSetSnapshot, RemoteError> {
+    fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
         let path = format!("/v1/namespaces/{}/signers", namespace_id.0);
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         Self::decode(response)
