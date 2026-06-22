@@ -7,14 +7,17 @@ pub use awaken_iam_contract::{
     ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderConfig,
     IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind, NamespaceId,
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ScopeRef, Session,
-    SessionId, Timestamp, WorkspaceId,
+    SessionId, SessionView, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
-    BeginLogin, EntropySource, IamCore, IamError, IdentityDirectory, IssuedLogin, LoginAttempt,
-    LoginBinding, LoginSecrets, OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod,
-    SessionDirectory,
+    BeginLogin, EntropySource, EstablishSession, IamCore, IamError, IdentityDirectory, IssuedLogin,
+    IssuedSession, LoginAttempt, LoginBinding, LoginSecrets, OAuthChallengeService, OsEntropy,
+    PkceChallenge, PkceMethod, SessionDirectory, SessionMinter, hash_session_token,
 };
-pub use awaken_iam_server::IamServer;
+pub use awaken_iam_server::{
+    DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, IamServer, SameSite, SessionCookieConfig,
+    SessionGateway,
+};
 
 #[cfg(test)]
 mod tests {

@@ -161,6 +161,48 @@ impl ExternalIdentity {
     }
 }
 
+/// Public view of the current session returned by `GET /v1/session`.
+///
+/// This is the safe projection of a [`Session`] for clients: it exposes the
+/// session and account coordinates and lifecycle timestamps, but never the
+/// bearer `token_hash`. The opaque session token lives only in the session
+/// cookie and is never echoed back in a response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionView {
+    /// Stable session row id.
+    pub session_id: SessionId,
+    /// Account authenticated by this session.
+    pub account_id: AccountId,
+    /// Identity used to establish the session, when applicable.
+    pub external_identity_id: Option<ExternalIdentityId>,
+    /// Session creation timestamp.
+    pub created_at: Timestamp,
+    /// Last observed activity timestamp.
+    pub last_seen_at: Timestamp,
+    /// Session expiration timestamp.
+    pub expires_at: Timestamp,
+}
+
+impl SessionView {
+    /// Project a stored [`Session`] into its public, token-free view.
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            account_id: session.account_id.clone(),
+            external_identity_id: session.external_identity_id.clone(),
+            created_at: session.created_at.clone(),
+            last_seen_at: session.last_seen_at.clone(),
+            expires_at: session.expires_at.clone(),
+        }
+    }
+}
+
+impl From<&Session> for SessionView {
+    fn from(session: &Session) -> Self {
+        Self::from_session(session)
+    }
+}
+
 /// Stored OAuth login-state challenge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthLoginState {

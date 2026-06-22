@@ -1,5 +1,11 @@
 //! Server assembly seam for Awaken IAM.
 
+mod session;
+
+pub use session::{
+    DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
+};
+
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,

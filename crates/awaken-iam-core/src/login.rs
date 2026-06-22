@@ -234,7 +234,7 @@ impl<E: EntropySource> OAuthChallengeService<E> {
 }
 
 /// Hash a login secret into its stored, comparable representation.
-fn hash_secret(secret: &str) -> String {
+pub(crate) fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
 }
