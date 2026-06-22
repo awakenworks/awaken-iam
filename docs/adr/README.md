@@ -10,3 +10,4 @@
 | [0005](0005-open-license-claim-verification.md) | License claim shape and offline verification are open; issuance stays closed | Proposed |
 | [0006](0006-async-signing-seam.md) | The token signing seam is async | Proposed |
 | [0007](0007-release-versioning-contract.md) | The repo is consumed at immutable version tags | Proposed |
+| [0008](0008-org-workspace-member-rbac.md) | One permission model for org/workspace members and API keys | Proposed |
