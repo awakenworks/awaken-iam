@@ -382,7 +382,7 @@ fn is_supported_subject_token_type(token_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access_token::{AccessTokenAuthority, SigningKeyMaterial};
+    use crate::access_token::{AccessTokenAuthority, LocalSeedSigner};
     use serde::Serialize;
 
     /// An external issuer's assertion, signed for a contract test.
@@ -397,7 +397,7 @@ mod tests {
     }
 
     fn issuer_authority() -> AccessTokenAuthority {
-        AccessTokenAuthority::new(SigningKeyMaterial::new("ext-key-1", [9u8; 32]))
+        AccessTokenAuthority::new(LocalSeedSigner::new("ext-key-1", [9u8; 32]))
     }
 
     fn registry(keys: Jwks) -> TrustedIssuerRegistry {
@@ -472,7 +472,7 @@ mod tests {
     fn an_assertion_signed_by_an_unknown_key_fails_closed() {
         let registry = registry(issuer_authority().jwks());
         // A forger signs a well-formed assertion with a different key.
-        let forger = AccessTokenAuthority::new(SigningKeyMaterial::new("ext-key-1", [1u8; 32]));
+        let forger = AccessTokenAuthority::new(LocalSeedSigner::new("ext-key-1", [1u8; 32]));
         let token = assertion(&forger, &valid_claims());
 
         let err = registry.authorize(&request(token)).unwrap_err();

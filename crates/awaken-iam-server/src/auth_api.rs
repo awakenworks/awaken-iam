@@ -73,7 +73,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::access_token::{
     AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
-    SigningKeyMaterial,
+    LocalSeedSigner,
 };
 use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
 use crate::token_exchange::{
@@ -827,7 +827,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let mut bootstrap = entropy.clone();
         let mut seed = [0u8; 32];
         bootstrap.fill_bytes(&mut seed);
-        let tokens = AccessTokenAuthority::new(SigningKeyMaterial::new(DEFAULT_SIGNING_KID, seed));
+        let tokens = AccessTokenAuthority::new(LocalSeedSigner::new(DEFAULT_SIGNING_KID, seed));
         Self {
             providers: Vec::new(),
             challenge: OAuthChallengeService::new(entropy.clone()),
@@ -1319,7 +1319,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     pub fn rotate_signing_key(&mut self, kid: impl Into<String>) {
         let mut seed = [0u8; 32];
         self.ids.fill_bytes(&mut seed);
-        self.tokens.rotate(SigningKeyMaterial::new(kid, seed));
+        self.tokens.rotate(LocalSeedSigner::new(kid, seed));
     }
 
     /// Prune a retired signing key by `kid` so tokens it signed no longer verify.

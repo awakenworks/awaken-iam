@@ -280,10 +280,10 @@ pub fn verify_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access_token::{SigningKeyMaterial, verify_access_token};
+    use crate::access_token::{LocalSeedSigner, verify_access_token};
 
     fn authority() -> AccessTokenAuthority {
-        AccessTokenAuthority::new(SigningKeyMaterial::new("cap-key-1", [9u8; 32]))
+        AccessTokenAuthority::new(LocalSeedSigner::new("cap-key-1", [9u8; 32]))
     }
 
     fn root_request() -> MintCapability {
@@ -554,7 +554,7 @@ mod tests {
         assert!(matches!(err, CapabilityError::Crypto(_)));
 
         // A capability minted by a different key does not verify here.
-        let other = AccessTokenAuthority::new(SigningKeyMaterial::new("cap-key-1", [3u8; 32]));
+        let other = AccessTokenAuthority::new(LocalSeedSigner::new("cap-key-1", [3u8; 32]));
         let forged = mint_capability(&other, root_request()).unwrap();
         let err = verify_capability(
             &forged,

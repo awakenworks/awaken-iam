@@ -7,20 +7,22 @@
 //! locally. This realizes the "JWKS, not shared secrets" rule of the auth-server
 //! design.
 //!
-//! Signing keys live behind a store seam ([`SigningKeyMaterial`]) rather than in
-//! plain env — an MVP stands in for a KMS/secret store, but the private seed is
-//! confined to this module and never serialized. The [`AccessTokenAuthority`]
-//! supports `kid`-versioned **rotation**: a rotated key is retained for
-//! verification (so tokens minted just before the rotation still verify) until it
-//! is explicitly [pruned](AccessTokenAuthority::prune), which retires every token
-//! it signed.
+//! Signing is abstracted behind the [`Signer`] seam (sign + `public_jwk` + `kid`)
+//! rather than reaching for a private key directly. The open repo ships
+//! [`LocalSeedSigner`], which holds an Ed25519 seed in process for dev and
+//! self-hosting; a managed deployment injects a KMS-backed [`Signer`] whose
+//! private key never enters the address space, so the secret never lands in this
+//! repo. The [`AccessTokenAuthority`] holds one or more signers and supports
+//! `kid`-versioned **rotation**: a rotated key is retained for verification (so
+//! tokens minted just before the rotation still verify) until it is explicitly
+//! [pruned](AccessTokenAuthority::prune), which retires every token it signed.
 
 use std::collections::HashSet;
 
 use awaken_iam_contract::{JsonWebKey, Jwks};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -41,29 +43,92 @@ const KEY_BYTES: usize = 32;
 /// Length of an Ed25519 signature in bytes.
 const SIG_BYTES: usize = 64;
 
-/// Private signing-key material as handed out by a KMS/secret store.
+/// The signing seam: an issuer of detached `EdDSA` signatures whose private key
+/// may live anywhere — in process, or behind a KMS the [`AccessTokenAuthority`]
+/// only ever calls through this trait.
 ///
-/// The 32-byte seed is the only secret; it is intentionally not `Debug`/`Serialize`
-/// so it cannot leak through logs or wire types. A real deployment fetches this
-/// from a managed secret store keyed by `kid`; the MVP constructs it in process.
-#[derive(Clone)]
-pub struct SigningKeyMaterial {
-    kid: String,
-    seed: [u8; KEY_BYTES],
+/// This is the open boundary that lets a managed deployment inject a KMS-backed
+/// signer without the private key ever entering the repo: the authority signs by
+/// handing the JWT signing input to [`sign`](Signer::sign), publishes verifiers'
+/// keys via [`public_jwk`](Signer::public_jwk), and stamps [`kid`](Signer::kid)
+/// into the header. The open repo ships exactly one implementation,
+/// [`LocalSeedSigner`]; the closed cloud platform supplies its own.
+///
+/// `Send + Sync` so an authority holding boxed signers can back a shared,
+/// concurrently-served auth API.
+pub trait Signer: Send + Sync {
+    /// The key id stamped into the JWT header and published in the JWKS, so a
+    /// verifier can select this key and rotation can target it.
+    fn kid(&self) -> &str;
+
+    /// The public half of this key as a JWK, for `/.well-known/jwks.json`
+    /// publication. Must never expose private material.
+    fn public_jwk(&self) -> JsonWebKey;
+
+    /// Produce the detached `EdDSA` (Ed25519) signature over `message` — the
+    /// JWT's `header.payload` signing input. Returns the raw 64-byte signature.
+    /// A KMS-backed signer surfaces transport/permission failures as
+    /// [`SignerError`].
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError>;
 }
 
-impl SigningKeyMaterial {
-    /// Build key material from a `kid` and a 32-byte Ed25519 seed.
+/// Failure raised by a [`Signer`] that could not produce a signature — e.g. a
+/// KMS rejected the request, was unreachable, or returned malformed bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("signer failed to produce a signature: {0}")]
+pub struct SignerError(pub String);
+
+/// Build the public JWK for an Ed25519 verifying key under `kid`.
+///
+/// Exposed so a KMS-backed [`Signer`] living outside this repo can publish its
+/// public key in exactly the JWK shape verifiers expect, given only the raw
+/// 32-byte public key it fetched from the KMS.
+pub fn ed25519_public_jwk(kid: impl Into<String>, public_key: [u8; KEY_BYTES]) -> JsonWebKey {
+    JsonWebKey {
+        kty: JWK_KTY.to_owned(),
+        crv: JWK_CRV.to_owned(),
+        x: URL_SAFE_NO_PAD.encode(public_key),
+        kid: kid.into(),
+        key_use: JWK_USE.to_owned(),
+        alg: ACCESS_TOKEN_ALG.to_owned(),
+    }
+}
+
+/// In-process [`Signer`] holding an Ed25519 seed — the open-repo default for dev
+/// and self-hosting.
+///
+/// The 32-byte seed is the only secret; the type is intentionally not
+/// `Debug`/`Serialize`/`Clone` so it cannot leak through logs or wire types and a
+/// held key is not casually duplicated. A managed deployment swaps this for a
+/// KMS-backed [`Signer`] (the seam this type stands behind) so no private seed is
+/// ever constructed here.
+pub struct LocalSeedSigner {
+    kid: String,
+    signing: SigningKey,
+}
+
+impl LocalSeedSigner {
+    /// Build a signer from a `kid` and a 32-byte Ed25519 seed.
     pub fn new(kid: impl Into<String>, seed: [u8; KEY_BYTES]) -> Self {
         Self {
             kid: kid.into(),
-            seed,
+            signing: SigningKey::from_bytes(&seed),
         }
     }
+}
 
-    /// The key id this material is published and selected under.
-    pub fn kid(&self) -> &str {
+impl Signer for LocalSeedSigner {
+    fn kid(&self) -> &str {
         &self.kid
+    }
+
+    fn public_jwk(&self) -> JsonWebKey {
+        ed25519_public_jwk(self.kid.clone(), self.signing.verifying_key().to_bytes())
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+        let signature: Signature = self.signing.sign(message);
+        Ok(signature.to_bytes().to_vec())
     }
 }
 
@@ -93,6 +158,10 @@ pub enum AccessTokenError {
     /// No signing key is available to mint a token.
     #[error("no signing key is configured")]
     NoSigningKey,
+    /// The active [`Signer`] failed to produce a signature (e.g. a KMS was
+    /// unreachable or rejected the request).
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
     /// The token is not a well-formed `header.payload.signature` JWT.
     #[error("access token is malformed")]
     Malformed,
@@ -130,65 +199,60 @@ struct JwtHeader {
     kid: String,
 }
 
-/// One signing key held by the authority.
-struct StoredKey {
-    kid: String,
-    signing: SigningKey,
-}
-
-impl StoredKey {
-    fn from_material(material: SigningKeyMaterial) -> Self {
-        Self {
-            kid: material.kid,
-            signing: SigningKey::from_bytes(&material.seed),
-        }
-    }
-
-    fn public_jwk(&self) -> JsonWebKey {
-        JsonWebKey {
-            kty: JWK_KTY.to_owned(),
-            crv: JWK_CRV.to_owned(),
-            x: URL_SAFE_NO_PAD.encode(self.signing.verifying_key().to_bytes()),
-            kid: self.kid.clone(),
-            key_use: JWK_USE.to_owned(),
-            alg: ACCESS_TOKEN_ALG.to_owned(),
-        }
-    }
-}
-
 /// Mints asymmetric access tokens and publishes their public keys as a JWKS.
 ///
-/// Keys are ordered oldest-first; the newest is the active signer. Rotation keeps
-/// predecessors verifiable until pruned, so the active set published by
-/// [`jwks`](Self::jwks) is exactly the keys a verifier may still trust.
+/// Signers are ordered oldest-first; the newest is the active signer. Each is held
+/// behind the [`Signer`] seam, so the active signer may be an in-process
+/// [`LocalSeedSigner`] or a KMS-backed signer injected by a managed deployment.
+/// Rotation keeps predecessors verifiable until pruned, so the active set
+/// published by [`jwks`](Self::jwks) is exactly the keys a verifier may still
+/// trust.
 pub struct AccessTokenAuthority {
-    keys: Vec<StoredKey>,
+    signers: Vec<Box<dyn Signer>>,
 }
 
 impl AccessTokenAuthority {
-    /// Build an authority with a single active signing key.
-    pub fn new(material: SigningKeyMaterial) -> Self {
+    /// Build an authority with a single active signer.
+    ///
+    /// Accepts any [`Signer`] — the open-repo [`LocalSeedSigner`] or a
+    /// closed-platform KMS signer — so the private key need never be a seed this
+    /// repo can construct.
+    pub fn new(signer: impl Signer + 'static) -> Self {
+        Self::from_signer(Box::new(signer))
+    }
+
+    /// Build an authority from an already-boxed signer.
+    ///
+    /// The dynamic-dispatch entry point for callers that choose the signer at
+    /// runtime (e.g. seed-in-dev vs. KMS-in-cloud) and so hold a `Box<dyn Signer>`
+    /// rather than a known concrete type.
+    pub fn from_signer(signer: Box<dyn Signer>) -> Self {
         Self {
-            keys: vec![StoredKey::from_material(material)],
+            signers: vec![signer],
         }
     }
 
-    /// The `kid` of the currently active signing key.
+    /// The `kid` of the currently active signer.
     pub fn active_kid(&self) -> &str {
-        &self
-            .keys
+        self.signers
             .last()
-            .expect("authority always retains at least one key")
-            .kid
+            .expect("authority always retains at least one signer")
+            .kid()
     }
 
-    /// Rotate in a new active key, retaining the previous one for verification.
+    /// Rotate in a new active signer, retaining the previous one for verification.
     ///
-    /// Re-using an existing `kid` replaces that key in place rather than adding a
-    /// duplicate, keeping the published set unambiguous.
-    pub fn rotate(&mut self, material: SigningKeyMaterial) {
-        self.keys.retain(|key| key.kid != material.kid);
-        self.keys.push(StoredKey::from_material(material));
+    /// Re-using an existing `kid` replaces that signer in place rather than adding
+    /// a duplicate, keeping the published set unambiguous.
+    pub fn rotate(&mut self, signer: impl Signer + 'static) {
+        self.rotate_signer(Box::new(signer));
+    }
+
+    /// Rotate in an already-boxed signer; the dynamic-dispatch counterpart of
+    /// [`rotate`](Self::rotate) for runtime-selected signers.
+    pub fn rotate_signer(&mut self, signer: Box<dyn Signer>) {
+        self.signers.retain(|held| held.kid() != signer.kid());
+        self.signers.push(signer);
     }
 
     /// Drop a retired key by `kid` so tokens it signed no longer verify.
@@ -199,15 +263,15 @@ impl AccessTokenAuthority {
         if self.active_kid() == kid {
             return false;
         }
-        let before = self.keys.len();
-        self.keys.retain(|key| key.kid != kid);
-        self.keys.len() != before
+        let before = self.signers.len();
+        self.signers.retain(|held| held.kid() != kid);
+        self.signers.len() != before
     }
 
     /// The JWKS document: every retained public key, newest first.
     pub fn jwks(&self) -> Jwks {
         Jwks {
-            keys: self.keys.iter().rev().map(StoredKey::public_jwk).collect(),
+            keys: self.signers.iter().rev().map(|s| s.public_jwk()).collect(),
         }
     }
 
@@ -228,15 +292,17 @@ impl AccessTokenAuthority {
         typ: &str,
         claims: &T,
     ) -> Result<String, AccessTokenError> {
-        let active = self.keys.last().ok_or(AccessTokenError::NoSigningKey)?;
+        let active = self.signers.last().ok_or(AccessTokenError::NoSigningKey)?;
         let header = JwtHeader {
             alg: ACCESS_TOKEN_ALG.to_owned(),
             typ: typ.to_owned(),
-            kid: active.kid.clone(),
+            kid: active.kid().to_owned(),
         };
         let signing_input = format!("{}.{}", encode_part(&header)?, encode_part(claims)?);
-        let signature: Signature = active.signing.sign(signing_input.as_bytes());
-        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let signature = active
+            .sign(signing_input.as_bytes())
+            .map_err(|err| AccessTokenError::SigningFailed(err.0))?;
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
         Ok(format!("{signing_input}.{sig_b64}"))
     }
 
@@ -501,9 +567,102 @@ mod tests {
         }
     }
 
+    /// A [`Signer`] defined outside the `access_token` module's own machinery,
+    /// standing in for the KMS-backed signer the closed platform would inject. It
+    /// proves the seam admits an out-of-repo implementation: the authority signs
+    /// and publishes through the trait alone, and a backend failure (`fail`)
+    /// surfaces as a [`SignerError`] rather than a panic.
+    struct ExternalSigner {
+        kid: String,
+        backing: SigningKey,
+        fail: bool,
+    }
+
+    impl ExternalSigner {
+        fn new(kid: &str, seed_byte: u8) -> Self {
+            Self {
+                kid: kid.into(),
+                backing: SigningKey::from_bytes(&seed(seed_byte)),
+                fail: false,
+            }
+        }
+
+        fn failing(kid: &str, seed_byte: u8) -> Self {
+            Self {
+                fail: true,
+                ..Self::new(kid, seed_byte)
+            }
+        }
+    }
+
+    impl Signer for ExternalSigner {
+        fn kid(&self) -> &str {
+            &self.kid
+        }
+
+        fn public_jwk(&self) -> JsonWebKey {
+            ed25519_public_jwk(self.kid.clone(), self.backing.verifying_key().to_bytes())
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+            if self.fail {
+                return Err(SignerError("kms unreachable".into()));
+            }
+            Ok(self.backing.sign(message).to_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn an_externally_supplied_signer_can_be_injected_and_verifies() {
+        // Stand in for a KMS: an out-of-module signer the authority only ever
+        // reaches through the trait. Inject through the dynamic-dispatch seam.
+        let kms = ExternalSigner::new("kms-key-1", 42);
+        let authority = AccessTokenAuthority::from_signer(Box::new(kms));
+        assert_eq!(authority.active_kid(), "kms-key-1");
+
+        let token = authority.mint(&claims("jti-kms")).unwrap();
+        let header: JwtHeader = decode_part(token.split('.').next().unwrap()).unwrap();
+        assert_eq!(header.kid, "kms-key-1");
+
+        // A verifier with only the published JWKS recovers the claims — the seam
+        // is transparent to verification.
+        let recovered = verify_access_token(&token, &authority.jwks()).unwrap();
+        assert_eq!(recovered, claims("jti-kms"));
+    }
+
+    #[test]
+    fn a_signer_failure_surfaces_as_signing_failed() {
+        // A KMS that rejects the request must fail the mint closed, not panic.
+        let failing = ExternalSigner::failing("kms-down", 1);
+        let authority = AccessTokenAuthority::from_signer(Box::new(failing));
+
+        let err = authority.mint(&claims("jti-1")).unwrap_err();
+        assert_eq!(
+            err,
+            AccessTokenError::SigningFailed("kms unreachable".into())
+        );
+    }
+
+    #[test]
+    fn an_external_signer_can_be_rotated_in() {
+        // A seed signer in dev, rotated to a KMS-style signer — the published set
+        // keeps both verifiable until the old one is pruned.
+        let mut authority = AccessTokenAuthority::new(LocalSeedSigner::new("seed-key", seed(5)));
+        let old = authority.mint(&claims("jti-old")).unwrap();
+
+        let kms = ExternalSigner::new("kms-key", 99);
+        authority.rotate_signer(Box::new(kms));
+        assert_eq!(authority.active_kid(), "kms-key");
+
+        let new = authority.mint(&claims("jti-new")).unwrap();
+        let jwks = authority.jwks();
+        verify_access_token(&old, &jwks).unwrap();
+        verify_access_token(&new, &jwks).unwrap();
+    }
+
     #[test]
     fn token_is_asymmetric_and_verifies_against_published_jwks() {
-        let authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(7)));
+        let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(7)));
         let token = authority.mint(&claims("jti-1")).unwrap();
 
         // The header carries alg + kid; three base64url segments.
@@ -529,7 +688,7 @@ mod tests {
 
     #[test]
     fn a_tampered_payload_fails_closed() {
-        let authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(3)));
+        let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(3)));
         let token = authority.mint(&claims("jti-1")).unwrap();
         let jwks = authority.jwks();
 
@@ -545,22 +704,22 @@ mod tests {
 
     #[test]
     fn a_token_from_a_different_key_does_not_verify() {
-        let mint_authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(1)));
+        let mint_authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(1)));
         let token = mint_authority.mint(&claims("jti-1")).unwrap();
 
         // A different authority publishes a different key under the same kid.
-        let other = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(2)));
+        let other = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(2)));
         let err = verify_access_token(&token, &other.jwks()).unwrap_err();
         assert_eq!(err, AccessTokenError::SignatureInvalid);
     }
 
     #[test]
     fn rotation_keeps_old_tokens_verifiable_until_pruned() {
-        let mut authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(10)));
+        let mut authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(10)));
         let old_token = authority.mint(&claims("jti-old")).unwrap();
 
         // Rotate: new tokens use the fresh key, but the old key stays published.
-        authority.rotate(SigningKeyMaterial::new("key-2", seed(20)));
+        authority.rotate(LocalSeedSigner::new("key-2", seed(20)));
         assert_eq!(authority.active_kid(), "key-2");
         let new_token = authority.mint(&claims("jti-new")).unwrap();
         let new_header: JwtHeader = decode_part(new_token.split('.').next().unwrap()).unwrap();
@@ -588,7 +747,7 @@ mod tests {
 
     #[test]
     fn a_revoked_jti_fails_closed_even_with_a_valid_signature() {
-        let authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(9)));
+        let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(9)));
         let token = authority.mint(&claims("jti-1")).unwrap();
         let jwks = authority.jwks();
 
@@ -615,7 +774,7 @@ mod tests {
 
     #[test]
     fn unknown_kid_and_foreign_alg_fail_closed() {
-        let authority = AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", seed(5)));
+        let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(5)));
         let token = authority.mint(&claims("jti-1")).unwrap();
 
         let empty = Jwks { keys: vec![] };

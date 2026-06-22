@@ -20,7 +20,7 @@
 use awaken_iam::{
     AccessTokenAuthority, AttenuateCapability, CapabilityCheck, CapabilityError,
     EntitlementCatalog, EntitlementDecision, EntitlementEngine, EntitlementRequest, LeaseEpoch,
-    MintCapability, Plan, PlanId, PlanTier, PrincipalRef, Quota, SigningKeyMaterial, attenuate,
+    LocalSeedSigner, MintCapability, Plan, PlanId, PlanTier, PrincipalRef, Quota, attenuate,
     mint_capability, verify_capability,
 };
 
@@ -34,7 +34,7 @@ fn agent(id: &str) -> PrincipalRef {
 /// same asymmetric key as an access token and verified against the same published
 /// JWKS, so a sandbox needs only the public keys to check a delegated token.
 fn authority() -> AccessTokenAuthority {
-    AccessTokenAuthority::new(SigningKeyMaterial::new("iam-cap-key-1", [7u8; 32]))
+    AccessTokenAuthority::new(LocalSeedSigner::new("iam-cap-key-1", [7u8; 32]))
 }
 
 /// The managed-agents run gate: a parent may run only when the entitlement plane

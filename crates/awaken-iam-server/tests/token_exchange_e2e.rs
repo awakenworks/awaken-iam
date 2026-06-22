@@ -7,8 +7,8 @@
 
 use awaken_iam_contract::PrincipalRef;
 use awaken_iam_server::{
-    AccessTokenAuthority, AuthApi, AuthApiError, AuthAuditEvent, SUBJECT_TOKEN_TYPE_JWT,
-    SigningKeyMaterial, TOKEN_EXCHANGE_GRANT_TYPE, TokenExchangeError, TokenExchangeRequest,
+    AccessTokenAuthority, AuthApi, AuthApiError, AuthAuditEvent, LocalSeedSigner,
+    SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE, TokenExchangeError, TokenExchangeRequest,
     TrustedIssuer, WorkloadBinding, verify_access_token,
 };
 use serde::Serialize;
@@ -29,7 +29,7 @@ struct UpstreamClaims {
 /// Build an `AuthApi` that trusts a single external issuer, plus the authority
 /// that stands in as that issuer's signing STS.
 fn federated() -> (AuthApi, AccessTokenAuthority) {
-    let issuer = AccessTokenAuthority::new(SigningKeyMaterial::new("ext-key-1", [9u8; 32]));
+    let issuer = AccessTokenAuthority::new(LocalSeedSigner::new("ext-key-1", [9u8; 32]));
     let mut api = AuthApi::new().with_issuer(IAM_ISSUER);
     api.register_trusted_issuer(TrustedIssuer {
         issuer: ISSUER.into(),
