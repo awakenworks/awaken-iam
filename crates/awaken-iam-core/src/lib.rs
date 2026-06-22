@@ -1,5 +1,6 @@
 //! Core IAM evaluation primitives.
 
+mod entitlement;
 mod fake_provider;
 mod github;
 mod login;
@@ -9,6 +10,10 @@ mod session;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+pub use entitlement::{
+    EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome, EntitlementReason,
+    EntitlementResolver, Plan, PlanId, PlanTier,
+};
 pub use fake_provider::{
     AuthorizeRedirect, AuthorizeRequest, FailureMode, FakeOidcProvider, FakeUser, IdTokenClaims,
     JsonWebKey, JsonWebKeySet, OidcDiscoveryDocument, OidcError, TokenRequest, TokenResponse,
@@ -30,9 +35,9 @@ pub use provider::{
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 
 use awaken_iam_contract::{
-    Account, AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
-    ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject,
-    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, Session, SessionId, Timestamp,
+    Account, AccountId, AuthorizationDecision, AuthorizationRequest, ExternalIdentity,
+    ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject, IdentityProviderKey,
+    OAuthLoginState, OAuthLoginStateId, Session, SessionId, Timestamp,
 };
 
 /// Identifies which bound login value failed verification on callback.
@@ -155,12 +160,6 @@ impl IamCore {
     /// grant stores will extend this through explicit policy inputs.
     pub fn authorize(&self, _request: &AuthorizationRequest) -> AuthorizationDecision {
         AuthorizationDecision::Deny
-    }
-
-    /// Evaluate entitlement. v1 starts as default-allow seam until billing / SKU
-    /// policy is implemented by a product deployment.
-    pub fn entitlement_default_allow(&self) -> EntitlementDecision {
-        EntitlementDecision::Allow
     }
 }
 
@@ -446,14 +445,6 @@ mod tests {
             scope: ScopeRef::Global,
         };
         assert_eq!(core.authorize(&request), AuthorizationDecision::Deny);
-    }
-
-    #[test]
-    fn entitlement_seam_defaults_allow() {
-        assert_eq!(
-            IamCore::new().entitlement_default_allow(),
-            EntitlementDecision::Allow
-        );
     }
 
     #[test]
