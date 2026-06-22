@@ -27,8 +27,12 @@ entitlement), surfacing distinct reason codes.
 Plan {
   id,                # e.g. plan:free, plan:team, plan:enterprise
   features: Set<FeatureKey>,
-  limits:   Map<FeatureKey, Quota>,   # optional numeric ceilings
+  limits:   Map<FeatureKey, Quota>,       # optional numeric ceilings
+  rates:    Map<FeatureKey, RateLimit>,   # optional per-window rate ceilings
 }
+
+Quota     = Limited(count) | Unlimited      # an inclusive numeric ceiling
+RateLimit = { max_per_window, window }      # window in second|minute|hour|day
 
 Subscription {
   subject_scope,     # Org or Account the plan is attached to
@@ -67,6 +71,22 @@ check_entitlement(principal, entitlement, resource?):
   4. limit defined and resource over it   -> Deny(quota_exceeded)
   5. otherwise                            -> Allow(entitled)
 ```
+
+## Quotas and rate limits
+
+A plan attaches two optional kinds of numeric ceiling to a feature key:
+
+- a **quota** — an inclusive total ceiling (e.g. *5 private namespaces*), and
+- a **rate limit** — a maximum number of units per time window (e.g.
+  *60 publishes / minute*).
+
+IAM **defines and answers** these ceilings; it holds no counters and performs no
+metering. The caller meters its own usage and supplies the observed count when it
+asks whether it is still within the limit. A feature with no quota or rate entry
+is unlimited. Step 4 of evaluation compares the caller-supplied usage against the
+defined ceiling: usage strictly *over* the ceiling resolves
+`Deny(quota_exceeded)`; a feature the plan does not entitle never reaches the
+quota check and resolves `Deny(plan_missing)` first.
 
 ## Modes
 

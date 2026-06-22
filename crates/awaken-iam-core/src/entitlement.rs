@@ -12,7 +12,7 @@
 //! later without threading billing state through grant evaluation. Two further
 //! modes exist today: a local plan catalog and a remote delegation seam.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use awaken_iam_contract::{EntitlementDecision, EntitlementRequest, PrincipalRef};
@@ -38,7 +38,86 @@ pub enum PlanTier {
     Enterprise,
 }
 
-/// A plan definition: the set of feature/SKU keys a subscriber is entitled to.
+/// A numeric ceiling IAM defines for a metered feature/SKU key.
+///
+/// IAM only *defines and answers* the ceiling — it holds no counters. The caller
+/// meters its own usage and supplies the observed count; [`Quota::permits`]
+/// answers whether that usage stays within the ceiling. A feature with no quota
+/// entry is unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quota {
+    /// An inclusive finite ceiling: usage at or below this count stays within.
+    Limited(u64),
+    /// No ceiling — the feature is entitled without a numeric cap.
+    Unlimited,
+}
+
+impl Quota {
+    /// Whether the caller-metered `usage` stays within this ceiling.
+    ///
+    /// The ceiling is inclusive: `Limited(n)` permits usage up to and including
+    /// `n` and is exceeded only by usage strictly greater than `n`. `Unlimited`
+    /// always permits.
+    pub fn permits(&self, usage: u64) -> bool {
+        match self {
+            Quota::Unlimited => true,
+            Quota::Limited(ceiling) => usage <= *ceiling,
+        }
+    }
+
+    /// The inclusive finite ceiling, if this quota is bounded.
+    pub fn ceiling(&self) -> Option<u64> {
+        match self {
+            Quota::Unlimited => None,
+            Quota::Limited(ceiling) => Some(*ceiling),
+        }
+    }
+}
+
+/// The time window a [`RateLimit`] is measured over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateWindow {
+    /// Per one-second window.
+    Second,
+    /// Per one-minute window.
+    Minute,
+    /// Per one-hour window.
+    Hour,
+    /// Per one-day window.
+    Day,
+}
+
+/// A rate-limit *definition*: the maximum units a feature permits per window.
+///
+/// Like [`Quota`], this is a definition only. IAM answers the shape of the limit;
+/// the caller tracks request counts over the window and enforces. A feature with
+/// no rate entry has no per-window cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    /// Maximum units permitted within a single window (inclusive).
+    pub max_per_window: u64,
+    /// The window the maximum is measured over.
+    pub window: RateWindow,
+}
+
+impl RateLimit {
+    /// Define a rate limit of `max_per_window` units per `window`.
+    pub fn new(max_per_window: u64, window: RateWindow) -> Self {
+        Self {
+            max_per_window,
+            window,
+        }
+    }
+
+    /// Whether `observed` units measured by the caller within one window stay
+    /// within this limit. The maximum is inclusive.
+    pub fn permits(&self, observed: u64) -> bool {
+        observed <= self.max_per_window
+    }
+}
+
+/// A plan definition: the feature/SKU keys a subscriber is entitled to, plus the
+/// optional numeric quota and rate-limit ceilings IAM defines for them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Stable plan identifier.
@@ -47,10 +126,16 @@ pub struct Plan {
     pub tier: PlanTier,
     /// Feature / SKU keys this plan entitles.
     pub features: BTreeSet<String>,
+    /// Optional numeric ceilings keyed by feature/SKU key.
+    pub limits: BTreeMap<String, Quota>,
+    /// Optional per-window rate-limit definitions keyed by feature/SKU key.
+    pub rates: BTreeMap<String, RateLimit>,
 }
 
 impl Plan {
-    /// Build a plan from an id, tier, and an iterator of feature/SKU keys.
+    /// Build a plan from an id, tier, and an iterator of feature/SKU keys. The
+    /// plan starts with no quota or rate-limit ceilings; attach them with
+    /// [`Plan::with_quota`] and [`Plan::with_rate_limit`].
     pub fn new<I, S>(id: PlanId, tier: PlanTier, features: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -60,12 +145,37 @@ impl Plan {
             id,
             tier,
             features: features.into_iter().map(Into::into).collect(),
+            limits: BTreeMap::new(),
+            rates: BTreeMap::new(),
         }
+    }
+
+    /// Attach a numeric quota ceiling to a feature/SKU key (builder style).
+    pub fn with_quota(mut self, feature: impl Into<String>, quota: Quota) -> Self {
+        self.limits.insert(feature.into(), quota);
+        self
+    }
+
+    /// Attach a per-window rate-limit definition to a feature/SKU key (builder
+    /// style).
+    pub fn with_rate_limit(mut self, feature: impl Into<String>, rate: RateLimit) -> Self {
+        self.rates.insert(feature.into(), rate);
+        self
     }
 
     /// Whether this plan entitles the given feature/SKU key.
     pub fn entitles(&self, feature: &str) -> bool {
         self.features.contains(feature)
+    }
+
+    /// The numeric quota ceiling defined for a feature/SKU key, if any.
+    pub fn quota(&self, feature: &str) -> Option<Quota> {
+        self.limits.get(feature).copied()
+    }
+
+    /// The rate-limit definition for a feature/SKU key, if any.
+    pub fn rate_limit(&self, feature: &str) -> Option<RateLimit> {
+        self.rates.get(feature).copied()
     }
 }
 
@@ -90,6 +200,18 @@ pub enum EntitlementReason {
     },
     /// No plan is assigned to the principal, so no feature can be entitled.
     NoPlanAssigned,
+    /// The plan entitles the feature, but the caller-metered usage is over the
+    /// quota ceiling IAM defines for it.
+    QuotaExceeded {
+        /// Plan that defined the ceiling.
+        plan: PlanId,
+        /// Feature/SKU key the ceiling applies to.
+        feature: String,
+        /// Inclusive ceiling defined for the feature.
+        ceiling: u64,
+        /// Usage the caller metered and supplied.
+        observed: u64,
+    },
     /// A remote entitlement resolver produced the decision.
     Remote,
 }
@@ -152,6 +274,19 @@ impl EntitlementCatalog {
         self.plans.get(plan_id)
     }
 
+    /// Answer the quota ceiling a principal's plan defines for a feature/SKU key.
+    /// Returns `None` when no plan is assigned or the feature has no ceiling.
+    pub fn quota_for(&self, principal: &PrincipalRef, feature: &str) -> Option<Quota> {
+        self.plan_for(principal)?.quota(feature)
+    }
+
+    /// Answer the rate-limit definition a principal's plan defines for a
+    /// feature/SKU key. Returns `None` when no plan is assigned or the feature
+    /// has no rate limit.
+    pub fn rate_limit_for(&self, principal: &PrincipalRef, feature: &str) -> Option<RateLimit> {
+        self.plan_for(principal)?.rate_limit(feature)
+    }
+
     fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
         let Some(plan) = self.plan_for(&request.principal) else {
             return EntitlementOutcome::deny(EntitlementReason::NoPlanAssigned);
@@ -168,6 +303,32 @@ impl EntitlementCatalog {
             })
         }
     }
+
+    fn evaluate_quota(&self, request: &EntitlementRequest, observed: u64) -> EntitlementOutcome {
+        let Some(plan) = self.plan_for(&request.principal) else {
+            return EntitlementOutcome::deny(EntitlementReason::NoPlanAssigned);
+        };
+        if !plan.entitles(&request.entitlement) {
+            return EntitlementOutcome::deny(EntitlementReason::PlanLacksFeature {
+                plan: plan.id.clone(),
+                feature: request.entitlement.clone(),
+            });
+        }
+        if let Some(Quota::Limited(ceiling)) = plan.quota(&request.entitlement) {
+            if observed > ceiling {
+                return EntitlementOutcome::deny(EntitlementReason::QuotaExceeded {
+                    plan: plan.id.clone(),
+                    feature: request.entitlement.clone(),
+                    ceiling,
+                    observed,
+                });
+            }
+        }
+        EntitlementOutcome::allow(EntitlementReason::PlanEntitles {
+            plan: plan.id.clone(),
+            feature: request.entitlement.clone(),
+        })
+    }
 }
 
 /// Remote entitlement seam: delegate the decision to an external service.
@@ -179,6 +340,25 @@ impl EntitlementCatalog {
 pub trait EntitlementResolver: fmt::Debug + Send + Sync {
     /// Resolve an entitlement request into an outcome.
     fn resolve(&self, request: &EntitlementRequest) -> EntitlementOutcome;
+
+    /// Answer the quota ceiling the remote defines for a feature/SKU key.
+    /// Defaults to "no ceiling defined" so existing resolvers stay valid.
+    fn quota(&self, _principal: &PrincipalRef, _feature: &str) -> Option<Quota> {
+        None
+    }
+
+    /// Answer the rate-limit definition the remote defines for a feature/SKU
+    /// key. Defaults to "no rate limit defined".
+    fn rate_limit(&self, _principal: &PrincipalRef, _feature: &str) -> Option<RateLimit> {
+        None
+    }
+
+    /// Resolve an entitlement request together with the caller-metered usage.
+    /// Defaults to the usage-agnostic [`EntitlementResolver::resolve`] so a
+    /// remote that does not model quotas keeps its existing behaviour.
+    fn resolve_quota(&self, request: &EntitlementRequest, _observed: u64) -> EntitlementOutcome {
+        self.resolve(request)
+    }
 }
 
 /// Evaluation mode for the entitlement plane.
@@ -245,6 +425,52 @@ impl EntitlementEngine {
     /// Evaluate a request into the contract Allow/Deny decision.
     pub fn check_entitlement(&self, request: &EntitlementRequest) -> EntitlementDecision {
         self.evaluate(request).decision
+    }
+
+    /// Answer the quota ceiling defined for a principal's feature/SKU key.
+    ///
+    /// IAM defines and answers the limit; the caller meters usage against it.
+    /// Default-allow mode imposes no ceilings (`None`); local mode reads the
+    /// plan catalog; remote mode delegates to the resolver.
+    pub fn quota(&self, principal: &PrincipalRef, feature: &str) -> Option<Quota> {
+        match &self.mode {
+            EntitlementMode::DefaultAllow => None,
+            EntitlementMode::Local(catalog) => catalog.quota_for(principal, feature),
+            EntitlementMode::Remote(resolver) => resolver.quota(principal, feature),
+        }
+    }
+
+    /// Answer the rate-limit definition for a principal's feature/SKU key.
+    ///
+    /// IAM defines and answers the limit; the caller meters request counts over
+    /// the window and enforces. Default-allow mode imposes no rate limits.
+    pub fn rate_limit(&self, principal: &PrincipalRef, feature: &str) -> Option<RateLimit> {
+        match &self.mode {
+            EntitlementMode::DefaultAllow => None,
+            EntitlementMode::Local(catalog) => catalog.rate_limit_for(principal, feature),
+            EntitlementMode::Remote(resolver) => resolver.rate_limit(principal, feature),
+        }
+    }
+
+    /// Evaluate a request against the quota ceiling using the caller-metered
+    /// `observed_usage`, returning a reasoned outcome.
+    ///
+    /// This realises step 4 of the evaluation flow: a plan that entitles the
+    /// feature but whose ceiling the supplied usage exceeds resolves
+    /// `Deny(QuotaExceeded)`. A feature with no ceiling, or usage within it,
+    /// resolves the same as [`EntitlementEngine::evaluate`].
+    pub fn check_quota(
+        &self,
+        request: &EntitlementRequest,
+        observed_usage: u64,
+    ) -> EntitlementOutcome {
+        match &self.mode {
+            EntitlementMode::DefaultAllow => {
+                EntitlementOutcome::allow(EntitlementReason::DefaultAllow)
+            }
+            EntitlementMode::Local(catalog) => catalog.evaluate_quota(request, observed_usage),
+            EntitlementMode::Remote(resolver) => resolver.resolve_quota(request, observed_usage),
+        }
     }
 }
 
@@ -333,6 +559,127 @@ mod tests {
         let outcome = engine.evaluate(&request(account("acct_2"), "pack.read", None));
         assert_eq!(outcome.decision, EntitlementDecision::Deny);
         assert_eq!(outcome.reason, EntitlementReason::NoPlanAssigned);
+    }
+
+    #[test]
+    fn quota_ceiling_is_inclusive() {
+        let quota = Quota::Limited(5);
+        assert!(quota.permits(0));
+        assert!(quota.permits(5));
+        assert!(!quota.permits(6));
+        assert_eq!(quota.ceiling(), Some(5));
+
+        assert!(Quota::Unlimited.permits(u64::MAX));
+        assert_eq!(Quota::Unlimited.ceiling(), None);
+    }
+
+    #[test]
+    fn rate_limit_max_is_inclusive() {
+        let rate = RateLimit::new(60, RateWindow::Minute);
+        assert!(rate.permits(60));
+        assert!(!rate.permits(61));
+        assert_eq!(rate.window, RateWindow::Minute);
+    }
+
+    #[test]
+    fn local_mode_answers_quota_and_rate_definitions() {
+        let mut catalog = EntitlementCatalog::new();
+        catalog.upsert_plan(
+            Plan::new(PlanId("team".into()), PlanTier::Team, ["namespace.private"])
+                .with_quota("namespace.private", Quota::Limited(5))
+                .with_rate_limit("pack.publish", RateLimit::new(60, RateWindow::Minute)),
+        );
+        catalog.assign(account("acct_1"), PlanId("team".into()));
+        let engine = EntitlementEngine::local(catalog);
+        let who = account("acct_1");
+
+        assert_eq!(
+            engine.quota(&who, "namespace.private"),
+            Some(Quota::Limited(5))
+        );
+        assert_eq!(
+            engine.rate_limit(&who, "pack.publish"),
+            Some(RateLimit::new(60, RateWindow::Minute))
+        );
+        // Features without a defined ceiling are unlimited (None).
+        assert_eq!(engine.quota(&who, "pack.publish"), None);
+        assert_eq!(engine.rate_limit(&who, "namespace.private"), None);
+        // An unassigned principal has no plan, hence no ceilings.
+        assert_eq!(engine.quota(&account("acct_2"), "namespace.private"), None);
+    }
+
+    #[test]
+    fn default_allow_imposes_no_ceilings() {
+        let engine = EntitlementEngine::default_allow();
+        let who = account("acct_1");
+        assert_eq!(engine.quota(&who, "namespace.private"), None);
+        assert_eq!(engine.rate_limit(&who, "pack.publish"), None);
+        let outcome = engine.check_quota(&request(who, "namespace.private", None), u64::MAX);
+        assert_eq!(outcome.decision, EntitlementDecision::Allow);
+        assert_eq!(outcome.reason, EntitlementReason::DefaultAllow);
+    }
+
+    #[test]
+    fn check_quota_denies_when_usage_over_ceiling() {
+        let mut catalog = EntitlementCatalog::new();
+        catalog.upsert_plan(
+            Plan::new(PlanId("team".into()), PlanTier::Team, ["namespace.private"])
+                .with_quota("namespace.private", Quota::Limited(2)),
+        );
+        catalog.assign(account("acct_1"), PlanId("team".into()));
+        let engine = EntitlementEngine::local(catalog);
+        let req = request(account("acct_1"), "namespace.private", None);
+
+        // At the inclusive ceiling -> still allowed.
+        let at = engine.check_quota(&req, 2);
+        assert_eq!(at.decision, EntitlementDecision::Allow);
+        assert_eq!(
+            at.reason,
+            EntitlementReason::PlanEntitles {
+                plan: PlanId("team".into()),
+                feature: "namespace.private".into(),
+            }
+        );
+
+        // Over the ceiling -> quota exceeded.
+        let over = engine.check_quota(&req, 3);
+        assert_eq!(over.decision, EntitlementDecision::Deny);
+        assert_eq!(
+            over.reason,
+            EntitlementReason::QuotaExceeded {
+                plan: PlanId("team".into()),
+                feature: "namespace.private".into(),
+                ceiling: 2,
+                observed: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn check_quota_fails_closed_before_reaching_ceiling() {
+        let mut catalog = EntitlementCatalog::new();
+        catalog.upsert_plan(
+            Plan::new(PlanId("free".into()), PlanTier::Free, ["pack.read"])
+                .with_quota("namespace.private", Quota::Limited(0)),
+        );
+        catalog.assign(account("acct_1"), PlanId("free".into()));
+        let engine = EntitlementEngine::local(catalog);
+
+        // Feature the plan does not entitle never reaches the quota check.
+        let lacks = engine.check_quota(&request(account("acct_1"), "namespace.private", None), 0);
+        assert_eq!(lacks.decision, EntitlementDecision::Deny);
+        assert_eq!(
+            lacks.reason,
+            EntitlementReason::PlanLacksFeature {
+                plan: PlanId("free".into()),
+                feature: "namespace.private".into(),
+            }
+        );
+
+        // Unassigned principal fails closed regardless of usage.
+        let unassigned = engine.check_quota(&request(account("acct_2"), "pack.read", None), 0);
+        assert_eq!(unassigned.decision, EntitlementDecision::Deny);
+        assert_eq!(unassigned.reason, EntitlementReason::NoPlanAssigned);
     }
 
     #[test]
