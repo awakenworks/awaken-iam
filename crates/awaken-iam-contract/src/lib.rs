@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 pub use identity::{
     Account, AccountStatus, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
     ExternalIdentityKey, ExternalSubject, IdentityProviderConfig, IdentityProviderConfigId,
-    IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId, Session,
-    SessionId, SessionView, Timestamp,
+    IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId,
+    OpenIdProviderMetadata, Session, SessionId, SessionView, Timestamp, UserInfo,
 };
 
 /// Global account identifier.

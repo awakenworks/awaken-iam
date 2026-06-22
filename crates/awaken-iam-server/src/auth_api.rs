@@ -5,15 +5,20 @@
 //! [`awaken_iam_core`]. It deliberately speaks in logical request/response
 //! values (URLs, `Set-Cookie` header strings, view DTOs) rather than binding to
 //! a concrete HTTP framework, matching the MVP in-process shape used elsewhere
-//! in the server crate. A deployment maps these onto its router of choice:
+//! in the server crate. A deployment maps these onto its router of choice.
+//!
+//! The routes form one canonical `/v1` auth tree (plus the well-known discovery
+//! paths), as specified by the auth-server design — never two paths for one job:
 //!
 //! | Route | Method on [`AuthApi`] |
 //! |---|---|
+//! | `GET /.well-known/openid-configuration` | [`AuthApi::openid_configuration`] |
 //! | `GET /v1/auth/providers` | [`AuthApi::list_providers`] |
-//! | `GET /v1/auth/{provider}/start` | [`AuthApi::start_login`] |
-//! | `GET /v1/auth/{provider}/callback` | [`AuthApi::complete_callback`] |
-//! | `POST /v1/auth/logout` | [`AuthApi::logout`] |
+//! | `GET /v1/auth/login/{provider}` | [`AuthApi::start_login`] |
+//! | `GET /v1/auth/callback/{provider}` | [`AuthApi::complete_callback`] |
 //! | `GET /v1/session` | [`AuthApi::current_session`] |
+//! | `DELETE /v1/session` | [`AuthApi::logout`] |
+//! | `GET /v1/oauth/userinfo` | [`AuthApi::userinfo`] |
 //! | `GET /v1/account/identities` | [`AuthApi::list_identities`] |
 //! | `POST /v1/account/identities` | [`AuthApi::link_identity`] |
 //! | `DELETE /v1/account/identities/{provider}/{subject}` | [`AuthApi::unlink_identity`] |
@@ -33,7 +38,8 @@ use std::collections::HashMap;
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ExternalIdentity, ExternalIdentityClaims,
     ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey,
-    IdentityProviderKind, OAuthLoginStateId, SessionId, SessionView, Timestamp,
+    IdentityProviderKind, OAuthLoginStateId, OpenIdProviderMetadata, SessionId, SessionView,
+    Timestamp, UserInfo,
 };
 use awaken_iam_core::{
     AuthorizationUrlRequest, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
@@ -269,7 +275,7 @@ struct PendingLogin {
     pkce_verifier: Option<String>,
 }
 
-/// Request to begin a login (`GET /v1/auth/{provider}/start`).
+/// Request to begin a login (`GET /v1/auth/login/{provider}`).
 #[derive(Debug, Clone)]
 pub struct StartLogin {
     /// Provider selected for the login.
@@ -295,7 +301,7 @@ pub struct StartLoginOutcome {
     pub return_to: ReturnToDecision,
 }
 
-/// Request to complete a login (`GET /v1/auth/{provider}/callback`).
+/// Request to complete a login (`GET /v1/auth/callback/{provider}`).
 #[derive(Debug, Clone)]
 pub struct CallbackRequest {
     /// Provider key from the callback route.
@@ -489,7 +495,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             .collect()
     }
 
-    /// `GET /v1/auth/{provider}/start`: mint a challenge and build the provider
+    /// `GET /v1/auth/login/{provider}`: mint a challenge and build the provider
     /// authorization redirect plus its correlation cookie.
     pub fn start_login(&mut self, request: StartLogin) -> Result<StartLoginOutcome, AuthApiError> {
         let index = self.provider_index(&request.provider_key)?;
@@ -564,7 +570,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         })
     }
 
-    /// `GET /v1/auth/{provider}/callback`: verify the challenge, exchange the
+    /// `GET /v1/auth/callback/{provider}`: verify the challenge, exchange the
     /// code for claims, resolve or provision the account, and establish a
     /// session.
     pub fn complete_callback(
@@ -699,7 +705,42 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             .current_session_from_cookie(cookie_header, now)?)
     }
 
-    /// `POST /v1/auth/logout`: revoke the presented session and clear its cookie.
+    /// `GET /.well-known/openid-configuration`: advertise this provider's
+    /// canonical endpoints for the `issuer` base URL.
+    ///
+    /// IAM is the OpenID Provider; the document lets relying parties discover
+    /// the `/v1` auth tree rather than hardcoding paths.
+    pub fn openid_configuration(&self, issuer: &str) -> OpenIdProviderMetadata {
+        OpenIdProviderMetadata::for_issuer(issuer)
+    }
+
+    /// `GET /v1/oauth/userinfo`: return the authenticated subject's OIDC claims.
+    ///
+    /// Resolves the live session from the request cookie (failing closed when it
+    /// is missing, revoked, or expired), then projects the account and its
+    /// latest linked provider claims into [`UserInfo`]. `sub` is IAM's own
+    /// account subject, never the upstream provider subject.
+    pub fn userinfo(
+        &mut self,
+        cookie_header: &str,
+        now: Timestamp,
+    ) -> Result<UserInfo, AuthApiError> {
+        let view = self.current_session(cookie_header, now)?;
+        let identity = view.external_identity_id.as_ref().and_then(|external_id| {
+            self.directory
+                .identities_for_account(&view.account_id)
+                .into_iter()
+                .find(|identity| &identity.id == external_id)
+        });
+        let userinfo = UserInfo::project(
+            &view.account_id,
+            identity.map(|identity| &identity.claims),
+            identity.map(|identity| &identity.last_seen_at),
+        );
+        Ok(userinfo)
+    }
+
+    /// `DELETE /v1/session`: revoke the presented session and clear its cookie.
     pub fn logout(
         &mut self,
         cookie_header: &str,
@@ -949,7 +990,7 @@ mod tests {
         api.register_provider(ProviderRegistration {
             config: config(true),
             adapter: Box::new(FakeAdapter),
-            redirect_uri: "https://app.example/v1/auth/fake/callback".into(),
+            redirect_uri: "https://app.example/v1/auth/callback/fake".into(),
             scopes: vec!["openid".into(), "email".into()],
             include_nonce: true,
             include_pkce: true,
@@ -1012,7 +1053,7 @@ mod tests {
                 ..config(false)
             },
             adapter: Box::new(FakeAdapter),
-            redirect_uri: "https://app.example/v1/auth/github/callback".into(),
+            redirect_uri: "https://app.example/v1/auth/callback/github".into(),
             scopes: vec![],
             include_nonce: false,
             include_pkce: true,
@@ -1293,6 +1334,103 @@ mod tests {
         assert!(matches!(
             err,
             AuthApiError::Login(IamError::DuplicateExternalIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn openid_configuration_advertises_canonical_endpoints() {
+        let api = api();
+        // A trailing slash on the issuer must not double the path separator.
+        let metadata = api.openid_configuration("https://iam.example/");
+        assert_eq!(metadata.issuer, "https://iam.example");
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://iam.example/v1/auth/login"
+        );
+        assert_eq!(
+            metadata.token_endpoint,
+            "https://iam.example/v1/oauth/token"
+        );
+        assert_eq!(
+            metadata.userinfo_endpoint,
+            "https://iam.example/v1/oauth/userinfo"
+        );
+        assert_eq!(
+            metadata.jwks_uri,
+            "https://iam.example/.well-known/jwks.json"
+        );
+        assert_eq!(metadata.response_types_supported, vec!["code".to_owned()]);
+        assert!(metadata.scopes_supported.contains(&"openid".to_owned()));
+
+        // The discovery document round-trips through the OIDC wire field names.
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(json["issuer"], "https://iam.example");
+        assert_eq!(
+            json["userinfo_endpoint"],
+            "https://iam.example/v1/oauth/userinfo"
+        );
+    }
+
+    #[test]
+    fn userinfo_projects_session_subject_and_claims() {
+        let mut api = api();
+        let outcome = start(&mut api, Some("/dashboard"));
+        let result = callback(&mut api, &outcome, "subject-1:user@example.com").unwrap();
+        let session_cookie = {
+            let token = SessionCookieConfig::default()
+                .extract_token(&result.set_session_cookie)
+                .unwrap();
+            format!("{DEFAULT_SESSION_COOKIE_NAME}={token}")
+        };
+
+        let userinfo = api
+            .userinfo(&session_cookie, Timestamp("2026-06-19T01:30:00Z".into()))
+            .unwrap();
+        // `sub` is IAM's account subject, not the upstream provider subject.
+        assert_eq!(userinfo.sub, result.session.account_id.0);
+        assert_ne!(userinfo.sub, "subject-1");
+        assert_eq!(userinfo.email.as_deref(), Some("user@example.com"));
+        assert_eq!(userinfo.email_verified, Some(true));
+        assert_eq!(userinfo.name.as_deref(), Some("Fake User"));
+        assert!(userinfo.updated_at.is_some());
+
+        // Absent claims are omitted from the serialized response.
+        let json = serde_json::to_value(&userinfo).unwrap();
+        assert!(json.get("picture").is_none());
+        assert_eq!(json["email"], "user@example.com");
+    }
+
+    #[test]
+    fn userinfo_fails_closed_without_a_session() {
+        let mut api = api();
+        let err = api
+            .userinfo("unrelated=1", Timestamp("2026-06-19T01:30:00Z".into()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthApiError::Login(IamError::SessionNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn userinfo_fails_closed_after_logout() {
+        let mut api = api();
+        let outcome = start(&mut api, Some("/dashboard"));
+        let result = callback(&mut api, &outcome, "subject-1:user@example.com").unwrap();
+        let token = SessionCookieConfig::default()
+            .extract_token(&result.set_session_cookie)
+            .unwrap();
+        let cookie = format!("{DEFAULT_SESSION_COOKIE_NAME}={token}");
+
+        api.logout(&cookie, Timestamp("2026-06-19T02:00:00Z".into()))
+            .unwrap();
+
+        let err = api
+            .userinfo(&cookie, Timestamp("2026-06-19T03:00:00Z".into()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthApiError::Login(IamError::SessionRevoked { .. })
         ));
     }
 }

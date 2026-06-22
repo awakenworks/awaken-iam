@@ -203,6 +203,124 @@ impl From<&Session> for SessionView {
     }
 }
 
+/// OpenID Provider metadata served at `/.well-known/openid-configuration`.
+///
+/// IAM is the OpenID Provider (OP) to product clients; this document advertises
+/// the canonical `/v1` endpoints of that provider so relying parties can
+/// discover them rather than hardcoding paths. Endpoint URLs are absolute and
+/// derived from the deployment `issuer`. Field names follow the OpenID Connect
+/// Discovery wire format verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenIdProviderMetadata {
+    /// Issuer identifier; the base URL the provider is reachable at.
+    pub issuer: String,
+    /// Authorization endpoint that begins a federated login.
+    pub authorization_endpoint: String,
+    /// Token endpoint for the `authorization_code` and `refresh_token` grants.
+    pub token_endpoint: String,
+    /// UserInfo endpoint returning the authenticated subject's claims.
+    pub userinfo_endpoint: String,
+    /// JWKS endpoint exposing the access-token signing keys.
+    pub jwks_uri: String,
+    /// OAuth `response_type` values supported (authorization-code flow only).
+    pub response_types_supported: Vec<String>,
+    /// Subject identifier types supported.
+    pub subject_types_supported: Vec<String>,
+    /// Signing algorithms used for issued `id_token`s.
+    pub id_token_signing_alg_values_supported: Vec<String>,
+    /// OIDC/OAuth scopes the provider recognizes.
+    pub scopes_supported: Vec<String>,
+    /// Grant types the token endpoint accepts.
+    pub grant_types_supported: Vec<String>,
+}
+
+impl OpenIdProviderMetadata {
+    /// Build provider metadata for an `issuer` base URL.
+    ///
+    /// Any trailing `/` on `issuer` is trimmed so the advertised endpoints never
+    /// contain a doubled separator. Endpoints mirror the canonical auth tree:
+    /// `/v1/auth/login`, `/v1/oauth/token`, `/v1/oauth/userinfo`, and
+    /// `/.well-known/jwks.json`.
+    pub fn for_issuer(issuer: &str) -> Self {
+        let base = issuer.trim_end_matches('/');
+        Self {
+            issuer: base.to_owned(),
+            authorization_endpoint: format!("{base}/v1/auth/login"),
+            token_endpoint: format!("{base}/v1/oauth/token"),
+            userinfo_endpoint: format!("{base}/v1/oauth/userinfo"),
+            jwks_uri: format!("{base}/.well-known/jwks.json"),
+            response_types_supported: vec!["code".to_owned()],
+            subject_types_supported: vec!["public".to_owned()],
+            id_token_signing_alg_values_supported: vec!["RS256".to_owned(), "EdDSA".to_owned()],
+            scopes_supported: vec![
+                "openid".to_owned(),
+                "email".to_owned(),
+                "profile".to_owned(),
+            ],
+            grant_types_supported: vec![
+                "authorization_code".to_owned(),
+                "refresh_token".to_owned(),
+            ],
+        }
+    }
+}
+
+/// OIDC UserInfo claims returned by `GET /v1/oauth/userinfo`.
+///
+/// `sub` is IAM's own stable subject for the authenticated account, never the
+/// upstream provider subject — products federate through IAM and see one
+/// identity coordinate regardless of which provider was used. The profile
+/// fields are the latest normalized [`ExternalIdentityClaims`] and are omitted
+/// from the response when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInfo {
+    /// Stable IAM subject identifier (the account id).
+    pub sub: String,
+    /// Email claim, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether the provider asserted the email is verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    /// Display name claim, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Username / handle claim, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+    /// Avatar URL claim, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Locale claim, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// Timestamp the claims were last refreshed, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+impl UserInfo {
+    /// Project the authenticated `account_id` and its latest provider claims
+    /// into OIDC UserInfo claims. With no linked identity claims, only `sub` is
+    /// populated.
+    pub fn project(
+        account_id: &AccountId,
+        claims: Option<&ExternalIdentityClaims>,
+        updated_at: Option<&Timestamp>,
+    ) -> Self {
+        Self {
+            sub: account_id.0.clone(),
+            email: claims.and_then(|claims| claims.email.clone()),
+            email_verified: claims.and_then(|claims| claims.email_verified),
+            name: claims.and_then(|claims| claims.display_name.clone()),
+            preferred_username: claims.and_then(|claims| claims.username.clone()),
+            picture: claims.and_then(|claims| claims.avatar_url.clone()),
+            locale: claims.and_then(|claims| claims.locale.clone()),
+            updated_at: updated_at.map(|stamp| stamp.0.clone()),
+        }
+    }
+}
+
 /// Stored OAuth login-state challenge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthLoginState {
