@@ -29,17 +29,24 @@ use awaken_iam_contract::{
     SignerSetSnapshot,
 };
 use awaken_iam_core::{
-    EntitlementEngine, IamCore, NamespaceTrustDirectory, PolicySet, ResourceModel,
+    EntitlementEngine, EntitlementProvider, IamCore, NamespaceTrustDirectory, PolicySet,
+    ResourceModel,
 };
 
-/// Authorization/entitlement protocol surface over an in-process [`IamCore`],
-/// [`EntitlementEngine`], and namespace [`NamespaceTrustDirectory`].
-#[derive(Debug, Default)]
+/// Authorization/entitlement protocol surface over an in-process [`IamCore`], an
+/// injectable [`EntitlementProvider`], and namespace [`NamespaceTrustDirectory`].
+#[derive(Debug)]
 pub struct AuthzApi {
     core: IamCore,
-    entitlements: EntitlementEngine,
+    entitlements: Box<dyn EntitlementProvider>,
     trust: NamespaceTrustDirectory,
     policy_version: u64,
+}
+
+impl Default for AuthzApi {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AuthzApi {
@@ -48,28 +55,29 @@ impl AuthzApi {
     pub fn new() -> Self {
         Self {
             core: IamCore::new(),
-            entitlements: EntitlementEngine::default_allow(),
+            entitlements: Box::new(EntitlementEngine::default_allow()),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }
     }
 
-    /// Build an API with a specific entitlement engine and an empty default-deny
-    /// policy.
-    pub fn with_entitlements(entitlements: EntitlementEngine) -> Self {
+    /// Build an API with a specific entitlement provider and an empty
+    /// default-deny policy. This is the deploy-time seam: an open
+    /// [`EntitlementEngine`] or a closed, licensed provider plugs in here.
+    pub fn with_entitlements(entitlements: impl EntitlementProvider + 'static) -> Self {
         Self {
             core: IamCore::new(),
-            entitlements,
+            entitlements: Box::new(entitlements),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }
     }
 
-    /// Build an API over an explicit core and entitlement engine.
-    pub fn from_parts(core: IamCore, entitlements: EntitlementEngine) -> Self {
+    /// Build an API over an explicit core and entitlement provider.
+    pub fn from_parts(core: IamCore, entitlements: impl EntitlementProvider + 'static) -> Self {
         Self {
             core,
-            entitlements,
+            entitlements: Box::new(entitlements),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }

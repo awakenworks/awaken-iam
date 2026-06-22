@@ -34,8 +34,9 @@ pub use authorization::{
 };
 pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
-    EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome, EntitlementReason,
-    EntitlementResolver, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow,
+    EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
+    EntitlementProvider, EntitlementReason, EntitlementResolver, Plan, PlanId, PlanTier, Quota,
+    RateLimit, RateWindow,
 };
 pub use events::{AuditLedger, DecisionTrace, DomainEvent};
 pub use fake_provider::{
