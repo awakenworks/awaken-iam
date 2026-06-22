@@ -1,15 +1,15 @@
 # IAM model
 
-This document defines the target IAM model for `awaken-iam`. It complements [IAM overview](iam-overview.md) and [ADR-0001](../adr/0001-iam-shared-boundary.md).
+This document defines the target IAM model for `awaken-iam`. It complements [domain model](domain-model.md) and [ADR-0001](../adr/0001-iam-shared-boundary.md).
 
 ## Purpose
 
-`awaken-iam` is the shared identity, authorization, scope, and entitlement control plane for AwakenWorks services:
+`awaken-iam` is the shared, product-agnostic identity, authorization, scope, and entitlement control plane for any service that needs the same account/org/workspace/project identity plane:
 
-- Oversight Cloud;
-- Awaken Next Cloud;
-- Oversight Pack Hub;
-- future cloud services that need the same account/org/workspace/project identity plane.
+- publishing / registry services;
+- collaboration / workspace services;
+- agent-runtime services;
+- any future service that adopts the same identity plane.
 
 The core authorization shape is:
 
@@ -35,9 +35,9 @@ IAM owns:
 
 IAM does not own:
 
-- Oversight Issues, Workflows, WorkProducts, FlowInstallations, ConnectorBindings, CredentialSources, or OutboundEffects;
-- Pack Hub package blobs, component indexes, flow indexes, or package versions;
-- Awaken runtime execution state, workers, agent runs, or model/provider runtime state.
+- product domain objects and their lifecycle (issues, workflows, work products, flow installations, connector bindings, credential sources, outbound effects);
+- registry artifacts (package blobs, component/flow indexes, package versions);
+- runtime execution state (workers, agent runs, model/provider runtime state).
 
 ## PrincipalRef
 
@@ -256,49 +256,35 @@ check_entitlement(EntitlementRequest) -> EntitlementDecision
 
 v1 entitlement may be default-allow, but the seam must exist so paid packs, private namespaces, and product-plan limits do not get mixed into grant evaluation.
 
-## Product integration boundaries
+## Integration patterns
 
-### Oversight Pack Hub
-
-Pack Hub asks IAM for namespace/package access:
+Services integrate by composing IAM calls; the model owns the decision, the
+service owns the resource. Representative call shapes, generic to any consumer:
 
 ```text
-publish pack:
+publish to a namespace:
   authorize(principal, pack.publish, namespace:acme)
   authorize(principal, namespace.signer.use, namespace:acme)
   check_entitlement(principal, pack.publish, acme/pkg)
 
-read private pack:
+read a private resource:
   authorize(principal, pack.read, namespace:acme)
   check_entitlement(principal, pack.read, acme/pkg)
-```
 
-Pack Hub still owns packages, package versions, component indexes, flow indexes, and blob metadata.
-
-### Oversight Cloud
-
-Oversight uses IAM for account/session and workspace/project access:
-
-```text
-install flow:
+act within a workspace / project:
   authorize(principal, flow.install, project:web)
   authorize(principal, connector.use, workspace:acme)
   check_entitlement(principal, pack.install, coordinate)
-```
 
-Oversight still owns Issues, Workflows, WorkProducts, ConnectorBindings, CredentialSources, FlowInstallations, OutboundEffects, and domain validation.
-
-### Awaken Next Cloud
-
-Awaken Next uses IAM for account/org/workspace access and product entitlement:
-
-```text
-run agent:
+run a tenant-gated capability:
   authorize(principal, agent.run, workspace:ws)
   check_entitlement(principal, model.strong_access, workspace:ws)
 ```
 
-Awaken runtime still owns execution state and runtime-specific capabilities.
+In every case the service still owns its own domain objects, runtime state, and
+business validation; IAM owns only identity, the authorization decision, and the
+entitlement check. See [permission mechanisms](permission-mechanisms.md) for how
+arbitrary models compose from these calls.
 
 ## API surface
 
@@ -328,8 +314,8 @@ Consumers should integrate through an IAM mode switch:
 ```toml
 [iam]
 mode = "remote" # local | remote
-base_url = "https://iam.awakenworks.com"
-audience = "oversight-pack-hub"
+base_url = "https://iam.example.com"
+audience = "example-service"
 timeout_ms = 3000
 
 [iam.local]
