@@ -6,13 +6,17 @@ separate from authorization. It extends
 [IAM model](iam-model.md#authorization-vs-entitlement) and replaces the
 placeholder `entitlement_default_allow() -> Allow` stub.
 
-> **Open seam, closed licensing.** This plane is an injection seam. The open repo
-> ships only the generic evaluation and the `default_allow` no-op, so a
-> self-hosted build is fully functional and unlicensed. A licensed implementation
-> — signed offline-verifiable licenses, quota leases, billing — is a *proprietary*
-> concern injected at deploy time by a commercial platform, and is documented
-> there, not here. The open repo never carries the licensing mechanism or its
-> threat model.
+> **Open seam, closed issuance.** This plane is an injection seam. The open repo
+> ships the generic evaluation, the `default_allow` no-op, and — so a self-hosted
+> build is fully functional and can honor a presented license without calling
+> home — the open `LicenseClaim` wire shape and its *offline verification* against
+> a pinned JWKS of public keys. What stays *proprietary* and injected at deploy
+> time by a commercial platform is everything that **mints** trust: the issuer's
+> private signing store, the plan catalog, quota leases, and billing, together
+> with the threat model around issuance. The open repo carries the claim shape and
+> the public-key verification check; it never carries a signing key or the issuing
+> pipeline. A build with no claim is unlicensed by default. The open/closed split
+> is recorded in [ADR-0005](../adr/0005-open-license-claim-verification.md).
 
 ## Why a separate plane
 
