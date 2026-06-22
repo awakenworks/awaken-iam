@@ -48,7 +48,9 @@ dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
  "awaken-iam-core",
+ "base64",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

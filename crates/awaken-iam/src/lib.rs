@@ -15,8 +15,11 @@ pub use awaken_iam_core::{
     PkceChallenge, PkceMethod, SessionDirectory, SessionMinter, hash_session_token,
 };
 pub use awaken_iam_server::{
-    DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, IamServer, SameSite, SessionCookieConfig,
-    SessionGateway,
+    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
+    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, IamServer,
+    LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary, ReturnToDecision,
+    ReturnToPolicy, SameSite, SessionCookieConfig, SessionGateway, StartLogin, StartLoginOutcome,
+    UnlinkIdentity,
 };
 
 #[cfg(test)]
