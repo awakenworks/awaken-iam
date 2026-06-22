@@ -1,7 +1,7 @@
 # ADR-0008 - One permission model for org/workspace members and API keys
 
 - **Status:** Proposed
-- **Implementation:** planned
+- **Implementation:** in-progress
 - **Date:** 2026-06-23
 - **Related:** ADR-0002, ADR-0004, [authorization engine](../design/authorization-engine.md)
 
