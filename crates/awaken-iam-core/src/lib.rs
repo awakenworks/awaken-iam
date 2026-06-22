@@ -6,6 +6,7 @@ mod fake_provider;
 mod github;
 mod login;
 mod provider;
+mod resource_model;
 mod session;
 
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,
 };
+pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 
 use awaken_iam_contract::{

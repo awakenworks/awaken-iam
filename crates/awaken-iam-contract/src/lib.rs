@@ -34,6 +34,19 @@ pub struct WorkspaceId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub String);
 
+/// Open resource-type discriminator registered by a product's resource model.
+///
+/// IAM never enumerates resource types; a product names its own (`"issue"`,
+/// `"document"`, `"deployment"`, ...) and registers their scope edges as data,
+/// so deep product hierarchies resolve through the same scope-graph walk without
+/// the core depending on the product.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResourceType(pub String);
+
+/// Identifier of a single resource instance within its [`ResourceType`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResourceId(pub String);
+
 /// Actor making a request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -62,6 +75,18 @@ pub enum ScopeRef {
     Project {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
+    },
+    /// Open product-resource scope.
+    ///
+    /// Anchors a grant at an arbitrary product resource (`issue:42`,
+    /// `document:readme`, ...). Its place in the hierarchy is not inferred from
+    /// the ids; it comes from parent edges a product registers through its
+    /// resource model, so the scope-graph walk resolves arbitrarily deep
+    /// hierarchies (leaf resource -> ... -> tenant root) without the core
+    /// knowing the product.
+    Resource {
+        resource_type: ResourceType,
+        resource_id: ResourceId,
     },
 }
 
@@ -123,6 +148,21 @@ mod tests {
         let json = serde_json::to_string(&scope).unwrap();
         assert!(json.contains("namespace"));
         assert!(json.contains("acme"));
+    }
+
+    #[test]
+    fn resource_scope_round_trips_with_kind_tag() {
+        let scope = ScopeRef::Resource {
+            resource_type: ResourceType("issue".into()),
+            resource_id: ResourceId("42".into()),
+        };
+        let json = serde_json::to_string(&scope).unwrap();
+        assert!(json.contains("\"kind\":\"resource\""));
+        assert!(json.contains("issue"));
+        assert!(json.contains("42"));
+
+        let restored: ScopeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, scope);
     }
 
     #[test]
