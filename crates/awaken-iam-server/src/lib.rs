@@ -2,6 +2,7 @@
 
 mod access_token;
 mod admin_api;
+mod anthropic_admin;
 mod assembly;
 mod auth_api;
 mod authz_api;
@@ -21,6 +22,14 @@ pub use access_token::{
     ed25519_public_jwk, verify_access_token, verify_active_access_token, verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
+pub use anthropic_admin::{
+    ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,
+    DEFAULT_PAGE_LIMIT, FEDERATION_ISSUER_ID_PREFIX, FEDERATION_RULE_ID_PREFIX, FederationIssuer,
+    FederationRule, ListParams, MAX_PAGE_LIMIT, Member, ORG_ADMIN_ACTION, ObjectKind, OrgRole,
+    Page, SERVICE_ACCOUNT_ID_PREFIX, ServiceAccount, WORKSPACE_ID_PREFIX, WorkspaceMember,
+    WorkspaceRole, admin_authorization_request, project_federation_issuers,
+    project_federation_rules,
+};
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
