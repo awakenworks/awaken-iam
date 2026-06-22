@@ -87,7 +87,7 @@ pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, Sh
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
 
 use awaken_iam_contract::{
-    Account, AccountId, ActionKey, ApiTokenId, ApiTokenPrefix, AuthorizationDecision,
+    Account, AccountId, ApiTokenId, ApiTokenPrefix, AuthorizationDecision,
     AuthorizationRequest, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey,
     ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, RefreshTokenChainId,
     RefreshTokenId, Session, SessionId, Timestamp,
@@ -274,14 +274,6 @@ pub enum IamError {
     ApiTokenExpired {
         /// Expired API-token id.
         id: ApiTokenId,
-    },
-    /// The API token authenticated but its scope does not cover the action.
-    #[error("api token scope does not cover the action")]
-    ApiTokenInsufficientScope {
-        /// API-token id whose scope was insufficient.
-        id: ApiTokenId,
-        /// Action that fell outside the token's scope set.
-        action: ActionKey,
     },
     /// Hashing or verifying an API-token secret failed.
     #[error("api token hashing failed: {detail}")]

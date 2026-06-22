@@ -17,10 +17,10 @@
 //! columns are read back with `CAST(col AS TEXT)`, portable across both.
 
 use awaken_iam_contract::{
-    Account, AccountId, ActionKey, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, GrantSubjectRef,
     IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
-    ResourceType, Session, SessionId, Timestamp,
+    ResourceType, Session, SessionId, Timestamp, WorkspaceId,
 };
 use awaken_iam_core::{
     AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
@@ -245,7 +245,7 @@ fn decode_api_token(row: &SqlRow) -> RepoResult<ApiToken> {
         prefix: ApiTokenPrefix(req(row, 1, "api_token.prefix")?),
         principal: json_decode(&req(row, 2, "api_token.principal")?, "principal")?,
         secret_hash: req(row, 3, "api_token.secret_hash")?,
-        scope: json_decode::<Vec<ActionKey>>(&req(row, 4, "api_token.scope")?, "token scope")?,
+        workspace: WorkspaceId(req(row, 4, "api_token.workspace")?),
         created_at: Timestamp(req(row, 5, "api_token.created_at")?),
         expires_at: opt(row, 6).map(Timestamp),
         revoked_at: opt(row, 7).map(Timestamp),
@@ -604,11 +604,10 @@ impl<B: SqlConn> LoginFlowRepo for SqlStore<B> {
 impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
     fn create(&self, token: ApiToken) -> RepoResult<()> {
         let principal = json_encode(&token.principal, "principal")?;
-        let scope = json_encode(&token.scope, "token scope")?;
         let sql = format!(
             "INSERT INTO {t} \
-             (id, prefix, principal, secret_hash, scope, created_at, expires_at, revoked_at) \
-             VALUES (?, ?, ?j, ?, ?j, ?, ?, ?)",
+             (id, prefix, principal, secret_hash, workspace, created_at, expires_at, revoked_at) \
+             VALUES (?, ?, ?j, ?, ?, ?, ?, ?)",
             t = self.table("api_tokens")
         );
         self.backend.execute(
@@ -618,7 +617,7 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
                 p(token.prefix.0),
                 p(principal),
                 p(token.secret_hash),
-                p(scope),
+                p(token.workspace.0),
                 p(token.created_at.0),
                 token.expires_at.map(|t| t.0),
                 token.revoked_at.map(|t| t.0),
@@ -629,7 +628,7 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
 
     fn get(&self, id: &ApiTokenId) -> RepoResult<Option<ApiToken>> {
         let sql = format!(
-            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
              created_at, expires_at, revoked_at FROM {} WHERE id = ?",
             self.table("api_tokens")
         );
@@ -639,7 +638,7 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
 
     fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepoResult<Option<ApiToken>> {
         let sql = format!(
-            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
              created_at, expires_at, revoked_at FROM {} WHERE prefix = ?",
             self.table("api_tokens")
         );
@@ -650,7 +649,7 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
     fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<ApiToken>> {
         let principal_json = json_encode(principal, "principal")?;
         let sql = format!(
-            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, CAST(scope AS TEXT), \
+            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
              created_at, expires_at, revoked_at FROM {} WHERE principal = ?j ORDER BY id",
             self.table("api_tokens")
         );
@@ -663,9 +662,8 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
 
     fn update(&self, token: ApiToken) -> RepoResult<()> {
         let principal = json_encode(&token.principal, "principal")?;
-        let scope = json_encode(&token.scope, "token scope")?;
         let sql = format!(
-            "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, scope = ?j, \
+            "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, workspace = ?, \
              created_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
             t = self.table("api_tokens")
         );
@@ -675,7 +673,7 @@ impl<B: SqlConn> ApiTokenRepo for SqlStore<B> {
                 p(token.prefix.0),
                 p(principal),
                 p(token.secret_hash),
-                p(scope),
+                p(token.workspace.0),
                 p(token.created_at.0),
                 token.expires_at.map(|t| t.0),
                 token.revoked_at.map(|t| t.0),

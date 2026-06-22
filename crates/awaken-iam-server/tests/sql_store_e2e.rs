@@ -9,10 +9,10 @@
 //! the ADR promises. Selecting the backend is configuration, not a code fork.
 
 use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ActionKey, ApiToken, ApiTokenId, ApiTokenPrefix,
-    ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey,
-    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ResourceId, ResourceType, ScopeRef, Session, SessionId, Timestamp,
+    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
+    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,
+    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
+    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
 };
 use awaken_iam_core::{
     AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
@@ -208,10 +208,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         prefix: ApiTokenPrefix("pfx_1".into()),
         principal: service("ci"),
         secret_hash: "$argon2id$hash".into(),
-        scope: vec![
-            ActionKey("pack.publish".into()),
-            ActionKey("pack.read".into()),
-        ],
+        workspace: WorkspaceId("wrkspc_default".into()),
         created_at: ts("2026-06-19T00:00:00Z"),
         expires_at: None,
         revoked_at: None,
@@ -235,9 +232,8 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
             .get_by_prefix(&ApiTokenPrefix("pfx_1".into()))
             .unwrap()
             .unwrap()
-            .scope
-            .len(),
-        2
+            .workspace,
+        WorkspaceId("wrkspc_default".into())
     );
     assert_eq!(
         ApiTokenRepo::list_for_principal(store, &service("ci"))
