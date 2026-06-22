@@ -1,6 +1,7 @@
 //! Core IAM evaluation primitives.
 
 mod fake_provider;
+mod github;
 mod login;
 mod provider;
 mod session;
@@ -12,6 +13,11 @@ pub use fake_provider::{
     AuthorizeRedirect, AuthorizeRequest, FailureMode, FakeOidcProvider, FakeUser, IdTokenClaims,
     JsonWebKey, JsonWebKeySet, OidcDiscoveryDocument, OidcError, TokenRequest, TokenResponse,
     UserInfoResponse,
+};
+pub use github::{
+    DEFAULT_AUTHORIZE_ENDPOINT, DEFAULT_TOKEN_ENDPOINT, GithubAccessToken, GithubEmail,
+    GithubProviderAdapter, GithubTransport, GithubTransportError, GithubUser, SelectedEmail,
+    TokenRequest, select_email,
 };
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
