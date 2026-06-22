@@ -4,6 +4,7 @@
 - [Domain model (DDD)](domain-model.md)
 - [Permission mechanisms](permission-mechanisms.md)
 - [Authorization engine](authorization-engine.md)
+- [Consumer integration](consumer-integration.md)
 - [Identity and auth server](auth-server.md)
 - [Namespace trust model](namespace-trust-model.md)
 - [Entitlement plane](entitlements.md)
