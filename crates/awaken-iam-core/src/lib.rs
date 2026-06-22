@@ -17,6 +17,7 @@ mod provider;
 mod provision;
 mod refresh_token;
 mod resource_model;
+mod role_catalog;
 mod session;
 mod shadow;
 pub mod smoke;
@@ -80,6 +81,7 @@ pub use refresh_token::{
     RotateRefreshToken, parse_presented_refresh_token,
 };
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
+pub use role_catalog::{ANTHROPIC_ROLE_IDS, ROLE_NAMESPACES, named_role_catalog, seed_named_roles};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, ShadowReport};
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
