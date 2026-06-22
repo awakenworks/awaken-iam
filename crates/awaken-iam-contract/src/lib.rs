@@ -3,7 +3,16 @@
 //! This crate is the stable seam used by product services. It contains DTOs and
 //! identifiers only; evaluation, persistence, and server code live elsewhere.
 
+mod identity;
+
 use serde::{Deserialize, Serialize};
+
+pub use identity::{
+    Account, AccountStatus, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
+    ExternalIdentityKey, ExternalSubject, IdentityProviderConfig, IdentityProviderConfigId,
+    IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId, Session,
+    SessionId, Timestamp,
+};
 
 /// Global account identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,5 +123,40 @@ mod tests {
         let json = serde_json::to_string(&scope).unwrap();
         assert!(json.contains("namespace"));
         assert!(json.contains("acme"));
+    }
+
+    #[test]
+    fn account_has_no_email_identity_key() {
+        let account = Account {
+            id: AccountId("acct_1".into()),
+            status: AccountStatus::Active,
+            display_name: Some("Ada".into()),
+            created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            updated_at: Timestamp("2026-06-19T00:00:00Z".into()),
+        };
+        let json = serde_json::to_value(account).unwrap();
+        assert!(json.get("email").is_none());
+    }
+
+    #[test]
+    fn external_identity_key_uses_provider_and_subject_not_email() {
+        let claims = ExternalIdentityClaims {
+            subject: ExternalSubject("sub_123".into()),
+            email: Some("first@example.com".into()),
+            email_verified: Some(true),
+            display_name: Some("First Name".into()),
+            username: None,
+            avatar_url: None,
+            locale: None,
+        };
+        let key = ExternalIdentityKey::from_claims(IdentityProviderKey("fake".into()), &claims);
+
+        let mut changed_claims = claims.clone();
+        changed_claims.email = Some("second@example.com".into());
+
+        assert_eq!(
+            key,
+            ExternalIdentityKey::from_claims(IdentityProviderKey("fake".into()), &changed_claims)
+        );
     }
 }

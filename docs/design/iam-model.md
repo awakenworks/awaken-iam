@@ -53,6 +53,89 @@ enum PrincipalRef {
 
 Future variants may include worker or service-account identities, but every request must resolve to a principal before it can be authorized. No principal means deny.
 
+## External identity and sessions
+
+Accounts are internal IAM principals. External login providers only establish or
+refresh a link to an account.
+
+Core records:
+
+```text
+Account {
+  id,
+  status,
+  display_name?,
+  created_at,
+  updated_at,
+}
+
+IdentityProviderConfig {
+  id,
+  provider_key,
+  kind,          # fake | oauth2 | oidc
+  display_name,
+  issuer_url?,
+  authorization_endpoint?,
+  token_endpoint?,
+  client_id?,
+  enabled,
+}
+
+ExternalIdentity {
+  id,
+  account_id,
+  provider_key,
+  claims,
+  first_seen_at,
+  last_seen_at,
+}
+
+ExternalIdentityClaims {
+  subject,
+  email?,
+  email_verified?,
+  display_name?,
+  username?,
+  avatar_url?,
+  locale?,
+}
+
+OAuthLoginState {
+  id,
+  provider_key,
+  state_hash,
+  nonce_hash?,
+  pkce_verifier_hash?,
+  return_to?,
+  created_at,
+  expires_at,
+  consumed_at?,
+}
+
+Session {
+  id,
+  account_id,
+  token_hash,
+  external_identity_id?,
+  created_at,
+  last_seen_at,
+  expires_at,
+  revoked_at?,
+}
+```
+
+External identity uniqueness is:
+
+```text
+provider_key + claims.subject
+```
+
+Email is not an identity key. It is a mutable provider claim and can change on a
+later login without creating or selecting a different account. Fake-provider
+login uses the same model: the fake provider emits a deterministic provider key
+and subject, then IAM resolves that provider+subject to the linked account and
+creates a session.
+
 ## ScopeRef
 
 Scopes are product/platform authorization targets.

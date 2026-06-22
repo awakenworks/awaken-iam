@@ -2,10 +2,14 @@
 
 pub use awaken_iam_client::IamClient;
 pub use awaken_iam_contract::{
-    AccountId, ActionKey, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
-    EntitlementRequest, NamespaceId, OrgId, PrincipalRef, ProjectId, ScopeRef, WorkspaceId,
+    Account, AccountId, AccountStatus, ActionKey, AuthorizationDecision, AuthorizationRequest,
+    EntitlementDecision, EntitlementRequest, ExternalIdentity, ExternalIdentityClaims,
+    ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderConfig,
+    IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ScopeRef, Session,
+    SessionId, Timestamp, WorkspaceId,
 };
-pub use awaken_iam_core::{IamCore, IamError};
+pub use awaken_iam_core::{IamCore, IamError, IdentityDirectory};
 pub use awaken_iam_server::IamServer;
 
 #[cfg(test)]
