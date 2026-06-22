@@ -1,9 +1,9 @@
-//! Long-lived, principal-scoped API tokens (permission mechanism 8).
+//! Long-lived, workspace-scoped API tokens (permission mechanism 8).
 //!
-//! API tokens authenticate machine and automation callers. A token is bound to a
-//! single workspace for credential attribution; its authority is not carried
-//! per-key but flows from its principal's role bindings through the policy engine
-//! (ADR-0008 decision 3). A token is two halves: a public, non-secret
+//! API tokens authenticate machine and automation callers; a key carries no
+//! per-key scope and its authority comes entirely from its principal's role
+//! bindings, evaluated through [`PolicySet`] like any account (ADR-0008
+//! decision 3). A token is two halves: a public, non-secret
 //! *prefix* used to locate the row, and a high-entropy *secret* that is hashed
 //! with **argon2id** and stored only as its PHC hash. The full cleartext token
 //! (`sk-ant-<prefix>.<secret>`) is returned exactly once at mint time and is
@@ -28,10 +28,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use awaken_iam_contract::{
-    ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, Timestamp, WorkspaceId,
+    ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, ScopeRef, Timestamp, WorkspaceId,
 };
 
-use crate::{EntropySource, IamError};
+use crate::{EntropySource, IamError, PolicySet, RoleBinding, RoleId};
 
 /// Scheme marker every rendered token carries, before the `<prefix>.<secret>`
 /// body, so a presented credential is recognizable and unambiguously parsed.
@@ -54,6 +54,12 @@ const SALT_BYTES: usize = 16;
 
 /// Request to mint a new API token.
 ///
+/// A key holds no per-key scope: minting names the `workspace` the key belongs
+/// to and the `role` it holds there, and the minter writes both the credential
+/// and the workspace-scoped [`RoleBinding`] in one step (ADR-0008 decision 4).
+/// The caller chooses `role` — in the product, the creating member's workspace
+/// role — and that defaulting lives with the caller.
+///
 /// `created_at`/`expires_at` follow the rest of the contract: time math lives
 /// with the caller as canonical RFC 3339 strings. `expires_at` is optional — a
 /// token without one never expires and lives until revoked — but when present it
@@ -64,10 +70,12 @@ pub struct MintApiToken {
     pub id: ApiTokenId,
     /// Principal the token authenticates as.
     pub principal: PrincipalRef,
-    /// Workspace the token is bound to for credential attribution (usage and
-    /// rate-limit accounting). It is not the token's authority; that flows from
-    /// the principal's role bindings through the policy engine.
+    /// Workspace the key belongs to: its credential attribution and the scope
+    /// at which its [`RoleBinding`] is written.
     pub workspace: WorkspaceId,
+    /// Workspace role the key holds; bound to `principal` at `workspace` so the
+    /// key's authority flows through [`PolicySet::evaluate`] like any account.
+    pub role: RoleId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
     /// Optional expiration timestamp; must be strictly after `created_at`.
@@ -99,8 +107,16 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         Self { entropy }
     }
 
-    /// Mint a token, persist its argon2id hash, and return the one-time
-    /// cleartext credential.
+    /// Mint a token, persist its argon2id hash, bind its workspace role, and
+    /// return the one-time cleartext credential.
+    ///
+    /// The credential and the [`RoleBinding`] are written in one step: the row
+    /// lands in `directory` and a binding of the token's principal to
+    /// `request.role` at `Workspace { workspace }` lands in `policy`, so the
+    /// key's authority flows through [`PolicySet::evaluate`] with no per-key
+    /// scope and no side path (ADR-0008 decisions 3 and 4). The binding is only
+    /// written once the credential persists, so a rejected mint leaves no
+    /// dangling authority.
     ///
     /// Fails with [`IamError::InvalidApiTokenWindow`] when an expiry is not
     /// strictly after creation, or with the duplicate errors from
@@ -108,6 +124,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
     pub fn mint(
         &mut self,
         directory: &mut ApiTokenDirectory,
+        policy: &mut PolicySet,
         request: MintApiToken,
     ) -> Result<IssuedApiToken, IamError> {
         if let Some(expires_at) = &request.expires_at
@@ -126,15 +143,23 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         let token = ApiToken {
             id: request.id,
             prefix: ApiTokenPrefix(prefix.clone()),
-            principal: request.principal,
+            principal: request.principal.clone(),
             secret_hash,
-            workspace: request.workspace,
+            workspace: request.workspace.clone(),
             created_at: request.created_at,
             expires_at: request.expires_at,
             revoked_at: None,
         };
 
         directory.create(token.clone())?;
+
+        policy.bind_role(RoleBinding {
+            principal: request.principal,
+            role: request.role,
+            scope: ScopeRef::Workspace {
+                workspace_id: request.workspace,
+            },
+        });
 
         Ok(IssuedApiToken {
             token,
@@ -154,10 +179,9 @@ impl<E: EntropySource> ApiTokenMinter<E> {
 ///
 /// A token is indexed by its public prefix (for presented-credential lookup) and
 /// by its id (for management operations like revoke). Authentication verifies
-/// the secret against the stored argon2id hash and applies liveness; a token
-/// carries no per-key authority, so there is no scope enforcement here —
-/// authorization flows from the principal's role bindings through the policy
-/// engine (ADR-0008 decision 3).
+/// the secret against the stored argon2id hash and applies liveness; there is no
+/// per-key authorization path — an authenticated key's authority is resolved by
+/// [`PolicySet::evaluate`] from its principal's role bindings (ADR-0008).
 #[derive(Debug, Default)]
 pub struct ApiTokenDirectory {
     by_prefix: HashMap<ApiTokenPrefix, ApiToken>,
@@ -333,6 +357,7 @@ mod tests {
                 service_id: "ci".into(),
             },
             workspace: WorkspaceId("wrkspc_default".into()),
+            role: RoleId("workspace_developer".into()),
             created_at: Timestamp("2026-06-19T00:00:00Z".into()),
             expires_at: expires_at.map(|value| Timestamp(value.into())),
         }
@@ -342,10 +367,12 @@ mod tests {
     fn mint_persists_only_a_hash_and_returns_cleartext_once() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
 
         let issued = minter
             .mint(
                 &mut directory,
+                &mut policy,
                 mint_request("tok_1", Some("2026-07-19T00:00:00Z")),
             )
             .unwrap();
@@ -388,8 +415,9 @@ mod tests {
     fn authenticate_round_trips_a_freshly_minted_token() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let issued = minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
 
         let live = directory
@@ -408,11 +436,68 @@ mod tests {
     }
 
     #[test]
+    fn mint_binds_the_workspace_role_so_the_key_authorizes_through_the_engine() {
+        use awaken_iam_contract::{ActionKey, AuthorizationDecision, AuthorizationRequest};
+
+        use crate::{ActionPattern, Effect, Grant, GrantId, GrantSubject};
+
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+
+        // The workspace_developer role may publish in the key's workspace.
+        policy.add_grant(Grant {
+            id: GrantId("g_dev".into()),
+            subject: GrantSubject::Role(RoleId("workspace_developer".into())),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Workspace {
+                workspace_id: WorkspaceId("wrkspc_default".into()),
+            },
+            effect: Effect::Allow,
+        });
+
+        // Minting writes the credential and the workspace-scoped role binding in
+        // one step; no per-key scope is attached.
+        minter
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
+            .unwrap();
+
+        let principal = PrincipalRef::Service {
+            service_id: "ci".into(),
+        };
+        let workspace = ScopeRef::Workspace {
+            workspace_id: WorkspaceId("wrkspc_default".into()),
+        };
+
+        // Authority flows through the engine via the bound role — no side path.
+        let allowed = policy.evaluate(&AuthorizationRequest::direct(
+            principal.clone(),
+            ActionKey("pack.publish".into()),
+            workspace.clone(),
+        ));
+        assert_eq!(allowed.decision, AuthorizationDecision::Allow);
+        assert_eq!(
+            allowed.matched_roles,
+            vec![RoleId("workspace_developer".into())]
+        );
+
+        // Guardrail: an action the role does not cover stays denied by default —
+        // the key holds no authority of its own.
+        let denied = policy.evaluate(&AuthorizationRequest::direct(
+            principal,
+            ActionKey("pack.delete".into()),
+            workspace,
+        ));
+        assert_eq!(denied.decision, AuthorizationDecision::Deny);
+    }
+
+    #[test]
     fn unknown_prefix_and_wrong_secret_fail_closed_identically() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let issued = minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
         let now = Timestamp("2026-06-19T06:00:00Z".into());
 
@@ -436,9 +521,11 @@ mod tests {
     fn expired_token_fails_closed() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let issued = minter
             .mint(
                 &mut directory,
+                &mut policy,
                 mint_request("tok_1", Some("2026-06-20T00:00:00Z")),
             )
             .unwrap();
@@ -458,8 +545,9 @@ mod tests {
     fn revocation_is_idempotent_and_blocks_authentication() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let issued = minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
         let now = Timestamp("2026-06-19T06:00:00Z".into());
 
@@ -505,9 +593,11 @@ mod tests {
     fn mint_rejects_a_non_forward_expiry_window() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let err = minter
             .mint(
                 &mut directory,
+                &mut policy,
                 mint_request("tok_1", Some("2026-06-19T00:00:00Z")),
             )
             .unwrap_err();
@@ -524,11 +614,12 @@ mod tests {
     fn create_rejects_a_duplicate_id() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
         let err = minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap_err();
         assert_eq!(
             err,
@@ -542,11 +633,12 @@ mod tests {
     fn list_for_principal_orders_by_id() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         minter
-            .mint(&mut directory, mint_request("tok_2", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_2", None))
             .unwrap();
         minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
 
         let principal = PrincipalRef::Service {
