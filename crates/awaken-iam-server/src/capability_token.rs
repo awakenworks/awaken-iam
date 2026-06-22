@@ -176,7 +176,7 @@ pub enum CapabilityError {
 }
 
 /// Mint a root capability token signed by the authority's active key.
-pub fn mint_capability(
+pub async fn mint_capability(
     authority: &AccessTokenAuthority,
     request: MintCapability,
 ) -> Result<String, CapabilityError> {
@@ -195,7 +195,7 @@ pub fn mint_capability(
         parent: None,
         obligation: request.obligation,
     };
-    Ok(authority.sign_jwt(CAPABILITY_TYP, &claims)?)
+    Ok(authority.sign_jwt(CAPABILITY_TYP, &claims).await?)
 }
 
 /// Derive an attenuated child capability from a presented `parent_token`.
@@ -206,7 +206,7 @@ pub fn mint_capability(
 /// subset and expiry no later than the parent's — and the child inherits the
 /// parent's issuer, audience, and epoch. The child is signed afresh by the
 /// authority and records the parent's `jti`.
-pub fn attenuate(
+pub async fn attenuate(
     authority: &AccessTokenAuthority,
     parent_token: &str,
     current_epoch: LeaseEpoch,
@@ -250,7 +250,7 @@ pub fn attenuate(
         // approval binding is inherited unchanged down the delegation chain.
         obligation: parent.obligation,
     };
-    Ok(authority.sign_jwt(CAPABILITY_TYP, &child)?)
+    Ok(authority.sign_jwt(CAPABILITY_TYP, &child).await?)
 }
 
 /// Verify a presented capability token against `check`, returning its claims.
@@ -308,10 +308,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn root_capability_verifies_against_published_jwks() {
+    #[tokio::test]
+    async fn root_capability_verifies_against_published_jwks() {
         let authority = authority();
-        let token = mint_capability(&authority, root_request()).unwrap();
+        let token = mint_capability(&authority, root_request()).await.unwrap();
 
         let claims = verify_capability(
             &token,
@@ -325,10 +325,10 @@ mod tests {
         assert_eq!(claims.epoch, LeaseEpoch::initial());
     }
 
-    #[test]
-    fn attenuation_narrows_scope_and_records_the_parent() {
+    #[tokio::test]
+    async fn attenuation_narrows_scope_and_records_the_parent() {
         let authority = authority();
-        let parent = mint_capability(&authority, root_request()).unwrap();
+        let parent = mint_capability(&authority, root_request()).await.unwrap();
 
         let child = attenuate(
             &authority,
@@ -343,6 +343,7 @@ mod tests {
                 sub: Some("sandbox-child".into()),
             },
         )
+        .await
         .unwrap();
 
         let claims = verify_capability(
@@ -358,8 +359,8 @@ mod tests {
         assert!(claims.exp <= root_request().exp);
     }
 
-    #[test]
-    fn capability_binds_to_an_obligation_and_a_child_inherits_it() {
+    #[tokio::test]
+    async fn capability_binds_to_an_obligation_and_a_child_inherits_it() {
         let authority = authority();
         // A capability minted to discharge a RequireApproval decision carries the
         // obligation id, so presenting the token is the approval — no re-query.
@@ -370,6 +371,7 @@ mod tests {
                 ..root_request()
             },
         )
+        .await
         .unwrap();
         let claims = verify_capability(
             &bound,
@@ -393,6 +395,7 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap();
         let child_claims = verify_capability(
             &child,
@@ -403,7 +406,7 @@ mod tests {
         assert_eq!(child_claims.obligation.as_deref(), Some("obl_2f9c1a"));
 
         // A capability not tied to an approval carries no obligation binding.
-        let unbound = mint_capability(&authority, root_request()).unwrap();
+        let unbound = mint_capability(&authority, root_request()).await.unwrap();
         let unbound_claims = verify_capability(
             &unbound,
             &authority.jwks(),
@@ -413,10 +416,10 @@ mod tests {
         assert!(unbound_claims.obligation.is_none());
     }
 
-    #[test]
-    fn attenuation_cannot_widen_scope_or_extend_expiry() {
+    #[tokio::test]
+    async fn attenuation_cannot_widen_scope_or_extend_expiry() {
         let authority = authority();
-        let parent = mint_capability(&authority, root_request()).unwrap();
+        let parent = mint_capability(&authority, root_request()).await.unwrap();
 
         // A scope the parent does not hold is refused.
         let widened = attenuate(
@@ -432,6 +435,7 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap_err();
         assert_eq!(widened, CapabilityError::ScopeNotSubset);
 
@@ -449,14 +453,15 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap_err();
         assert_eq!(extended, CapabilityError::ExpiryNotBounded);
     }
 
-    #[test]
-    fn a_lease_epoch_change_invalidates_outstanding_tokens() {
+    #[tokio::test]
+    async fn a_lease_epoch_change_invalidates_outstanding_tokens() {
         let authority = authority();
-        let token = mint_capability(&authority, root_request()).unwrap();
+        let token = mint_capability(&authority, root_request()).await.unwrap();
         let jwks = authority.jwks();
 
         // Valid at the epoch it was minted under.
@@ -486,14 +491,15 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap_err();
         assert_eq!(err, CapabilityError::EpochFenced);
     }
 
-    #[test]
-    fn audience_and_expiry_are_enforced() {
+    #[tokio::test]
+    async fn audience_and_expiry_are_enforced() {
         let authority = authority();
-        let token = mint_capability(&authority, root_request()).unwrap();
+        let token = mint_capability(&authority, root_request()).await.unwrap();
         let jwks = authority.jwks();
 
         let wrong_aud = verify_capability(
@@ -518,10 +524,10 @@ mod tests {
         assert_eq!(expired, CapabilityError::Expired);
     }
 
-    #[test]
-    fn a_capability_token_is_not_accepted_as_an_access_token() {
+    #[tokio::test]
+    async fn a_capability_token_is_not_accepted_as_an_access_token() {
         let authority = authority();
-        let token = mint_capability(&authority, root_request()).unwrap();
+        let token = mint_capability(&authority, root_request()).await.unwrap();
 
         // The shared key signs both families, but the `typ` fence keeps a
         // capability token from being replayed at an access-token verifier.
@@ -535,10 +541,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_tampered_capability_fails_the_signature_check() {
+    #[tokio::test]
+    async fn a_tampered_capability_fails_the_signature_check() {
         let authority = authority();
-        let token = mint_capability(&authority, root_request()).unwrap();
+        let token = mint_capability(&authority, root_request()).await.unwrap();
         let jwks = authority.jwks();
 
         // Flipping the last byte of the signature breaks verification.
@@ -555,7 +561,7 @@ mod tests {
 
         // A capability minted by a different key does not verify here.
         let other = AccessTokenAuthority::new(LocalSeedSigner::new("cap-key-1", [3u8; 32]));
-        let forged = mint_capability(&other, root_request()).unwrap();
+        let forged = mint_capability(&other, root_request()).await.unwrap();
         let err = verify_capability(
             &forged,
             &jwks,
@@ -571,15 +577,15 @@ mod tests {
         let mut bad = root_request();
         bad.exp = bad.iat;
         assert_eq!(
-            mint_capability(&authority, bad).unwrap_err(),
+            mint_capability(&authority, bad).await.unwrap_err(),
             CapabilityError::InvalidWindow
         );
     }
 
-    #[test]
-    fn attenuation_can_be_chained_transitively() {
+    #[tokio::test]
+    async fn attenuation_can_be_chained_transitively() {
         let authority = authority();
-        let parent = mint_capability(&authority, root_request()).unwrap();
+        let parent = mint_capability(&authority, root_request()).await.unwrap();
 
         let child = attenuate(
             &authority,
@@ -594,6 +600,7 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap();
 
         // The grandchild narrows further and stays within the child's bound.
@@ -610,6 +617,7 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap();
 
         let claims = verify_capability(
@@ -635,6 +643,7 @@ mod tests {
                 sub: None,
             },
         )
+        .await
         .unwrap_err();
         assert_eq!(err, CapabilityError::ScopeNotSubset);
     }

@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use awaken_iam_contract::{JsonWebKey, Jwks};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -56,20 +57,24 @@ const SIG_BYTES: usize = 64;
 ///
 /// `Send + Sync` so an authority holding boxed signers can back a shared,
 /// concurrently-served auth API.
+#[async_trait]
 pub trait Signer: Send + Sync {
     /// The key id stamped into the JWT header and published in the JWKS, so a
     /// verifier can select this key and rotation can target it.
     fn kid(&self) -> &str;
 
     /// The public half of this key as a JWK, for `/.well-known/jwks.json`
-    /// publication. Must never expose private material.
+    /// publication. Must never expose private material. Synchronous because the
+    /// public key is fetched once when the signer is built and cached, so JWKS
+    /// publication never reaches across the (possibly remote) signer boundary.
     fn public_jwk(&self) -> JsonWebKey;
 
     /// Produce the detached `EdDSA` (Ed25519) signature over `message` — the
     /// JWT's `header.payload` signing input. Returns the raw 64-byte signature.
-    /// A KMS-backed signer surfaces transport/permission failures as
+    /// Async so a KMS/HSM-backed signer can do a remote round-trip without
+    /// blocking the runtime; it surfaces transport/permission failures as
     /// [`SignerError`].
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError>;
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError>;
 }
 
 /// Failure raised by a [`Signer`] that could not produce a signature — e.g. a
@@ -117,6 +122,7 @@ impl LocalSeedSigner {
     }
 }
 
+#[async_trait]
 impl Signer for LocalSeedSigner {
     fn kid(&self) -> &str {
         &self.kid
@@ -126,7 +132,7 @@ impl Signer for LocalSeedSigner {
         ed25519_public_jwk(self.kid.clone(), self.signing.verifying_key().to_bytes())
     }
 
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
         let signature: Signature = self.signing.sign(message);
         Ok(signature.to_bytes().to_vec())
     }
@@ -276,8 +282,8 @@ impl AccessTokenAuthority {
     }
 
     /// Mint a signed access token for `claims` using the active key.
-    pub fn mint(&self, claims: &AccessTokenClaims) -> Result<String, AccessTokenError> {
-        self.sign_jwt(ACCESS_TOKEN_TYP, claims)
+    pub async fn mint(&self, claims: &AccessTokenClaims) -> Result<String, AccessTokenError> {
+        self.sign_jwt(ACCESS_TOKEN_TYP, claims).await
     }
 
     /// Sign an arbitrary claim set as a compact JWT under the active key.
@@ -287,7 +293,7 @@ impl AccessTokenAuthority {
     /// access token cannot be replayed where a capability token is expected and
     /// vice versa. Both families share the active signing key and JWKS so a single
     /// rotation/prune covers every token IAM issues.
-    pub(crate) fn sign_jwt<T: Serialize>(
+    pub(crate) async fn sign_jwt<T: Serialize>(
         &self,
         typ: &str,
         claims: &T,
@@ -301,6 +307,7 @@ impl AccessTokenAuthority {
         let signing_input = format!("{}.{}", encode_part(&header)?, encode_part(claims)?);
         let signature = active
             .sign(signing_input.as_bytes())
+            .await
             .map_err(|err| AccessTokenError::SigningFailed(err.0))?;
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
         Ok(format!("{signing_input}.{sig_b64}"))
@@ -316,8 +323,8 @@ impl AccessTokenAuthority {
     /// STS in an RFC 8693 token-exchange contract test. Verify the result with
     /// [`verify_signed_claims`], which checks the signature without asserting a
     /// particular `typ`.
-    pub fn sign_claims<T: Serialize>(&self, claims: &T) -> Result<String, AccessTokenError> {
-        self.sign_jwt("JWT", claims)
+    pub async fn sign_claims<T: Serialize>(&self, claims: &T) -> Result<String, AccessTokenError> {
+        self.sign_jwt("JWT", claims).await
     }
 }
 
@@ -595,6 +602,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Signer for ExternalSigner {
         fn kid(&self) -> &str {
             &self.kid
@@ -604,7 +612,7 @@ mod tests {
             ed25519_public_jwk(self.kid.clone(), self.backing.verifying_key().to_bytes())
         }
 
-        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+        async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
             if self.fail {
                 return Err(SignerError("kms unreachable".into()));
             }
@@ -612,15 +620,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_externally_supplied_signer_can_be_injected_and_verifies() {
+    #[tokio::test]
+    async fn an_externally_supplied_signer_can_be_injected_and_verifies() {
         // Stand in for a KMS: an out-of-module signer the authority only ever
         // reaches through the trait. Inject through the dynamic-dispatch seam.
         let kms = ExternalSigner::new("kms-key-1", 42);
         let authority = AccessTokenAuthority::from_signer(Box::new(kms));
         assert_eq!(authority.active_kid(), "kms-key-1");
 
-        let token = authority.mint(&claims("jti-kms")).unwrap();
+        let token = authority.mint(&claims("jti-kms")).await.unwrap();
         let header: JwtHeader = decode_part(token.split('.').next().unwrap()).unwrap();
         assert_eq!(header.kid, "kms-key-1");
 
@@ -630,40 +638,40 @@ mod tests {
         assert_eq!(recovered, claims("jti-kms"));
     }
 
-    #[test]
-    fn a_signer_failure_surfaces_as_signing_failed() {
+    #[tokio::test]
+    async fn a_signer_failure_surfaces_as_signing_failed() {
         // A KMS that rejects the request must fail the mint closed, not panic.
         let failing = ExternalSigner::failing("kms-down", 1);
         let authority = AccessTokenAuthority::from_signer(Box::new(failing));
 
-        let err = authority.mint(&claims("jti-1")).unwrap_err();
+        let err = authority.mint(&claims("jti-1")).await.unwrap_err();
         assert_eq!(
             err,
             AccessTokenError::SigningFailed("kms unreachable".into())
         );
     }
 
-    #[test]
-    fn an_external_signer_can_be_rotated_in() {
+    #[tokio::test]
+    async fn an_external_signer_can_be_rotated_in() {
         // A seed signer in dev, rotated to a KMS-style signer — the published set
         // keeps both verifiable until the old one is pruned.
         let mut authority = AccessTokenAuthority::new(LocalSeedSigner::new("seed-key", seed(5)));
-        let old = authority.mint(&claims("jti-old")).unwrap();
+        let old = authority.mint(&claims("jti-old")).await.unwrap();
 
         let kms = ExternalSigner::new("kms-key", 99);
         authority.rotate_signer(Box::new(kms));
         assert_eq!(authority.active_kid(), "kms-key");
 
-        let new = authority.mint(&claims("jti-new")).unwrap();
+        let new = authority.mint(&claims("jti-new")).await.unwrap();
         let jwks = authority.jwks();
         verify_access_token(&old, &jwks).unwrap();
         verify_access_token(&new, &jwks).unwrap();
     }
 
-    #[test]
-    fn token_is_asymmetric_and_verifies_against_published_jwks() {
+    #[tokio::test]
+    async fn token_is_asymmetric_and_verifies_against_published_jwks() {
         let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(7)));
-        let token = authority.mint(&claims("jti-1")).unwrap();
+        let token = authority.mint(&claims("jti-1")).await.unwrap();
 
         // The header carries alg + kid; three base64url segments.
         assert_eq!(token.split('.').count(), 3);
@@ -686,10 +694,10 @@ mod tests {
         assert_eq!(recovered, claims("jti-1"));
     }
 
-    #[test]
-    fn a_tampered_payload_fails_closed() {
+    #[tokio::test]
+    async fn a_tampered_payload_fails_closed() {
         let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(3)));
-        let token = authority.mint(&claims("jti-1")).unwrap();
+        let token = authority.mint(&claims("jti-1")).await.unwrap();
         let jwks = authority.jwks();
 
         // Swap the payload for a forged one while keeping the original signature.
@@ -702,10 +710,10 @@ mod tests {
         assert_eq!(err, AccessTokenError::SignatureInvalid);
     }
 
-    #[test]
-    fn a_token_from_a_different_key_does_not_verify() {
+    #[tokio::test]
+    async fn a_token_from_a_different_key_does_not_verify() {
         let mint_authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(1)));
-        let token = mint_authority.mint(&claims("jti-1")).unwrap();
+        let token = mint_authority.mint(&claims("jti-1")).await.unwrap();
 
         // A different authority publishes a different key under the same kid.
         let other = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(2)));
@@ -713,15 +721,15 @@ mod tests {
         assert_eq!(err, AccessTokenError::SignatureInvalid);
     }
 
-    #[test]
-    fn rotation_keeps_old_tokens_verifiable_until_pruned() {
+    #[tokio::test]
+    async fn rotation_keeps_old_tokens_verifiable_until_pruned() {
         let mut authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(10)));
-        let old_token = authority.mint(&claims("jti-old")).unwrap();
+        let old_token = authority.mint(&claims("jti-old")).await.unwrap();
 
         // Rotate: new tokens use the fresh key, but the old key stays published.
         authority.rotate(LocalSeedSigner::new("key-2", seed(20)));
         assert_eq!(authority.active_kid(), "key-2");
-        let new_token = authority.mint(&claims("jti-new")).unwrap();
+        let new_token = authority.mint(&claims("jti-new")).await.unwrap();
         let new_header: JwtHeader = decode_part(new_token.split('.').next().unwrap()).unwrap();
         assert_eq!(new_header.kid, "key-2");
 
@@ -745,10 +753,10 @@ mod tests {
         verify_access_token(&new_token, &pruned).unwrap();
     }
 
-    #[test]
-    fn a_revoked_jti_fails_closed_even_with_a_valid_signature() {
+    #[tokio::test]
+    async fn a_revoked_jti_fails_closed_even_with_a_valid_signature() {
         let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(9)));
-        let token = authority.mint(&claims("jti-1")).unwrap();
+        let token = authority.mint(&claims("jti-1")).await.unwrap();
         let jwks = authority.jwks();
 
         // Unrevoked: the token verifies against the denylist-aware path.
@@ -772,10 +780,10 @@ mod tests {
         verify_active_access_token(&token, &jwks, &revocations).unwrap();
     }
 
-    #[test]
-    fn unknown_kid_and_foreign_alg_fail_closed() {
+    #[tokio::test]
+    async fn unknown_kid_and_foreign_alg_fail_closed() {
         let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(5)));
-        let token = authority.mint(&claims("jti-1")).unwrap();
+        let token = authority.mint(&claims("jti-1")).await.unwrap();
 
         let empty = Jwks { keys: vec![] };
         assert_eq!(

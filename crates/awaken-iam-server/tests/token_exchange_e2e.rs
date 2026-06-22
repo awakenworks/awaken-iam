@@ -46,7 +46,7 @@ fn federated() -> (AuthApi, AccessTokenAuthority) {
     (api, issuer)
 }
 
-fn assertion(issuer: &AccessTokenAuthority, aud: &str) -> String {
+async fn assertion(issuer: &AccessTokenAuthority, aud: &str) -> String {
     issuer
         .sign_claims(&UpstreamClaims {
             iss: ISSUER.into(),
@@ -54,6 +54,7 @@ fn assertion(issuer: &AccessTokenAuthority, aud: &str) -> String {
             aud: aud.into(),
             exp: 2_000,
         })
+        .await
         .unwrap()
 }
 
@@ -68,11 +69,12 @@ fn request(subject_token: String) -> TokenExchangeRequest {
     }
 }
 
-#[test]
-fn exchange_mints_an_iam_token_for_the_bound_service_principal() {
+#[tokio::test]
+async fn exchange_mints_an_iam_token_for_the_bound_service_principal() {
     let (mut api, issuer) = federated();
     let response = api
-        .exchange_token(request(assertion(&issuer, IAM_ISSUER)))
+        .exchange_token(request(assertion(&issuer, IAM_ISSUER).await))
+        .await
         .unwrap();
 
     // The issued token authenticates the bound service principal with its
@@ -104,13 +106,14 @@ fn exchange_mints_an_iam_token_for_the_bound_service_principal() {
     )));
 }
 
-#[test]
-fn exchange_rejects_an_untrusted_assertion_and_audits_it() {
+#[tokio::test]
+async fn exchange_rejects_an_untrusted_assertion_and_audits_it() {
     let (mut api, issuer) = federated();
     // Same issuer id, but the assertion targets an audience IAM does not
     // accept, so it must fail closed and emit no token.
     let err = api
-        .exchange_token(request(assertion(&issuer, "https://wrong.example")))
+        .exchange_token(request(assertion(&issuer, "https://wrong.example").await))
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
