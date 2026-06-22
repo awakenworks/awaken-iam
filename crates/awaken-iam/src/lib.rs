@@ -9,7 +9,7 @@ pub use awaken_iam_contract::{
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProjectId, ScopeRef, Session,
     SessionId, Timestamp, WorkspaceId,
 };
-pub use awaken_iam_core::{IamCore, IamError, IdentityDirectory};
+pub use awaken_iam_core::{IamCore, IamError, IdentityDirectory, SessionDirectory};
 pub use awaken_iam_server::IamServer;
 
 #[cfg(test)]

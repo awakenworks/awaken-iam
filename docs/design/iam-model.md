@@ -136,6 +136,12 @@ login uses the same model: the fake provider emits a deterministic provider key
 and subject, then IAM resolves that provider+subject to the linked account and
 creates a session.
 
+The login loop carries two invariants. An `OAuthLoginState` challenge is
+single-use: it is started once and consumed at most once, and an expired
+challenge cannot be consumed. A `Session` authenticates only while it is
+unrevoked and unexpired; revocation is idempotent. These rules are enforced
+independently of the mutable claims carried by the identity.
+
 ## ScopeRef
 
 Scopes are product/platform authorization targets.
