@@ -1,0 +1,27 @@
+name: Guardrail lints
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: guardrail-lints-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guardrails:
+    name: Mechanical guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Self-check enforcers
+        run: cargo run -p xtask -- guardrail-lints --self-check
+      - name: Enforce guardrails
+        run: cargo run -p xtask -- guardrail-lints

@@ -1,0 +1,17 @@
+[package]
+name = "awaken-iam-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+awaken-iam-contract.workspace = true
+awaken-iam-core.workspace = true
+awaken-iam-client.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,56 @@
+# Git hooks, installed via `pnpm hooks:install`.
+#
+# Two layers of enforcement:
+#   - xtask  : semantic / dependency guardrails (Rust)
+#   - scripts/ci : text governance checks (Python)
+
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: cargo fmt --all
+      stage_fixed: true
+    secrets:
+      run: python3 scripts/ci/check_secrets.py {staged_files}
+    doc-links:
+      glob: "*.md"
+      run: python3 scripts/ci/check_doc_links.py {staged_files}
+    root-docs:
+      run: python3 scripts/ci/check_root_docs.py {staged_files}
+    hidden-unicode:
+      run: python3 scripts/ci/check_hidden_unicode.py {staged_files}
+    file-length:
+      run: python3 scripts/ci/check_file_length.py --staged
+    open-core-boundary:
+      run: python3 scripts/ci/check_open_core_boundary.py --staged
+    adr:
+      glob: "docs/adr/*.md"
+      run: python3 scripts/ci/check_adr.py {staged_files}
+    adr-immutability:
+      glob: "docs/adr/*.md"
+      run: python3 scripts/ci/check_adr_immutability.py --self-test && python3 scripts/ci/check_adr_immutability.py --staged
+
+pre-push:
+  parallel: false
+  commands:
+    clippy:
+      run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+    guardrails:
+      run: cargo run -p xtask -- guardrail-lints
+    file-length:
+      run: python3 scripts/ci/check_file_length.py --self-test && python3 scripts/ci/check_file_length.py
+    adr-immutability:
+      run: python3 scripts/ci/check_adr_immutability.py --base origin/main
+    test:
+      run: cargo test --workspace
+
+commit-msg:
+  commands:
+    commit-shape:
+      run: python3 scripts/ci/check_commit_shape.py {1}
+
+post-rewrite:
+  commands:
+    commit-shape:
+      run: 'true # rebased commits are validated on the next push'
