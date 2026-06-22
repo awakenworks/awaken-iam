@@ -541,8 +541,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 },
                 Migration {
                     id: "0002_directory",
-                    id: "0002_fence",
                     up_sql: AUTHZ_0002,
+                },
+                Migration {
+                    id: "0003_fence",
+                    up_sql: AUTHZ_0003,
                 },
             ],
         },
@@ -695,7 +698,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_roles (\
 // holds both counters; a grant/role/membership change bumps `version` and a
 // revoke bumps `epoch`, each in the same transaction as the write it fences. No
 // FK crosses into another bundle. See high-availability.md.
-const AUTHZ_0002: &str = "\
+const AUTHZ_0003: &str = "\
 CREATE TABLE IF NOT EXISTS {prefix}_fence (\
  id INTEGER PRIMARY KEY, \
  version BIGINT NOT NULL DEFAULT 1, \
@@ -947,7 +950,7 @@ mod tests {
         // a hopeful ready over a ledger it can no longer trust.
         store
             .pool_mut()
-            .force_checksum("iam.authz", "0002_fence", "deadbeef");
+            .force_checksum("iam.authz", "0003_fence", "deadbeef");
         assert!(!store.migrations_applied().expect("probe"));
     }
 }

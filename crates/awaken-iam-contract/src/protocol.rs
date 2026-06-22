@@ -14,10 +14,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId, OrgId,
-    PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
     ActionKey, AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId,
-    OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef, WorkspaceId,
+    OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
 };
 
 /// The authority empowered to discharge a require-approval obligation.
@@ -340,6 +338,8 @@ pub struct SignerSetSnapshot {
     pub version: u64,
     /// Active signer keys, ordered by key id for a deterministic sequence.
     pub signers: Vec<SignerKey>,
+}
+
 /// The grant/edge effect of creating one product resource, propagated to IAM so
 /// the authorization plane stays consistent with the consumer's domain row.
 ///
@@ -539,6 +539,9 @@ mod tests {
         assert_eq!(parsed, snapshot);
         // The version fence is carried so a consumer can cache behind it.
         assert_eq!(parsed.version, 9);
+    }
+
+    #[test]
     fn resource_model_registration_round_trips_through_json() {
         let registration = ResourceModelRegistration {
             resource_types: vec![ResourceTypeRegistration {
@@ -551,6 +554,34 @@ mod tests {
             }],
             actions: vec![ActionKey("issue.assign".into())],
             edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Namespace {
+                    namespace_id: NamespaceId("acme".into()),
+                },
+            }],
+        };
+        let json = serde_json::to_string(&registration).unwrap();
+        let parsed: ResourceModelRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, registration);
+
+        let registered = ResourceModelRegistered { version: 7 };
+        let json = serde_json::to_string(&registered).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResourceModelRegistered>(&json).unwrap(),
+            registered
+        );
+    }
+
+    #[test]
+    fn resource_model_registration_defaults_empty_fields() {
+        // A consumer may register only edges (or only types); omitted arrays
+        // default to empty rather than failing to deserialize.
+        let parsed: ResourceModelRegistration = serde_json::from_str(r#"{"edges":[]}"#).unwrap();
+        assert_eq!(parsed, ResourceModelRegistration::default());
+    }
+
+    #[test]
     fn resource_provision_round_trips_through_json() {
         let provision = ResourceProvision {
             idempotency_key: "issue:42".into(),
@@ -577,27 +608,12 @@ mod tests {
                 },
             }],
         };
-        let json = serde_json::to_string(&registration).unwrap();
-        let parsed: ResourceModelRegistration = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, registration);
-
-        let registered = ResourceModelRegistered { version: 7 };
-        let json = serde_json::to_string(&registered).unwrap();
-        assert_eq!(
-            serde_json::from_str::<ResourceModelRegistered>(&json).unwrap(),
-            registered
-        );
-    }
-
-    #[test]
-    fn resource_model_registration_defaults_empty_fields() {
-        // A consumer may register only edges (or only types); omitted arrays
-        // default to empty rather than failing to deserialize.
-        let parsed: ResourceModelRegistration = serde_json::from_str(r#"{"edges":[]}"#).unwrap();
-        assert_eq!(parsed, ResourceModelRegistration::default());
         let json = serde_json::to_string(&provision).unwrap();
         let parsed: ResourceProvision = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, provision);
+    }
+
+    #[test]
     fn snapshot_without_group_fields_defaults_to_empty() {
         // A snapshot minted before groups became a subject omits the new fields;
         // it must still deserialize, with empty group rosters and bindings.

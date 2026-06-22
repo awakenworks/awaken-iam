@@ -25,12 +25,12 @@ use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    NamespaceId, PolicySnapshot, SignerSetSnapshot,
+    NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+    SignerSetSnapshot,
 };
-use awaken_iam_core::{EntitlementEngine, IamCore, NamespaceTrustDirectory, PolicySet};
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+use awaken_iam_core::{
+    EntitlementEngine, IamCore, NamespaceTrustDirectory, PolicySet, ResourceModel,
 };
-use awaken_iam_core::{EntitlementEngine, IamCore, PolicySet, ResourceModel};
 
 /// Authorization/entitlement protocol surface over an in-process [`IamCore`],
 /// [`EntitlementEngine`], and namespace [`NamespaceTrustDirectory`].

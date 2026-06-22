@@ -278,6 +278,8 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
     /// reconstructing the server and discarding issued codes.
     pub fn register_client(&mut self, client: RegisteredClient) {
         self.registry.register(client);
+    }
+
     /// Authenticate a client at the token endpoint (RFC 6749 §2.3) for a grant
     /// that does not redeem a freshly issued code — notably the `refresh_token`
     /// grant, where there is no authorization code to carry the client binding.

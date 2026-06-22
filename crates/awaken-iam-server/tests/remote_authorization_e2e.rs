@@ -13,12 +13,11 @@ use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, R
 use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId, PolicySnapshot,
-    PrincipalRef, ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
+    EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId,
+    PolicySnapshot, PrincipalRef, ResourceId, ResourceModelRegistered,
+    ResourceModelRegistration, ResourceParentEdge, ResourceType, ResourceTypeRegistration,
+    ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
     SignerKeyStatus, SignerSetSnapshot, Timestamp,
-    EntitlementDecision, EntitlementRequest, PolicySnapshot, PrincipalRef, ResourceId,
-    ResourceModelRegistered, ResourceModelRegistration, ResourceParentEdge, ResourceType,
-    ResourceTypeRegistration, ScopeRef,
 };
 use awaken_iam_core::{
     ActionPattern, Effect, EntitlementCatalog, EntitlementEngine, Grant, GrantId, GrantSubject,
@@ -122,8 +121,10 @@ impl AuthzTransport for JsonLoopbackTransport {
         if !self.online {
             return Err(RemoteError("offline".into()));
         }
-        serde_json::from_str(&serde_json::to_string(&self.api.signers(namespace_id)).unwrap())
-            .map_err(|err| RemoteError(err.to_string()))
+        serde_json::from_str(
+            &serde_json::to_string(&self.api.borrow().signers(namespace_id)).unwrap(),
+        )
+        .map_err(|err| RemoteError(err.to_string()))
     }
 }
 
@@ -285,7 +286,7 @@ fn remote_mode_fetches_signer_set_under_the_version_fence() {
         .unwrap();
     let fenced = api.signers(&namespace).version;
 
-    let client = RemoteIamClient::new(JsonLoopbackTransport { api, online: true });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::online(api));
     let set = client.fetch_signers(&namespace).unwrap();
     // Pack Hub receives the active signer set over the wire under the shared
     // version fence, so it can cache and re-sync exactly as it does the snapshot.
@@ -301,12 +302,12 @@ fn remote_mode_fetches_signer_set_under_the_version_fence() {
 
 #[test]
 fn remote_mode_signer_fetch_fails_closed_when_iam_is_unreachable() {
-    let client = RemoteIamClient::new(JsonLoopbackTransport {
-        api: publish_api(),
-        online: false,
-    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::offline(publish_api()));
     // An unreachable IAM yields a transport error, never a stale signer set.
     assert!(client.fetch_signers(&NamespaceId("acme".into())).is_err());
+}
+
+#[test]
 fn registering_a_resource_model_over_the_wire_resolves_open_scopes() {
     // A consumer teaches IAM, over the wire, that issue:42 nests under a project
     // it already holds a grant at. After registration the remote `authorize`

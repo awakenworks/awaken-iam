@@ -1115,6 +1115,9 @@ fn redeem(code: &str) -> RedeemAuthorizationCode {
         access_expires_at: 1_900_000_000,
         now: Timestamp("2026-06-19T01:01:00Z".into()),
         refresh_expires_at: Timestamp("2026-07-19T00:00:00Z".into()),
+    }
+}
+
 /// Stand up a downstream provider with a single confidential client registered
 /// for the `product.example` callback, and issue a code for `acct_ada`.
 fn op_provider_with_issued_code(
@@ -1252,12 +1255,19 @@ fn downstream_authorization_code_is_single_use() {
     api.redeem_authorization_code(redeem(&code)).unwrap();
     // Replaying the consumed code fails closed; it can never mint a second grant.
     let err = api.redeem_authorization_code(redeem(&code)).unwrap_err();
+    assert_eq!(
+        err,
+        AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)
+    );
+}
+
+#[test]
 fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
     let mut api = api();
     let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
 
     let grant = api
-        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
         .expect("redeem");
 
     // The grant carries the down-scoped set and the authenticated account.
@@ -1295,7 +1305,7 @@ fn redeeming_without_a_request_nonce_omits_the_id_token_nonce() {
     let (mut provider, issued) = op_provider_with_issued_code(None);
 
     let grant = api
-        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
         .expect("redeem");
 
     let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
@@ -1308,13 +1318,13 @@ fn a_replayed_code_fails_closed_through_the_provider() {
     let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
 
     // First redemption succeeds and consumes the single-use code.
-    api.redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+    api.redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
         .expect("first redeem");
 
     // A second redemption surfaces the provider's invalid-grant error and mints
     // nothing.
     let err = api
-        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
         .unwrap_err();
     assert_eq!(
         err,

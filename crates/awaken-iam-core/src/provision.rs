@@ -22,6 +22,7 @@
 
 use awaken_iam_contract::{GrantEffect, GrantSubjectRef, ResourceProvision};
 
+use crate::GroupId;
 use crate::authorization::{ActionPattern, Effect, Grant, GrantId, GrantSubject, RoleId};
 use crate::ports::{GrantRepo, RepoResult, ResourceModelRepo};
 use crate::resource_model::ResourceEdge;
@@ -54,6 +55,9 @@ pub fn apply_resource_provision(
                     GrantSubject::Principal(principal.clone())
                 }
                 GrantSubjectRef::Role { role_id } => GrantSubject::Role(RoleId(role_id.clone())),
+                GrantSubjectRef::Group { group_id } => {
+                    GrantSubject::Group(GroupId(group_id.clone()))
+                }
             },
             action_pattern: ActionPattern(grant.action_pattern.clone()),
             scope: grant.scope.clone(),

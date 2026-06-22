@@ -14,9 +14,7 @@ use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, R
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
-    PolicySnapshot, SignerSetSnapshot,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
-    ResourceModelRegistered, ResourceModelRegistration,
+    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
 };
 use awaken_iam_server::{
     AuthzApi, Deployment, IamAssembly, IamDaemon, RecordingExecutor, RouteSpec,

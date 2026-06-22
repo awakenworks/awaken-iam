@@ -81,6 +81,7 @@ fn parent_capability(epoch: LeaseEpoch) -> MintCapability {
             "net.fetch".into(),
             "model.invoke".into(),
         ],
+        obligation: None,
     }
 }
 
