@@ -28,12 +28,12 @@ pub use awaken_iam_core::{
     EntitlementOutcome, EntitlementProvider, EntitlementReason, EntitlementResolver, EntropySource,
     EstablishSession, GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject,
     IamCore, IamError, IdentityDirectory, IssuedAuthorizationCode, IssuedLogin, IssuedSession,
-    LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant, NamespaceTrustDirectory,
-    OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
-    OAuthClientRegistry, OAuthProviderError, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId,
-    PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient, ResourceEdge,
-    ResourceModel, ResourceTypeDef, RoleBinding, RoleId, SessionDirectory, SessionMinter,
-    ShadowAuthorizer, ShadowOutcome, ShadowReport, TokenRedemption, TrustError,
+    LicenseEntitlements, LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant,
+    NamespaceTrustDirectory, OAuthAuthorizationRequest, OAuthAuthorizationServer,
+    OAuthChallengeService, OAuthClientRegistry, OAuthProviderError, OsEntropy, PkceChallenge,
+    PkceMethod, Plan, PlanId, PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient,
+    ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding, RoleId, SessionDirectory,
+    SessionMinter, ShadowAuthorizer, ShadowOutcome, ShadowReport, TokenRedemption, TrustError,
     apply_resource_provision, hash_session_token,
 };
 pub use awaken_iam_server::{

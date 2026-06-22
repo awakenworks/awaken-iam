@@ -7,6 +7,7 @@ mod auth_api;
 mod authz_api;
 mod capability_token;
 pub mod http;
+mod license;
 mod oauth_client_admin;
 mod op_id_token;
 mod session;
@@ -32,6 +33,10 @@ pub use authz_api::AuthzApi;
 pub use capability_token::{
     AttenuateCapability, CapabilityCheck, CapabilityClaims, CapabilityError, LeaseEpoch,
     MintCapability, attenuate, mint_capability, verify_capability,
+};
+pub use license::{
+    ENV_LICENSE_FILE, ENV_LICENSE_INLINE, LicenseConfig, LicenseLoadError, LicenseRejection,
+    LicenseResolution, LicenseSource, LicenseStatus,
 };
 pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
 pub use op_id_token::{

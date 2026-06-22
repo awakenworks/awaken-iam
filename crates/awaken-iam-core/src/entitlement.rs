@@ -17,7 +17,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use awaken_iam_contract::{EntitlementDecision, EntitlementRequest, PrincipalRef};
+use awaken_iam_contract::{EntitlementDecision, EntitlementRequest, LicenseClaim, PrincipalRef};
 
 /// Identifier of a billing plan / product tier definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -218,6 +218,27 @@ pub enum EntitlementReason {
     },
     /// A remote entitlement resolver produced the decision.
     Remote,
+    /// A verified license claim entitles the requested feature/SKU key.
+    LicenseEntitles {
+        /// Feature/SKU key the claim matched.
+        feature: String,
+    },
+    /// A verified license claim is installed but does not list the requested
+    /// feature/SKU key.
+    LicenseLacksFeature {
+        /// Feature/SKU key that was absent from the claim.
+        feature: String,
+    },
+    /// The license entitles the feature, but the caller-metered usage is over the
+    /// inclusive ceiling the claim defines for it.
+    LicenseQuotaExceeded {
+        /// Feature/SKU key the ceiling applies to.
+        feature: String,
+        /// Inclusive ceiling the claim defines for the feature.
+        ceiling: u64,
+        /// Usage the caller metered and supplied.
+        observed: u64,
+    },
 }
 
 impl EntitlementReason {
@@ -231,6 +252,9 @@ impl EntitlementReason {
             EntitlementReason::NoPlanAssigned => "no_plan_assigned",
             EntitlementReason::QuotaExceeded { .. } => "quota_exceeded",
             EntitlementReason::Remote => "remote",
+            EntitlementReason::LicenseEntitles { .. } => "license_entitles",
+            EntitlementReason::LicenseLacksFeature { .. } => "license_lacks_feature",
+            EntitlementReason::LicenseQuotaExceeded { .. } => "license_quota_exceeded",
         }
     }
 }
@@ -359,6 +383,94 @@ impl EntitlementCatalog {
     }
 }
 
+/// Entitlements distilled from a verified [`LicenseClaim`] — the adapter that
+/// turns the open license document into an evaluable entitlement policy.
+///
+/// This is the consume side of the open-source licensing story: minting and
+/// signing a claim live in the closed platform, while this type reads the
+/// `features` and `limits` a verified claim carries and answers entitlement and
+/// quota questions from them. The mapping is exactly:
+///
+/// - a feature listed in `claim.features` is entitled;
+/// - `claim.limits[feature] = n` becomes an inclusive [`Quota::Limited(n)`];
+/// - a feature that is entitled but carries no limit is [`Quota::Unlimited`];
+/// - a feature absent from `claim.features` is not entitled (and has no quota).
+///
+/// The claim is principal-agnostic: a license unlocks the same feature set and
+/// ceilings for every principal in the deployment it was issued to. The caller
+/// is responsible for verifying the claim ([`LicenseClaim::verify`]) before
+/// bridging it — this type performs no signature or validity-window checks and
+/// only consumes the entitlement payload, so a cloud-issued claim and a
+/// self-hosted local-seed claim that carry the same payload apply identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseEntitlements {
+    features: BTreeSet<String>,
+    limits: BTreeMap<String, u64>,
+}
+
+impl LicenseEntitlements {
+    /// Bridge a verified license claim's entitlement payload into a policy.
+    ///
+    /// Reads only `features` and `limits`; the signature, validity window, and
+    /// epoch must already have been checked by [`LicenseClaim::verify`].
+    pub fn from_claim(claim: &LicenseClaim) -> Self {
+        Self {
+            features: claim.features.iter().cloned().collect(),
+            limits: claim.limits.clone(),
+        }
+    }
+
+    /// Whether the claim entitles the given feature/SKU key.
+    pub fn entitles(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    /// The quota for a feature/SKU key: `None` when the feature is not entitled,
+    /// [`Quota::Limited`] when the claim defines a numeric ceiling, and
+    /// [`Quota::Unlimited`] when the feature is entitled without a ceiling.
+    pub fn quota(&self, feature: &str) -> Option<Quota> {
+        if !self.entitles(feature) {
+            return None;
+        }
+        Some(match self.limits.get(feature) {
+            Some(ceiling) => Quota::Limited(*ceiling),
+            None => Quota::Unlimited,
+        })
+    }
+
+    fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
+        if self.entitles(&request.entitlement) {
+            EntitlementOutcome::allow(EntitlementReason::LicenseEntitles {
+                feature: request.entitlement.clone(),
+            })
+        } else {
+            EntitlementOutcome::deny(EntitlementReason::LicenseLacksFeature {
+                feature: request.entitlement.clone(),
+            })
+        }
+    }
+
+    fn evaluate_quota(&self, request: &EntitlementRequest, observed: u64) -> EntitlementOutcome {
+        if !self.entitles(&request.entitlement) {
+            return EntitlementOutcome::deny(EntitlementReason::LicenseLacksFeature {
+                feature: request.entitlement.clone(),
+            });
+        }
+        if let Some(&ceiling) = self.limits.get(&request.entitlement)
+            && observed > ceiling
+        {
+            return EntitlementOutcome::deny(EntitlementReason::LicenseQuotaExceeded {
+                feature: request.entitlement.clone(),
+                ceiling,
+                observed,
+            });
+        }
+        EntitlementOutcome::allow(EntitlementReason::LicenseEntitles {
+            feature: request.entitlement.clone(),
+        })
+    }
+}
+
 /// Remote entitlement seam: delegate the decision to an external service.
 ///
 /// The control plane keeps entitlement evaluation behind this trait so a
@@ -399,6 +511,8 @@ pub enum EntitlementMode {
     Local(EntitlementCatalog),
     /// Delegate to a remote entitlement service.
     Remote(Box<dyn EntitlementResolver>),
+    /// Evaluate against the entitlements a verified license claim carries.
+    License(LicenseEntitlements),
 }
 
 /// Injectable entitlement plane: the deploy-time seam every product service
@@ -509,6 +623,21 @@ impl EntitlementEngine {
         }
     }
 
+    /// Construct an engine that evaluates against a verified license claim.
+    ///
+    /// This is the claim → [`EntitlementProvider`] bridge: it maps the claim's
+    /// `features` and `limits` into the entitlement plane (see
+    /// [`LicenseEntitlements`]). The caller must verify the claim with
+    /// [`LicenseClaim::verify`] before installing the resulting engine; an
+    /// unverified or rejected claim must fall back to
+    /// [`default_allow`](EntitlementEngine::default_allow) so an unlicensed
+    /// deployment keeps full functionality.
+    pub fn from_license(claim: &LicenseClaim) -> Self {
+        Self {
+            mode: EntitlementMode::License(LicenseEntitlements::from_claim(claim)),
+        }
+    }
+
     /// The mode this engine evaluates in.
     pub fn mode(&self) -> &EntitlementMode {
         &self.mode
@@ -522,6 +651,7 @@ impl EntitlementEngine {
             }
             EntitlementMode::Local(catalog) => catalog.evaluate(request),
             EntitlementMode::Remote(resolver) => resolver.resolve(request),
+            EntitlementMode::License(license) => license.evaluate(request),
         }
     }
 
@@ -540,6 +670,7 @@ impl EntitlementEngine {
             EntitlementMode::DefaultAllow => None,
             EntitlementMode::Local(catalog) => catalog.quota_for(principal, feature),
             EntitlementMode::Remote(resolver) => resolver.quota(principal, feature),
+            EntitlementMode::License(license) => license.quota(feature),
         }
     }
 
@@ -552,6 +683,9 @@ impl EntitlementEngine {
             EntitlementMode::DefaultAllow => None,
             EntitlementMode::Local(catalog) => catalog.rate_limit_for(principal, feature),
             EntitlementMode::Remote(resolver) => resolver.rate_limit(principal, feature),
+            // A license claim carries features and numeric limits but no
+            // per-window rate definitions, so license mode imposes none.
+            EntitlementMode::License(_) => None,
         }
     }
 
@@ -573,6 +707,7 @@ impl EntitlementEngine {
             }
             EntitlementMode::Local(catalog) => catalog.evaluate_quota(request, observed_usage),
             EntitlementMode::Remote(resolver) => resolver.resolve_quota(request, observed_usage),
+            EntitlementMode::License(license) => license.evaluate_quota(request, observed_usage),
         }
     }
 }
@@ -869,6 +1004,118 @@ mod tests {
                 u64::MAX
             ),
             EntitlementOutcome::allow(EntitlementReason::Remote)
+        );
+    }
+
+    fn license_claim(features: &[&str], limits: &[(&str, u64)]) -> LicenseClaim {
+        use awaken_iam_contract::{LicenseSignature, Timestamp};
+        LicenseClaim {
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+            limits: limits.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+            issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
+            not_after: Timestamp("2026-12-01T00:00:00Z".into()),
+            epoch: 1,
+            sig: LicenseSignature {
+                kid: "lic-1".into(),
+                value: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn license_maps_features_and_limits_to_entitlement_and_quota() {
+        let claim = license_claim(
+            &["pack.publish", "model.strong_access"],
+            &[("pack.publish", 5)],
+        );
+        let engine = EntitlementEngine::from_license(&claim);
+        let who = account("acct_1");
+        assert!(matches!(engine.mode(), EntitlementMode::License(_)));
+
+        // A listed feature is entitled.
+        let allowed = engine.evaluate(&request(account("acct_1"), "pack.publish", None));
+        assert_eq!(allowed.decision, EntitlementDecision::Allow);
+        assert_eq!(
+            allowed.reason,
+            EntitlementReason::LicenseEntitles {
+                feature: "pack.publish".into(),
+            }
+        );
+
+        // A feature with a numeric limit becomes a Limited quota.
+        assert_eq!(engine.quota(&who, "pack.publish"), Some(Quota::Limited(5)));
+        // Entitled but without a limit is Unlimited.
+        assert_eq!(
+            engine.quota(&who, "model.strong_access"),
+            Some(Quota::Unlimited)
+        );
+        // An absent feature is not entitled and carries no quota.
+        let denied = engine.evaluate(&request(account("acct_1"), "namespace.private", None));
+        assert_eq!(denied.decision, EntitlementDecision::Deny);
+        assert_eq!(
+            denied.reason,
+            EntitlementReason::LicenseLacksFeature {
+                feature: "namespace.private".into(),
+            }
+        );
+        assert_eq!(engine.quota(&who, "namespace.private"), None);
+        // A claim defines no per-window rate limits.
+        assert_eq!(engine.rate_limit(&who, "pack.publish"), None);
+    }
+
+    #[test]
+    fn license_check_quota_is_inclusive_and_fails_closed() {
+        let claim = license_claim(&["namespace.private"], &[("namespace.private", 2)]);
+        let engine = EntitlementEngine::from_license(&claim);
+        let req = request(account("acct_1"), "namespace.private", None);
+
+        // At the inclusive ceiling -> allowed.
+        assert_eq!(
+            engine.check_quota(&req, 2).decision,
+            EntitlementDecision::Allow
+        );
+        // Over the ceiling -> quota exceeded.
+        let over = engine.check_quota(&req, 3);
+        assert_eq!(over.decision, EntitlementDecision::Deny);
+        assert_eq!(
+            over.reason,
+            EntitlementReason::LicenseQuotaExceeded {
+                feature: "namespace.private".into(),
+                ceiling: 2,
+                observed: 3,
+            }
+        );
+        // A feature the claim does not list never reaches the quota check.
+        let lacks = engine.check_quota(&request(account("acct_1"), "pack.read", None), 0);
+        assert_eq!(lacks.decision, EntitlementDecision::Deny);
+        assert_eq!(
+            lacks.reason,
+            EntitlementReason::LicenseLacksFeature {
+                feature: "pack.read".into(),
+            }
+        );
+        // An entitled feature without a limit permits any usage.
+        let unlimited = license_claim(&["pack.publish"], &[]);
+        let engine = EntitlementEngine::from_license(&unlimited);
+        let outcome =
+            engine.check_quota(&request(account("acct_1"), "pack.publish", None), u64::MAX);
+        assert_eq!(outcome.decision, EntitlementDecision::Allow);
+    }
+
+    #[test]
+    fn a_cloud_claim_and_a_self_host_claim_apply_identically() {
+        // Two claims that carry the same entitlement payload but differ in
+        // issuance metadata (epoch, key id) bridge to identical policy.
+        let mut cloud = license_claim(&["pack.publish"], &[("pack.publish", 3)]);
+        cloud.epoch = 9;
+        cloud.sig.kid = "cloud-key".into();
+        let mut self_host = license_claim(&["pack.publish"], &[("pack.publish", 3)]);
+        self_host.epoch = 1;
+        self_host.sig.kid = "local-seed".into();
+
+        assert_eq!(
+            LicenseEntitlements::from_claim(&cloud),
+            LicenseEntitlements::from_claim(&self_host)
         );
     }
 
