@@ -34,6 +34,8 @@ dependencies = [
  "awaken-iam-contract",
  "base64",
  "getrandom",
+ "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "thiserror",
