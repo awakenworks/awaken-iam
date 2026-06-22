@@ -17,7 +17,7 @@ pub use fake_provider::{
 pub use github::{
     DEFAULT_AUTHORIZE_ENDPOINT, DEFAULT_TOKEN_ENDPOINT, GithubAccessToken, GithubEmail,
     GithubProviderAdapter, GithubTransport, GithubTransportError, GithubUser, SelectedEmail,
-    TokenRequest, select_email,
+    TokenRequest as GithubTokenRequest, select_email,
 };
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
