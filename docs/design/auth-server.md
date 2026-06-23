@@ -22,8 +22,15 @@ one place to rotate secrets, one audit point.
 
 ## Provider adapter (genericity)
 
-A provider is data + a small adapter, so the set is config-driven. We ship
-Google, GitHub, and a deterministic fake (tests) — and no more (YAGNI).
+A provider is data + a small adapter, so the set is config-driven. We ship two
+vendor adapters (Google OIDC, GitHub OAuth2), a deterministic fake (tests), and a
+**generic config-driven adapter** (`GenericOAuthProvider`) that speaks the
+standard authorization-code + userinfo flow for *any* compliant OIDC/OAuth2
+provider. Onboarding a new upstream IdP — Microsoft Entra, Okta, Auth0, a
+self-hosted Keycloak — is then configuration (its endpoints, client id, and a
+deployment secret), not a new adapter. The two vendor adapters remain only where
+a provider deviates from the standard (GitHub has no id_token; Google pins issuer
+and JWKS).
 
 ```rust
 trait IdentityProvider {
