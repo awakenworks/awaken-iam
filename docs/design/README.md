@@ -11,4 +11,5 @@
 - [Entitlement plane](entitlements.md)
 - [Remote protocol and client](remote-protocol.md)
 - [Deployment and storage](deployment.md)
+- [High availability and operations](high-availability.md)
 - [Migration plan](migration-strategy.md)
