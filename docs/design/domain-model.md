@@ -41,7 +41,7 @@ cluster; references across aggregates are by id.
 
 | Aggregate (root) | Holds | Invariant |
 |---|---|---|
-| **Account** | profile, status, linked External Identities | external identity is unique by `(provider, subject)`; email never selects an account |
+| **Account** | profile, status, linked External Identities | external identity is unique by `(provider, subject)`; a verified email selects an account only on explicit user confirmation, never silently; unlinking the last identity is refused |
 | **LoginFlow** | state/nonce/PKCE challenge | started once, consumed at most once, not after expiry |
 | **Session** | → AccountId, token hash, expiry | authenticates only while unexpired and unrevoked; revocation is idempotent |
 | **ApiToken** | → Principal, scopes, secret hash | active until revoked; secret stored only as hash |
@@ -80,7 +80,7 @@ Every state change emits an event; events feed the audit trail and bump the
 snapshot `version` that invalidates consumer caches.
 
 ```text
-AccountRegistered, ExternalIdentityLinked,
+AccountRegistered, ExternalIdentityLinked, ExternalIdentityUnlinked,
 SessionEstablished, SessionRevoked, ApiTokenIssued, ApiTokenRevoked,
 RoleDefined, GrantIssued, GrantRevoked, MembershipGranted, MembershipRevoked,
 SignerRegistered, SignerRevoked, SubscriptionChanged,
