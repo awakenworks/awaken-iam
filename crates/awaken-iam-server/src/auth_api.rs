@@ -724,16 +724,13 @@ pub enum AuthApiError {
     /// Minting an asymmetric access token failed.
     #[error(transparent)]
     AccessToken(#[from] AccessTokenError),
-<<<<<<< HEAD
     /// A federated token exchange (RFC 8693) was rejected.
     #[error(transparent)]
     TokenExchange(#[from] TokenExchangeError),
-=======
     /// The downstream OAuth provider rejected an authorize or token-redemption
     /// request (unknown client, bad redirect URI, PKCE failure, expired code, …).
     #[error(transparent)]
     OAuthProvider(#[from] OAuthProviderError),
->>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -750,12 +747,9 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     refresh_tokens: RefreshTokenDirectory,
     refresh_minter: RefreshTokenMinter<E>,
     access_revocations: AccessTokenRevocations,
-<<<<<<< HEAD
     trusted_issuers: TrustedIssuerRegistry,
     iam_issuer: String,
-=======
     oauth_provider: OAuthAuthorizationServer<E>,
->>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
     audit: Vec<AuthAuditEvent>,
     ids: E,
 }
@@ -799,15 +793,12 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             refresh_tokens: RefreshTokenDirectory::new(),
             refresh_minter: RefreshTokenMinter::new(entropy.clone()),
             access_revocations: AccessTokenRevocations::new(),
-<<<<<<< HEAD
             trusted_issuers: TrustedIssuerRegistry::new(),
             iam_issuer: String::new(),
-=======
             oauth_provider: OAuthAuthorizationServer::new(
                 OAuthClientRegistry::new(),
                 entropy.clone(),
             ),
->>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
             audit: Vec::new(),
             ids: entropy,
         }
