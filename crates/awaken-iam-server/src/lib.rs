@@ -5,6 +5,7 @@ mod admin_api;
 mod assembly;
 mod auth_api;
 mod authz_api;
+mod capability_token;
 mod session;
 mod store;
 
@@ -16,11 +17,15 @@ pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, LinkIdentity, LogoutOutcome, MintAccessToken, ProviderRegistration,
-    ProviderSummary, ReturnToDecision, ReturnToPolicy, StartLogin, StartLoginOutcome,
-    UnlinkIdentity,
+    DEFAULT_LOGIN_COOKIE_NAME, LinkIdentity, LogoutOutcome, MintAccessToken,
+    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, ReturnToDecision,
+    ReturnToPolicy, StartLogin, StartLoginOutcome, UnlinkIdentity,
 };
 pub use authz_api::AuthzApi;
+pub use capability_token::{
+    AttenuateCapability, CapabilityCheck, CapabilityClaims, CapabilityError, LeaseEpoch,
+    MintCapability, attenuate, mint_capability, verify_capability,
+};
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
 };
