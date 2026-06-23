@@ -1,12 +1,14 @@
 # Third-party login provider setup
 
-This guide is the operator runbook for the two upstream identity providers
-`awaken-iam` brokers: **Google** (OpenID Connect) and **GitHub** (OAuth 2.0). It
-covers registering the upstream OAuth application, the exact callback URLs IAM
-expects, the environment variables each adapter reads, and how local and
-production deployments differ. It complements the architectural model in the
-[auth server](auth-server.md) design; read that first for *why* IAM is the
-broker, then this for *how* to wire a real provider.
+This guide is the operator runbook for the upstream identity providers
+`awaken-iam` brokers: the per-vendor **Google** (OpenID Connect) and **GitHub**
+(OAuth 2.0) adapters, plus the **generic OIDC / OAuth 2.0 adapter** that onboards
+any compliant provider — Microsoft Entra, Okta, Auth0, Keycloak — by
+configuration alone. It covers registering the upstream OAuth application, the
+exact callback URLs IAM expects, the environment variables each adapter reads,
+and how local and production deployments differ. It complements the
+architectural model in the [auth server](auth-server.md) design; read that first
+for *why* IAM is the broker, then this for *how* to wire a real provider.
 
 IAM is the OAuth client (relying party) to Google/GitHub and the OpenID Provider
 to product apps. Products never register their own Google/GitHub apps — there is
@@ -22,6 +24,11 @@ and callback routes:
 |---|---|---|---|---|
 | Google | `google` | OIDC | `GET /v1/auth/login/google` | `GET /v1/auth/callback/google` |
 | GitHub | `github` | OAuth 2.0 | `GET /v1/auth/login/github` | `GET /v1/auth/callback/github` |
+| Generic | `<key>` | OIDC / OAuth 2.0 | `GET /v1/auth/login/<key>` | `GET /v1/auth/callback/<key>` |
+
+The generic adapter's provider key is chosen by the operator at configuration
+time (for example `entra`, `okta`, `keycloak`); it slots into the same login and
+callback routes as the per-vendor keys.
 
 The **callback URL** (also called the redirect URI / authorized redirect) you
 register with the upstream provider is the IAM origin plus the callback route:
@@ -115,6 +122,93 @@ IAM mints neither a PKCE verifier nor an OIDC nonce for this provider.
 | `GITHUB_CLIENT_SECRET` | yes | OAuth client secret (deployment secret). |
 | `GITHUB_REDIRECT_URI` | yes | Absolute callback URL registered above. |
 | `GITHUB_SCOPES` | no | Space-separated scopes; defaults to `read:user user:email`. |
+
+## Generic OIDC / OAuth 2.0 provider (configuration-only)
+
+Beyond the two hand-written vendor adapters, IAM ships a **generic adapter** that
+speaks the standard authorization-code flow from configuration alone. Any
+compliant OpenID Connect or OAuth 2.0 server — Microsoft Entra ID, Okta, Auth0, a
+self-hosted Keycloak, an internal IdP — is onboarded by **registering its
+endpoints and client credentials, not by writing code**. This is the escape
+hatch that keeps "add another IdP" a config change.
+
+### OIDC discovery: issuer URL is enough
+
+For a compliant **OpenID Connect** provider the adapter performs
+[discovery](https://openid.net/specs/openid-connect-discovery-1_0.html): given
+only the `issuer_url`, it fetches
+
+```text
+<issuer_url>/.well-known/openid-configuration
+```
+
+and reads the `authorization_endpoint`, `token_endpoint`, and
+`userinfo_endpoint` from that document. So a discovery-capable provider needs
+**only its issuer URL, client id, and client secret** — no endpoint wiring at
+all. Endpoints you *do* configure explicitly always win over discovery, so a
+provider with a non-standard layout (or a plain OAuth 2.0 server with no
+discovery document) can pin each endpoint by hand and skip the well-known fetch
+entirely.
+
+The trailing slash on the issuer is normalized, so both
+`https://idp.example` and `https://idp.example/` resolve the same document.
+
+### Register the upstream app
+
+1. In the provider's admin console, register a new **web / confidential OAuth
+   client** (the exact name varies: "App registration" on Entra, "Application"
+   on Okta/Auth0, "Client" on Keycloak).
+2. Add the callback URL — the IAM origin plus the provider's callback route — to
+   the client's **redirect URIs**, byte-for-byte as IAM sends it:
+
+   ```text
+   https://<iam-host>/v1/auth/callback/<key>
+   ```
+
+3. Grant the standard OIDC scopes `openid`, `email`, `profile` (the adapter's
+   defaults) so userinfo returns a subject, email, and profile claims.
+4. Copy the **issuer URL**, **client id**, and **client secret** into the
+   deployment configuration and secret store.
+
+### Configuration
+
+The public fields live in the provider's `IdentityProviderConfig`; the client
+secret and userinfo endpoint are deployment material kept out of the contract:
+
+| Field | Required | Source | Meaning |
+|---|---|---|---|
+| `provider_key` | yes | config | Operator-chosen key in the login/callback routes. |
+| `kind` | yes | config | `oidc` (enables discovery) or `oauth2`. |
+| `issuer_url` | yes for OIDC | config | Base URL whose `/.well-known/openid-configuration` supplies the endpoints. |
+| `authorization_endpoint` | only if not discoverable | config | Overrides the discovered value. |
+| `token_endpoint` | only if not discoverable | config | Overrides the discovered value. |
+| `client_id` | yes | config | Public OAuth client id. |
+| Client secret | yes | secret store | OAuth client secret used at the token endpoint. |
+| Userinfo endpoint | only if not discoverable | secret/config | Overrides the discovered value. |
+| Scopes | no | config | Defaults to `openid email profile`. |
+
+For a discovery-capable OIDC provider the required set collapses to
+`provider_key`, `kind = oidc`, `issuer_url`, `client_id`, and the client secret —
+everything else is resolved at login time from the well-known document.
+
+A plain **OAuth 2.0** provider (no `id_token`, often no discovery document)
+configures `kind = oauth2` and pins `authorization_endpoint`, `token_endpoint`,
+and the userinfo endpoint explicitly; the adapter then reads the authenticated
+subject from userinfo exactly as the OIDC path does.
+
+### Endpoints (worked example: Keycloak)
+
+For an issuer of `https://idp.example/realms/acme`, discovery resolves to:
+
+| Purpose | Value |
+|---|---|
+| Discovery | `https://idp.example/realms/acme/.well-known/openid-configuration` |
+| Authorization | `https://idp.example/realms/acme/protocol/openid-connect/auth` |
+| Token | `https://idp.example/realms/acme/protocol/openid-connect/token` |
+| Userinfo | `https://idp.example/realms/acme/protocol/openid-connect/userinfo` |
+
+Only the issuer is configured; the other three rows are read from the discovery
+document at login time.
 
 ## Secret references
 
