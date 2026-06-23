@@ -70,6 +70,10 @@ use crate::access_token::{
     AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
     SigningKeyMaterial,
 };
+use crate::token_exchange::{
+    BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse, TrustedIssuer, TrustedIssuerRegistry,
+};
 use crate::{SessionCookieConfig, SessionGateway};
 
 /// Default key id minted for the bootstrap access-token signing key.
@@ -308,6 +312,26 @@ pub enum AuthAuditEvent {
         jti: String,
         /// When the revocation was recorded.
         at: Timestamp,
+    },
+    /// An upstream workload assertion was exchanged for an IAM access token.
+    WorkloadIdentityFederated {
+        /// Trusted external issuer that signed the accepted assertion.
+        issuer: String,
+        /// Verified upstream subject the assertion authenticated.
+        subject: String,
+        /// Service principal the issued IAM token authenticates as.
+        principal: PrincipalRef,
+        /// Unique id of the issued token, enabling per-token revocation.
+        jti: String,
+        /// When the token was issued, as unix seconds.
+        at: i64,
+    },
+    /// A token-exchange request was rejected before a token could be issued.
+    WorkloadIdentityRejected {
+        /// Stable machine-readable reason the exchange failed.
+        reason: TokenExchangeError,
+        /// When the failure was observed, as unix seconds.
+        at: i64,
     },
 }
 
@@ -623,6 +647,9 @@ pub enum AuthApiError {
     /// Minting an asymmetric access token failed.
     #[error(transparent)]
     AccessToken(#[from] AccessTokenError),
+    /// A federated token exchange (RFC 8693) was rejected.
+    #[error(transparent)]
+    TokenExchange(#[from] TokenExchangeError),
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -639,6 +666,8 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     refresh_tokens: RefreshTokenDirectory,
     refresh_minter: RefreshTokenMinter<E>,
     access_revocations: AccessTokenRevocations,
+    trusted_issuers: TrustedIssuerRegistry,
+    iam_issuer: String,
     audit: Vec<AuthAuditEvent>,
     ids: E,
 }
@@ -682,6 +711,8 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             refresh_tokens: RefreshTokenDirectory::new(),
             refresh_minter: RefreshTokenMinter::new(entropy.clone()),
             access_revocations: AccessTokenRevocations::new(),
+            trusted_issuers: TrustedIssuerRegistry::new(),
+            iam_issuer: String::new(),
             audit: Vec::new(),
             ids: entropy,
         }
@@ -703,6 +734,19 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     pub fn with_login_cookie(mut self, cookie: SessionCookieConfig) -> Self {
         self.login_cookie = cookie;
         self
+    }
+
+    /// Set the IAM issuer (`iss`) stamped into tokens minted by federated token
+    /// exchange. A deployment configures this to its own canonical base URL.
+    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.iam_issuer = issuer.into();
+        self
+    }
+
+    /// Register (or replace, by issuer id) a trusted external issuer whose
+    /// assertions IAM will exchange for IAM tokens via RFC 8693 token exchange.
+    pub fn register_trusted_issuer(&mut self, issuer: TrustedIssuer) {
+        self.trusted_issuers.upsert(issuer);
     }
 
     /// Register a provider with its adapter and flow configuration.
@@ -1042,6 +1086,86 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             scope: request.scopes,
         };
         Ok(self.tokens.mint(&claims)?)
+    }
+
+    /// `POST /v1/oauth/token` (`grant_type=…:token-exchange`): exchange an
+    /// upstream workload assertion for a short-lived IAM access token.
+    ///
+    /// This is the federated workload-identity seam (RFC 8693): an external
+    /// workload presents an assertion it already holds from a trusted external
+    /// issuer, and IAM — after verifying the assertion's signature against that
+    /// issuer's published keys and validating its issuer, audience, and validity
+    /// window — mints its own access token for the **service principal** the
+    /// verified subject is bound to. The issued token is signed by the same key
+    /// IAM publishes at [`jwks`](Self::jwks), so it verifies identically to every
+    /// other IAM access token. No long-lived secret is exchanged or stored.
+    ///
+    /// Every outcome is audited. The error fails closed and collapses to a coarse
+    /// OAuth error code (see [`TokenExchangeError::oauth_error_code`]) so the wire
+    /// response never distinguishes an unknown issuer from a missing binding.
+    pub fn exchange_token(
+        &mut self,
+        request: TokenExchangeRequest,
+    ) -> Result<TokenExchangeResponse, AuthApiError> {
+        let (service_id, audience, scopes, issuer, subject) =
+            match self.trusted_issuers.authorize(&request) {
+                Ok((binding, verified)) => (
+                    binding.service_id.clone(),
+                    binding.audience.clone(),
+                    binding.scopes.clone(),
+                    verified.issuer,
+                    verified.subject,
+                ),
+                Err(err) => {
+                    self.audit.push(AuthAuditEvent::WorkloadIdentityRejected {
+                        reason: err.clone(),
+                        at: request.now,
+                    });
+                    return Err(AuthApiError::TokenExchange(err));
+                }
+            };
+
+        let jti = self.mint_id("jti");
+        let claims = AccessTokenClaims {
+            iss: self.iam_issuer.clone(),
+            sub: service_id.clone(),
+            aud: audience,
+            exp: request.now + request.issued_token_lifetime_secs,
+            iat: request.now,
+            jti: jti.clone(),
+            scope: scopes.clone(),
+        };
+        let access_token = match self.tokens.mint(&claims) {
+            Ok(token) => token,
+            Err(err) => {
+                let err = TokenExchangeError::from(err);
+                self.audit.push(AuthAuditEvent::WorkloadIdentityRejected {
+                    reason: err.clone(),
+                    at: request.now,
+                });
+                return Err(AuthApiError::TokenExchange(err));
+            }
+        };
+
+        let principal = PrincipalRef::Service {
+            service_id: service_id.clone(),
+        };
+        self.audit.push(AuthAuditEvent::WorkloadIdentityFederated {
+            issuer,
+            subject,
+            principal: principal.clone(),
+            jti,
+            at: request.now,
+        });
+
+        Ok(TokenExchangeResponse {
+            access_token,
+            issued_token_type: ISSUED_TOKEN_TYPE_ACCESS_TOKEN.to_owned(),
+            token_type: BEARER_TOKEN_TYPE.to_owned(),
+            expires_in: request.issued_token_lifetime_secs,
+            scope: scopes,
+            principal,
+        })
     }
 
     /// Rotate the active access-token signing key, drawing a fresh seed from the

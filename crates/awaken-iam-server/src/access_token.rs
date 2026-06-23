@@ -88,7 +88,7 @@ pub struct AccessTokenClaims {
 }
 
 /// Errors raised while minting or verifying access tokens.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AccessTokenError {
     /// No signing key is available to mint a token.
     #[error("no signing key is configured")]
@@ -239,6 +239,20 @@ impl AccessTokenAuthority {
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
         Ok(format!("{signing_input}.{sig_b64}"))
     }
+
+    /// Sign an arbitrary serializable claim set into a compact `EdDSA` JWT with
+    /// the active key, stamping its `kid` into the header under the generic `"JWT"`
+    /// type.
+    ///
+    /// Unlike [`mint`](Self::mint) / [`sign_jwt`](Self::sign_jwt), this carries no
+    /// IAM token-family `typ` fence: it models an *external* issuer signing a
+    /// federated workload assertion, so an authority can stand in as the upstream
+    /// STS in an RFC 8693 token-exchange contract test. Verify the result with
+    /// [`verify_signed_claims`], which checks the signature without asserting a
+    /// particular `typ`.
+    pub fn sign_claims<T: Serialize>(&self, claims: &T) -> Result<String, AccessTokenError> {
+        self.sign_jwt("JWT", claims)
+    }
 }
 
 /// Verify an access token against a published [`Jwks`], returning its claims.
@@ -286,6 +300,51 @@ pub(crate) fn verify_jwt<T: DeserializeOwned>(
         });
     }
 
+    verify_signature_and_decode(header, header_b64, payload_b64, sig_b64, jwks)
+}
+
+/// Verify an `EdDSA` JWT against `jwks` and deserialize its payload claims,
+/// **without** asserting any particular `typ` header.
+///
+/// Generic over the claim shape so callers beyond IAM's own access token — most
+/// notably RFC 8693 federated token exchange, which must verify an *upstream*
+/// issuer's assertion whose claim set differs from [`AccessTokenClaims`] and
+/// whose `typ` is set by that foreign issuer — can reuse the exact same
+/// cryptographic path. It performs the structural checks of
+/// [`verify_access_token`]: `header.payload.signature` well-formedness, the
+/// `EdDSA` algorithm, `kid` key selection, and strict Ed25519 signature
+/// verification. Validation of claim *values* (issuer, audience, expiry) is the
+/// caller's responsibility, since those rules differ per token use.
+pub fn verify_signed_claims<T: DeserializeOwned>(
+    token: &str,
+    jwks: &Jwks,
+) -> Result<T, AccessTokenError> {
+    let mut parts = token.split('.');
+    let header_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    let payload_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    let sig_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    if parts.next().is_some() {
+        return Err(AccessTokenError::Malformed);
+    }
+
+    let header: JwtHeader = decode_part(header_b64)?;
+    if header.alg != ACCESS_TOKEN_ALG {
+        return Err(AccessTokenError::UnsupportedAlg(header.alg));
+    }
+
+    verify_signature_and_decode(header, header_b64, payload_b64, sig_b64, jwks)
+}
+
+/// Select the published key by `kid`, verify the Ed25519 signature over
+/// `header.payload`, and decode the payload claims. Shared by the typ-fenced
+/// [`verify_jwt`] and the typ-agnostic [`verify_signed_claims`].
+fn verify_signature_and_decode<T: DeserializeOwned>(
+    header: JwtHeader,
+    header_b64: &str,
+    payload_b64: &str,
+    sig_b64: &str,
+    jwks: &Jwks,
+) -> Result<T, AccessTokenError> {
     let jwk = jwks
         .keys
         .iter()
@@ -365,6 +424,24 @@ pub fn verify_active_access_token(
         return Err(AccessTokenError::Revoked(claims.jti));
     }
     Ok(claims)
+}
+
+/// Decode a JWT's payload claims **without verifying its signature**.
+///
+/// This is intentionally unauthenticated: it exists only to read an untrusted
+/// routing hint — the `iss` claim — from a presented token so the caller can
+/// look up *which* trusted issuer's keys to then verify it against with
+/// [`verify_signed_claims`]. The returned claims must never be trusted until
+/// that verification succeeds.
+pub fn decode_unverified_claims<T: DeserializeOwned>(token: &str) -> Result<T, AccessTokenError> {
+    let mut parts = token.split('.');
+    let _header_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    let payload_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    let sig_b64 = parts.next().ok_or(AccessTokenError::Malformed)?;
+    if sig_b64.is_empty() || parts.next().is_some() {
+        return Err(AccessTokenError::Malformed);
+    }
+    decode_part(payload_b64)
 }
 
 fn encode_part<T: Serialize>(value: &T) -> Result<String, AccessTokenError> {

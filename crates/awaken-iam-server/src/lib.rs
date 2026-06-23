@@ -8,10 +8,12 @@ mod authz_api;
 mod capability_token;
 mod session;
 mod store;
+mod token_exchange;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
-    AccessTokenRevocations, SigningKeyMaterial, verify_access_token, verify_active_access_token,
+    AccessTokenRevocations, SigningKeyMaterial, decode_unverified_claims, verify_access_token,
+    verify_active_access_token, verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
@@ -33,6 +35,12 @@ pub use session::{
 pub use store::{
     BundleScope, Dialect, IamStore, InMemoryStore, MigrateReport, Migration, MigrationBundle,
     MigrationExecutor, PlannedMigration, RecordingExecutor, bundles,
+};
+pub use token_exchange::{
+    BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, SUBJECT_TOKEN_TYPE_ACCESS_TOKEN,
+    SUBJECT_TOKEN_TYPE_ID_TOKEN, SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE,
+    TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, TrustedIssuer,
+    TrustedIssuerRegistry, WorkloadBinding,
 };
 
 use awaken_iam_client::IamClient;

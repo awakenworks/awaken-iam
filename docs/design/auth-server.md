@@ -137,7 +137,7 @@ GET    /v1/session                      # current session
 DELETE /v1/session                      # logout
 POST   /v1/tokens                       # mint API token
 DELETE /v1/tokens/{id}
-POST   /v1/oauth/token                  # authorization_code + refresh_token grants
+POST   /v1/oauth/token                  # authorization_code, refresh_token, token-exchange grants
 POST   /v1/oauth/revoke                 # RFC 7009
 GET    /v1/oauth/userinfo               # OIDC userinfo
 GET    /.well-known/jwks.json           # RFC 7517
@@ -146,6 +146,49 @@ GET    /.well-known/openid-configuration
 
 Authorization and entitlement endpoints live alongside under the same `/v1` tree;
 see [remote protocol](remote-protocol.md).
+
+## Federated workload identity (token exchange)
+
+An external workload — a CI job, a cloud function, another cloud's STS — already
+holds an assertion from its own issuer. Rather than provision and rotate a
+long-lived IAM secret for it, IAM accepts that assertion and exchanges it for a
+short-lived IAM access token, following **RFC 8693**. IAM is the broker here too:
+a workload federates through one trust anchor instead of every product minting
+its own machine credentials.
+
+The exchange is a single `POST /v1/oauth/token` with
+`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, carrying the
+upstream assertion as `subject_token`:
+
+```text
+1. The workload presents subject_token (an upstream JWT) and subject_token_type.
+2. IAM reads the assertion's *untrusted* `iss` only to select which trusted
+   external issuer's published keys to verify against, then verifies the
+   signature against them.
+3. IAM validates the value claims: issuer match, accepted audience, and the
+   expiry / not-before window.
+4. IAM resolves the verified `(issuer, subject)` to a configured workload
+   binding — the service principal and scopes it may assume. A valid assertion is
+   necessary but never sufficient: with no binding the exchange fails closed.
+5. IAM mints its own access token for that service principal, signed by the same
+   key it publishes at `/.well-known/jwks.json`, so the issued token verifies
+   identically to every other IAM access token. No long-lived secret is stored on
+   either side.
+```
+
+A **trusted external issuer** is data: its `iss`, the accepted `aud` values, the
+public keys IAM verifies its assertions against (the issuer's own JWKS), and the
+subject→principal bindings it authorizes. Adding a federation later is a registry
+entry, not a code change. Every exchange — issued or rejected — is audited, and a
+rejection collapses to a coarse RFC 8693 OAuth error code so the wire response
+never distinguishes an unknown issuer from a bad signature from a missing
+binding, matching the **no information leak** rule above.
+
+> **MVP shortcut.** Upstream assertions are verified as `EdDSA`/`Ed25519` JWTs,
+> the single algorithm IAM signs and publishes with elsewhere, and subject
+> mapping is by exact match. The registry, binding, request, and response shapes
+> are kept extensible so a later ADR can add RS256 upstream verification or
+> subject-pattern matching without a wire break.
 
 ## Caller authentication
 
