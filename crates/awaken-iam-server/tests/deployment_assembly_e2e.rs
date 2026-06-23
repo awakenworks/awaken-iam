@@ -13,7 +13,8 @@
 use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, RemoteIamClient};
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
+    PolicySnapshot, SignerSetSnapshot,
 };
 use awaken_iam_server::{
     AuthzApi, Deployment, IamAssembly, IamDaemon, RecordingExecutor, RouteSpec,
@@ -81,6 +82,10 @@ impl AuthzTransport for DaemonTransport<'_> {
 
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
         Ok(self.api.snapshot())
+    }
+
+    fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
+        Ok(self.api.signers(namespace_id))
     }
 }
 

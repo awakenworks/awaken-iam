@@ -24,16 +24,17 @@ use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    PolicySnapshot,
+    NamespaceId, PolicySnapshot, SignerSetSnapshot,
 };
-use awaken_iam_core::{EntitlementEngine, IamCore, PolicySet};
+use awaken_iam_core::{EntitlementEngine, IamCore, NamespaceTrustDirectory, PolicySet};
 
-/// Authorization/entitlement protocol surface over an in-process [`IamCore`] and
-/// [`EntitlementEngine`].
+/// Authorization/entitlement protocol surface over an in-process [`IamCore`],
+/// [`EntitlementEngine`], and namespace [`NamespaceTrustDirectory`].
 #[derive(Debug, Default)]
 pub struct AuthzApi {
     core: IamCore,
     entitlements: EntitlementEngine,
+    trust: NamespaceTrustDirectory,
     policy_version: u64,
 }
 
@@ -44,6 +45,7 @@ impl AuthzApi {
         Self {
             core: IamCore::new(),
             entitlements: EntitlementEngine::default_allow(),
+            trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }
     }
@@ -54,6 +56,7 @@ impl AuthzApi {
         Self {
             core: IamCore::new(),
             entitlements,
+            trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }
     }
@@ -63,6 +66,7 @@ impl AuthzApi {
         Self {
             core,
             entitlements,
+            trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
         }
     }
@@ -124,6 +128,40 @@ impl AuthzApi {
     /// payload. Returns `None` when `since` already matches the current version.
     pub fn snapshot_since(&self, since: u64) -> Option<PolicySnapshot> {
         (self.policy_version > since).then(|| self.snapshot())
+    }
+
+    /// Read-only access to the namespace trust directory.
+    pub fn trust(&self) -> &NamespaceTrustDirectory {
+        &self.trust
+    }
+
+    /// Mutable access to the namespace trust directory, e.g. to record ownership
+    /// or register/revoke signer keys. Mutating it bumps the version fence — the
+    /// same fence [`snapshot`](Self::snapshot) reports — so a registry consumer
+    /// re-fetches the signer set after a registration or revocation.
+    pub fn trust_mut(&mut self) -> &mut NamespaceTrustDirectory {
+        self.policy_version += 1;
+        &mut self.trust
+    }
+
+    /// `GET /v1/namespaces/{namespace_id}/signers`: capture a namespace's active
+    /// signer set under the current version fence for trust-root distribution.
+    ///
+    /// A registry consumer (Pack Hub) caches this and re-fetches only when
+    /// `version` advances, so revocation propagates on the next sync while
+    /// offline/edge verification stays possible against the cached set. An
+    /// unknown or unowned namespace yields an empty set at the current version.
+    pub fn signers(&self, namespace_id: &NamespaceId) -> SignerSetSnapshot {
+        SignerSetSnapshot {
+            namespace_id: namespace_id.clone(),
+            version: self.policy_version,
+            signers: self
+                .trust
+                .active_signers(namespace_id)
+                .into_iter()
+                .cloned()
+                .collect(),
+        }
     }
 }
 
@@ -281,5 +319,66 @@ mod tests {
             // Local evaluation from the synced snapshot mirrors the remote answer.
             assert_eq!(local.evaluate(&req).to_outcome(), api.authorize(&req));
         }
+    }
+
+    #[test]
+    fn signers_are_served_under_the_version_fence() {
+        use awaken_iam_contract::{
+            NamespaceId, NamespaceOwner, OrgId, SignerKey, SignerKeyAlgorithm,
+            SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp,
+        };
+
+        let namespace = NamespaceId("acme".into());
+        let ts = |value: &str| Timestamp(value.into());
+        let key = |id: &str, fingerprint: &str| SignerKey {
+            id: SignerKeyId(id.into()),
+            namespace_id: namespace.clone(),
+            fingerprint: SignerKeyFingerprint(fingerprint.into()),
+            algorithm: SignerKeyAlgorithm::Ed25519,
+            public_key: "base64-public-key".into(),
+            status: SignerKeyStatus::Active,
+            label: None,
+            registered_at: ts("2026-06-20T00:00:00Z"),
+            revoked_at: None,
+        };
+
+        let mut api = AuthzApi::new();
+        // An unowned namespace yields an empty set at the current fence.
+        assert_eq!(api.signers(&namespace).signers, vec![]);
+        assert_eq!(api.signers(&namespace).version, 1);
+
+        // Establishing ownership and registering keys advances the fence each time.
+        api.trust_mut().set_namespace_owner(NamespaceOwner {
+            namespace_id: namespace.clone(),
+            owner_org_id: OrgId("org_acme".into()),
+            created_at: ts("2026-06-20T00:00:00Z"),
+        });
+        api.trust_mut()
+            .register_signer_key(key("key_b", "fp_b"))
+            .unwrap();
+        api.trust_mut()
+            .register_signer_key(key("key_a", "fp_a"))
+            .unwrap();
+
+        let set = api.signers(&namespace);
+        assert_eq!(set.namespace_id, namespace);
+        // Fence advanced from 1 across the three trust mutations.
+        assert_eq!(set.version, 4);
+        // Active signers come back ordered by id, only public material carried.
+        let ids: Vec<&str> = set.signers.iter().map(|k| k.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["key_a", "key_b"]);
+
+        // Revoking a key advances the fence and drops it from the served set.
+        api.trust_mut()
+            .revoke_signer_key(
+                &namespace,
+                &SignerKeyId("key_a".into()),
+                ts("2026-06-21T00:00:00Z"),
+            )
+            .unwrap();
+        let after = api.signers(&namespace);
+        assert_eq!(after.version, 5);
+        let ids: Vec<&str> = after.signers.iter().map(|k| k.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["key_b"]);
     }
 }

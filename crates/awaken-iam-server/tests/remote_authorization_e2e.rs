@@ -11,7 +11,9 @@ use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, R
 use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, PolicySnapshot, PrincipalRef, ScopeRef,
+    EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId, PolicySnapshot,
+    PrincipalRef, ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
+    SignerKeyStatus, SignerSetSnapshot, Timestamp,
 };
 use awaken_iam_core::{
     ActionPattern, Effect, EntitlementCatalog, EntitlementEngine, Grant, GrantId, GrantSubject,
@@ -78,6 +80,14 @@ impl AuthzTransport for JsonLoopbackTransport {
             return Err(RemoteError("offline".into()));
         }
         serde_json::from_str(&serde_json::to_string(&self.api.snapshot()).unwrap())
+            .map_err(|err| RemoteError(err.to_string()))
+    }
+
+    fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
+        if !self.online {
+            return Err(RemoteError("offline".into()));
+        }
+        serde_json::from_str(&serde_json::to_string(&self.api.signers(namespace_id)).unwrap())
             .map_err(|err| RemoteError(err.to_string()))
     }
 }
@@ -227,4 +237,52 @@ fn synced_snapshot_matches_remote_authorize() {
         // Local evaluation from the synced snapshot is byte-identical to remote.
         assert_eq!(local_outcome, remote_outcome);
     }
+}
+
+#[test]
+fn remote_mode_fetches_signer_set_under_the_version_fence() {
+    let namespace = NamespaceId("acme".into());
+    let mut api = publish_api();
+    api.trust_mut().set_namespace_owner(NamespaceOwner {
+        namespace_id: namespace.clone(),
+        owner_org_id: OrgId("org_acme".into()),
+        created_at: Timestamp("2026-06-20T00:00:00Z".into()),
+    });
+    api.trust_mut()
+        .register_signer_key(SignerKey {
+            id: SignerKeyId("key_1".into()),
+            namespace_id: namespace.clone(),
+            fingerprint: SignerKeyFingerprint("fp_abc".into()),
+            algorithm: SignerKeyAlgorithm::Ed25519,
+            public_key: "base64-public-key".into(),
+            status: SignerKeyStatus::Active,
+            label: None,
+            registered_at: Timestamp("2026-06-20T00:00:00Z".into()),
+            revoked_at: None,
+        })
+        .unwrap();
+    let fenced = api.signers(&namespace).version;
+
+    let client = RemoteIamClient::new(JsonLoopbackTransport { api, online: true });
+    let set = client.fetch_signers(&namespace).unwrap();
+    // Pack Hub receives the active signer set over the wire under the shared
+    // version fence, so it can cache and re-sync exactly as it does the snapshot.
+    assert_eq!(set.namespace_id, namespace);
+    assert_eq!(set.version, fenced);
+    assert_eq!(set.signers.len(), 1);
+    assert_eq!(
+        set.signers[0].fingerprint,
+        SignerKeyFingerprint("fp_abc".into())
+    );
+    assert!(set.signers[0].is_active());
+}
+
+#[test]
+fn remote_mode_signer_fetch_fails_closed_when_iam_is_unreachable() {
+    let client = RemoteIamClient::new(JsonLoopbackTransport {
+        api: publish_api(),
+        online: false,
+    });
+    // An unreachable IAM yields a transport error, never a stale signer set.
+    assert!(client.fetch_signers(&NamespaceId("acme".into())).is_err());
 }

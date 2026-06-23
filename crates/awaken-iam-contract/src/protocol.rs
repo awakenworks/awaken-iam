@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId, OrgId,
-    PrincipalRef, ResourceId, ResourceType, ScopeRef, WorkspaceId,
+    PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
 };
 
 /// Reasoned response to `POST /v1/authorize`.
@@ -181,6 +181,26 @@ pub struct PolicySnapshot {
     pub scope_graph: ScopeGraphSnapshot,
 }
 
+/// A namespace's active signer set, served under the policy version fence.
+///
+/// `GET /v1/namespaces/{namespace_id}/signers` returns this so a registry
+/// consumer (Pack Hub) can cache the namespace's trusted signing keys and
+/// re-fetch only when `version` advances. It carries the *same* fence as
+/// [`PolicySnapshot`], so a signer registration or revocation propagates on the
+/// next sync — verification stays possible offline while revocation is never
+/// stale by more than one fence step. Only public key material is ever carried;
+/// IAM is not a secrets store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerSetSnapshot {
+    /// Namespace whose signer set this captures.
+    pub namespace_id: NamespaceId,
+    /// Monotonic version fence the signer set was captured at, shared with the
+    /// authorization [`PolicySnapshot`] so consumers cache both behind one fence.
+    pub version: u64,
+    /// Active signer keys, ordered by key id for a deterministic sequence.
+    pub signers: Vec<SignerKey>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +288,33 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         let parsed: PolicySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, snapshot);
+    }
+
+    #[test]
+    fn signer_set_snapshot_round_trips_through_json() {
+        use crate::{
+            SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus,
+            Timestamp,
+        };
+        let snapshot = SignerSetSnapshot {
+            namespace_id: NamespaceId("acme".into()),
+            version: 9,
+            signers: vec![SignerKey {
+                id: SignerKeyId("key_1".into()),
+                namespace_id: NamespaceId("acme".into()),
+                fingerprint: SignerKeyFingerprint("fp_abc".into()),
+                algorithm: SignerKeyAlgorithm::Ed25519,
+                public_key: "base64-public-key".into(),
+                status: SignerKeyStatus::Active,
+                label: Some("release signer".into()),
+                registered_at: Timestamp("2026-06-20T00:00:00Z".into()),
+                revoked_at: None,
+            }],
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let parsed: SignerSetSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, snapshot);
+        // The version fence is carried so a consumer can cache behind it.
+        assert_eq!(parsed.version, 9);
     }
 }
