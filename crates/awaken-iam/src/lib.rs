@@ -16,12 +16,13 @@ pub use awaken_iam_contract::{
     SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
-    BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
-    EntitlementReason, EntitlementResolver, EntropySource, EstablishSession, IamCore, IamError,
-    IdentityDirectory, IssuedLogin, IssuedSession, LoginAttempt, LoginBinding, LoginSecrets,
-    NamespaceGrant, NamespaceTrustDirectory, OAuthChallengeService, OsEntropy, PkceChallenge,
-    PkceMethod, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow, ResourceEdge, ResourceModel,
-    ResourceTypeDef, SessionDirectory, SessionMinter, TrustError, hash_session_token,
+    ActionPattern, BeginLogin, Effect, EntitlementCatalog, EntitlementEngine, EntitlementMode,
+    EntitlementOutcome, EntitlementReason, EntitlementResolver, EntropySource, EstablishSession,
+    Grant, GrantId, GrantSubject, IamCore, IamError, IdentityDirectory, IssuedLogin, IssuedSession,
+    LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant, NamespaceTrustDirectory,
+    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, PolicySet,
+    Quota, RateLimit, RateWindow, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
+    SessionMinter, TrustError, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
