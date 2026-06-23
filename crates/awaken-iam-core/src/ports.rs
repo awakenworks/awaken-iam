@@ -14,8 +14,9 @@
 //! foreign key — see [deployment](../../../docs/design/deployment.md).
 
 use awaken_iam_contract::{
-    Account, AccountId, ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, OAuthLoginState,
-    OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId, Timestamp,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity, ExternalIdentityId,
+    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId,
+    Timestamp,
 };
 
 use crate::{
@@ -83,6 +84,24 @@ pub trait SessionRepo: Send + Sync {
     fn create(&self, session: Session) -> RepoResult<()>;
     /// Replace an existing session (activity refresh, revocation).
     fn update(&self, session: Session) -> RepoResult<()>;
+}
+
+/// Persistence for long-lived, principal-scoped [`ApiToken`] rows.
+///
+/// The natural lookup key on the authentication path is the public
+/// [`ApiTokenPrefix`]; only the argon2id `secret_hash` is stored, never the
+/// cleartext token. Revocation is an in-place update of an existing row.
+pub trait ApiTokenRepo: Send + Sync {
+    /// Persist a newly minted token, failing closed on a duplicate id or prefix.
+    fn create(&self, token: ApiToken) -> RepoResult<()>;
+    /// Resolve a token by id.
+    fn get(&self, id: &ApiTokenId) -> RepoResult<Option<ApiToken>>;
+    /// Resolve a token from its presented public prefix.
+    fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepoResult<Option<ApiToken>>;
+    /// List tokens held by a principal, ordered by token id.
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<ApiToken>>;
+    /// Replace an existing token (revocation, scope update).
+    fn update(&self, token: ApiToken) -> RepoResult<()>;
 }
 
 /// Persistence for in-flight OAuth login-state challenges.

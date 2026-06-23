@@ -330,10 +330,16 @@ pub fn bundles() -> Vec<MigrationBundle> {
     vec![
         MigrationBundle {
             scope: BundleScope::Identity,
-            migrations: vec![Migration {
-                id: "0001_identity",
-                up_sql: IDENTITY_0001,
-            }],
+            migrations: vec![
+                Migration {
+                    id: "0001_identity",
+                    up_sql: IDENTITY_0001,
+                },
+                Migration {
+                    id: "0002_api_tokens",
+                    up_sql: IDENTITY_0002,
+                },
+            ],
         },
         MigrationBundle {
             scope: BundleScope::Authz,
@@ -397,6 +403,24 @@ CREATE TABLE IF NOT EXISTS {prefix}_login_flows (\
  expires_at TEXT NOT NULL, \
  consumed_at TEXT);";
 
+// Long-lived, principal-scoped API tokens. Stored as the public lookup prefix
+// plus the argon2id hash of the secret half — never the cleartext token. The
+// scope is the JSON-encoded ActionKey set the token may exercise; `principal`
+// is the JSON contract form, resolved in the domain with no FK into another
+// bundle. An optional `expires_at` and a `revoked_at` stamp carry liveness.
+const IDENTITY_0002: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_api_tokens (\
+ id TEXT PRIMARY KEY, \
+ prefix TEXT NOT NULL UNIQUE, \
+ principal JSONB NOT NULL, \
+ secret_hash TEXT NOT NULL, \
+ scope JSONB NOT NULL, \
+ created_at TEXT NOT NULL, \
+ expires_at TEXT, \
+ revoked_at TEXT);\n\
+CREATE INDEX IF NOT EXISTS {prefix}_api_tokens_principal_idx \
+ ON {prefix}_api_tokens (principal);";
+
 // --- iam.authz DDL ---------------------------------------------------------
 //
 // Grants, role memberships, and the resource-model registry. Subjects and
@@ -456,6 +480,7 @@ mod tests {
         assert_eq!(store.ledger_table(), "iam_schema_migrations");
         let plan = store.plan();
         assert!(plan.iter().any(|m| m.sql.contains("iam_accounts")));
+        assert!(plan.iter().any(|m| m.sql.contains("iam_api_tokens")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_grants")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_plans")));
         // No unrendered template tokens leak into the executed SQL.
