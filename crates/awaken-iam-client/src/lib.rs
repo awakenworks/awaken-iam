@@ -16,3 +16,18 @@ pub trait IamClient {
     /// Check account/product entitlement.
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision;
 }
+
+/// A shared reference to a client is itself a client.
+///
+/// This lets an embedded deployment hand its in-process engine to the local arm
+/// of [`IamClientMode`] by borrow, without surrendering ownership or cloning the
+/// policy — the local client and the mounted routes then share one engine.
+impl<C: IamClient + ?Sized> IamClient for &C {
+    fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
+        (**self).authorize(request)
+    }
+
+    fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
+        (**self).check_entitlement(request)
+    }
+}

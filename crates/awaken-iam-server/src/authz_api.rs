@@ -20,9 +20,11 @@
 //! snapshot is authorization-only; entitlement is always evaluated live so a
 //! plan or billing change takes effect without a re-sync.
 
+use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
-    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
+    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    PolicySnapshot,
 };
 use awaken_iam_core::{EntitlementEngine, IamCore, PolicySet};
 
@@ -122,6 +124,24 @@ impl AuthzApi {
     /// payload. Returns `None` when `since` already matches the current version.
     pub fn snapshot_since(&self, since: u64) -> Option<PolicySnapshot> {
         (self.policy_version > since).then(|| self.snapshot())
+    }
+}
+
+/// In-process [`IamClient`] over the same engines that serve `/v1`.
+///
+/// This is the **local** client an embedded deployment hands to in-process
+/// callers (see [deployment](../../../../docs/design/deployment.md)): it resolves
+/// decisions by calling the very `AuthzApi` that backs the mounted routes, so a
+/// local-mode decision is byte-identical to a remote `POST /v1/authorize` against
+/// the same policy — no network hop, no second policy copy. Standalone callers
+/// instead reach this API through the remote `IamClient`.
+impl IamClient for AuthzApi {
+    fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
+        self.authorize(&request).decision
+    }
+
+    fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
+        self.check_entitlement(&request).decision
     }
 }
 

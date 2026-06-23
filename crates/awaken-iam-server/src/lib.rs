@@ -1,12 +1,14 @@
 //! Server assembly seam for Awaken IAM.
 
 mod admin_api;
+mod assembly;
 mod auth_api;
 mod authz_api;
 mod session;
 mod store;
 
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
+pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
     DEFAULT_LOGIN_COOKIE_NAME, LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary,
