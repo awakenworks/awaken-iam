@@ -1,7 +1,9 @@
 //! Convenience facade for Awaken IAM library users.
 
 pub use awaken_iam_client::{
-    AuthzTransport, IamClient, IamClientMode, RemoteError, RemoteIamClient,
+    AuthzTransport, DrainReport, IamClient, IamClientMode, InMemoryOutbox, OutboxError,
+    OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore, ProvisionTransport, RemoteError,
+    RemoteIamClient,
 };
 #[cfg(feature = "http")]
 pub use awaken_iam_client::{
@@ -15,9 +17,10 @@ pub use awaken_iam_contract::{
     GrantSnapshot, GrantSubjectRef, IdentityProviderConfig, IdentityProviderConfigId,
     IdentityProviderKey, IdentityProviderKind, NamespaceId, NamespaceOwner, OAuthLoginState,
     OAuthLoginStateId, OrgId, PolicySnapshot, PrincipalRef, ProjectId, RefreshToken,
-    RefreshTokenChainId, RefreshTokenId, RefreshTokenView, ResourceId, ResourceType,
-    RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, Session, SessionId, SessionView, SignerKey,
-    SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp, WorkspaceId,
+    RefreshTokenChainId, RefreshTokenId, RefreshTokenView, ResourceId, ResourceProvision,
+    ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, Session, SessionId,
+    SessionView, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus,
+    Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditLedger, AuditSink, AuthorizedGrant, BeginLogin, DecisionTrace,
@@ -30,6 +33,16 @@ pub use awaken_iam_core::{
     OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, PolicySet, Quota, RateLimit,
     RateWindow, RegisteredClient, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
     SessionMinter, TokenRedemption, TrustError, hash_session_token,
+    ActionPattern, AuthorizedGrant, BeginLogin, Effect, EntitlementCatalog, EntitlementEngine,
+    EntitlementMode, EntitlementOutcome, EntitlementReason, EntitlementResolver, EntropySource,
+    EstablishSession, GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject,
+    IamCore, IamError, IdentityDirectory, IssuedAuthorizationCode, IssuedLogin, IssuedSession,
+    LoginAttempt, LoginBinding, LoginSecrets, NamespaceGrant, NamespaceTrustDirectory,
+    OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
+    OAuthClientRegistry, OAuthProviderError, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId,
+    PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient, ResourceEdge,
+    ResourceModel, ResourceTypeDef, SessionDirectory, SessionMinter, TokenRedemption, TrustError,
+    apply_resource_provision, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
