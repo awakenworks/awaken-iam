@@ -67,6 +67,17 @@ pub trait AuthzTransport {
 
     /// `GET /v1/namespaces/{namespace_id}/signers`.
     fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError>;
+    /// `GET /v1/authz/snapshot?since={since}`: fetch the snapshot only when the
+    /// policy has advanced past `since`, so a synced consumer can skip an
+    /// unchanged payload on the version fence.
+    ///
+    /// The default implementation fetches the full snapshot and filters by
+    /// version locally; a transport whose backend honours `since` should
+    /// override this to skip the payload on the wire.
+    fn fetch_snapshot_since(&self, since: u64) -> Result<Option<PolicySnapshot>, RemoteError> {
+        let snapshot = self.fetch_snapshot()?;
+        Ok((snapshot.version > since).then_some(snapshot))
+    }
 }
 
 /// IAM client that resolves decisions over the remote protocol.

@@ -3,6 +3,7 @@
 #[cfg(feature = "http")]
 mod http;
 mod remote;
+mod snapshot;
 
 #[cfg(feature = "http")]
 pub use http::{DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig};
@@ -14,6 +15,7 @@ pub use outbox::{
     ProvisionTransport,
 };
 pub use remote::{AuthzTransport, IamClientMode, RemoteError, RemoteIamClient};
+pub use snapshot::{REASON_UNSYNCED, SnapshotCache, SyncStatus};
 
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,

@@ -16,6 +16,7 @@ http = ["dep:reqwest", "dep:serde"]
 
 [dependencies]
 awaken-iam-contract.workspace = true
+awaken-iam-core.workspace = true
 thiserror.workspace = true
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
