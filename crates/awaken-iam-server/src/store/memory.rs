@@ -11,12 +11,13 @@ use std::sync::Mutex;
 
 use awaken_iam_contract::{
     Account, AccountId, ExternalIdentity, ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId,
-    PrincipalRef, Session, SessionId, Timestamp,
+    OrgId, PrincipalRef, Session, SessionId, Timestamp,
 };
 use awaken_iam_core::{
-    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId, GrantRepo,
-    LoginFlowRepo, Plan, PlanId, PlanRepo, RepoError, RepoResult, ResourceEdge, ResourceModelRepo,
-    RoleBinding, RoleBindingRepo, SessionRepo,
+    AccountRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group,
+    GroupId, GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, RepoError,
+    RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
+    RoleRepo, SessionRepo,
 };
 
 /// JSON-serializable key used to index rows whose natural key is a contract
@@ -36,6 +37,9 @@ struct Identity {
 
 #[derive(Default)]
 struct Authz {
+    orgs: BTreeMap<String, Organization>,
+    groups: BTreeMap<String, Group>,
+    roles: BTreeMap<String, RoleDef>,
     grants: BTreeMap<String, Grant>,
     role_bindings: BTreeMap<String, RoleBinding>,
     resource_edges: BTreeMap<String, ResourceEdge>,
@@ -232,6 +236,100 @@ impl LoginFlowRepo for InMemoryStore {
     }
 }
 
+impl OrgRepo for InMemoryStore {
+    fn get(&self, id: &OrgId) -> RepoResult<Option<Organization>> {
+        Ok(self.authz.lock().unwrap().orgs.get(&id.0).cloned())
+    }
+
+    fn upsert(&self, org: Organization) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .orgs
+            .insert(org.id.0.clone(), org);
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<Organization>> {
+        Ok(self.authz.lock().unwrap().orgs.values().cloned().collect())
+    }
+
+    fn remove(&self, id: &OrgId) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .orgs
+            .remove(&id.0)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound(format!("organization {} not found", id.0)))
+    }
+}
+
+impl GroupRepo for InMemoryStore {
+    fn get(&self, id: &GroupId) -> RepoResult<Option<Group>> {
+        Ok(self.authz.lock().unwrap().groups.get(&id.0).cloned())
+    }
+
+    fn upsert(&self, group: Group) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .groups
+            .insert(group.id.0.clone(), group);
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<Group>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .groups
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn remove(&self, id: &GroupId) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .groups
+            .remove(&id.0)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound(format!("group {} not found", id.0)))
+    }
+}
+
+impl RoleRepo for InMemoryStore {
+    fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
+        Ok(self.authz.lock().unwrap().roles.get(&id.0).cloned())
+    }
+
+    fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .roles
+            .insert(role.id.0.clone(), role);
+        Ok(())
+    }
+
+    fn list(&self) -> RepoResult<Vec<RoleDef>> {
+        Ok(self.authz.lock().unwrap().roles.values().cloned().collect())
+    }
+
+    fn remove(&self, id: &RoleId) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .roles
+            .remove(&id.0)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound(format!("role {} not found", id.0)))
+    }
+}
+
 impl GrantRepo for InMemoryStore {
     fn put(&self, grant: Grant) -> RepoResult<()> {
         self.authz
@@ -303,6 +401,20 @@ impl RoleBindingRepo for InMemoryStore {
             .values()
             .cloned()
             .collect())
+    }
+
+    fn remove(&self, binding: &RoleBinding) -> RepoResult<()> {
+        let key = json_key(
+            &(&binding.principal, &binding.role.0, &binding.scope),
+            "role binding",
+        )?;
+        self.authz
+            .lock()
+            .unwrap()
+            .role_bindings
+            .remove(&key)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound("role binding not found".to_owned()))
     }
 }
 
@@ -387,9 +499,10 @@ impl AuditSink for InMemoryStore {
 mod tests {
     use super::*;
     use awaken_iam_contract::{
-        ExternalIdentityClaims, ExternalIdentityId, ExternalSubject, IdentityProviderKey, ScopeRef,
+        ExternalIdentityClaims, ExternalIdentityId, ExternalSubject, IdentityProviderKey, OrgId,
+        ScopeRef,
     };
-    use awaken_iam_core::{Effect, GrantSubject, PlanTier, RoleId};
+    use awaken_iam_core::{ActionPattern, Effect, GrantSubject, PlanTier, RoleId};
 
     fn ts(value: &str) -> Timestamp {
         Timestamp(value.into())
@@ -431,7 +544,7 @@ mod tests {
             AccountRepo::get(&store, &AccountId("a".into())).unwrap(),
             None
         );
-        store.upsert(account("a")).unwrap();
+        AccountRepo::upsert(&store, account("a")).unwrap();
         assert_eq!(AccountRepo::list(&store).unwrap().len(), 1);
         assert_eq!(
             AccountRepo::get(&store, &AccountId("a".into()))
@@ -537,9 +650,9 @@ mod tests {
                 .is_some()
         );
         assert_eq!(GrantRepo::list(&store).unwrap().len(), 1);
-        store.remove(&GrantId("g1".into())).unwrap();
+        GrantRepo::remove(&store, &GrantId("g1".into())).unwrap();
         assert!(matches!(
-            store.remove(&GrantId("g1".into())),
+            GrantRepo::remove(&store, &GrantId("g1".into())),
             Err(RepoError::NotFound(_))
         ));
     }
@@ -559,6 +672,73 @@ mod tests {
             .unwrap();
         assert_eq!(store.list_for_principal(&principal).unwrap().len(), 1);
         assert_eq!(RoleBindingRepo::list(&store).unwrap().len(), 1);
+
+        let binding = RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("admin".into()),
+            scope: ScopeRef::Global,
+        };
+        RoleBindingRepo::remove(&store, &binding).unwrap();
+        assert_eq!(RoleBindingRepo::list(&store).unwrap().len(), 0);
+        assert!(matches!(
+            RoleBindingRepo::remove(&store, &binding),
+            Err(RepoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn orgs_groups_and_roles_round_trip() {
+        let store = InMemoryStore::new();
+        let org = Organization {
+            id: OrgId("acme".into()),
+            display_name: Some("Acme".into()),
+            owner: PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            },
+            created_at: ts("2026-06-21T00:00:00Z"),
+            updated_at: ts("2026-06-21T00:00:00Z"),
+        };
+        OrgRepo::upsert(&store, org.clone()).unwrap();
+        assert_eq!(
+            OrgRepo::get(&store, &OrgId("acme".into())).unwrap(),
+            Some(org)
+        );
+        assert_eq!(OrgRepo::list(&store).unwrap().len(), 1);
+        OrgRepo::remove(&store, &OrgId("acme".into())).unwrap();
+        assert!(matches!(
+            OrgRepo::remove(&store, &OrgId("acme".into())),
+            Err(RepoError::NotFound(_))
+        ));
+
+        let group = Group {
+            id: GroupId("eng".into()),
+            org: OrgId("acme".into()),
+            display_name: None,
+            members: vec![PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            }],
+            created_at: ts("2026-06-21T00:00:00Z"),
+            updated_at: ts("2026-06-21T00:00:00Z"),
+        };
+        GroupRepo::upsert(&store, group.clone()).unwrap();
+        assert_eq!(GroupRepo::get(&store, &group.id).unwrap(), Some(group));
+        assert_eq!(GroupRepo::list(&store).unwrap().len(), 1);
+
+        let role = RoleDef {
+            id: RoleId("publisher".into()),
+            display_name: Some("Publisher".into()),
+            action_patterns: vec![ActionPattern("pack.*".into())],
+            created_at: ts("2026-06-21T00:00:00Z"),
+            updated_at: ts("2026-06-21T00:00:00Z"),
+        };
+        RoleRepo::upsert(&store, role.clone()).unwrap();
+        assert_eq!(RoleRepo::get(&store, &role.id).unwrap(), Some(role));
+        assert_eq!(RoleRepo::list(&store).unwrap().len(), 1);
+        RoleRepo::remove(&store, &RoleId("publisher".into())).unwrap();
+        assert!(matches!(
+            RoleRepo::remove(&store, &RoleId("publisher".into())),
+            Err(RepoError::NotFound(_))
+        ));
     }
 
     #[test]

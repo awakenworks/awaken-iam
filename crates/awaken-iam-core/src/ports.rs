@@ -15,10 +15,13 @@
 
 use awaken_iam_contract::{
     Account, AccountId, ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, OAuthLoginState,
-    OAuthLoginStateId, PrincipalRef, Session, SessionId, Timestamp,
+    OAuthLoginStateId, OrgId, PrincipalRef, Session, SessionId, Timestamp,
 };
 
-use crate::{Grant, GrantId, Plan, PlanId, ResourceEdge, RoleBinding};
+use crate::{
+    Grant, GrantId, Group, GroupId, Organization, Plan, PlanId, ResourceEdge, RoleBinding, RoleDef,
+    RoleId,
+};
 
 /// Error surface shared by every repository port.
 ///
@@ -96,6 +99,42 @@ pub trait LoginFlowRepo: Send + Sync {
 // iam.authz
 // ---------------------------------------------------------------------------
 
+/// Persistence for [`Organization`] aggregates.
+pub trait OrgRepo: Send + Sync {
+    /// Resolve an organization by id, returning `None` when absent.
+    fn get(&self, id: &OrgId) -> RepoResult<Option<Organization>>;
+    /// Insert or replace an organization.
+    fn upsert(&self, org: Organization) -> RepoResult<()>;
+    /// List every organization ordered by id.
+    fn list(&self) -> RepoResult<Vec<Organization>>;
+    /// Remove an organization, failing closed when it is absent.
+    fn remove(&self, id: &OrgId) -> RepoResult<()>;
+}
+
+/// Persistence for [`Group`] aggregates.
+pub trait GroupRepo: Send + Sync {
+    /// Resolve a group by id, returning `None` when absent.
+    fn get(&self, id: &GroupId) -> RepoResult<Option<Group>>;
+    /// Insert or replace a group.
+    fn upsert(&self, group: Group) -> RepoResult<()>;
+    /// List every group ordered by id.
+    fn list(&self) -> RepoResult<Vec<Group>>;
+    /// Remove a group, failing closed when it is absent.
+    fn remove(&self, id: &GroupId) -> RepoResult<()>;
+}
+
+/// Persistence for [`RoleDef`] definitions.
+pub trait RoleRepo: Send + Sync {
+    /// Resolve a role definition by id, returning `None` when absent.
+    fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>>;
+    /// Insert or replace a role definition.
+    fn upsert(&self, role: RoleDef) -> RepoResult<()>;
+    /// List every role definition ordered by id.
+    fn list(&self) -> RepoResult<Vec<RoleDef>>;
+    /// Remove a role definition, failing closed when it is absent.
+    fn remove(&self, id: &RoleId) -> RepoResult<()>;
+}
+
 /// Persistence for authorization [`Grant`] rows.
 pub trait GrantRepo: Send + Sync {
     /// Insert or replace a grant.
@@ -116,6 +155,8 @@ pub trait RoleBindingRepo: Send + Sync {
     fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<RoleBinding>>;
     /// List every binding.
     fn list(&self) -> RepoResult<Vec<RoleBinding>>;
+    /// Remove an exact binding, failing closed when it is absent.
+    fn remove(&self, binding: &RoleBinding) -> RepoResult<()>;
 }
 
 /// Persistence for the product resource-model registry (parent edges).
