@@ -257,6 +257,17 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         &self.authz
     }
 
+    /// Consume the assembly and yield its owned [`AuthzApi`].
+    ///
+    /// Migrations have already run by the time an assembly exists, and the
+    /// authorization plane evaluates from its in-memory policy rather than the
+    /// store; a deployment that only serves the authorization half of `/v1` (the
+    /// standalone [`http`](crate::http) router) takes the engine this way to
+    /// share it read-only across connections.
+    pub fn into_authz(self) -> AuthzApi {
+        self.authz
+    }
+
     /// The canonical `/v1` routes this assembly mounts (auth then authz).
     ///
     /// Both deployments mount the identical manifest; embedded mounts it onto the
@@ -303,6 +314,14 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
     /// Mutable access to the underlying assembly.
     pub fn assembly_mut(&mut self) -> &mut IamAssembly<Pool> {
         &mut self.assembly
+    }
+
+    /// Consume the daemon and yield its underlying standalone assembly.
+    ///
+    /// The standalone process uses this to take ownership of the assembly after
+    /// `start` has migrated, then serve its authorization engine over HTTP.
+    pub fn into_assembly(self) -> IamAssembly<Pool> {
+        self.assembly
     }
 
     /// The canonical `/v1` routes the daemon serves.
