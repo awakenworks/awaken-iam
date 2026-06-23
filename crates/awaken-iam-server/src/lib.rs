@@ -3,6 +3,7 @@
 mod auth_api;
 mod authz_api;
 mod session;
+mod store;
 
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
@@ -12,6 +13,10 @@ pub use auth_api::{
 pub use authz_api::AuthzApi;
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
+};
+pub use store::{
+    BundleScope, IamStore, InMemoryStore, MigrateReport, Migration, MigrationBundle,
+    MigrationExecutor, PlannedMigration, RecordingExecutor, bundles,
 };
 
 use awaken_iam_client::IamClient;

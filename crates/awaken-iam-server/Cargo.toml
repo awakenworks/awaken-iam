@@ -13,7 +13,10 @@ awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 awaken-iam-contract.workspace = true
