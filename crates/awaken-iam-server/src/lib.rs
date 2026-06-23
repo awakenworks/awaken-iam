@@ -31,7 +31,7 @@ pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
 };
 pub use store::{
-    BundleScope, IamStore, InMemoryStore, MigrateReport, Migration, MigrationBundle,
+    BundleScope, Dialect, IamStore, InMemoryStore, MigrateReport, Migration, MigrationBundle,
     MigrationExecutor, PlannedMigration, RecordingExecutor, bundles,
 };
 

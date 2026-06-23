@@ -25,7 +25,7 @@ pub use awaken_iam_core::{
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
-    CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, Deployment,
+    CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, Deployment, Dialect,
     EstablishedSession, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, IamServer,
     IssueTokenGrant, LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration,
     ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,

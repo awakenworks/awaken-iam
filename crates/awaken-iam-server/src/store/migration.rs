@@ -32,6 +32,56 @@ use awaken_iam_core::{RepoError, RepoResult};
 /// The token every bundle's DDL uses where the configured table prefix belongs.
 const PREFIX_TOKEN: &str = "{prefix}";
 
+/// Portable type-token vocabulary (ADR-0003).
+///
+/// Each row is `(token, postgres, sqlite)`. A bundle's DDL is authored
+/// dialect-neutral using these tokens wherever a backend-specific column type or
+/// function belongs; the active backend's [`Dialect`] renders each to its
+/// concrete form alongside the table prefix. Only tokens actually used by the
+/// shipped bundles need a row, but the set is kept small and stable so adding a
+/// backend is a column in this table, not a schema rewrite.
+const TYPE_TOKENS: &[(&str, &str, &str)] = &[
+    ("{json}", "JSONB", "TEXT"),
+    ("{timestamptz}", "TIMESTAMPTZ", "TEXT"),
+    ("{now}", "now()", "CURRENT_TIMESTAMP"),
+    ("{blob}", "BYTEA", "BLOB"),
+    ("{pk_autoinc}", "BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+];
+
+/// Ledger DDL template, rendered per dialect like any bundle step.
+const LEDGER_TEMPLATE: &str = "\
+CREATE TABLE IF NOT EXISTS {prefix}_schema_migrations (\
+ bundle TEXT NOT NULL, \
+ id TEXT NOT NULL, \
+ checksum TEXT NOT NULL, \
+ applied_at {timestamptz} NOT NULL DEFAULT {now}, \
+ PRIMARY KEY (bundle, id))";
+
+/// SQL backend a deployment renders and applies the migration plan against.
+///
+/// The backend choice is configuration, not a code fork (see
+/// [ADR-0003](../../../../docs/adr/0003-storage-backends.md)): the same bundles,
+/// ledger discipline, and `MigrationExecutor` seam drive either, and only the
+/// dialect-token rendering and the single-applier guard differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// PostgreSQL — the standalone / cloud / multi-node HA backend.
+    #[default]
+    Postgres,
+    /// SQLite — the embedded / local / single-node backend.
+    Sqlite,
+}
+
+impl Dialect {
+    /// Render a single type token to this dialect's concrete form.
+    fn render_token(self, postgres: &'static str, sqlite: &'static str) -> &'static str {
+        match self {
+            Dialect::Postgres => postgres,
+            Dialect::Sqlite => sqlite,
+        }
+    }
+}
+
 /// Component-scope partition a migration bundle belongs to.
 ///
 /// The scope decides *where the tables live* (which bundle owns them), distinct
@@ -171,26 +221,36 @@ impl<Pool> IamStore<Pool> {
     /// The ledger table name: `<prefix>_schema_migrations`.
     ///
     /// Each component keeps its own ledger so siblings sharing a database never
-    /// contend on a single migration table.
+    /// contend on a single migration table. The name carries only the prefix —
+    /// no type tokens — so it is dialect-independent.
     pub fn ledger_table(&self) -> String {
-        self.render(&format!("{PREFIX_TOKEN}_schema_migrations"))
+        format!("{PREFIX_TOKEN}_schema_migrations").replace(PREFIX_TOKEN, &self.prefix)
     }
 
-    /// DDL that creates this store's ledger if it does not already exist.
+    /// Render a DDL template for `dialect`: substitute the table prefix, then
+    /// every [`TYPE_TOKENS`] entry to its dialect-specific form.
+    fn render_ddl(&self, template: &str, dialect: Dialect) -> String {
+        let mut sql = template.replace(PREFIX_TOKEN, &self.prefix);
+        for (token, postgres, sqlite) in TYPE_TOKENS {
+            sql = sql.replace(token, dialect.render_token(postgres, sqlite));
+        }
+        sql
+    }
+}
+
+impl<Pool: MigrationExecutor> IamStore<Pool> {
+    /// DDL that creates this store's ledger if it does not already exist,
+    /// rendered for the executor's backend [`Dialect`].
     pub fn ledger_ddl(&self) -> String {
-        format!(
-            "CREATE TABLE IF NOT EXISTS {ledger} (\
-             bundle TEXT NOT NULL, \
-             id TEXT NOT NULL, \
-             checksum TEXT NOT NULL, \
-             applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-             PRIMARY KEY (bundle, id))",
-            ledger = self.ledger_table()
-        )
+        self.render_ddl(LEDGER_TEMPLATE, self.pool.dialect())
     }
 
-    /// The full ordered set of migrations rendered for this prefix.
+    /// The full ordered set of migrations rendered for this prefix and the
+    /// executor's backend [`Dialect`]. The `checksum` is the neutral-template
+    /// identity (ADR-0003 decision 5), so it is stable across dialects even
+    /// though the rendered `sql` differs.
     pub fn plan(&self) -> Vec<PlannedMigration> {
+        let dialect = self.pool.dialect();
         let mut planned = Vec::new();
         for bundle in bundles() {
             for migration in &bundle.migrations {
@@ -198,19 +258,13 @@ impl<Pool> IamStore<Pool> {
                     bundle: bundle.scope.id(),
                     id: migration.id,
                     checksum: migration.checksum(),
-                    sql: self.render(migration.up_sql),
+                    sql: self.render_ddl(migration.up_sql, dialect),
                 });
             }
         }
         planned
     }
 
-    fn render(&self, template: &str) -> String {
-        template.replace(PREFIX_TOKEN, &self.prefix)
-    }
-}
-
-impl<Pool: MigrationExecutor> IamStore<Pool> {
     /// Apply every pending migration in order, verifying already-applied steps.
     ///
     /// Idempotent: a step whose ledger checksum matches is skipped. A step whose
@@ -259,6 +313,15 @@ pub struct MigrateReport {
 /// in-memory [`RecordingExecutor`]. Keeping the seam here lets the same plan and
 /// ledger discipline drive embedded and standalone identically.
 pub trait MigrationExecutor {
+    /// The SQL backend this executor applies against.
+    ///
+    /// Drives dialect-token rendering of the plan. Defaults to
+    /// [`Dialect::Postgres`] so existing executors need no change; a SQLite
+    /// executor overrides it.
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
+    }
+
     /// Create the ledger table if absent.
     fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()>;
     /// Return the recorded checksum for an applied `(bundle, id)`, if any.
@@ -278,14 +341,25 @@ pub struct RecordingExecutor {
     ledger_created: bool,
     /// Ledger rows keyed by `(bundle, id)` to their recorded checksum.
     ledger: Vec<(String, String, String)>,
+    /// Backend dialect the plan is rendered against.
+    dialect: Dialect,
     /// DDL statements executed in order.
     pub executed: Vec<String>,
 }
 
 impl RecordingExecutor {
-    /// A fresh executor with an empty ledger.
+    /// A fresh executor with an empty ledger, rendering for the default
+    /// ([`Dialect::Postgres`]) backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh executor that renders the plan for a specific backend dialect.
+    pub fn with_dialect(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            ..Self::default()
+        }
     }
 
     /// Overwrite a ledger row's checksum to simulate a drifted prior apply.
@@ -304,6 +378,10 @@ impl RecordingExecutor {
 }
 
 impl MigrationExecutor for RecordingExecutor {
+    fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
     fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()> {
         if !self.ledger_created {
             self.executed.push(ledger_ddl.to_owned());
@@ -388,7 +466,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_external_identities (\
  account_id TEXT NOT NULL, \
  provider_key TEXT NOT NULL, \
  subject TEXT NOT NULL, \
- claims JSONB NOT NULL, \
+ claims {json} NOT NULL, \
  first_seen_at TEXT NOT NULL, \
  last_seen_at TEXT NOT NULL, \
  UNIQUE (provider_key, subject));\n\
@@ -423,9 +501,9 @@ const IDENTITY_0002: &str = "\
 CREATE TABLE IF NOT EXISTS {prefix}_api_tokens (\
  id TEXT PRIMARY KEY, \
  prefix TEXT NOT NULL UNIQUE, \
- principal JSONB NOT NULL, \
+ principal {json} NOT NULL, \
  secret_hash TEXT NOT NULL, \
- scope JSONB NOT NULL, \
+ scope {json} NOT NULL, \
  created_at TEXT NOT NULL, \
  expires_at TEXT, \
  revoked_at TEXT);\n\
@@ -440,19 +518,19 @@ CREATE INDEX IF NOT EXISTS {prefix}_api_tokens_principal_idx \
 const AUTHZ_0001: &str = "\
 CREATE TABLE IF NOT EXISTS {prefix}_grants (\
  id TEXT PRIMARY KEY, \
- subject JSONB NOT NULL, \
+ subject {json} NOT NULL, \
  action_pattern TEXT NOT NULL, \
- scope JSONB NOT NULL, \
+ scope {json} NOT NULL, \
  effect TEXT NOT NULL);\n\
 CREATE TABLE IF NOT EXISTS {prefix}_role_bindings (\
- principal JSONB NOT NULL, \
+ principal {json} NOT NULL, \
  role TEXT NOT NULL, \
- scope JSONB NOT NULL, \
+ scope {json} NOT NULL, \
  PRIMARY KEY (principal, role, scope));\n\
 CREATE TABLE IF NOT EXISTS {prefix}_resource_edges (\
  resource_type TEXT NOT NULL, \
  resource_id TEXT NOT NULL, \
- parent JSONB NOT NULL, \
+ parent {json} NOT NULL, \
  PRIMARY KEY (resource_type, resource_id));";
 
 // --- iam.entitlement DDL ---------------------------------------------------
@@ -464,11 +542,11 @@ const ENTITLEMENT_0001: &str = "\
 CREATE TABLE IF NOT EXISTS {prefix}_plans (\
  id TEXT PRIMARY KEY, \
  tier TEXT NOT NULL, \
- features JSONB NOT NULL, \
- limits JSONB NOT NULL, \
- rates JSONB NOT NULL);\n\
+ features {json} NOT NULL, \
+ limits {json} NOT NULL, \
+ rates {json} NOT NULL);\n\
 CREATE TABLE IF NOT EXISTS {prefix}_subscriptions (\
- principal JSONB NOT NULL PRIMARY KEY, \
+ principal {json} NOT NULL PRIMARY KEY, \
  plan_id TEXT NOT NULL);";
 
 #[cfg(test)]
@@ -494,8 +572,69 @@ mod tests {
         assert!(plan.iter().any(|m| m.sql.contains("iam_api_tokens")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_grants")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_plans")));
-        // No unrendered template tokens leak into the executed SQL.
+        // No unrendered template tokens leak into the executed SQL — neither the
+        // prefix token nor any type token.
         assert!(plan.iter().all(|m| !m.sql.contains(PREFIX_TOKEN)));
+        for (token, _, _) in TYPE_TOKENS {
+            assert!(
+                plan.iter().all(|m| !m.sql.contains(token)),
+                "type token {token} leaked into rendered SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_postgres_and_sqlite_type_tokens_distinctly() {
+        let pg = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Postgres), "iam")
+            .expect("valid prefix");
+        let lite = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Sqlite), "iam")
+            .expect("valid prefix");
+
+        let pg_sql: String = pg.plan().iter().map(|m| m.sql.clone()).collect();
+        let lite_sql: String = lite.plan().iter().map(|m| m.sql.clone()).collect();
+
+        // Postgres keeps JSONB; SQLite renders the portable TEXT form and never
+        // emits a Postgres-only type.
+        assert!(pg_sql.contains("claims JSONB"));
+        assert!(!lite_sql.contains("JSONB"));
+        assert!(lite_sql.contains("claims TEXT"));
+
+        // The ledger timestamp default differs per dialect.
+        assert!(pg.ledger_ddl().contains("TIMESTAMPTZ"));
+        assert!(pg.ledger_ddl().contains("now()"));
+        assert!(lite.ledger_ddl().contains("CURRENT_TIMESTAMP"));
+        assert!(!lite.ledger_ddl().contains("TIMESTAMPTZ"));
+    }
+
+    #[test]
+    fn checksum_is_dialect_independent_but_rendered_sql_is_not() {
+        // ADR-0003 decision 5: the migration's recorded identity is the neutral
+        // template, so the checksum is the same on either backend even though
+        // the rendered SQL is dialect-specific.
+        let pg = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Postgres), "iam")
+            .expect("valid prefix");
+        let lite = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Sqlite), "iam")
+            .expect("valid prefix");
+        let (pg_plan, lite_plan) = (pg.plan(), lite.plan());
+        assert_eq!(pg_plan.len(), lite_plan.len());
+        for (a, b) in pg_plan.iter().zip(lite_plan.iter()) {
+            assert_eq!(a.checksum, b.checksum, "{}::{} identity drifted", a.bundle, a.id);
+            assert_ne!(a.sql, b.sql, "{}::{} rendered identically", a.bundle, a.id);
+        }
+    }
+
+    #[test]
+    fn both_dialects_migrate_cleanly_and_idempotently() {
+        for dialect in [Dialect::Postgres, Dialect::Sqlite] {
+            let mut store = IamStore::with_prefix(RecordingExecutor::with_dialect(dialect), "iam")
+                .expect("valid prefix");
+            let first = store.migrate().expect("first migrate");
+            assert_eq!(first.applied, store.plan().len());
+            assert_eq!(first.skipped, 0);
+            let second = store.migrate().expect("second migrate");
+            assert_eq!(second.applied, 0);
+            assert_eq!(second.skipped, store.plan().len());
+        }
     }
 
     #[test]
