@@ -30,11 +30,11 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
-use awaken_iam_contract::{OrgId, PrincipalRef, ScopeRef, Timestamp};
+use awaken_iam_contract::{OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp};
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, OrgRepo,
-    Organization, RepoError, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleInvariant,
-    RoleRepo,
+    Organization, RepoError, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo,
+    RoleDef, RoleId, RoleInvariant, RoleRepo,
 };
 
 /// A policy-administration domain event.
@@ -85,6 +85,13 @@ pub enum DomainEvent {
         /// Scope at which the binding applied.
         scope: ScopeRef,
     },
+    /// A consumer registered (or extended) its resource model.
+    ResourceModelRegistered {
+        /// Number of resource types declared in the registration.
+        resource_types: usize,
+        /// Number of per-instance scope parent edges registered.
+        edges: usize,
+    },
 }
 
 impl DomainEvent {
@@ -104,6 +111,7 @@ impl DomainEvent {
             DomainEvent::GrantRevoked(_) => "grant.revoke",
             DomainEvent::MembershipGranted { .. } => "membership.grant",
             DomainEvent::MembershipRevoked { .. } => "membership.revoke",
+            DomainEvent::ResourceModelRegistered { .. } => "resource_model.register",
         }
     }
 
@@ -132,6 +140,10 @@ impl DomainEvent {
                 role,
                 scope,
             } => format!("role {} for {principal:?} at {scope:?}", role.0),
+            DomainEvent::ResourceModelRegistered {
+                resource_types,
+                edges,
+            } => format!("resource model: {resource_types} types, {edges} edges"),
         }
     }
 }
@@ -188,7 +200,7 @@ pub struct PolicyAdminApi<S> {
 
 impl<S> PolicyAdminApi<S>
 where
-    S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + AuditSink,
+    S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + ResourceModelRepo + AuditSink,
 {
     /// Build a PAP over `store` at initial snapshot version 1.
     pub fn new(store: S) -> Self {
@@ -419,6 +431,41 @@ where
     ) -> AdminResult<Vec<RoleBinding>> {
         Ok(RoleBindingRepo::list_for_principal(&self.store, principal)?)
     }
+
+    // -- resource model -----------------------------------------------------
+
+    /// Register a consumer's resource model, persisting its per-instance scope
+    /// parent edges so the product hierarchy survives a restart and feeds the
+    /// authorization snapshot.
+    ///
+    /// Edges are upserted by `(resource_type, resource_id)`, so re-registering an
+    /// instance replaces its parent rather than duplicating it (the
+    /// "registered, never inferred" invariant). The resource types and standalone
+    /// actions are vocabulary the evaluator folds in live through
+    /// [`AuthzApi::register_resource_model`](crate::AuthzApi::register_resource_model);
+    /// only the edges are durable policy state, so they are what this PAP
+    /// persists. Advances the snapshot version once for the whole registration.
+    pub fn register_resource_model(
+        &mut self,
+        registration: &ResourceModelRegistration,
+        at: Timestamp,
+    ) -> AdminResult<u64> {
+        for edge in &registration.edges {
+            ResourceModelRepo::put_edge(&self.store, ResourceEdge::from(edge.clone()))?;
+        }
+        self.commit(
+            DomainEvent::ResourceModelRegistered {
+                resource_types: registration.resource_types.len(),
+                edges: registration.edges.len(),
+            },
+            at,
+        )
+    }
+
+    /// List every persisted resource-model parent edge.
+    pub fn list_resource_edges(&self) -> AdminResult<Vec<ResourceEdge>> {
+        Ok(ResourceModelRepo::list_edges(&self.store)?)
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +632,55 @@ mod tests {
             pap.events().first().unwrap(),
             DomainEvent::MembershipGranted { .. }
         ));
+    }
+
+    #[test]
+    fn resource_model_registration_persists_edges_and_bumps_version() {
+        use awaken_iam_contract::{
+            ResourceId, ResourceModelRegistration, ResourceParentEdge, ResourceType,
+            ResourceTypeRegistration,
+        };
+
+        let mut pap = pap();
+        let registration = ResourceModelRegistration {
+            resource_types: vec![ResourceTypeRegistration {
+                resource_type: ResourceType("issue".into()),
+                parent_type: None,
+                actions: Vec::new(),
+            }],
+            actions: Vec::new(),
+            edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Org {
+                    org_id: OrgId("acme".into()),
+                },
+            }],
+        };
+        let version = pap.register_resource_model(&registration, at()).unwrap();
+        assert_eq!(version, 2);
+        let edges = pap.list_resource_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].resource_id, ResourceId("42".into()));
+
+        // Re-registering the same instance with a new parent replaces it rather
+        // than duplicating — edges are upserted by (type, id).
+        let mut moved = registration.clone();
+        moved.edges[0].parent = ScopeRef::Global;
+        pap.register_resource_model(&moved, at()).unwrap();
+        let edges = pap.list_resource_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].parent, ScopeRef::Global);
+
+        assert!(matches!(
+            pap.events().first().unwrap(),
+            DomainEvent::ResourceModelRegistered {
+                resource_types: 1,
+                edges: 1
+            }
+        ));
+        let audit = AuditSink::events(pap.store()).unwrap();
+        assert_eq!(audit[0].action, "resource_model.register");
     }
 
     #[test]

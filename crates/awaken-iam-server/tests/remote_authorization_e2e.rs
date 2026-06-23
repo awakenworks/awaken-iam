@@ -7,6 +7,8 @@
 //! contract shapes, the server assembly, and the client's fail-closed mapping
 //! are exercised together against the current authorization core.
 
+use std::cell::RefCell;
+
 use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, RemoteIamClient};
 use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
@@ -14,6 +16,9 @@ use awaken_iam_contract::{
     EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId, PolicySnapshot,
     PrincipalRef, ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
     SignerKeyStatus, SignerSetSnapshot, Timestamp,
+    EntitlementDecision, EntitlementRequest, PolicySnapshot, PrincipalRef, ResourceId,
+    ResourceModelRegistered, ResourceModelRegistration, ResourceParentEdge, ResourceType,
+    ResourceTypeRegistration, ScopeRef,
 };
 use awaken_iam_core::{
     ActionPattern, Effect, EntitlementCatalog, EntitlementEngine, Grant, GrantId, GrantSubject,
@@ -25,11 +30,25 @@ use awaken_iam_server::{AuthzApi, IamServer};
 /// wire hop without a real socket. When `online` is false every call reports a
 /// transport error so the fail-closed path can be exercised.
 struct JsonLoopbackTransport {
-    api: AuthzApi,
+    api: RefCell<AuthzApi>,
     online: bool,
 }
 
 impl JsonLoopbackTransport {
+    fn online(api: AuthzApi) -> Self {
+        Self {
+            api: RefCell::new(api),
+            online: true,
+        }
+    }
+
+    fn offline(api: AuthzApi) -> Self {
+        Self {
+            api: RefCell::new(api),
+            online: false,
+        }
+    }
+
     fn roundtrip<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         request: &Req,
@@ -39,7 +58,7 @@ impl JsonLoopbackTransport {
             return Err(RemoteError("offline".into()));
         }
         let body = serde_json::to_string(request).map_err(|err| RemoteError(err.to_string()))?;
-        let response = handle(&self.api, &body);
+        let response = handle(&self.api.borrow(), &body);
         serde_json::from_str(&response).map_err(|err| RemoteError(err.to_string()))
     }
 }
@@ -75,11 +94,27 @@ impl AuthzTransport for JsonLoopbackTransport {
         })
     }
 
+    fn register_resource_model(
+        &self,
+        registration: &ResourceModelRegistration,
+    ) -> Result<ResourceModelRegistered, RemoteError> {
+        if !self.online {
+            return Err(RemoteError("offline".into()));
+        }
+        let body =
+            serde_json::to_string(registration).map_err(|err| RemoteError(err.to_string()))?;
+        let parsed: ResourceModelRegistration =
+            serde_json::from_str(&body).map_err(|err| RemoteError(err.to_string()))?;
+        let registered = self.api.borrow_mut().register_resource_model(&parsed);
+        serde_json::from_str(&serde_json::to_string(&registered).unwrap())
+            .map_err(|err| RemoteError(err.to_string()))
+    }
+
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
         if !self.online {
             return Err(RemoteError("offline".into()));
         }
-        serde_json::from_str(&serde_json::to_string(&self.api.snapshot()).unwrap())
+        serde_json::from_str(&serde_json::to_string(&self.api.borrow().snapshot()).unwrap())
             .map_err(|err| RemoteError(err.to_string()))
     }
 
@@ -136,10 +171,9 @@ fn remote_mode_resolves_authorization_over_the_wire() {
     // The product binds to one `IamClient` type; `remote` mode is selected by
     // configuration, with an in-process `IamServer` as the `local` alternative.
     let client: IamClientMode<IamServer, RemoteIamClient<JsonLoopbackTransport>> =
-        IamClientMode::Remote(RemoteIamClient::new(JsonLoopbackTransport {
-            api: publish_api(),
-            online: true,
-        }));
+        IamClientMode::Remote(RemoteIamClient::new(JsonLoopbackTransport::online(
+            publish_api(),
+        )));
     assert!(client.is_remote());
 
     // A covered action is allowed; an uncovered one defaults to deny.
@@ -155,10 +189,7 @@ fn remote_mode_resolves_authorization_over_the_wire() {
 
 #[test]
 fn remote_outcome_carries_the_decision_trace() {
-    let client = RemoteIamClient::new(JsonLoopbackTransport {
-        api: publish_api(),
-        online: true,
-    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::online(publish_api()));
     let outcome = client
         .authorize_outcome(&authorize_request("pack.publish"))
         .unwrap();
@@ -181,10 +212,7 @@ fn remote_outcome_carries_the_decision_trace() {
 
 #[test]
 fn remote_entitlement_check_reports_plan_reason() {
-    let client = RemoteIamClient::new(JsonLoopbackTransport {
-        api: publish_api(),
-        online: true,
-    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::online(publish_api()));
     let response = client
         .check_entitlement_response(&EntitlementRequest {
             principal: PrincipalRef::Account {
@@ -200,10 +228,7 @@ fn remote_entitlement_check_reports_plan_reason() {
 
 #[test]
 fn remote_mode_fails_closed_when_iam_is_unreachable() {
-    let client = RemoteIamClient::new(JsonLoopbackTransport {
-        api: publish_api(),
-        online: false,
-    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::offline(publish_api()));
     // An IAM that cannot answer denies; it never degrades to allow.
     assert_eq!(
         client.authorize(authorize_request("pack.publish")),
@@ -223,10 +248,7 @@ fn remote_mode_fails_closed_when_iam_is_unreachable() {
 
 #[test]
 fn synced_snapshot_matches_remote_authorize() {
-    let client = RemoteIamClient::new(JsonLoopbackTransport {
-        api: publish_api(),
-        online: true,
-    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::online(publish_api()));
     let snapshot = client.fetch_snapshot().unwrap();
     let local = PolicySet::from_snapshot(&snapshot);
 
@@ -285,4 +307,79 @@ fn remote_mode_signer_fetch_fails_closed_when_iam_is_unreachable() {
     });
     // An unreachable IAM yields a transport error, never a stale signer set.
     assert!(client.fetch_signers(&NamespaceId("acme".into())).is_err());
+fn registering_a_resource_model_over_the_wire_resolves_open_scopes() {
+    // A consumer teaches IAM, over the wire, that issue:42 nests under a project
+    // it already holds a grant at. After registration the remote `authorize`
+    // resolves the open resource scope up to that project, and the registered
+    // edge rides the snapshot so a synced consumer answers identically.
+    let mut core = IamCore::new();
+    core.policy_mut().add_grant(Grant {
+        id: GrantId("g_proj".into()),
+        subject: GrantSubject::Principal(service("publisher")),
+        action_pattern: ActionPattern("issue.*".into()),
+        scope: ScopeRef::Project {
+            workspace_id: awaken_iam_contract::WorkspaceId("ws_main".into()),
+            project_id: awaken_iam_contract::ProjectId("proj_web".into()),
+        },
+        effect: Effect::Allow,
+    });
+    let client = RemoteIamClient::new(JsonLoopbackTransport::online(AuthzApi::from_parts(
+        core,
+        EntitlementEngine::default_allow(),
+    )));
+
+    let issue_scope = ScopeRef::Resource {
+        resource_type: ResourceType("issue".into()),
+        resource_id: ResourceId("42".into()),
+    };
+    let close_issue = AuthorizationRequest::direct(
+        service("publisher"),
+        ActionKey("issue.close".into()),
+        issue_scope.clone(),
+    );
+
+    // Before registration the open scope has no ancestry, so it falls through to
+    // default-deny — the fail-closed posture holds for unregistered resources.
+    assert_eq!(
+        client.authorize(close_issue.clone()),
+        AuthorizationDecision::Deny
+    );
+
+    let registered = client
+        .register_resource_model(&ResourceModelRegistration {
+            resource_types: vec![ResourceTypeRegistration {
+                resource_type: ResourceType("issue".into()),
+                parent_type: None,
+                actions: vec![ActionKey("issue.close".into())],
+            }],
+            actions: Vec::new(),
+            edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Project {
+                    workspace_id: awaken_iam_contract::WorkspaceId("ws_main".into()),
+                    project_id: awaken_iam_contract::ProjectId("proj_web".into()),
+                },
+            }],
+        })
+        .unwrap();
+    assert!(registered.version >= 1);
+
+    // The project grant now covers the issue resource through the registered edge.
+    assert_eq!(client.authorize(close_issue), AuthorizationDecision::Allow);
+
+    // A synced consumer rebuilds the same ancestry from the snapshot.
+    let snapshot = client.fetch_snapshot().unwrap();
+    assert_eq!(snapshot.version, registered.version);
+    let local = PolicySet::from_snapshot(&snapshot);
+    assert_eq!(
+        local
+            .evaluate(&AuthorizationRequest::direct(
+                service("publisher"),
+                ActionKey("issue.close".into()),
+                issue_scope,
+            ))
+            .decision,
+        AuthorizationDecision::Allow
+    );
 }

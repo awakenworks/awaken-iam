@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId, OrgId,
     PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
+    ActionKey, AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId,
+    OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef, WorkspaceId,
 };
 
 /// The authority empowered to discharge a require-approval obligation.
@@ -204,6 +206,58 @@ pub struct ScopeGraphSnapshot {
     pub workspace_orgs: Vec<WorkspaceOrgEdge>,
     /// Open-resource parent edges.
     pub resource_parents: Vec<ResourceParentEdge>,
+}
+
+/// Wire shape of one resource type a consumer registers.
+///
+/// Mirrors the core resource-type definition: the type's own discriminator, the
+/// type it nests under (documenting the intended hierarchy shape), and the
+/// actions it contributes to the open action catalog. The concrete per-instance
+/// parent is still carried separately as a [`ResourceParentEdge`], because a leaf
+/// instance may nest under a well-known scope rather than another resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTypeRegistration {
+    /// The resource type this entry declares.
+    pub resource_type: ResourceType,
+    /// The resource type this one nests under, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_type: Option<ResourceType>,
+    /// Actions defined on the type, folded into the open action catalog.
+    #[serde(default)]
+    pub actions: Vec<ActionKey>,
+}
+
+/// Request body for `POST /v1/authz/resource-model`.
+///
+/// A consumer teaches IAM its hierarchy and vocabulary **as data**: the resource
+/// types it anchors grants at, any standalone actions, and the per-instance
+/// scope parent edges that let the evaluator resolve open
+/// [`ScopeRef::Resource`](crate::ScopeRef::Resource) scopes through the same
+/// ancestor walk used for the well-known scopes. Registration is additive and
+/// idempotent: re-registering a type replaces its definition and re-registering
+/// an edge replaces that instance's parent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceModelRegistration {
+    /// Resource types the consumer registers, with their declared actions.
+    #[serde(default)]
+    pub resource_types: Vec<ResourceTypeRegistration>,
+    /// Standalone actions registered into the open catalog.
+    #[serde(default)]
+    pub actions: Vec<ActionKey>,
+    /// Per-instance scope parent edges anchoring resources in the hierarchy.
+    #[serde(default)]
+    pub edges: Vec<ResourceParentEdge>,
+}
+
+/// Response to `POST /v1/authz/resource-model`.
+///
+/// Returns the policy version the registration advanced to, so a local-mode
+/// consumer knows the snapshot it must reach before the registered resources
+/// resolve identically in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceModelRegistered {
+    /// Monotonic policy version after the registration was applied.
+    pub version: u64,
 }
 
 /// Versioned snapshot of the authorization policy served for local-mode sync.
@@ -398,5 +452,42 @@ mod tests {
         assert_eq!(parsed, snapshot);
         // The version fence is carried so a consumer can cache behind it.
         assert_eq!(parsed.version, 9);
+    fn resource_model_registration_round_trips_through_json() {
+        let registration = ResourceModelRegistration {
+            resource_types: vec![ResourceTypeRegistration {
+                resource_type: ResourceType("issue".into()),
+                parent_type: None,
+                actions: vec![
+                    ActionKey("issue.read".into()),
+                    ActionKey("issue.close".into()),
+                ],
+            }],
+            actions: vec![ActionKey("issue.assign".into())],
+            edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("issue".into()),
+                resource_id: ResourceId("42".into()),
+                parent: ScopeRef::Namespace {
+                    namespace_id: NamespaceId("acme".into()),
+                },
+            }],
+        };
+        let json = serde_json::to_string(&registration).unwrap();
+        let parsed: ResourceModelRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, registration);
+
+        let registered = ResourceModelRegistered { version: 7 };
+        let json = serde_json::to_string(&registered).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResourceModelRegistered>(&json).unwrap(),
+            registered
+        );
+    }
+
+    #[test]
+    fn resource_model_registration_defaults_empty_fields() {
+        // A consumer may register only edges (or only types); omitted arrays
+        // default to empty rather than failing to deserialize.
+        let parsed: ResourceModelRegistration = serde_json::from_str(r#"{"edges":[]}"#).unwrap();
+        assert_eq!(parsed, ResourceModelRegistration::default());
     }
 }
