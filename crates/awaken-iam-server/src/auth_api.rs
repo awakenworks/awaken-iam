@@ -23,6 +23,16 @@
 //! | `POST /v1/account/identities` | [`AuthApi::link_identity`] |
 //! | `DELETE /v1/account/identities/{provider}/{subject}` | [`AuthApi::unlink_identity`] |
 //!
+//! Product services (Oversight Cloud, Pack Hub, Awaken Next Cloud) consume this
+//! API as their authentication seam: rather than parsing a Google or GitHub
+//! token, a product forwards the opaque IAM session cookie to
+//! [`AuthApi::resolve_principal`] and receives the account [`PrincipalRef`] that
+//! backs the live session. It then drives its own grant and entitlement checks
+//! against [`AuthzApi`](crate::AuthzApi) with that principal. Resolution fails
+//! closed for a missing, unknown, revoked, or expired session, and for a session
+//! whose account is disabled, so a product can never manufacture a principal of
+//! its own.
+//!
 //! The front half of the login loop mints a challenge whose hashes are persisted
 //! in the [`SessionDirectory`](awaken_iam_core::SessionDirectory); the one-time
 //! cleartext secrets needed to finish the exchange (the PKCE verifier and OIDC
@@ -38,8 +48,8 @@ use std::collections::HashMap;
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ExternalIdentity, ExternalIdentityClaims,
     ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey,
-    IdentityProviderKind, OAuthLoginStateId, OpenIdProviderMetadata, SessionId, SessionView,
-    Timestamp, UserInfo,
+    IdentityProviderKind, OAuthLoginStateId, OpenIdProviderMetadata, PrincipalRef, SessionId,
+    SessionView, Timestamp, UserInfo,
 };
 use awaken_iam_core::{
     AuthorizationUrlRequest, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
@@ -218,6 +228,33 @@ pub enum AuthAuditEvent {
         /// When the link was removed.
         at: Timestamp,
     },
+    /// A product service resolved a session principal at the authentication
+    /// seam, ready to drive its own grant and entitlement checks.
+    PrincipalResolved {
+        /// Account principal resolved from the presented IAM session.
+        principal: PrincipalRef,
+        /// When the principal was resolved.
+        at: Timestamp,
+    },
+    /// A product service presented a session that could not be resolved to an
+    /// active account principal, so the request failed closed.
+    PrincipalResolutionFailed {
+        /// Stable machine-readable reason resolution failed.
+        reason: PrincipalResolutionFailure,
+        /// When the failure was observed.
+        at: Timestamp,
+    },
+}
+
+/// Stable machine-readable reason a session could not be resolved to an active
+/// account principal at the product authentication seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalResolutionFailure {
+    /// No live session backed the presented cookie (missing, unknown, revoked,
+    /// or expired).
+    Unauthenticated,
+    /// The session resolved to an account that is disabled or unknown.
+    AccountDisabled,
 }
 
 /// Stable machine-readable reason a login attempt failed.
@@ -392,6 +429,12 @@ pub enum AuthApiError {
     /// The external identity is linked to a different account.
     #[error("external identity is linked to a different account")]
     IdentityAccountMismatch,
+    /// The presented IAM session could not be resolved to a live session.
+    #[error("request is not authenticated by a live IAM session")]
+    Unauthenticated,
+    /// The session resolved to an account that is disabled or no longer exists.
+    #[error("session principal account is disabled")]
+    AccountDisabled,
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -703,6 +746,59 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         Ok(self
             .sessions
             .current_session_from_cookie(cookie_header, now)?)
+    }
+
+    /// Resolve the account principal backing the presented IAM session.
+    ///
+    /// This is the shared authentication seam product services consume: rather
+    /// than parsing a Google or GitHub token, Oversight Cloud, Pack Hub, and
+    /// Awaken Next Cloud forward the opaque IAM session cookie and let IAM
+    /// resolve the live session to its [`PrincipalRef::Account`]. The product
+    /// then drives its own grant and entitlement checks against
+    /// [`AuthzApi`](crate::AuthzApi) with that principal — IAM resolves *who*,
+    /// never *what* the product domain decides.
+    ///
+    /// Resolution fails closed: it returns [`AuthApiError::Unauthenticated`]
+    /// when the cookie does not back a live session (missing, unknown, revoked,
+    /// or expired), and [`AuthApiError::AccountDisabled`] when the session
+    /// resolves to a disabled or unknown account. The product can therefore
+    /// never manufacture a principal of its own. Every outcome is audited.
+    pub fn resolve_principal(
+        &mut self,
+        cookie_header: &str,
+        now: Timestamp,
+    ) -> Result<PrincipalRef, AuthApiError> {
+        let account_id = match self
+            .sessions
+            .current_session_from_cookie(cookie_header, now.clone())
+        {
+            Ok(view) => view.account_id,
+            Err(_) => {
+                self.audit.push(AuthAuditEvent::PrincipalResolutionFailed {
+                    reason: PrincipalResolutionFailure::Unauthenticated,
+                    at: now,
+                });
+                return Err(AuthApiError::Unauthenticated);
+            }
+        };
+
+        match self.directory.account(&account_id) {
+            Some(account) if account.status == AccountStatus::Active => {
+                let principal = PrincipalRef::Account { account_id };
+                self.audit.push(AuthAuditEvent::PrincipalResolved {
+                    principal: principal.clone(),
+                    at: now,
+                });
+                Ok(principal)
+            }
+            _ => {
+                self.audit.push(AuthAuditEvent::PrincipalResolutionFailed {
+                    reason: PrincipalResolutionFailure::AccountDisabled,
+                    at: now,
+                });
+                Err(AuthApiError::AccountDisabled)
+            }
+        }
     }
 
     /// `GET /.well-known/openid-configuration`: advertise this provider's
@@ -1432,5 +1528,138 @@ mod tests {
             err,
             AuthApiError::Login(IamError::SessionRevoked { .. })
         ));
+    }
+
+    /// Drive a full login and return the live session cookie header a product
+    /// service forwards to IAM on a subsequent request.
+    fn logged_in_session(api: &mut AuthApi<SequentialEntropy>) -> (CallbackOutcome, String) {
+        let outcome = start(api, Some("/dashboard"));
+        let result = callback(api, &outcome, "subject-1:user@example.com").unwrap();
+        let token = SessionCookieConfig::default()
+            .extract_token(&result.set_session_cookie)
+            .unwrap();
+        let cookie = format!("{DEFAULT_SESSION_COOKIE_NAME}={token}");
+        (result, cookie)
+    }
+
+    #[test]
+    fn product_resolves_principal_from_iam_session() {
+        let mut api = api();
+        let (result, cookie) = logged_in_session(&mut api);
+
+        // The product forwards only the opaque IAM session cookie — never a
+        // Google or GitHub token — and IAM resolves the account principal.
+        let principal = api
+            .resolve_principal(&cookie, Timestamp("2026-06-19T01:00:00Z".into()))
+            .unwrap();
+        assert_eq!(
+            principal,
+            PrincipalRef::Account {
+                account_id: result.session.account_id.clone(),
+            }
+        );
+        assert!(
+            api.audit_log()
+                .iter()
+                .any(|event| matches!(event, AuthAuditEvent::PrincipalResolved { .. }))
+        );
+    }
+
+    #[test]
+    fn session_principal_drives_remote_authorize() {
+        use crate::AuthzApi;
+        use awaken_iam_contract::{
+            ActionKey, AuthorizationDecision, AuthorizationRequest, ScopeRef,
+        };
+        use awaken_iam_core::{ActionPattern, Effect, Grant, GrantId, GrantSubject};
+
+        let mut api = api();
+        let (_result, cookie) = logged_in_session(&mut api);
+        let principal = api
+            .resolve_principal(&cookie, Timestamp("2026-06-19T01:00:00Z".into()))
+            .unwrap();
+
+        // The product takes the session-resolved principal to the authorization
+        // seam (`POST /v1/authorize`). Default-deny without a grant.
+        let publish = AuthorizationRequest::direct(
+            principal.clone(),
+            ActionKey("pack.publish".into()),
+            ScopeRef::Global,
+        );
+        let mut authz = AuthzApi::new();
+        assert_eq!(
+            authz.authorize(&publish).decision,
+            AuthorizationDecision::Deny
+        );
+
+        // Granting the action to the session principal flips the decision —
+        // proving the product authorizes the principal IAM resolved, not one it
+        // asserts on its own.
+        authz.policy_mut().add_grant(Grant {
+            id: GrantId("g1".into()),
+            subject: GrantSubject::Principal(principal.clone()),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+        assert_eq!(
+            authz.authorize(&publish).decision,
+            AuthorizationDecision::Allow
+        );
+    }
+
+    #[test]
+    fn resolve_principal_without_session_fails_closed() {
+        let mut api = api();
+        let err = api
+            .resolve_principal("unrelated=1", Timestamp("2026-06-19T01:00:00Z".into()))
+            .unwrap_err();
+        assert_eq!(err, AuthApiError::Unauthenticated);
+        assert!(api.audit_log().iter().any(|event| matches!(
+            event,
+            AuthAuditEvent::PrincipalResolutionFailed {
+                reason: PrincipalResolutionFailure::Unauthenticated,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn resolve_principal_after_logout_fails_closed() {
+        let mut api = api();
+        let (_result, cookie) = logged_in_session(&mut api);
+        api.logout(&cookie, Timestamp("2026-06-19T02:00:00Z".into()))
+            .unwrap();
+
+        // A revoked session cannot be replayed to resolve a principal.
+        let err = api
+            .resolve_principal(&cookie, Timestamp("2026-06-19T03:00:00Z".into()))
+            .unwrap_err();
+        assert_eq!(err, AuthApiError::Unauthenticated);
+    }
+
+    #[test]
+    fn resolve_principal_for_disabled_account_fails_closed() {
+        let mut api = api();
+        let (result, cookie) = logged_in_session(&mut api);
+        let account_id = result.session.account_id.clone();
+
+        // Disable the account behind the otherwise-live session.
+        let mut account = api.directory().account(&account_id).unwrap().clone();
+        account.status = AccountStatus::Disabled;
+        account.updated_at = Timestamp("2026-06-19T02:00:00Z".into());
+        api.directory.upsert_account(account);
+
+        let err = api
+            .resolve_principal(&cookie, Timestamp("2026-06-19T03:00:00Z".into()))
+            .unwrap_err();
+        assert_eq!(err, AuthApiError::AccountDisabled);
+        assert!(api.audit_log().iter().any(|event| matches!(
+            event,
+            AuthAuditEvent::PrincipalResolutionFailed {
+                reason: PrincipalResolutionFailure::AccountDisabled,
+                ..
+            }
+        )));
     }
 }

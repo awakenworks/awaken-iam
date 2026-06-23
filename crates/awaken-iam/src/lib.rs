@@ -26,9 +26,9 @@ pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
     CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, Deployment,
     EstablishedSession, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, IamServer,
-    LinkIdentity, LogoutOutcome, ProviderRegistration, ProviderSummary, ReturnToDecision,
-    ReturnToPolicy, RouteSpec, SameSite, SessionCookieConfig, SessionGateway, StartLogin,
-    StartLoginOutcome, UnlinkIdentity,
+    LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration, ProviderSummary,
+    ReturnToDecision, ReturnToPolicy, RouteSpec, SameSite, SessionCookieConfig, SessionGateway,
+    StartLogin, StartLoginOutcome, UnlinkIdentity,
 };
 
 #[cfg(test)]
