@@ -232,6 +232,68 @@ mod tests {
     }
 
     #[test]
+    fn a_registered_model_resolves_a_chained_resource_hierarchy() {
+        // A product teaches IAM a two-hop hierarchy entirely as data:
+        // comment:7 -> issue:42 -> project:web. A grant anchored at the project
+        // must cover the comment through both registered resource edges, proving
+        // the registry's `apply_to` feeds the same arbitrary-depth ancestor walk
+        // the well-known scopes use — not just a single resource->scope hop.
+        let mut model = ResourceModel::new();
+        model
+            .register_resource_type(issue_type())
+            .register_resource_type(ResourceTypeDef {
+                resource_type: ResourceType("comment".into()),
+                parent_type: Some(ResourceType("issue".into())),
+                actions: vec![ActionKey("comment.delete".into())],
+            })
+            .register_parent(
+                ResourceType("issue".into()),
+                ResourceId("42".into()),
+                ScopeRef::Project {
+                    workspace_id: WorkspaceId("ws_main".into()),
+                    project_id: ProjectId("proj_web".into()),
+                },
+            )
+            .register_parent(
+                ResourceType("comment".into()),
+                ResourceId("7".into()),
+                ScopeRef::Resource {
+                    resource_type: ResourceType("issue".into()),
+                    resource_id: ResourceId("42".into()),
+                },
+            );
+
+        let mut policy = PolicySet::new();
+        policy.register_resource_model(&model);
+        policy.add_grant(Grant {
+            id: GrantId("g_proj".into()),
+            subject: GrantSubject::Principal(PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            }),
+            action_pattern: ActionPattern("comment.*".into()),
+            scope: ScopeRef::Project {
+                workspace_id: WorkspaceId("ws_main".into()),
+                project_id: ProjectId("proj_web".into()),
+            },
+            effect: Effect::Allow,
+        });
+
+        let trace = policy.evaluate(&AuthorizationRequest {
+            principal: PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            },
+            on_behalf_of: Vec::new(),
+            action: ActionKey("comment.delete".into()),
+            scope: ScopeRef::Resource {
+                resource_type: ResourceType("comment".into()),
+                resource_id: ResourceId("7".into()),
+            },
+        });
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_proj".into())]);
+    }
+
+    #[test]
     fn edges_are_recorded_in_registration_order() {
         let mut model = ResourceModel::new();
         model
