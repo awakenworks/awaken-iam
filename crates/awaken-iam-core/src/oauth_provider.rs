@@ -252,6 +252,33 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
     /// reconstructing the server and discarding issued codes.
     pub fn register_client(&mut self, client: RegisteredClient) {
         self.registry.register(client);
+    /// Authenticate a client at the token endpoint (RFC 6749 §2.3) for a grant
+    /// that does not redeem a freshly issued code — notably the `refresh_token`
+    /// grant, where there is no authorization code to carry the client binding.
+    ///
+    /// A confidential client must present the secret it registered with; a public
+    /// client presents none. The presented secret is compared against the stored
+    /// hash, never the cleartext. On success the registered client is returned so
+    /// the caller can apply any further client-scoped checks; failures collapse to
+    /// [`OAuthProviderError::UnknownClient`] or
+    /// [`OAuthProviderError::InvalidClientSecret`] so a caller cannot probe which
+    /// clients exist or distinguish a missing from a wrong secret.
+    pub fn authenticate_client(
+        &self,
+        client_id: &str,
+        client_secret: Option<&str>,
+    ) -> Result<&RegisteredClient, OAuthProviderError> {
+        let client = self
+            .registry
+            .get(client_id)
+            .ok_or(OAuthProviderError::UnknownClient)?;
+        if let Some(expected) = &client.secret_hash {
+            let presented = client_secret.ok_or(OAuthProviderError::InvalidClientSecret)?;
+            if &hash_session_token(presented) != expected {
+                return Err(OAuthProviderError::InvalidClientSecret);
+            }
+        }
+        Ok(client)
     }
 
     /// Validate an authorization request and issue a single-use code bound to the
@@ -657,6 +684,52 @@ mod tests {
                 now(),
             ),
             Err(OAuthProviderError::RedirectUriMismatch)
+        );
+    }
+
+    #[test]
+    fn confidential_client_authenticates_at_the_token_endpoint() {
+        let mut registry = OAuthClientRegistry::new();
+        registry.register(RegisteredClient::confidential(
+            "service-client",
+            "top-secret",
+            vec!["https://svc.example/cb".into()],
+            ["openid"],
+        ));
+        let server = server(registry);
+
+        // The right secret authenticates and yields the registered client.
+        let client = server
+            .authenticate_client("service-client", Some("top-secret"))
+            .expect("authenticate");
+        assert_eq!(client.client_id, "service-client");
+
+        // A wrong or missing secret fails closed.
+        assert_eq!(
+            server.authenticate_client("service-client", Some("wrong")),
+            Err(OAuthProviderError::InvalidClientSecret)
+        );
+        assert_eq!(
+            server.authenticate_client("service-client", None),
+            Err(OAuthProviderError::InvalidClientSecret)
+        );
+    }
+
+    #[test]
+    fn public_client_authenticates_without_a_secret() {
+        let server = server(public_registry());
+        let client = server
+            .authenticate_client("product-web", None)
+            .expect("authenticate");
+        assert!(client.client_id == "product-web");
+    }
+
+    #[test]
+    fn an_unknown_client_is_rejected_at_authentication() {
+        let server = server(public_registry());
+        assert_eq!(
+            server.authenticate_client("ghost", Some("anything")),
+            Err(OAuthProviderError::UnknownClient)
         );
     }
 }

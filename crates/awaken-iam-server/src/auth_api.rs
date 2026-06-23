@@ -19,6 +19,7 @@
 //! | `POST /v1/oauth/token` (`authorization_code`) | [`AuthApi::redeem_authorization_code`] |
 //! | `POST /v1/oauth/token` (initial grant) | [`AuthApi::issue_token_grant`] |
 //! | `POST /v1/oauth/token` (`refresh_token`) | [`AuthApi::refresh_token_grant`] |
+//! | `POST /v1/oauth/token` (`refresh_token`, OP client) | [`AuthApi::op_refresh_token_grant`] |
 //! | `POST /v1/oauth/revoke` (RFC 7009) | [`AuthApi::revoke_token`] |
 //! | `GET /v1/auth/providers` | [`AuthApi::list_providers`] |
 //! | `GET /v1/auth/login/{provider}` | [`AuthApi::start_login`] |
@@ -71,6 +72,7 @@ use awaken_iam_core::{
     OAuthAuthorizationServer, OAuthChallengeService, OAuthProviderError, OsEntropy, ProviderError,
     RefreshTokenDirectory, RefreshTokenMinter, RotateRefreshToken, SessionDirectory,
     TokenRedemption, parse_presented_refresh_token,
+    parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -787,6 +789,10 @@ pub enum AuthApiError {
     /// Assembling the OIDC `id_token` for a redeemed grant failed.
     #[error(transparent)]
     IdToken(#[from] IdTokenError),
+    /// Authenticating the client at the downstream OP token endpoint failed
+    /// (unknown client or invalid client authentication).
+    #[error(transparent)]
+    OAuthProvider(#[from] OAuthProviderError),
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -1549,6 +1555,31 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             refresh_token: rotated.secret,
             refresh_token_view: RefreshTokenView::from(&rotated.token),
         })
+    }
+
+    /// `POST /v1/oauth/token` (`refresh_token` grant, IAM as OpenID Provider):
+    /// authenticate the requesting client, then rotate the presented refresh
+    /// token and mint a fresh access token.
+    ///
+    /// This is the downstream-OP twin of [`refresh_token_grant`](Self::refresh_token_grant):
+    /// at the OP token endpoint a registered product client drives the grant, so
+    /// the client is authenticated against `provider`'s registry first (RFC 6749
+    /// §2.3 — a confidential client presents its secret, a public client none).
+    /// Only once the client is authenticated does the request fall through to the
+    /// landed rotation-with-reuse-detection machinery, which retires the presented
+    /// token, issues its successor under the same chain, and fails closed by
+    /// revoking the whole chain when an already-retired token is replayed. The new
+    /// access token inherits the chain's stored subject/audience/scope, never
+    /// client-supplied claims.
+    pub fn op_refresh_token_grant<C: EntropySource>(
+        &mut self,
+        provider: &OAuthAuthorizationServer<C>,
+        client_id: &str,
+        client_secret: Option<&str>,
+        request: RefreshGrant,
+    ) -> Result<TokenGrant, AuthApiError> {
+        provider.authenticate_client(client_id, client_secret)?;
+        self.refresh_token_grant(request)
     }
 
     /// `POST /v1/oauth/revoke` (RFC 7009): revoke a presented token.
