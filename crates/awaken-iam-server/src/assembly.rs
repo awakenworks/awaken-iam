@@ -6,12 +6,12 @@
 //! assembly seam:
 //!
 //! ```text
-//! embedded:   host builds shared PgPool
+//! embedded:   host builds the shared pool (Postgres) or opens a SQLite connection
 //!             -> IamStore::with_prefix(pool, "iam"); store.migrate()  (runs iam.* bundles)
 //!             -> mount IAM /v1 routes onto the host router
 //!             -> in-process callers use the local IamClient (no network hop)
 //!
-//! standalone: iam-daemon builds its own pool
+//! standalone: iam-daemon builds its own pool (Postgres for cloud/HA)
 //!             -> IamStore::with_prefix(pool, "iam"); store.migrate()
 //!             -> serve the canonical /v1 API
 //!             -> remote callers use the remote IamClient

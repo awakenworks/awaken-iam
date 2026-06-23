@@ -16,7 +16,14 @@
 //! database next to siblings using their own prefixes) or standalone (its own
 //! database) from one codebase. The pool itself is supplied by the host through
 //! a [`MigrationExecutor`]; this module is pool-agnostic so the core stays
-//! storage-free and a Postgres executor is a thin edge adapter over the plan.
+//! storage-free and each backend executor (Postgres, SQLite) is a thin edge
+//! adapter over the plan.
+//!
+//! DDL is authored **dialect-neutral**: a step's template uses the prefix token
+//! and a small portable type-token vocabulary (e.g. `{json}`, `{timestamptz}`,
+//! `{blob}`), which the backend executor renders to that dialect alongside the
+//! prefix; a step that cannot be expressed neutrally may carry a per-dialect
+//! override. See [ADR-0003](../../../../docs/adr/0003-storage-backends.md).
 
 use sha2::{Digest, Sha256};
 
@@ -62,13 +69,16 @@ impl BundleScope {
 
 /// A single append-only DDL step within a bundle.
 ///
-/// `up_sql` is a Postgres DDL template that uses the [`PREFIX_TOKEN`] wherever a
-/// table name is built, so the same statement renders against any prefix.
+/// `up_sql` is a dialect-neutral DDL template that uses the [`PREFIX_TOKEN`]
+/// wherever a table name is built, and portable type tokens (e.g. `{json}`,
+/// `{timestamptz}`, `{blob}`) wherever a backend-specific column type belongs, so
+/// the same statement renders against any prefix and either backend (see
+/// [ADR-0003](../../../../docs/adr/0003-storage-backends.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Migration {
     /// Stable, ordered id unique within the owning bundle (e.g. `0001_init`).
     pub id: &'static str,
-    /// Prefix-templated Postgres DDL applied for this step.
+    /// Prefix- and type-token-templated DDL applied for this step.
     pub up_sql: &'static str,
 }
 
@@ -111,14 +121,15 @@ pub struct PlannedMigration {
     pub id: &'static str,
     /// Checksum of the canonical template.
     pub checksum: String,
-    /// Prefix-rendered Postgres DDL to execute.
+    /// Prefix- and dialect-rendered DDL to execute for the active backend.
     pub sql: String,
 }
 
 /// Storage adapter that owns IAM's schema for a given table prefix.
 ///
 /// `Pool` is the host-supplied connection handle (a `PgPool` in the Postgres
-/// deployment, the recording executor in tests). The store never opens or owns
+/// deployment, a SQLite connection in the single-node deployment, the recording
+/// executor in tests). The store never opens or owns
 /// the pool's lifecycle in embedded mode — it owns its *schema within* the
 /// shared database, isolated by the distinct prefix and its own ledger.
 #[derive(Debug, Clone)]
