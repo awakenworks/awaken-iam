@@ -34,7 +34,9 @@ pub use session::{
 };
 pub use store::{
     BundleScope, Dialect, IamStore, InMemoryStore, MigrateReport, Migration, MigrationBundle,
-    MigrationExecutor, PlannedMigration, RecordingExecutor, bundles,
+    MigrationExecutor, PlannedMigration, PostgresBackend, RecordingExecutor, SqlConn, SqlParam,
+    SqlRow, SqlStore, SqliteBackend, bundles, postgres_migrated_store, sqlite_in_memory_store,
+    sqlite_migrated_store,
 };
 pub use token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, SUBJECT_TOKEN_TYPE_ACCESS_TOKEN,

@@ -15,6 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use awaken_iam_contract::{EntitlementDecision, EntitlementRequest, PrincipalRef};
 
 /// Identifier of a billing plan / product tier definition.
@@ -44,7 +46,8 @@ pub enum PlanTier {
 /// meters its own usage and supplies the observed count; [`Quota::permits`]
 /// answers whether that usage stays within the ceiling. A feature with no quota
 /// entry is unlimited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Quota {
     /// An inclusive finite ceiling: usage at or below this count stays within.
     Limited(u64),
@@ -75,7 +78,8 @@ impl Quota {
 }
 
 /// The time window a [`RateLimit`] is measured over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RateWindow {
     /// Per one-second window.
     Second,
@@ -92,7 +96,7 @@ pub enum RateWindow {
 /// Like [`Quota`], this is a definition only. IAM answers the shape of the limit;
 /// the caller tracks request counts over the window and enforces. A feature with
 /// no rate entry has no per-window cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimit {
     /// Maximum units permitted within a single window (inclusive).
     pub max_per_window: u64,
