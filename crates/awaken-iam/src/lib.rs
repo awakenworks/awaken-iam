@@ -9,17 +9,18 @@ pub use awaken_iam_contract::{
     EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject, GrantEffect,
     GrantSnapshot, GrantSubjectRef, IdentityProviderConfig, IdentityProviderConfigId,
-    IdentityProviderKey, IdentityProviderKind, NamespaceId, OAuthLoginState, OAuthLoginStateId,
-    OrgId, PolicySnapshot, PrincipalRef, ProjectId, ResourceId, ResourceType, RoleBindingSnapshot,
-    ScopeGraphSnapshot, ScopeRef, Session, SessionId, SessionView, Timestamp, WorkspaceId,
+    IdentityProviderKey, IdentityProviderKind, NamespaceId, NamespaceOwner, OAuthLoginState,
+    OAuthLoginStateId, OrgId, PolicySnapshot, PrincipalRef, ProjectId, ResourceId, ResourceType,
+    RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, Session, SessionId, SessionView, SignerKey,
+    SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
     BeginLogin, EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
     EntitlementReason, EntitlementResolver, EntropySource, EstablishSession, IamCore, IamError,
     IdentityDirectory, IssuedLogin, IssuedSession, LoginAttempt, LoginBinding, LoginSecrets,
-    OAuthChallengeService, OsEntropy, PkceChallenge, PkceMethod, Plan, PlanId, PlanTier, Quota,
-    RateLimit, RateWindow, ResourceEdge, ResourceModel, ResourceTypeDef, SessionDirectory,
-    SessionMinter, hash_session_token,
+    NamespaceGrant, NamespaceTrustDirectory, OAuthChallengeService, OsEntropy, PkceChallenge,
+    PkceMethod, Plan, PlanId, PlanTier, Quota, RateLimit, RateWindow, ResourceEdge, ResourceModel,
+    ResourceTypeDef, SessionDirectory, SessionMinter, TrustError, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,

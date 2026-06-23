@@ -5,6 +5,7 @@
 
 mod identity;
 mod protocol;
+mod trust;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,10 @@ pub use protocol::{
     AuthorizationOutcome, BatchAuthorizationRequest, BatchAuthorizationResponse,
     EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceOrgEdge,
     PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
+};
+pub use trust::{
+    NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
+    SignerKeyStatus,
 };
 
 /// Global account identifier.
