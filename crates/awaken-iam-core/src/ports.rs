@@ -20,8 +20,8 @@ use awaken_iam_contract::{
 };
 
 use crate::{
-    Grant, GrantId, Group, GroupId, Organization, Plan, PlanId, ResourceEdge, RoleBinding, RoleDef,
-    RoleId,
+    Grant, GrantId, Group, GroupId, Organization, Plan, PlanId, RegisteredClient, ResourceEdge,
+    RoleBinding, RoleDef, RoleId,
 };
 
 /// Error surface shared by every repository port.
@@ -112,6 +112,24 @@ pub trait LoginFlowRepo: Send + Sync {
     fn get(&self, id: &OAuthLoginStateId) -> RepoResult<Option<OAuthLoginState>>;
     /// Mark a challenge consumed at `at`; consumed challenges cannot be reused.
     fn mark_consumed(&self, id: &OAuthLoginStateId, at: Timestamp) -> RepoResult<()>;
+}
+
+/// Persistence for downstream OAuth provider [`RegisteredClient`] rows.
+///
+/// These are the product clients allowed to integrate against IAM as an OAuth
+/// authorization server. The natural key is the public `client_id`; only the
+/// confidential `secret_hash` is stored, never the cleartext secret. The
+/// authorization server hydrates its [`OAuthClientRegistry`](crate::OAuthClientRegistry)
+/// from this port rather than from an in-memory seed.
+pub trait OAuthClientRepo: Send + Sync {
+    /// Insert or replace a registered client by its `client_id`.
+    fn upsert(&self, client: RegisteredClient) -> RepoResult<()>;
+    /// Resolve a registered client by id, returning `None` when absent.
+    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>>;
+    /// List every registered client ordered by id.
+    fn list(&self) -> RepoResult<Vec<RegisteredClient>>;
+    /// Remove a registered client, failing closed when it is absent.
+    fn remove(&self, client_id: &str) -> RepoResult<()>;
 }
 
 // ---------------------------------------------------------------------------

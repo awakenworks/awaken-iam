@@ -16,9 +16,9 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId,
-    GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId,
-    PlanRepo, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo,
-    RoleDef, RoleId, RoleRepo, SessionRepo,
+    GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization,
+    Plan, PlanId, PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge,
+    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 
 /// JSON-serializable key used to index rows whose natural key is a contract
@@ -36,6 +36,7 @@ struct Identity {
     login_flows: BTreeMap<String, OAuthLoginState>,
     api_tokens: BTreeMap<String, ApiToken>,
     api_tokens_by_prefix: BTreeMap<String, String>,
+    oauth_clients: BTreeMap<String, RegisteredClient>,
 }
 
 #[derive(Default)]
@@ -299,6 +300,48 @@ impl ApiTokenRepo for InMemoryStore {
             .insert(token.prefix.0.clone(), token.id.0.clone());
         guard.api_tokens.insert(token.id.0.clone(), token);
         Ok(())
+    }
+}
+
+impl OAuthClientRepo for InMemoryStore {
+    fn upsert(&self, client: RegisteredClient) -> RepoResult<()> {
+        self.identity
+            .lock()
+            .unwrap()
+            .oauth_clients
+            .insert(client.client_id.clone(), client);
+        Ok(())
+    }
+
+    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>> {
+        Ok(self
+            .identity
+            .lock()
+            .unwrap()
+            .oauth_clients
+            .get(client_id)
+            .cloned())
+    }
+
+    fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+        Ok(self
+            .identity
+            .lock()
+            .unwrap()
+            .oauth_clients
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn remove(&self, client_id: &str) -> RepoResult<()> {
+        self.identity
+            .lock()
+            .unwrap()
+            .oauth_clients
+            .remove(client_id)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound(format!("oauth client {client_id} not found")))
     }
 }
 
@@ -807,6 +850,45 @@ mod tests {
             RoleBindingRepo::remove(&store, &binding),
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn oauth_clients_upsert_get_list_and_remove() {
+        let store = InMemoryStore::new();
+        assert_eq!(OAuthClientRepo::get(&store, "web").unwrap(), None);
+
+        let public = RegisteredClient::public(
+            "web",
+            vec!["https://web.example/cb".into()],
+            ["openid", "email"],
+        );
+        OAuthClientRepo::upsert(&store, public.clone()).unwrap();
+        assert_eq!(
+            OAuthClientRepo::get(&store, "web").unwrap(),
+            Some(public.clone())
+        );
+        assert_eq!(OAuthClientRepo::list(&store).unwrap().len(), 1);
+
+        // Upsert replaces in place by client id (a rotation rewrites the secret).
+        let confidential = RegisteredClient::confidential(
+            "web",
+            "s3cret",
+            vec!["https://web.example/cb".into()],
+            ["openid", "email"],
+        );
+        OAuthClientRepo::upsert(&store, confidential.clone()).unwrap();
+        assert_eq!(
+            OAuthClientRepo::get(&store, "web").unwrap(),
+            Some(confidential)
+        );
+        assert_eq!(OAuthClientRepo::list(&store).unwrap().len(), 1);
+
+        OAuthClientRepo::remove(&store, "web").unwrap();
+        assert!(matches!(
+            OAuthClientRepo::remove(&store, "web"),
+            Err(RepoError::NotFound(_))
+        ));
+        assert!(OAuthClientRepo::list(&store).unwrap().is_empty());
     }
 
     #[test]
