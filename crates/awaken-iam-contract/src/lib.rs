@@ -13,8 +13,9 @@ pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,
     IdentityProviderConfig, IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind,
-    JsonWebKey, Jwks, OAuthLoginState, OAuthLoginStateId, OpenIdProviderMetadata, Session,
-    SessionId, SessionView, Timestamp, UserInfo,
+    JsonWebKey, Jwks, OAuthLoginState, OAuthLoginStateId, OpenIdProviderMetadata, RefreshToken,
+    RefreshTokenChainId, RefreshTokenId, RefreshTokenView, Session, SessionId, SessionView,
+    Timestamp, UserInfo,
 };
 pub use protocol::{
     AuthorizationOutcome, BatchAuthorizationRequest, BatchAuthorizationResponse,

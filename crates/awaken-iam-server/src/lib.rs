@@ -11,15 +11,16 @@ mod store;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
-    SigningKeyMaterial, verify_access_token,
+    AccessTokenRevocations, SigningKeyMaterial, verify_access_token, verify_active_access_token,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, LinkIdentity, LogoutOutcome, MintAccessToken,
-    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, ReturnToDecision,
-    ReturnToPolicy, StartLogin, StartLoginOutcome, UnlinkIdentity,
+    DEFAULT_LOGIN_COOKIE_NAME, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
+    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, RefreshGrant,
+    ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin,
+    StartLoginOutcome, TokenGrant, UnlinkIdentity,
 };
 pub use authz_api::AuthzApi;
 pub use capability_token::{
