@@ -18,12 +18,50 @@ use crate::{
     PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
 };
 
+/// The authority empowered to discharge a require-approval obligation.
+///
+/// In the MVP this is the scope the deciding require-approval grant is anchored
+/// at: an approval recorded at (or above) this scope discharges the obligation.
+/// It is modeled as a struct rather than a bare [`ScopeRef`] so a future
+/// widening — a named approver role or principal — is an additive field rather
+/// than a wire break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalAuthority {
+    /// Scope that owns the obligation; approval is granted at or above it.
+    pub scope: ScopeRef,
+}
+
+/// An approval obligation the caller must discharge before a
+/// [`AuthorizationDecision::RequireApproval`] decision becomes an effective
+/// allow.
+///
+/// It is carried only on a require-approval outcome and is the single hand-off
+/// seam between IAM's decision and the caller's approval execution. The approval
+/// is discharged **product-side** (a recorded approval keyed by `obligation_id`)
+/// or by minting a **capability token bound to `obligation_id`** — never by
+/// re-querying authorize and never by adding a per-instance grant, so the
+/// decision stays a pure function of policy.
+///
+/// `obligation_id` is content-addressed over the principal chain, action, scope,
+/// and deciding `policy_id`, so re-querying authorize for the same question
+/// yields the same id and an approval discharged against it is idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalObligation {
+    /// Stable, content-addressed id the approval is discharged against.
+    pub obligation_id: String,
+    /// Id of the policy (grant) whose require-approval effect imposed it.
+    pub policy_id: String,
+    /// Authority empowered to discharge the approval.
+    pub authority: ApprovalAuthority,
+}
+
 /// Reasoned response to `POST /v1/authorize`.
 ///
 /// Mirrors the engine's decision trace on the wire: the three-valued decision, a
 /// stable snake_case reason code, and the ids of the grants and roles that
 /// produced the deciding effect, so an audit/debug surface needs no second round
-/// trip.
+/// trip. A `require_approval` decision additionally carries the
+/// [`ApprovalObligation`] the caller must discharge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationOutcome {
     /// Allow/deny/require-approval decision returned to the caller.
@@ -34,6 +72,11 @@ pub struct AuthorizationOutcome {
     pub matched_grants: Vec<String>,
     /// Ids of the roles whose grants contributed to the deciding effect.
     pub matched_roles: Vec<String>,
+    /// Approval obligation, present iff `decision` is `require_approval`. The
+    /// caller discharges it product-side or as a capability token bound to its
+    /// `obligation_id`; an allow or deny carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation: Option<ApprovalObligation>,
 }
 
 /// Request body for `POST /v1/authorize/batch`.
@@ -213,11 +256,50 @@ mod tests {
             reason: "allowed_by_grant".into(),
             matched_grants: vec!["g1".into()],
             matched_roles: vec!["publisher".into()],
+            obligation: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let parsed: AuthorizationOutcome = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, outcome);
         assert!(json.contains("allowed_by_grant"));
+        // An allow carries no obligation, and the field is omitted on the wire.
+        assert!(!json.contains("obligation"));
+    }
+
+    #[test]
+    fn require_approval_outcome_carries_its_obligation_envelope() {
+        let outcome = AuthorizationOutcome {
+            decision: AuthorizationDecision::RequireApproval,
+            reason: "needs_approval".into(),
+            matched_grants: vec!["g_gate".into()],
+            matched_roles: vec![],
+            obligation: Some(ApprovalObligation {
+                obligation_id: "obl_abc123".into(),
+                policy_id: "g_gate".into(),
+                authority: ApprovalAuthority {
+                    scope: ScopeRef::Namespace {
+                        namespace_id: NamespaceId("acme".into()),
+                    },
+                },
+            }),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let parsed: AuthorizationOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, outcome);
+        let obligation = parsed.obligation.expect("require_approval carries one");
+        assert_eq!(obligation.obligation_id, "obl_abc123");
+        assert_eq!(obligation.policy_id, "g_gate");
+    }
+
+    #[test]
+    fn outcome_without_obligation_field_still_deserializes() {
+        // A payload written before the obligation envelope existed (an allow with
+        // no `obligation` key) still parses, defaulting the field to absent.
+        let json = r#"{"decision":"allow","reason":"allowed_by_grant",
+            "matched_grants":["g1"],"matched_roles":[]}"#;
+        let parsed: AuthorizationOutcome = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.decision, AuthorizationDecision::Allow);
+        assert!(parsed.obligation.is_none());
     }
 
     #[test]

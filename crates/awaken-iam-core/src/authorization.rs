@@ -27,10 +27,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use awaken_iam_contract::{
-    ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, GrantEffect,
-    GrantSnapshot, GrantSubjectRef, NamespaceId, NamespaceOrgEdge, OrgId, PolicySnapshot,
-    PrincipalRef, ResourceId, ResourceParentEdge, ResourceType, RoleBindingSnapshot,
-    ScopeGraphSnapshot, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
+    ActionKey, ApprovalAuthority, ApprovalObligation, AuthorizationDecision, AuthorizationOutcome,
+    AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceId,
+    NamespaceOrgEdge, OrgId, PolicySnapshot, PrincipalRef, ResourceId, ResourceParentEdge,
+    ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
 
 /// Identifier of a role (a reusable bundle of grants).
@@ -175,17 +175,24 @@ pub struct AuthorizationTrace {
     /// Ids of the roles whose grants contributed to the deciding effect, in
     /// policy order.
     pub matched_roles: Vec<RoleId>,
+    /// Approval obligation the caller must discharge, present iff `decision` is
+    /// [`AuthorizationDecision::RequireApproval`]. It is the engine's hand-off
+    /// seam: the approval is discharged against its `obligation_id` product-side
+    /// or as a capability token, never by re-querying authorize.
+    pub obligation: Option<ApprovalObligation>,
 }
 
 impl AuthorizationTrace {
     /// Project the trace onto the [`AuthorizationOutcome`] wire DTO, flattening
-    /// the reason to its stable code and the matched ids to plain strings.
+    /// the reason to its stable code and the matched ids to plain strings. The
+    /// approval obligation, when present, is carried through unchanged.
     pub fn to_outcome(&self) -> AuthorizationOutcome {
         AuthorizationOutcome {
             decision: self.decision,
             reason: self.reason.code().to_owned(),
             matched_grants: self.matched_grants.iter().map(|id| id.0.clone()).collect(),
             matched_roles: self.matched_roles.iter().map(|id| id.0.clone()).collect(),
+            obligation: self.obligation.clone(),
         }
     }
 }
@@ -468,6 +475,12 @@ impl PolicySet {
             let (grants, roles) = match grant.effect {
                 Effect::Allow => (&mut matches.allow_grants, &mut matches.allow_roles),
                 Effect::RequireApproval => {
+                    // Anchor the obligation at the first approval grant's scope,
+                    // matching `approval_grants[0]` so authority and policy id
+                    // describe the same deciding grant.
+                    if matches.approval_anchor.is_none() {
+                        matches.approval_anchor = Some(grant.scope.clone());
+                    }
                     (&mut matches.approval_grants, &mut matches.approval_roles)
                 }
                 Effect::Deny => (&mut matches.deny_grants, &mut matches.deny_roles),
@@ -512,6 +525,7 @@ impl PolicySet {
                 reason: DecisionReason::PrincipalUnresolved,
                 matched_grants: Vec::new(),
                 matched_roles: Vec::new(),
+                obligation: None,
             };
         }
 
@@ -519,6 +533,7 @@ impl PolicySet {
         let mut deny_roles: Vec<RoleId> = Vec::new();
         let mut approval_grants: Vec<GrantId> = Vec::new();
         let mut approval_roles: Vec<RoleId> = Vec::new();
+        let mut approval_anchor: Option<ScopeRef> = None;
         let mut allow_grants: Vec<GrantId> = Vec::new();
         let mut allow_roles: Vec<RoleId> = Vec::new();
         let mut any_unmatched = false;
@@ -530,6 +545,11 @@ impl PolicySet {
             }
             extend_unique(&mut deny_grants, link.deny_grants);
             extend_unique(&mut deny_roles, link.deny_roles);
+            if approval_grants.is_empty() {
+                // First link contributing an approval grant fixes the anchor,
+                // keeping it aligned with the eventual `approval_grants[0]`.
+                approval_anchor = approval_anchor.or(link.approval_anchor);
+            }
             extend_unique(&mut approval_grants, link.approval_grants);
             extend_unique(&mut approval_roles, link.approval_roles);
             extend_unique(&mut allow_grants, link.allow_grants);
@@ -544,6 +564,7 @@ impl PolicySet {
                 reason: DecisionReason::DeniedByGrant,
                 matched_grants: deny_grants,
                 matched_roles: deny_roles,
+                obligation: None,
             };
         }
         // Conjunction: a link with no matching grant is not permitted, so the
@@ -554,14 +575,28 @@ impl PolicySet {
                 reason: DecisionReason::DefaultDeny,
                 matched_grants: Vec::new(),
                 matched_roles: Vec::new(),
+                obligation: None,
             };
         }
         if !approval_grants.is_empty() {
+            // The deciding grant (first in policy order) names the policy and its
+            // anchor scope; the obligation id is content-addressed so re-querying
+            // authorize is idempotent against the recorded/token-bound approval.
+            let policy_id = approval_grants[0].0.clone();
+            let authority = ApprovalAuthority {
+                scope: approval_anchor.unwrap_or_else(|| scope.clone()),
+            };
+            let obligation = ApprovalObligation {
+                obligation_id: obligation_id(chain, action, scope, &policy_id),
+                policy_id,
+                authority,
+            };
             return AuthorizationTrace {
                 decision: AuthorizationDecision::RequireApproval,
                 reason: DecisionReason::NeedsApproval,
                 matched_grants: approval_grants,
                 matched_roles: approval_roles,
+                obligation: Some(obligation),
             };
         }
         AuthorizationTrace {
@@ -569,6 +604,7 @@ impl PolicySet {
             reason: DecisionReason::AllowedByGrant,
             matched_grants: allow_grants,
             matched_roles: allow_roles,
+            obligation: None,
         }
     }
 
@@ -712,6 +748,9 @@ struct LinkMatches {
     allow_roles: Vec<RoleId>,
     approval_grants: Vec<GrantId>,
     approval_roles: Vec<RoleId>,
+    /// Scope of the first require-approval grant matched on this link, in policy
+    /// order. It is the scope the obligation's approval authority is anchored at.
+    approval_anchor: Option<ScopeRef>,
     deny_grants: Vec<GrantId>,
     deny_roles: Vec<RoleId>,
 }
@@ -732,6 +771,55 @@ fn extend_unique<T: PartialEq>(target: &mut Vec<T>, extra: Vec<T>) {
             target.push(value);
         }
     }
+}
+
+/// Derive the content-addressed id of a require-approval obligation.
+///
+/// The id is a SHA-256 digest over the canonical principal chain, action, scope,
+/// and deciding `policy_id`. It is therefore deterministic and identical whether
+/// computed by the server or by a consumer evaluating a synced snapshot, so an
+/// approval recorded (or a capability token minted) against it is idempotent and
+/// re-querying authorize for the same question never invents a new obligation.
+fn obligation_id(
+    chain: &[&PrincipalRef],
+    action: &ActionKey,
+    scope: &ScopeRef,
+    policy_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"awaken-iam.obligation.v1");
+    hasher.update(b"\x00policy\x00");
+    hasher.update(policy_id.as_bytes());
+    hasher.update(b"\x00action\x00");
+    hasher.update(action.0.as_bytes());
+    hasher.update(b"\x00scope\x00");
+    hasher.update(canonical_json(scope).as_bytes());
+    hasher.update(b"\x00chain\x00");
+    for principal in chain {
+        hasher.update(canonical_json(principal).as_bytes());
+        hasher.update(b"\x1e");
+    }
+    let digest = hasher.finalize();
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(4 + 32);
+    id.push_str("obl_");
+    for byte in &digest[..16] {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    id
+}
+
+/// Serialize a contract DTO to its canonical JSON string for hashing.
+///
+/// Serde emits struct and enum fields in declaration order, so this is stable
+/// across processes; the rare serialization failure degrades to an empty string
+/// rather than panicking in the evaluation hot path.
+fn canonical_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1244,6 +1332,88 @@ mod tests {
         let trace = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
         assert_eq!(trace.decision, AuthorizationDecision::RequireApproval);
         assert_eq!(trace.matched_grants, vec![GrantId("g_appr".into())]);
+    }
+
+    #[test]
+    fn require_approval_carries_an_obligation_naming_policy_and_authority() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_gate".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("issue.delete".into()),
+            scope: ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+            effect: Effect::RequireApproval,
+        });
+
+        let trace = policy.evaluate(&request(
+            account("ada"),
+            "issue.delete",
+            ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::RequireApproval);
+        let obligation = trace.obligation.as_ref().expect("approval carries one");
+        // The deciding grant names the policy and anchors the approval authority.
+        assert_eq!(obligation.policy_id, "g_gate");
+        assert_eq!(
+            obligation.authority.scope,
+            ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            }
+        );
+        assert!(obligation.obligation_id.starts_with("obl_"));
+    }
+
+    #[test]
+    fn allow_and_deny_carry_no_obligation() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_allow".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.read".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        let allowed = policy.evaluate(&request(account("ada"), "pack.read", ScopeRef::Global));
+        assert_eq!(allowed.decision, AuthorizationDecision::Allow);
+        assert!(allowed.obligation.is_none());
+
+        // A bare default-deny on an unmatched action also carries no obligation.
+        let denied = policy.evaluate(&request(account("ada"), "pack.delete", ScopeRef::Global));
+        assert_eq!(denied.decision, AuthorizationDecision::Deny);
+        assert!(denied.obligation.is_none());
+    }
+
+    #[test]
+    fn obligation_id_is_stable_across_re_queries_and_varies_by_question() {
+        let mut policy = PolicySet::new();
+        for (id, subject) in [("g_ada", account("ada")), ("g_bob", account("bob"))] {
+            policy.add_grant(Grant {
+                id: GrantId(id.into()),
+                subject: GrantSubject::Principal(subject),
+                action_pattern: ActionPattern("issue.*".into()),
+                scope: ScopeRef::Global,
+                effect: Effect::RequireApproval,
+            });
+        }
+
+        let first = policy.evaluate(&request(account("ada"), "issue.delete", ScopeRef::Global));
+        let again = policy.evaluate(&request(account("ada"), "issue.delete", ScopeRef::Global));
+        let other_action =
+            policy.evaluate(&request(account("ada"), "issue.archive", ScopeRef::Global));
+        let other_principal =
+            policy.evaluate(&request(account("bob"), "issue.delete", ScopeRef::Global));
+
+        let id = |t: &AuthorizationTrace| t.obligation.as_ref().unwrap().obligation_id.clone();
+        // Re-querying the same question is idempotent: identical obligation id.
+        assert_eq!(id(&first), id(&again));
+        // A different action or principal is a different obligation.
+        assert_ne!(id(&first), id(&other_action));
+        assert_ne!(id(&first), id(&other_principal));
     }
 
     #[test]

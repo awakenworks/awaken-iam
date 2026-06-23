@@ -230,6 +230,33 @@ mod tests {
     }
 
     #[test]
+    fn authorize_surfaces_the_obligation_on_require_approval() {
+        let mut api = AuthzApi::new();
+        api.policy_mut().add_grant(Grant {
+            id: GrantId("g_gate".into()),
+            subject: GrantSubject::Principal(service("svc")),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
+        let outcome = api.authorize(&request(service("svc"), "pack.publish", ScopeRef::Global));
+        assert_eq!(outcome.decision, AuthorizationDecision::RequireApproval);
+        assert_eq!(outcome.reason, "needs_approval");
+        let obligation = outcome.obligation.expect("require_approval carries one");
+        assert_eq!(obligation.policy_id, "g_gate");
+        assert_eq!(obligation.authority.scope, ScopeRef::Global);
+        assert!(obligation.obligation_id.starts_with("obl_"));
+
+        // The discharge seam is the obligation, not a re-query: asking authorize
+        // again yields the very same obligation id rather than a fresh one.
+        let again = api.authorize(&request(service("svc"), "pack.publish", ScopeRef::Global));
+        assert_eq!(
+            again.obligation.map(|o| o.obligation_id),
+            Some(obligation.obligation_id)
+        );
+    }
+
+    #[test]
     fn batch_preserves_request_order() {
         let mut api = AuthzApi::new();
         api.policy_mut().add_grant(Grant {
@@ -311,14 +338,28 @@ mod tests {
             scope: ScopeRef::Global,
             effect: Effect::Allow,
         });
+        // A require-approval grant so the obligation envelope is exercised too.
+        api.policy_mut().add_grant(Grant {
+            id: GrantId("g_gate".into()),
+            subject: GrantSubject::Principal(service("svc")),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::RequireApproval,
+        });
         let snapshot = api.snapshot();
         let local = PolicySet::from_snapshot(&snapshot);
 
-        for action in ["pack.publish", "image.push"] {
+        for action in ["pack.publish", "pack.read", "image.push"] {
             let req = request(service("svc"), action, ScopeRef::Global);
-            // Local evaluation from the synced snapshot mirrors the remote answer.
+            // Local evaluation from the synced snapshot mirrors the remote answer,
+            // obligation id and all — the id is content-addressed, not minted.
             assert_eq!(local.evaluate(&req).to_outcome(), api.authorize(&req));
         }
+        // The publish question really does resolve to an obligation-bearing
+        // require-approval, so the equality above is meaningful, not vacuous.
+        let publish = api.authorize(&request(service("svc"), "pack.publish", ScopeRef::Global));
+        assert_eq!(publish.decision, AuthorizationDecision::RequireApproval);
+        assert!(publish.obligation.is_some());
     }
 
     #[test]

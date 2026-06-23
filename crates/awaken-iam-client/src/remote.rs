@@ -243,6 +243,7 @@ mod tests {
                 .into(),
                 matched_grants: if allow { vec!["g1".into()] } else { vec![] },
                 matched_roles: vec![],
+                obligation: None,
             })
         }
 
