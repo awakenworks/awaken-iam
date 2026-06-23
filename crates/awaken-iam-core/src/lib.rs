@@ -5,6 +5,7 @@ mod authorization;
 mod directory;
 mod entitlement;
 mod fake_provider;
+mod generic_oauth;
 mod github;
 mod google;
 mod linking;
@@ -38,6 +39,7 @@ pub use fake_provider::{
     JsonWebKey, JsonWebKeySet, OidcDiscoveryDocument, OidcError, TokenRequest, TokenResponse,
     UserInfoResponse,
 };
+pub use generic_oauth::{GenericOAuthProvider, GenericOAuthSecrets};
 pub use github::{
     DEFAULT_AUTHORIZE_ENDPOINT, DEFAULT_TOKEN_ENDPOINT, GithubAccessToken, GithubEmail,
     GithubProviderAdapter, GithubTransport, GithubTransportError, GithubUser, SelectedEmail,

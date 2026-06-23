@@ -245,7 +245,12 @@ fn domain_pack_permissions_are_fully_managed_by_namespace_trust() {
     assert!(trust.namespace_owner(&acme).is_some());
 
     // Publisher role: publish + read + yank + signer use.
-    for action in ["pack.publish", "pack.read", "pack.yank", "namespace.signer.use"] {
+    for action in [
+        "pack.publish",
+        "pack.read",
+        "pack.yank",
+        "namespace.signer.use",
+    ] {
         trust
             .grant(&acme, publisher.clone(), ActionKey(action.into()))
             .unwrap();
@@ -285,7 +290,11 @@ fn domain_pack_permissions_are_fully_managed_by_namespace_trust() {
     // Signer revocation is the trust-root signal: a revoked key no longer signs
     // new versions, so the verification-time lookup yields nothing.
     trust
-        .revoke_signer_key(&acme, &SignerKeyId("key_release".into()), ts("2026-06-21T12:00:00Z"))
+        .revoke_signer_key(
+            &acme,
+            &SignerKeyId("key_release".into()),
+            ts("2026-06-21T12:00:00Z"),
+        )
         .unwrap();
     assert!(trust.lookup_signer(&acme, &fingerprint).is_none());
     assert!(!trust.is_authorized_signer(&acme, &fingerprint));
