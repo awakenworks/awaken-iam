@@ -6,6 +6,7 @@
 - [Authorization engine](authorization-engine.md)
 - [Consumer integration](consumer-integration.md)
 - [Identity and auth server](auth-server.md)
+- [Third-party login provider setup](provider-setup.md)
 - [Namespace trust model](namespace-trust-model.md)
 - [Entitlement plane](entitlements.md)
 - [Remote protocol and client](remote-protocol.md)
