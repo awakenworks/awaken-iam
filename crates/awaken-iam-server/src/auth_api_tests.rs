@@ -966,6 +966,60 @@ fn redeem(code: &str) -> RedeemAuthorizationCode {
         access_expires_at: 1_900_000_000,
         now: Timestamp("2026-06-19T01:01:00Z".into()),
         refresh_expires_at: Timestamp("2026-07-19T00:00:00Z".into()),
+/// Stand up a downstream provider with a single confidential client registered
+/// for the `product.example` callback, and issue a code for `acct_ada`.
+fn op_provider_with_issued_code(
+    nonce: Option<&str>,
+) -> (
+    awaken_iam_core::OAuthAuthorizationServer<SequentialEntropy>,
+    awaken_iam_core::IssuedAuthorizationCode,
+) {
+    let mut registry = awaken_iam_core::OAuthClientRegistry::new();
+    registry.register(awaken_iam_core::RegisteredClient::confidential(
+        "product-web",
+        "top-secret",
+        vec!["https://product.example/cb".into()],
+        ["openid", "email", "profile"],
+    ));
+    let mut provider =
+        awaken_iam_core::OAuthAuthorizationServer::new(registry, SequentialEntropy::default());
+    let issued = provider
+        .issue_code(
+            AccountId("acct_ada".into()),
+            &awaken_iam_core::OAuthAuthorizationRequest {
+                client_id: "product-web".into(),
+                redirect_uri: "https://product.example/cb".into(),
+                scopes: vec!["openid".into(), "email".into()],
+                code_challenge: None,
+                code_challenge_method: None,
+                nonce: nonce.map(Into::into),
+                state: Some("state-1".into()),
+            },
+            Timestamp("2026-06-21T00:00:00Z".into()),
+            Timestamp("2026-06-21T00:05:00Z".into()),
+        )
+        .expect("issue code");
+    (provider, issued)
+}
+
+fn redemption(code: &str) -> awaken_iam_core::TokenRedemption {
+    awaken_iam_core::TokenRedemption {
+        client_id: "product-web".into(),
+        client_secret: Some("top-secret".into()),
+        code: code.into(),
+        redirect_uri: "https://product.example/cb".into(),
+        code_verifier: None,
+    }
+}
+
+fn op_request() -> OpCodeRedemption {
+    OpCodeRedemption {
+        issuer: "https://iam.example".into(),
+        access_audience: "packs-service".into(),
+        issued_at: 1_899_996_400,
+        access_expires_at: 1_900_000_000,
+        id_token_expires_at: 1_899_999_999,
+        now: Timestamp("2026-06-21T00:01:00Z".into()),
     }
 }
 
@@ -1049,6 +1103,70 @@ fn downstream_authorization_code_is_single_use() {
     api.redeem_authorization_code(redeem(&code)).unwrap();
     // Replaying the consumed code fails closed; it can never mint a second grant.
     let err = api.redeem_authorization_code(redeem(&code)).unwrap_err();
+fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
+    let mut api = api();
+    let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
+
+    let grant = api
+        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .expect("redeem");
+
+    // The grant carries the down-scoped set and the authenticated account.
+    assert_eq!(grant.account_id, AccountId("acct_ada".into()));
+    assert_eq!(grant.scopes, vec!["openid".to_owned(), "email".to_owned()]);
+
+    // The access token verifies against the published JWKS + denylist and stamps
+    // the grant's subject and scopes — never client-supplied claims.
+    let access = api.verify_access_token(&grant.access_token).unwrap();
+    assert_eq!(access.iss, "https://iam.example");
+    assert_eq!(access.sub, "acct_ada");
+    assert_eq!(access.aud, "packs-service");
+    assert_eq!(access.scope, vec!["openid".to_owned(), "email".to_owned()]);
+    assert_eq!(access.jti, grant.access_token_jti);
+
+    // The id_token verifies against the same JWKS and asserts the OIDC subject to
+    // the redeeming client: its audience is the client_id, and the request nonce
+    // is bound in.
+    let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
+    assert_eq!(id.iss, "https://iam.example");
+    assert_eq!(id.sub, "acct_ada");
+    assert_eq!(id.aud, "product-web");
+    assert_eq!(id.iat, 1_899_996_400);
+    assert_eq!(id.exp, 1_899_999_999);
+    assert_eq!(id.nonce.as_deref(), Some("nonce-xyz"));
+
+    // Family fence on the real artifacts: the id_token cannot be replayed as an
+    // access token.
+    assert!(api.verify_access_token(&grant.id_token).is_err());
+}
+
+#[test]
+fn redeeming_without_a_request_nonce_omits_the_id_token_nonce() {
+    let mut api = api();
+    let (mut provider, issued) = op_provider_with_issued_code(None);
+
+    let grant = api
+        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .expect("redeem");
+
+    let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
+    assert_eq!(id.nonce, None);
+}
+
+#[test]
+fn a_replayed_code_fails_closed_through_the_provider() {
+    let mut api = api();
+    let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
+
+    // First redemption succeeds and consumes the single-use code.
+    api.redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .expect("first redeem");
+
+    // A second redemption surfaces the provider's invalid-grant error and mints
+    // nothing.
+    let err = api
+        .redeem_authorization_code(&mut provider, &redemption(&issued.code), op_request())
+        .unwrap_err();
     assert_eq!(
         err,
         AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)

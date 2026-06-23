@@ -7,6 +7,7 @@ mod auth_api;
 mod authz_api;
 mod capability_token;
 pub mod http;
+mod op_id_token;
 mod session;
 mod store;
 mod token_exchange;
@@ -21,14 +22,17 @@ pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDae
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
     DEFAULT_LOGIN_COOKIE_NAME, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
-    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, RefreshGrant,
-    ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin,
-    StartLoginOutcome, TokenGrant, UnlinkIdentity,
+    OpCodeRedemption, OpTokenGrant, PrincipalResolutionFailure, ProviderRegistration,
+    ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
+    RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant, UnlinkIdentity,
 };
 pub use authz_api::AuthzApi;
 pub use capability_token::{
     AttenuateCapability, CapabilityCheck, CapabilityClaims, CapabilityError, LeaseEpoch,
     MintCapability, attenuate, mint_capability, verify_capability,
+};
+pub use op_id_token::{
+    ID_TOKEN_TYP, IdTokenError, MintIdToken, OidcIdTokenClaims, mint_id_token, verify_id_token,
 };
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
