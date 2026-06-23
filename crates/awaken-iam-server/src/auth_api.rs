@@ -13,6 +13,8 @@
 //! | Route | Method on [`AuthApi`] |
 //! |---|---|
 //! | `GET /.well-known/openid-configuration` | [`AuthApi::openid_configuration`] |
+//! | `GET /.well-known/jwks.json` | [`AuthApi::jwks`] |
+//! | `POST /v1/tokens` (access) | [`AuthApi::mint_access_token`] |
 //! | `GET /v1/auth/providers` | [`AuthApi::list_providers`] |
 //! | `GET /v1/auth/login/{provider}` | [`AuthApi::start_login`] |
 //! | `GET /v1/auth/callback/{provider}` | [`AuthApi::complete_callback`] |
@@ -48,7 +50,7 @@ use std::collections::HashMap;
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ExternalIdentity, ExternalIdentityClaims,
     ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey,
-    IdentityProviderKind, OAuthLoginStateId, OpenIdProviderMetadata, PrincipalRef, SessionId,
+    IdentityProviderKind, Jwks, OAuthLoginStateId, OpenIdProviderMetadata, PrincipalRef, SessionId,
     SessionView, Timestamp, UserInfo,
 };
 use awaken_iam_core::{
@@ -59,7 +61,13 @@ use awaken_iam_core::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+use crate::access_token::{
+    AccessTokenAuthority, AccessTokenClaims, AccessTokenError, SigningKeyMaterial,
+};
 use crate::{SessionCookieConfig, SessionGateway};
+
+/// Default key id minted for the bootstrap access-token signing key.
+const DEFAULT_SIGNING_KID: &str = "iam-access-key-1";
 
 /// Number of random bytes drawn for each generated id (256 bits).
 const ID_BYTES: usize = 32;
@@ -379,6 +387,27 @@ pub struct LogoutOutcome {
     pub clear_session_cookie: String,
 }
 
+/// Request to mint an asymmetric bearer access token (`POST /v1/tokens`).
+///
+/// The caller supplies the principal and validity window; IAM mints a unique
+/// `jti` (so the token is individually revocable) and signs the JWT with the
+/// active rotation key, stamping its `kid` into the header.
+#[derive(Debug, Clone)]
+pub struct MintAccessToken {
+    /// Issuer identifier stamped into the `iss` claim.
+    pub issuer: String,
+    /// Subject the token authenticates (the IAM account/principal id).
+    pub subject: String,
+    /// Audience: the service the token is presented to.
+    pub audience: String,
+    /// Issued-at time as a Unix timestamp (seconds).
+    pub issued_at: i64,
+    /// Expiration time as a Unix timestamp (seconds); short-lived (≈1h).
+    pub expires_at: i64,
+    /// Scopes granted to the bearer.
+    pub scopes: Vec<String>,
+}
+
 /// Request to link an already-verified external identity to an account.
 #[derive(Debug, Clone)]
 pub struct LinkIdentity {
@@ -435,6 +464,9 @@ pub enum AuthApiError {
     /// The session resolved to an account that is disabled or no longer exists.
     #[error("session principal account is disabled")]
     AccountDisabled,
+    /// Minting an asymmetric access token failed.
+    #[error(transparent)]
+    AccessToken(#[from] AccessTokenError),
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -447,6 +479,7 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     pending: HashMap<OAuthLoginStateId, PendingLogin>,
     return_to: ReturnToPolicy,
     login_cookie: SessionCookieConfig,
+    tokens: AccessTokenAuthority,
     audit: Vec<AuthAuditEvent>,
     ids: E,
 }
@@ -471,6 +504,12 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             name: DEFAULT_LOGIN_COOKIE_NAME.to_owned(),
             ..SessionCookieConfig::default()
         };
+        // Draw the bootstrap signing seed from a clone so the live `ids` stream
+        // (and therefore minted ids) is unaffected by key generation.
+        let mut bootstrap = entropy.clone();
+        let mut seed = [0u8; 32];
+        bootstrap.fill_bytes(&mut seed);
+        let tokens = AccessTokenAuthority::new(SigningKeyMaterial::new(DEFAULT_SIGNING_KID, seed));
         Self {
             providers: Vec::new(),
             challenge: OAuthChallengeService::new(entropy.clone()),
@@ -480,6 +519,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             pending: HashMap::new(),
             return_to: ReturnToPolicy::default(),
             login_cookie,
+            tokens,
             audit: Vec::new(),
             ids: entropy,
         }
@@ -808,6 +848,54 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// the `/v1` auth tree rather than hardcoding paths.
     pub fn openid_configuration(&self, issuer: &str) -> OpenIdProviderMetadata {
         OpenIdProviderMetadata::for_issuer(issuer)
+    }
+
+    /// `GET /.well-known/jwks.json`: publish the public access-token signing keys.
+    ///
+    /// Verifiers fetch this set and check tokens locally — IAM never shares a
+    /// secret. The set holds the active key plus any rotated-but-unpruned
+    /// predecessors so a token minted just before a rotation still verifies.
+    pub fn jwks(&self) -> Jwks {
+        self.tokens.jwks()
+    }
+
+    /// The `kid` of the active access-token signing key.
+    pub fn active_signing_kid(&self) -> &str {
+        self.tokens.active_kid()
+    }
+
+    /// `POST /v1/tokens`: mint a signed asymmetric bearer access token.
+    ///
+    /// The token is a compact JWT signed with the active key (EdDSA/Ed25519),
+    /// carrying that key's `kid` in the header and a freshly minted `jti` so it
+    /// can be revoked individually. Verifiers validate it against [`jwks`](Self::jwks).
+    pub fn mint_access_token(&mut self, request: MintAccessToken) -> Result<String, AuthApiError> {
+        let claims = AccessTokenClaims {
+            iss: request.issuer,
+            sub: request.subject,
+            aud: request.audience,
+            exp: request.expires_at,
+            iat: request.issued_at,
+            jti: self.mint_id("jti"),
+            scope: request.scopes,
+        };
+        Ok(self.tokens.mint(&claims)?)
+    }
+
+    /// Rotate the active access-token signing key, drawing a fresh seed from the
+    /// entropy source. The previous key stays published for verification until
+    /// [`prune_signing_key`](Self::prune_signing_key) retires it.
+    pub fn rotate_signing_key(&mut self, kid: impl Into<String>) {
+        let mut seed = [0u8; 32];
+        self.ids.fill_bytes(&mut seed);
+        self.tokens.rotate(SigningKeyMaterial::new(kid, seed));
+    }
+
+    /// Prune a retired signing key by `kid` so tokens it signed no longer verify.
+    ///
+    /// The active key cannot be pruned. Returns whether a key was removed.
+    pub fn prune_signing_key(&mut self, kid: &str) -> bool {
+        self.tokens.prune(kid)
     }
 
     /// `GET /v1/oauth/userinfo`: return the authenticated subject's OIDC claims.
@@ -1661,5 +1749,63 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn mint_request() -> MintAccessToken {
+        MintAccessToken {
+            issuer: "https://iam.example".into(),
+            subject: "acct_1".into(),
+            audience: "packs-service".into(),
+            issued_at: 1_899_996_400,
+            expires_at: 1_900_000_000,
+            scopes: vec!["pack.read".into()],
+        }
+    }
+
+    #[test]
+    fn minted_access_token_is_asymmetric_and_verifies_against_published_jwks() {
+        let mut api = api();
+        let token = api.mint_access_token(mint_request()).unwrap();
+
+        // The token is signed by the active key and verifies against the JWKS
+        // alone — no shared secret is needed by the verifier.
+        let jwks = api.jwks();
+        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.keys[0].kid, api.active_signing_kid());
+        let claims = crate::verify_access_token(&token, &jwks).unwrap();
+        assert_eq!(claims.sub, "acct_1");
+        assert_eq!(claims.aud, "packs-service");
+        assert_eq!(claims.scope, vec!["pack.read".to_owned()]);
+        // A unique jti is minted so the token can be revoked individually.
+        assert!(claims.jti.starts_with("jti_"));
+
+        // Two mints get distinct jti values.
+        let other = api.mint_access_token(mint_request()).unwrap();
+        let other_claims = crate::verify_access_token(&other, &api.jwks()).unwrap();
+        assert_ne!(claims.jti, other_claims.jti);
+    }
+
+    #[test]
+    fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
+        let mut api = api();
+        let old_kid = api.active_signing_kid().to_owned();
+        let old_token = api.mint_access_token(mint_request()).unwrap();
+
+        api.rotate_signing_key("iam-access-key-2");
+        assert_eq!(api.active_signing_kid(), "iam-access-key-2");
+        let new_token = api.mint_access_token(mint_request()).unwrap();
+
+        // Both tokens verify while the old key is still published.
+        let jwks = api.jwks();
+        assert_eq!(jwks.keys.len(), 2);
+        crate::verify_access_token(&old_token, &jwks).unwrap();
+        crate::verify_access_token(&new_token, &jwks).unwrap();
+
+        // Pruning the retired key retires the tokens it signed.
+        assert!(api.prune_signing_key(&old_kid));
+        let pruned = api.jwks();
+        assert_eq!(pruned.keys.len(), 1);
+        assert!(crate::verify_access_token(&old_token, &pruned).is_err());
+        crate::verify_access_token(&new_token, &pruned).unwrap();
     }
 }
