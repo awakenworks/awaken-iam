@@ -4,6 +4,7 @@
 //! identifiers only; evaluation, persistence, and server code live elsewhere.
 
 mod identity;
+mod protocol;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,11 @@ pub use identity::{
     ExternalIdentityKey, ExternalSubject, IdentityProviderConfig, IdentityProviderConfigId,
     IdentityProviderKey, IdentityProviderKind, OAuthLoginState, OAuthLoginStateId,
     OpenIdProviderMetadata, Session, SessionId, SessionView, Timestamp, UserInfo,
+};
+pub use protocol::{
+    AuthorizationOutcome, BatchAuthorizationRequest, BatchAuthorizationResponse,
+    EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceOrgEdge,
+    PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
 };
 
 /// Global account identifier.

@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 awaken-iam-contract.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

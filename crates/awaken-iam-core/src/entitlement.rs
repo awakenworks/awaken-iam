@@ -216,6 +216,21 @@ pub enum EntitlementReason {
     Remote,
 }
 
+impl EntitlementReason {
+    /// Returns a stable snake_case code suitable for audit logs and the remote
+    /// protocol's `reason` field.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EntitlementReason::DefaultAllow => "default_allow",
+            EntitlementReason::PlanEntitles { .. } => "plan_entitles",
+            EntitlementReason::PlanLacksFeature { .. } => "plan_lacks_feature",
+            EntitlementReason::NoPlanAssigned => "no_plan_assigned",
+            EntitlementReason::QuotaExceeded { .. } => "quota_exceeded",
+            EntitlementReason::Remote => "remote",
+        }
+    }
+}
+
 /// Outcome of an entitlement check: the decision plus an explanation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntitlementOutcome {
@@ -237,6 +252,15 @@ impl EntitlementOutcome {
         Self {
             decision: EntitlementDecision::Deny,
             reason,
+        }
+    }
+
+    /// Project the outcome onto the [`EntitlementCheckResponse`] wire DTO,
+    /// flattening the reason to its stable code.
+    pub fn to_response(&self) -> awaken_iam_contract::EntitlementCheckResponse {
+        awaken_iam_contract::EntitlementCheckResponse {
+            decision: self.decision,
+            reason: self.reason.code().to_owned(),
         }
     }
 }
