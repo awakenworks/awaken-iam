@@ -1,7 +1,11 @@
 //! Client-facing IAM traits.
 
+#[cfg(feature = "http")]
+mod http;
 mod remote;
 
+#[cfg(feature = "http")]
+pub use http::{DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig};
 pub use remote::{AuthzTransport, IamClientMode, RemoteError, RemoteIamClient};
 
 use awaken_iam_contract::{

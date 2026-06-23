@@ -3,6 +3,10 @@
 pub use awaken_iam_client::{
     AuthzTransport, IamClient, IamClientMode, RemoteError, RemoteIamClient,
 };
+#[cfg(feature = "http")]
+pub use awaken_iam_client::{
+    DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig,
+};
 pub use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ActionKey, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
