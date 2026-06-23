@@ -245,6 +245,15 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         &self.registry
     }
 
+    /// Register or replace a client in the underlying registry.
+    ///
+    /// Lets a caller that built the server over an empty registry add clients
+    /// later (e.g. as a deployment provisions its product integrations) without
+    /// reconstructing the server and discarding issued codes.
+    pub fn register_client(&mut self, client: RegisteredClient) {
+        self.registry.register(client);
+    }
+
     /// Validate an authorization request and issue a single-use code bound to the
     /// authenticated `account_id`.
     ///

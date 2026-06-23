@@ -118,7 +118,9 @@ const AUTH_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/auth/callback/{provider}"),
     RouteSpec::get("/v1/session"),
     RouteSpec::delete("/v1/session"),
+    RouteSpec::get("/v1/oauth/authorize"),
     RouteSpec::post("/v1/oauth/token"),
+    RouteSpec::post("/v1/oauth/revoke"),
     RouteSpec::get("/v1/oauth/userinfo"),
     RouteSpec::get("/v1/account/identities"),
     RouteSpec::post("/v1/account/identities"),
@@ -401,10 +403,17 @@ mod tests {
         assert!(routes.contains(&RouteSpec::get("/v1/session")));
         assert!(routes.contains(&RouteSpec::post("/v1/authorize")));
         assert!(routes.contains(&RouteSpec::get("/v1/authz/snapshot")));
+<<<<<<< HEAD
         // The well-known discovery surface mounts both the OIDC metadata and the
         // JWKS so third parties can verify IAM-signed access tokens.
         assert!(routes.contains(&RouteSpec::get("/.well-known/openid-configuration")));
         assert!(routes.contains(&RouteSpec::get("/.well-known/jwks.json")));
+=======
+        // The downstream OpenID Provider endpoints are mounted alongside.
+        assert!(routes.contains(&RouteSpec::get("/v1/oauth/authorize")));
+        assert!(routes.contains(&RouteSpec::post("/v1/oauth/token")));
+        assert!(routes.contains(&RouteSpec::post("/v1/oauth/revoke")));
+>>>>>>> eba9b2d (✨ feat(server): mount downstream OpenID Provider authorize/token/revoke routes)
         // No path leaks an unrendered template token or omits its version prefix.
         assert!(
             routes

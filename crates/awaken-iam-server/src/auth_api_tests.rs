@@ -912,3 +912,145 @@ fn rfc7009_revoke_of_an_unknown_token_is_a_silent_noop() {
     });
     assert!(!outcome.revoked);
 }
+
+/// Register a confidential downstream product client integrating against IAM as
+/// the OpenID Provider.
+fn register_downstream_client(api: &mut AuthApi<SequentialEntropy>) {
+    api.register_oauth_client(RegisteredClient::confidential(
+        "product-web",
+        "client-secret",
+        vec!["https://product.example/callback".into()],
+        ["openid", "email"],
+    ));
+}
+
+fn downstream_authorize(cookie: &str) -> DownstreamAuthorizeRequest {
+    DownstreamAuthorizeRequest {
+        cookie_header: cookie.to_owned(),
+        authorization: OAuthAuthorizationRequest {
+            client_id: "product-web".into(),
+            redirect_uri: "https://product.example/callback".into(),
+            scopes: vec!["openid".into(), "email".into()],
+            code_challenge: None,
+            code_challenge_method: None,
+            nonce: Some("nonce-xyz".into()),
+            state: Some("state abc".into()),
+        },
+        now: Timestamp("2026-06-19T01:00:00Z".into()),
+        code_expires_at: Timestamp("2026-06-19T01:05:00Z".into()),
+    }
+}
+
+fn code_from_redirect(redirect_to: &str) -> String {
+    redirect_to
+        .split("code=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn redeem(code: &str) -> RedeemAuthorizationCode {
+    RedeemAuthorizationCode {
+        redemption: TokenRedemption {
+            client_id: "product-web".into(),
+            client_secret: Some("client-secret".into()),
+            code: code.to_owned(),
+            redirect_uri: "https://product.example/callback".into(),
+            code_verifier: None,
+        },
+        issuer: "https://iam.example".into(),
+        issued_at: 1_899_996_400,
+        access_expires_at: 1_900_000_000,
+        now: Timestamp("2026-06-19T01:01:00Z".into()),
+        refresh_expires_at: Timestamp("2026-07-19T00:00:00Z".into()),
+    }
+}
+
+#[test]
+fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
+    let mut api = api();
+    register_downstream_client(&mut api);
+    let (result, cookie) = logged_in_session(&mut api);
+    let account_id = result.session.account_id.clone();
+
+    // `GET /v1/oauth/authorize`: the authenticated end-user's session backs a
+    // code bound to the product client, returned on its registered redirect URI.
+    let authorized = api.authorize(downstream_authorize(&cookie)).unwrap();
+    assert!(
+        authorized
+            .redirect_to
+            .starts_with("https://product.example/callback?code=")
+    );
+    // The opaque `state` is echoed back, percent-encoded so it cannot break out.
+    assert!(authorized.redirect_to.contains("&state=state%20abc"));
+    assert!(
+        api.audit_log()
+            .iter()
+            .any(|event| matches!(event, AuthAuditEvent::DownstreamCodeIssued { .. }))
+    );
+
+    // `POST /v1/oauth/token` (authorization_code): redeem the code for a grant.
+    let code = code_from_redirect(&authorized.redirect_to);
+    let grant = api.redeem_authorization_code(redeem(&code)).unwrap();
+
+    // The minted access token authenticates the end-user's account and carries
+    // the granted scopes; it verifies against the published JWKS.
+    let claims = api.verify_access_token(&grant.access_token).unwrap();
+    assert_eq!(claims.sub, account_id.0);
+    assert_eq!(claims.aud, "product-web");
+    assert_eq!(claims.scope, vec!["openid".to_owned(), "email".to_owned()]);
+    assert!(grant.refresh_token.starts_with("oiamr_"));
+    assert!(
+        api.audit_log()
+            .iter()
+            .any(|event| matches!(event, AuthAuditEvent::DownstreamCodeRedeemed { .. }))
+    );
+}
+
+#[test]
+fn downstream_authorize_fails_closed_without_a_session() {
+    let mut api = api();
+    register_downstream_client(&mut api);
+    // No live IAM session backs the request, so no code is issued.
+    let err = api
+        .authorize(downstream_authorize("unrelated=1"))
+        .unwrap_err();
+    assert!(matches!(err, AuthApiError::Login(_)));
+    assert!(
+        !api.audit_log()
+            .iter()
+            .any(|event| matches!(event, AuthAuditEvent::DownstreamCodeIssued { .. }))
+    );
+}
+
+#[test]
+fn downstream_authorize_rejects_an_unregistered_client() {
+    let mut api = api();
+    let (_result, cookie) = logged_in_session(&mut api);
+    // The client was never registered with the OpenID Provider.
+    let err = api.authorize(downstream_authorize(&cookie)).unwrap_err();
+    assert_eq!(
+        err,
+        AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::UnknownClient)
+    );
+}
+
+#[test]
+fn downstream_authorization_code_is_single_use() {
+    let mut api = api();
+    register_downstream_client(&mut api);
+    let (_result, cookie) = logged_in_session(&mut api);
+    let authorized = api.authorize(downstream_authorize(&cookie)).unwrap();
+    let code = code_from_redirect(&authorized.redirect_to);
+
+    api.redeem_authorization_code(redeem(&code)).unwrap();
+    // Replaying the consumed code fails closed; it can never mint a second grant.
+    let err = api.redeem_authorization_code(redeem(&code)).unwrap_err();
+    assert_eq!(
+        err,
+        AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)
+    );
+}
