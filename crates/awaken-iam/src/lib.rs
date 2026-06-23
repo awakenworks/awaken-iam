@@ -36,6 +36,7 @@ mod tests {
             principal: PrincipalRef::Service {
                 service_id: "svc".into(),
             },
+            on_behalf_of: Vec::new(),
             action: ActionKey("pack.publish".into()),
             scope: ScopeRef::Global,
         });

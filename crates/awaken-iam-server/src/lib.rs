@@ -71,6 +71,7 @@ mod tests {
         };
         let auth = server.authorize(AuthorizationRequest {
             principal: principal.clone(),
+            on_behalf_of: Vec::new(),
             action: ActionKey("pack.publish".into()),
             scope: ScopeRef::Global,
         });
@@ -102,6 +103,7 @@ mod tests {
         assert_eq!(
             server.authorize(AuthorizationRequest {
                 principal: principal.clone(),
+                on_behalf_of: Vec::new(),
                 action: ActionKey("pack.read".into()),
                 scope: ScopeRef::Global,
             }),

@@ -208,6 +208,18 @@ impl IamCore {
         self.policy.evaluate(request)
     }
 
+    /// Filter `candidates` to the scopes on which `principal` may perform
+    /// `action`, in input order, in a single pass. Lets list endpoints answer
+    /// "which of these rows are visible" without one authorize call per row.
+    pub fn visible(
+        &self,
+        principal: &awaken_iam_contract::PrincipalRef,
+        action: &awaken_iam_contract::ActionKey,
+        candidates: &[awaken_iam_contract::ScopeRef],
+    ) -> Vec<awaken_iam_contract::ScopeRef> {
+        self.policy.visible(principal, action, candidates)
+    }
+
     /// Evaluate entitlement. v1 starts as default-allow seam until billing / SKU
     /// management and true entitlement controls are wired in downstream.
     pub fn entitle(&self) -> EntitlementEngine {
@@ -490,6 +502,7 @@ mod tests {
             principal: awaken_iam_contract::PrincipalRef::Account {
                 account_id: AccountId("test".into()),
             },
+            on_behalf_of: Vec::new(),
             action: awaken_iam_contract::ActionKey("pack.read".into()),
             scope: awaken_iam_contract::ScopeRef::Global,
         };
@@ -512,6 +525,7 @@ mod tests {
             principal: awaken_iam_contract::PrincipalRef::Service {
                 service_id: "svc".into(),
             },
+            on_behalf_of: Vec::new(),
             action: awaken_iam_contract::ActionKey("pack.publish".into()),
             scope: awaken_iam_contract::ScopeRef::Global,
         };
@@ -520,6 +534,35 @@ mod tests {
         let trace = core.evaluate(&request);
         assert_eq!(trace.reason, DecisionReason::AllowedByGrant);
         assert_eq!(trace.matched_grants, vec![GrantId("g1".into())]);
+    }
+
+    #[test]
+    fn visible_filters_candidates_through_the_facade() {
+        let mut core = IamCore::new();
+        let principal = awaken_iam_contract::PrincipalRef::Account {
+            account_id: AccountId("ada".into()),
+        };
+        core.policy_mut().add_grant(Grant {
+            id: GrantId("g_global".into()),
+            subject: GrantSubject::Principal(principal.clone()),
+            action_pattern: ActionPattern("pack.read".into()),
+            scope: awaken_iam_contract::ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        let candidates = vec![
+            awaken_iam_contract::ScopeRef::Namespace {
+                namespace_id: awaken_iam_contract::NamespaceId("acme".into()),
+            },
+            awaken_iam_contract::ScopeRef::Global,
+        ];
+        let visible = core.visible(
+            &principal,
+            &awaken_iam_contract::ActionKey("pack.read".into()),
+            &candidates,
+        );
+        // A global grant covers every candidate scope beneath it.
+        assert_eq!(visible, candidates);
     }
 
     #[test]
