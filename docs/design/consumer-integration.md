@@ -206,6 +206,18 @@ credentials stay in-repo and never route through IAM. A principal whose plan lac
 the feature fails closed, and an absent in-repo capability also blocks the run —
 that second decision is made locally, not by IAM.
 
+Per [ADR-0004](../adr/0004-consumers-reuse-iam-authz.md), managed agents widen
+this from entitlement-only to also reusing IAM's **attenuated capability tokens**
+(permission mechanism 7) for sub-agent / sandbox delegation. The flow composes
+the two planes without reimplementing either: the entitlement plane gates *who*
+may run (`agent.run`, the model tier, and the run quota); then a cleared parent
+agent mints a scope-narrowed, epoch-fenced capability and **attenuates** it for a
+sub-agent, handing the child strictly less authority for a bounded time. The
+sandbox verifies the delegated token holder-independently against the published
+JWKS, and advancing the sandbox lease epoch fences every outstanding token out at
+once. IAM still owns neither the run loop nor the in-sandbox enforcement — it
+mints and verifies the delegated authority; the runtime spends it.
+
 ## Consequences
 
 - The shared contract stays small and product-agnostic; guardrails **G1** and

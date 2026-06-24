@@ -48,15 +48,17 @@ pub use awaken_iam_core::{
     TokenRedemption, TrustError, hash_session_token,
 };
 pub use awaken_iam_server::{
-    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
-    CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, Deployment, Dialect,
-    EstablishedSession, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, IamServer,
-    IssueTokenGrant, LinkIdentity, LogoutOutcome, PrincipalResolutionFailure, ProviderRegistration,
-    ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
-    RevokeTokenHint, RouteSpec, SameSite, SessionCookieConfig, SessionGateway, StartLogin,
+    AccessTokenAuthority, AccessTokenError, AttenuateCapability, AuthApi, AuthApiError,
+    AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome, CallbackRequest, CapabilityCheck,
+    CapabilityClaims, CapabilityError, DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME,
+    Deployment, Dialect, EstablishedSession, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon,
+    IamServer, IssueTokenGrant, LeaseEpoch, LinkIdentity, LogoutOutcome, MintCapability,
+    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, RefreshGrant,
+    ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, RouteSpec,
+    SameSite, SessionCookieConfig, SessionGateway, SigningKeyMaterial, StartLogin,
     StartLoginOutcome, TOKEN_EXCHANGE_GRANT_TYPE, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, TokenGrant, TrustedIssuer, TrustedIssuerRegistry, UnlinkIdentity,
-    WorkloadBinding,
+    WorkloadBinding, attenuate, mint_capability, verify_capability,
 };
 
 #[cfg(test)]
