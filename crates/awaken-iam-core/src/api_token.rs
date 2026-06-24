@@ -6,8 +6,8 @@
 //! (ADR-0008 decision 3). A token is two halves: a public, non-secret
 //! *prefix* used to locate the row, and a high-entropy *secret* that is hashed
 //! with **argon2id** and stored only as its PHC hash. The full cleartext token
-//! (`oiam_<prefix>.<secret>`) is returned exactly once at mint time and is never
-//! recoverable afterwards — mirroring how sessions and login secrets are
+//! (`sk-ant-<prefix>.<secret>`) is returned exactly once at mint time and is
+//! never recoverable afterwards — mirroring how sessions and login secrets are
 //! handled, but with a memory-hard hash because the secret is a long-lived
 //! credential rather than a short-TTL challenge.
 //!
@@ -35,7 +35,13 @@ use crate::{EntropySource, IamError};
 
 /// Scheme marker every rendered token carries, before the `<prefix>.<secret>`
 /// body, so a presented credential is recognizable and unambiguously parsed.
-const TOKEN_SCHEME: &str = "oiam_";
+///
+/// Rendered in the Anthropic `sk-ant-`-compatible shape (ADR-0008 decision 6, an
+/// owned divergence): the marker is the only Anthropic-facing part of the
+/// credential; the `<prefix>.<secret>` body stays our own. base64url never
+/// contains `.`, and the marker is stripped literally before the body is split,
+/// so the parse is unambiguous even though the marker itself ends in `-`.
+const TOKEN_SCHEME: &str = "sk-ant-";
 
 /// Random bytes drawn for the public lookup prefix (64 bits).
 const PREFIX_BYTES: usize = 8;
@@ -70,7 +76,7 @@ pub struct MintApiToken {
 
 /// Result of minting a token: the persisted row plus its one-time cleartext.
 ///
-/// The `secret` is the full `oiam_<prefix>.<secret>` credential to hand to the
+/// The `secret` is the full `sk-ant-<prefix>.<secret>` credential to hand to the
 /// caller exactly once; only the argon2id hash on [`IssuedApiToken::token`] is
 /// persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn cleartext_renders_in_the_sk_ant_shape_and_parses_back() {
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut directory = ApiTokenDirectory::new();
+        let issued = minter
+            .mint(&mut directory, mint_request("tok_1", None))
+            .unwrap();
+
+        // The Anthropic-compatible marker is the literal wire shape (ADR-0008
+        // decision 6), not just whatever TOKEN_SCHEME happens to hold.
+        assert!(issued.secret.starts_with("sk-ant-"));
+        assert!(!issued.secret.starts_with("oiam_"));
+
+        // The marker is stripped and the body splits back into the stored prefix
+        // and a non-empty secret, even though the marker itself ends in `-`.
+        let (prefix, secret) = parse_presented_token(&issued.secret).unwrap();
+        assert_eq!(prefix, issued.token.prefix);
+        assert!(!secret.is_empty());
+    }
+
+    #[test]
     fn authenticate_round_trips_a_freshly_minted_token() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
@@ -392,7 +418,7 @@ mod tests {
 
         // A presented token for an unregistered prefix.
         let unknown = directory
-            .authenticate("oiam_ZZZZZZZZ.deadbeef", &now)
+            .authenticate("sk-ant-ZZZZZZZZ.deadbeef", &now)
             .unwrap_err();
         assert_eq!(unknown, IamError::ApiTokenInvalid);
 

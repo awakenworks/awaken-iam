@@ -92,10 +92,10 @@ pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, Sh
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
 
 use awaken_iam_contract::{
-    Account, AccountId, ApiTokenId, ApiTokenPrefix, AuthorizationDecision,
-    AuthorizationRequest, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey,
-    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, RefreshTokenChainId,
-    RefreshTokenId, Session, SessionId, Timestamp,
+    Account, AccountId, ApiTokenId, ApiTokenPrefix, AuthorizationDecision, AuthorizationRequest,
+    ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject,
+    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, RefreshTokenChainId, RefreshTokenId,
+    Session, SessionId, Timestamp,
 };
 
 /// Identifies which bound login value failed verification on callback.
