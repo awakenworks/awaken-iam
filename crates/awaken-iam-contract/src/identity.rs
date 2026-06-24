@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AccountId, ActionKey, PrincipalRef};
+use crate::{AccountId, PrincipalRef, WorkspaceId};
 
 /// Identity provider configuration identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -417,13 +417,16 @@ pub struct ApiTokenPrefix(pub String);
 /// A long-lived, principal-scoped API token, persisted only as a hash.
 ///
 /// API tokens authenticate machine and automation callers
-/// ([`PrincipalRef::Service`] / [`PrincipalRef::ApiToken`]) whose authority is a
-/// fixed [`scope`](ApiToken::scope) set of [`ActionKey`]s. Only the public
-/// [`prefix`](ApiToken::prefix) and the argon2id [`secret_hash`](ApiToken::secret_hash)
-/// are stored; the cleartext token is shown exactly once at mint time and never
-/// again. Liveness is the conjunction of "not revoked" and "not past
-/// `expires_at`"; a token with no `expires_at` never expires and lives until it
-/// is revoked.
+/// ([`PrincipalRef::Service`] / [`PrincipalRef::ApiToken`]). A token is bound to a
+/// single [`workspace`](ApiToken::workspace) for credential attribution (usage and
+/// rate-limit accounting), matching the one-workspace API key; its **authority** is
+/// not carried per-key but is whatever its principal's role bindings cover,
+/// evaluated through the same policy engine as any account (ADR-0008 decision 3).
+/// Only the public [`prefix`](ApiToken::prefix) and the argon2id
+/// [`secret_hash`](ApiToken::secret_hash) are stored; the cleartext token is shown
+/// exactly once at mint time and never again. Liveness is the conjunction of "not
+/// revoked" and "not past `expires_at`"; a token with no `expires_at` never expires
+/// and lives until it is revoked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiToken {
     /// Stable token row id.
@@ -434,8 +437,10 @@ pub struct ApiToken {
     pub principal: PrincipalRef,
     /// Argon2id PHC hash of the token's secret half.
     pub secret_hash: String,
-    /// Action scope this token may exercise; an empty set authorizes nothing.
-    pub scope: Vec<ActionKey>,
+    /// Workspace the token is bound to for credential attribution — usage and
+    /// rate-limit accounting. It is not the token's authority; that flows from the
+    /// principal's role bindings through the policy engine.
+    pub workspace: WorkspaceId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
     /// Optional expiration timestamp; `None` never expires.
@@ -457,18 +462,13 @@ impl ApiToken {
             None => true,
         }
     }
-
-    /// Whether `action` is within this token's scope set (exact match).
-    pub fn authorizes(&self, action: &ActionKey) -> bool {
-        self.scope.contains(action)
-    }
 }
 
 /// Public view of an [`ApiToken`] safe to return to clients.
 ///
-/// It exposes the token's coordinates, scope, and lifecycle timestamps but never
-/// the `secret_hash`. The cleartext token itself is only ever returned once, at
-/// mint time, and is not part of this view.
+/// It exposes the token's coordinates, workspace binding, and lifecycle timestamps
+/// but never the `secret_hash`. The cleartext token itself is only ever returned
+/// once, at mint time, and is not part of this view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiTokenView {
     /// Stable token row id.
@@ -477,8 +477,8 @@ pub struct ApiTokenView {
     pub prefix: ApiTokenPrefix,
     /// Principal this token authenticates as.
     pub principal: PrincipalRef,
-    /// Action scope this token may exercise.
-    pub scope: Vec<ActionKey>,
+    /// Workspace the token is bound to for credential attribution.
+    pub workspace: WorkspaceId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
     /// Optional expiration timestamp.
@@ -494,7 +494,7 @@ impl ApiTokenView {
             id: token.id.clone(),
             prefix: token.prefix.clone(),
             principal: token.principal.clone(),
-            scope: token.scope.clone(),
+            workspace: token.workspace.clone(),
             created_at: token.created_at.clone(),
             expires_at: token.expires_at.clone(),
             revoked_at: token.revoked_at.clone(),

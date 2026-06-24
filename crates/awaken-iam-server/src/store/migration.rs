@@ -530,6 +530,10 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     id: "0003_oauth_clients",
                     up_sql: IDENTITY_0003,
                 },
+                Migration {
+                    id: "0004_api_token_workspace",
+                    up_sql: IDENTITY_0004,
+                },
             ],
         },
         MigrationBundle {
@@ -641,6 +645,16 @@ CREATE TABLE IF NOT EXISTS {prefix}_oauth_clients (\
  redirect_uris {json} NOT NULL, \
  allowed_scopes {json} NOT NULL, \
  secret_hash TEXT);";
+
+// Collapse API-token authorization onto the policy engine (ADR-0008 decision 3):
+// a key no longer carries a per-key `scope` ActionKey set; it is bound to one
+// `workspace` for credential attribution (usage and rate-limit accounting) and
+// draws its authority from the principal's role bindings. Drop the `scope`
+// column and add the `workspace` binding. The default backfills any pre-existing
+// row; every mint thereafter supplies the workspace explicitly.
+const IDENTITY_0004: &str = "\
+ALTER TABLE {prefix}_api_tokens DROP COLUMN scope;\n\
+ALTER TABLE {prefix}_api_tokens ADD COLUMN workspace TEXT NOT NULL DEFAULT '';";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //
@@ -799,22 +813,30 @@ mod tests {
     #[test]
     fn checksum_is_dialect_independent_but_rendered_sql_is_not() {
         // ADR-0003 decision 5: the migration's recorded identity is the neutral
-        // template, so the checksum is the same on either backend even though
-        // the rendered SQL is dialect-specific.
+        // template, so the checksum is the same on either backend even though the
+        // rendered SQL is dialect-specific. A migration that carries no type token
+        // (e.g. a portable `ALTER TABLE` that names only TEXT columns) renders
+        // identically on both backends, so divergence is asserted across the plan
+        // as a whole rather than for every single step.
         let pg = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Postgres), "iam")
             .expect("valid prefix");
         let lite = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Sqlite), "iam")
             .expect("valid prefix");
         let (pg_plan, lite_plan) = (pg.plan(), lite.plan());
         assert_eq!(pg_plan.len(), lite_plan.len());
+        let mut any_diverged = false;
         for (a, b) in pg_plan.iter().zip(lite_plan.iter()) {
             assert_eq!(
                 a.checksum, b.checksum,
                 "{}::{} identity drifted",
                 a.bundle, a.id
             );
-            assert_ne!(a.sql, b.sql, "{}::{} rendered identically", a.bundle, a.id);
+            any_diverged |= a.sql != b.sql;
         }
+        assert!(
+            any_diverged,
+            "no migration rendered dialect-specifically; type-token rendering is inert"
+        );
     }
 
     #[test]

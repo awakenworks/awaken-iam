@@ -1,7 +1,9 @@
 //! Long-lived, principal-scoped API tokens (permission mechanism 8).
 //!
-//! API tokens authenticate machine and automation callers whose authority is a
-//! fixed [`ActionKey`] scope set. A token is two halves: a public, non-secret
+//! API tokens authenticate machine and automation callers. A token is bound to a
+//! single workspace for credential attribution; its authority is not carried
+//! per-key but flows from its principal's role bindings through the policy engine
+//! (ADR-0008 decision 3). A token is two halves: a public, non-secret
 //! *prefix* used to locate the row, and a high-entropy *secret* that is hashed
 //! with **argon2id** and stored only as its PHC hash. The full cleartext token
 //! (`oiam_<prefix>.<secret>`) is returned exactly once at mint time and is never
@@ -26,7 +28,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use awaken_iam_contract::{
-    ActionKey, ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, Timestamp,
+    ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, Timestamp, WorkspaceId,
 };
 
 use crate::{EntropySource, IamError};
@@ -56,8 +58,10 @@ pub struct MintApiToken {
     pub id: ApiTokenId,
     /// Principal the token authenticates as.
     pub principal: PrincipalRef,
-    /// Action scope the token may exercise; an empty set authorizes nothing.
-    pub scope: Vec<ActionKey>,
+    /// Workspace the token is bound to for credential attribution (usage and
+    /// rate-limit accounting). It is not the token's authority; that flows from
+    /// the principal's role bindings through the policy engine.
+    pub workspace: WorkspaceId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
     /// Optional expiration timestamp; must be strictly after `created_at`.
@@ -118,7 +122,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
             prefix: ApiTokenPrefix(prefix.clone()),
             principal: request.principal,
             secret_hash,
-            scope: request.scope,
+            workspace: request.workspace,
             created_at: request.created_at,
             expires_at: request.expires_at,
             revoked_at: None,
@@ -144,8 +148,10 @@ impl<E: EntropySource> ApiTokenMinter<E> {
 ///
 /// A token is indexed by its public prefix (for presented-credential lookup) and
 /// by its id (for management operations like revoke). Authentication verifies
-/// the secret against the stored argon2id hash and applies liveness; scope
-/// enforcement is layered on top by [`ApiTokenDirectory::authorize`].
+/// the secret against the stored argon2id hash and applies liveness; a token
+/// carries no per-key authority, so there is no scope enforcement here —
+/// authorization flows from the principal's role bindings through the policy
+/// engine (ADR-0008 decision 3).
 #[derive(Debug, Default)]
 pub struct ApiTokenDirectory {
     by_prefix: HashMap<ApiTokenPrefix, ApiToken>,
@@ -227,27 +233,6 @@ impl ApiTokenDirectory {
         {
             return Err(IamError::ApiTokenExpired {
                 id: token.id.clone(),
-            });
-        }
-        Ok(token)
-    }
-
-    /// Authenticate a presented token and require `action` to be in its scope.
-    ///
-    /// Layers scope enforcement over [`ApiTokenDirectory::authenticate`]: a live
-    /// token whose scope set does not contain `action` fails closed with
-    /// [`IamError::ApiTokenInsufficientScope`].
-    pub fn authorize(
-        &self,
-        presented: &str,
-        action: &ActionKey,
-        now: &Timestamp,
-    ) -> Result<&ApiToken, IamError> {
-        let token = self.authenticate(presented, now)?;
-        if !token.authorizes(action) {
-            return Err(IamError::ApiTokenInsufficientScope {
-                id: token.id.clone(),
-                action: action.clone(),
             });
         }
         Ok(token)
@@ -341,7 +326,7 @@ mod tests {
             principal: PrincipalRef::Service {
                 service_id: "ci".into(),
             },
-            scope: vec![ActionKey("pack.publish".into())],
+            workspace: WorkspaceId("wrkspc_default".into()),
             created_at: Timestamp("2026-06-19T00:00:00Z".into()),
             expires_at: expires_at.map(|value| Timestamp(value.into())),
         }
@@ -391,33 +376,9 @@ mod tests {
                 service_id: "ci".into()
             }
         );
-    }
-
-    #[test]
-    fn authorize_enforces_the_action_scope_set() {
-        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
-        let mut directory = ApiTokenDirectory::new();
-        let issued = minter
-            .mint(&mut directory, mint_request("tok_1", None))
-            .unwrap();
-        let now = Timestamp("2026-06-19T06:00:00Z".into());
-
-        // An in-scope action is authorized.
-        directory
-            .authorize(&issued.secret, &ActionKey("pack.publish".into()), &now)
-            .unwrap();
-
-        // An out-of-scope action fails closed naming the missing action.
-        let err = directory
-            .authorize(&issued.secret, &ActionKey("pack.yank".into()), &now)
-            .unwrap_err();
-        assert_eq!(
-            err,
-            IamError::ApiTokenInsufficientScope {
-                id: ApiTokenId("tok_1".into()),
-                action: ActionKey("pack.yank".into()),
-            }
-        );
+        // The token carries its workspace binding for credential attribution; it
+        // holds no per-key authority of its own.
+        assert_eq!(live.workspace, WorkspaceId("wrkspc_default".into()));
     }
 
     #[test]
