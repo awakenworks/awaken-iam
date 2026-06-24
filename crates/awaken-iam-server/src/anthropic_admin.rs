@@ -1248,6 +1248,7 @@ mod tests {
                 service_id: "ci".to_owned(),
                 audience: "iam".to_owned(),
                 scopes: vec!["workspace:developer".to_owned()],
+                workspace: WorkspaceId("wrkspc_default".to_owned()),
             }],
             enabled: true,
         };

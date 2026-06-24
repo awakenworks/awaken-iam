@@ -2,6 +2,7 @@
 
 mod access_token;
 mod admin_api;
+mod admin_http;
 mod anthropic_admin;
 mod assembly;
 mod auth_api;
@@ -22,6 +23,7 @@ pub use access_token::{
     ed25519_public_jwk, verify_access_token, verify_active_access_token, verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi};
+pub use admin_http::{AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router};
 pub use anthropic_admin::{
     ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,
     DEFAULT_PAGE_LIMIT, FEDERATION_ISSUER_ID_PREFIX, FEDERATION_RULE_ID_PREFIX, FederationIssuer,
