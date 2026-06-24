@@ -21,6 +21,8 @@ use awaken_iam_core::{
     ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 
+use super::fence::{Fence, FenceStore};
+
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
 fn json_key<T: serde::Serialize>(value: &T, what: &str) -> RepoResult<String> {
@@ -62,6 +64,7 @@ pub struct InMemoryStore {
     authz: Mutex<Authz>,
     entitlement: Mutex<Entitlement>,
     audit: Mutex<Vec<AuditEvent>>,
+    fence: Mutex<Fence>,
 }
 
 impl std::fmt::Debug for InMemoryStore {
@@ -601,6 +604,24 @@ impl AuditSink for InMemoryStore {
 
     fn events(&self) -> RepoResult<Vec<AuditEvent>> {
         Ok(self.audit.lock().unwrap().clone())
+    }
+}
+
+impl FenceStore for InMemoryStore {
+    fn fence(&self) -> RepoResult<Fence> {
+        Ok(*self.fence.lock().unwrap())
+    }
+
+    fn advance_version(&self) -> RepoResult<u64> {
+        let mut fence = self.fence.lock().unwrap();
+        fence.version += 1;
+        Ok(fence.version)
+    }
+
+    fn advance_epoch(&self) -> RepoResult<u64> {
+        let mut fence = self.fence.lock().unwrap();
+        fence.epoch += 1;
+        Ok(fence.epoch)
     }
 }
 

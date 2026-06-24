@@ -26,7 +26,7 @@
 
 use awaken_iam_core::{EntitlementEngine, RepoResult};
 
-use crate::{AuthApi, AuthzApi, IamStore, MigrateReport, MigrationExecutor};
+use crate::{AuthApi, AuthzApi, IamStore, Liveness, MigrateReport, MigrationExecutor, Readiness};
 
 /// IAM's canonical table prefix inside whichever database hosts it.
 ///
@@ -140,6 +140,14 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/authz/resource-model"),
     RouteSpec::get("/v1/authz/snapshot"),
 ];
+
+/// The operational health probes the load balancer and orchestrator route on.
+///
+/// Unversioned by convention (`/healthz`, `/readyz`) so probes are stable across
+/// `/v1` revisions. `/healthz` is liveness ([`IamAssembly::healthz`]); `/readyz`
+/// is readiness ([`IamAssembly::readyz`]). See
+/// [high availability](../../../../docs/design/high-availability.md).
+const OPS_ROUTES: &[RouteSpec] = &[RouteSpec::get("/healthz"), RouteSpec::get("/readyz")];
 
 /// The shared assembly both deployments reuse.
 ///
@@ -278,6 +286,8 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     }
 
     /// The canonical `/v1` routes this assembly mounts (auth then authz).
+    /// The canonical routes this assembly mounts: the `/v1` surface (auth then
+    /// authz) followed by the operational health probes.
     ///
     /// Both deployments mount the identical manifest; embedded mounts it onto the
     /// host router, standalone serves it directly.
@@ -285,8 +295,33 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         AUTH_ROUTES
             .iter()
             .chain(AUTHZ_ROUTES.iter())
+            .chain(OPS_ROUTES.iter())
             .copied()
             .collect()
+    }
+
+    /// Liveness probe (`/healthz`): the process is up.
+    ///
+    /// Deliberately store-independent so a transient store outage does not
+    /// trigger a needless restart — that is what readiness is for. Always
+    /// [`Liveness::Up`] for a running process.
+    pub fn healthz(&self) -> Liveness {
+        Liveness::Up
+    }
+
+    /// Readiness probe (`/readyz`): the store is reachable and this node's
+    /// migrations are applied.
+    ///
+    /// Reads the ledger to confirm every planned migration is recorded; that read
+    /// doubles as the store-reachability check. Fails closed — a pending/drifted
+    /// migration or an unreadable store reports *not ready*, so the balancer
+    /// drains the node rather than route to one that cannot evaluate fresh.
+    pub fn readyz(&self) -> Readiness {
+        match self.store.migrations_applied() {
+            Ok(true) => Readiness::ready(),
+            Ok(false) => Readiness::not_ready("migrations not fully applied"),
+            Err(err) => Readiness::not_ready(format!("store unreachable: {err}")),
+        }
     }
 }
 
@@ -334,8 +369,19 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
     }
 
     /// The canonical `/v1` routes the daemon serves.
+    /// The canonical routes the daemon serves (the `/v1` surface plus probes).
     pub fn routes(&self) -> Vec<RouteSpec> {
         self.assembly.routes()
+    }
+
+    /// Liveness probe (`/healthz`) the orchestrator restarts a wedged node on.
+    pub fn healthz(&self) -> Liveness {
+        self.assembly.healthz()
+    }
+
+    /// Readiness probe (`/readyz`) the load balancer routes ready nodes on.
+    pub fn readyz(&self) -> Readiness {
+        self.assembly.readyz()
     }
 }
 
@@ -404,7 +450,10 @@ mod tests {
         let routes = IamAssembly::embedded(RecordingExecutor::new())
             .expect("assemble")
             .routes();
-        assert_eq!(routes.len(), AUTH_ROUTES.len() + AUTHZ_ROUTES.len());
+        assert_eq!(
+            routes.len(),
+            AUTH_ROUTES.len() + AUTHZ_ROUTES.len() + OPS_ROUTES.len()
+        );
         // Both halves of /v1 are mounted from one assembly.
         assert!(routes.contains(&RouteSpec::get("/v1/session")));
         assert!(routes.contains(&RouteSpec::post("/v1/authorize")));
@@ -420,10 +469,37 @@ mod tests {
         // The namespace trust-root lookup is mounted alongside the authz routes.
         assert!(routes.contains(&RouteSpec::get("/v1/namespaces/{namespace_id}/signers")));
         // No path leaks an unrendered template token or omits its version prefix.
+        // The operational probes are mounted alongside the /v1 surface.
+        assert!(routes.contains(&RouteSpec::get("/healthz")));
+        assert!(routes.contains(&RouteSpec::get("/readyz")));
+        // No path leaks an unrendered template token; every path is either the
+        // versioned surface, the well-known discovery prefix, or a health probe.
+        assert!(routes.iter().all(|r| {
+            r.path.starts_with("/v1/")
+                || r.path.starts_with("/.")
+                || r.path == "/healthz"
+                || r.path == "/readyz"
+        }));
+    }
+
+    #[test]
+    fn healthz_is_live_and_readyz_is_ready_after_migration() {
+        let assembly = IamAssembly::embedded(RecordingExecutor::new()).expect("assemble");
+        // Liveness is up for a running process and never touches the store.
+        assert!(assembly.healthz().is_live());
+        // Readiness is green because assembly migrated the store before returning.
+        assert!(assembly.readyz().is_ready());
+    }
+
+    #[test]
+    fn readyz_fails_closed_when_migrations_are_not_applied() {
+        // A store that was never migrated has an incomplete ledger, so readiness
+        // must report not-ready and drain the node rather than serve traffic.
+        let store = IamStore::with_prefix(RecordingExecutor::new(), IAM_TABLE_PREFIX)
+            .expect("valid prefix");
         assert!(
-            routes
-                .iter()
-                .all(|r| r.path.starts_with("/v1/") || r.path.starts_with("/."))
+            !store.migrations_applied().expect("probe ledger"),
+            "an un-migrated store must not report ready"
         );
     }
 
