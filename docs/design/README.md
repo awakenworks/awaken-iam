@@ -4,6 +4,7 @@
 - [Domain model (DDD)](domain-model.md)
 - [Permission mechanisms](permission-mechanisms.md)
 - [Authorization engine](authorization-engine.md)
+- [Seeding and provisioning](seeding-and-provisioning.md)
 - [Consumer integration](consumer-integration.md)
 - [Identity and auth server](auth-server.md)
 - [Third-party login provider setup](provider-setup.md)
