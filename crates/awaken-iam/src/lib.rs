@@ -43,6 +43,9 @@ pub use awaken_iam_core::{
     PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient, ResourceEdge,
     ResourceModel, ResourceTypeDef, SessionDirectory, SessionMinter, TokenRedemption, TrustError,
     apply_resource_provision, hash_session_token,
+    RateWindow, RegisteredClient, ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding,
+    RoleId, SessionDirectory, SessionMinter, ShadowAuthorizer, ShadowOutcome, ShadowReport,
+    TokenRedemption, TrustError, hash_session_token,
 };
 pub use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, AuthzApi, CallbackOutcome,
