@@ -5,7 +5,8 @@
 //! access token that verifies against IAM's own published JWKS — exercising the
 //! whole path through [`AuthApi::exchange_token`] with no internal access.
 
-use awaken_iam_contract::PrincipalRef;
+use awaken_iam_contract::{PrincipalRef, ScopeRef, WorkspaceId};
+use awaken_iam_core::{RoleBinding, RoleId};
 use awaken_iam_server::{
     AccessTokenAuthority, AuthApi, AuthApiError, AuthAuditEvent, LocalSeedSigner,
     SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE, TokenExchangeError, TokenExchangeRequest,
@@ -16,6 +17,7 @@ use serde::Serialize;
 const ISSUER: &str = "https://sts.ci.example";
 const SUBJECT: &str = "repo:acme/app:ref:refs/heads/main";
 const IAM_ISSUER: &str = "https://iam.example";
+const WORKSPACE: &str = "wrkspc_default";
 
 /// An external issuer's assertion, signed for the exchange.
 #[derive(Serialize)]
@@ -39,7 +41,8 @@ fn federated() -> (AuthApi, AccessTokenAuthority) {
             subject: SUBJECT.into(),
             service_id: "svc_ci_publisher".into(),
             audience: "packs-service".into(),
-            scopes: vec!["pack.publish".into()],
+            scopes: vec!["pack.publish".into(), "workspace:developer".into()],
+            workspace: WorkspaceId(WORKSPACE.into()),
         }],
         enabled: true,
     });
@@ -87,7 +90,26 @@ async fn exchange_mints_an_iam_token_for_the_bound_service_principal() {
     );
     assert_eq!(response.token_type, "Bearer");
     assert_eq!(response.expires_in, 3_600);
-    assert_eq!(response.scope, vec!["pack.publish".to_owned()]);
+    assert_eq!(
+        response.scope,
+        vec!["pack.publish".to_owned(), "workspace:developer".to_owned()]
+    );
+
+    // The rule's `workspace:developer` OAuth scope maps to the workspace role the
+    // minted token is treated as holding for its service principal (ADR-0008
+    // decision 5), while the plain `pack.publish` capability yields no role.
+    assert_eq!(
+        response.workspace_roles,
+        vec![RoleBinding {
+            principal: PrincipalRef::Service {
+                service_id: "svc_ci_publisher".into()
+            },
+            role: RoleId("workspace_developer".into()),
+            scope: ScopeRef::Workspace {
+                workspace_id: WorkspaceId(WORKSPACE.into())
+            },
+        }]
+    );
 
     // It is signed by IAM's own key and verifies against the published JWKS,
     // identically to any other IAM access token — no shared secret needed.

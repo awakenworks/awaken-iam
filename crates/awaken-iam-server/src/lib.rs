@@ -55,7 +55,7 @@ pub use token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, SUBJECT_TOKEN_TYPE_ACCESS_TOKEN,
     SUBJECT_TOKEN_TYPE_ID_TOKEN, SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE,
     TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, TrustedIssuer,
-    TrustedIssuerRegistry, WorkloadBinding,
+    TrustedIssuerRegistry, WORKSPACE_ROLE_SCOPE_PREFIX, WorkloadBinding, workspace_role_for_scope,
 };
 pub use upstream_http::{
     DEFAULT_GITHUB_API_BASE, DEFAULT_GITHUB_USER_AGENT, DEFAULT_TIMEOUT, ReqwestGithubTransport,

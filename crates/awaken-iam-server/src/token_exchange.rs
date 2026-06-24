@@ -41,10 +41,39 @@
 //! response) are deliberately extensible so a later ADR can add RS256 upstream
 //! verification or subject-pattern matching without a wire break.
 
-use awaken_iam_contract::{Jwks, PrincipalRef};
+use awaken_iam_contract::{Jwks, PrincipalRef, ScopeRef, WorkspaceId};
+use awaken_iam_core::{ANTHROPIC_ROLE_IDS, RoleBinding, RoleId};
 use serde::Deserialize;
 
 use crate::access_token::{AccessTokenError, decode_unverified_claims, verify_signed_claims};
+
+/// OAuth scope prefix marking a federation rule scope that maps to a **workspace
+/// role** rather than a plain capability (ADR-0008 decision 5). A rule scope of
+/// `workspace:developer` rides the same `scopes` list as a capability scope like
+/// `pack.publish`; this prefix is what distinguishes the two.
+pub const WORKSPACE_ROLE_SCOPE_PREFIX: &str = "workspace:";
+
+/// Map a federation rule's OAuth scope to the seeded **workspace role** its
+/// minted token is treated as holding (ADR-0008 decision 5).
+///
+/// A scope of the form `workspace:<suffix>` resolves to the workspace role
+/// `workspace_<suffix>` (so `workspace:developer` → `workspace_developer`), and
+/// only when that role is one of the seeded named-catalog roles. Any other input
+/// returns `None` and is **not** a workspace-role mapping: a plain capability
+/// scope (`pack.publish`), a bare `workspace:`, or an unknown role
+/// (`workspace:superuser`). This is a pure projection onto the existing catalog —
+/// it mints no token, writes no binding, and defines no new role.
+pub fn workspace_role_for_scope(scope: &str) -> Option<RoleId> {
+    let suffix = scope.strip_prefix(WORKSPACE_ROLE_SCOPE_PREFIX)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let role_id = format!("workspace_{suffix}");
+    ANTHROPIC_ROLE_IDS
+        .iter()
+        .find(|known| **known == role_id)
+        .map(|known| RoleId((*known).to_owned()))
+}
 
 /// RFC 8693 `grant_type` selecting a token exchange at the token endpoint.
 pub const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -74,7 +103,55 @@ pub struct WorkloadBinding {
     /// Audience stamped into the issued IAM token (the service it targets).
     pub audience: String,
     /// Scopes granted to the issued IAM token.
+    ///
+    /// A scope of the form `workspace:<role>` is a **federation rule → workspace
+    /// role** mapping (ADR-0008 decision 5): the minted token is treated as
+    /// holding that workspace role in [`workspace`](WorkloadBinding::workspace).
+    /// See [`workspace_role_bindings`](WorkloadBinding::workspace_role_bindings).
+    /// Any other scope is a plain capability carried verbatim on the token.
     pub scopes: Vec<String>,
+    /// Workspace the federated token holds its workspace roles in.
+    ///
+    /// A service account is implicitly in the default workspace and explicitly
+    /// addable to others (ADR-0008 decision 5); this names the workspace the
+    /// rule's `workspace:<role>` scopes resolve their [`RoleBinding`]s at.
+    pub workspace: WorkspaceId,
+}
+
+impl WorkloadBinding {
+    /// The workspace [`RoleBinding`]s the issued token is treated as holding
+    /// (ADR-0008 decision 5).
+    ///
+    /// Each `workspace:<role>` scope is projected to a binding that holds the
+    /// corresponding seeded workspace role for this rule's service principal,
+    /// scoped to the rule's [`workspace`](WorkloadBinding::workspace). Scopes that
+    /// are not workspace-role scopes (plain capabilities, unknown roles) are
+    /// skipped, and a role listed more than once yields one binding, first-seen
+    /// order preserved. The result reuses the existing `RoleBinding` engine type:
+    /// federation grants a workspace role through the one permission model, with
+    /// no separate federation engine.
+    pub fn workspace_role_bindings(&self) -> Vec<RoleBinding> {
+        let principal = PrincipalRef::Service {
+            service_id: self.service_id.clone(),
+        };
+        let mut bindings: Vec<RoleBinding> = Vec::new();
+        for scope in &self.scopes {
+            let Some(role) = workspace_role_for_scope(scope) else {
+                continue;
+            };
+            if bindings.iter().any(|binding| binding.role == role) {
+                continue;
+            }
+            bindings.push(RoleBinding {
+                principal: principal.clone(),
+                role,
+                scope: ScopeRef::Workspace {
+                    workspace_id: self.workspace.clone(),
+                },
+            });
+        }
+        bindings
+    }
 }
 
 /// A trusted external issuer whose assertions IAM will exchange for IAM tokens.
@@ -152,6 +229,10 @@ pub struct TokenExchangeResponse {
     pub scope: Vec<String>,
     /// The service principal the issued token authenticates as.
     pub principal: PrincipalRef,
+    /// Workspace roles the issued token is treated as holding (ADR-0008
+    /// decision 5), resolved from the federation rule's `workspace:<role>`
+    /// scopes. Empty when the rule grants only plain capability scopes.
+    pub workspace_roles: Vec<RoleBinding>,
 }
 
 /// Stable machine-readable reason a token exchange was rejected.
@@ -411,6 +492,7 @@ mod tests {
                 service_id: "svc_ci_publisher".into(),
                 audience: "packs-service".into(),
                 scopes: vec!["pack.publish".into()],
+                workspace: WorkspaceId("wrkspc_default".into()),
             }],
             enabled: true,
         });
@@ -586,5 +668,102 @@ mod tests {
                 .unwrap_err(),
             TokenExchangeError::MalformedSubjectToken
         );
+    }
+
+    #[test]
+    fn each_workspace_scope_maps_to_its_seeded_workspace_role() {
+        // Every seeded workspace role is reachable by its `workspace:<suffix>`
+        // scope, matching the ADR-0008 decision-5 example `workspace:developer`.
+        for (scope, role) in [
+            ("workspace:admin", "workspace_admin"),
+            ("workspace:developer", "workspace_developer"),
+            ("workspace:limited_developer", "workspace_limited_developer"),
+            ("workspace:user", "workspace_user"),
+            ("workspace:billing", "workspace_billing"),
+        ] {
+            assert_eq!(
+                workspace_role_for_scope(scope),
+                Some(RoleId(role.into())),
+                "scope {scope} should map to {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_workspace_scopes_do_not_map_to_a_role() {
+        // A plain capability, a bare prefix, an unknown role, and an org-role
+        // name (org roles are not workspace roles) all map to nothing.
+        for scope in [
+            "pack.publish",
+            "workspace:",
+            "workspace:superuser",
+            "workspace:admin:extra",
+            "developer",
+            "admin",
+        ] {
+            assert_eq!(
+                workspace_role_for_scope(scope),
+                None,
+                "scope {scope} must not map to a workspace role"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_role_bindings_project_only_workspace_scopes_to_the_service() {
+        let binding = WorkloadBinding {
+            subject: "repo:acme/app:ref:refs/heads/main".into(),
+            service_id: "svc_ci_publisher".into(),
+            audience: "packs-service".into(),
+            // Mixes a capability scope, two distinct workspace roles, an unknown
+            // workspace role, and a duplicate of the first role.
+            scopes: vec![
+                "pack.publish".into(),
+                "workspace:developer".into(),
+                "workspace:superuser".into(),
+                "workspace:admin".into(),
+                "workspace:developer".into(),
+            ],
+            workspace: WorkspaceId("wrkspc_acme".into()),
+        };
+
+        // Only the two known workspace roles survive, de-duplicated and in
+        // first-seen order, each bound to the service principal at the rule's
+        // workspace; the capability and unknown role contribute nothing.
+        assert_eq!(
+            binding.workspace_role_bindings(),
+            vec![
+                RoleBinding {
+                    principal: PrincipalRef::Service {
+                        service_id: "svc_ci_publisher".into()
+                    },
+                    role: RoleId("workspace_developer".into()),
+                    scope: ScopeRef::Workspace {
+                        workspace_id: WorkspaceId("wrkspc_acme".into())
+                    },
+                },
+                RoleBinding {
+                    principal: PrincipalRef::Service {
+                        service_id: "svc_ci_publisher".into()
+                    },
+                    role: RoleId("workspace_admin".into()),
+                    scope: ScopeRef::Workspace {
+                        workspace_id: WorkspaceId("wrkspc_acme".into())
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_capability_only_rule_holds_no_workspace_role() {
+        let binding = WorkloadBinding {
+            subject: "repo:acme/app:ref:refs/heads/main".into(),
+            service_id: "svc_ci_publisher".into(),
+            audience: "packs-service".into(),
+            scopes: vec!["pack.publish".into()],
+            workspace: WorkspaceId("wrkspc_default".into()),
+        };
+        assert!(binding.workspace_role_bindings().is_empty());
     }
 }

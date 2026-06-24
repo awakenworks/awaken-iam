@@ -1255,12 +1255,13 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         &mut self,
         request: TokenExchangeRequest,
     ) -> Result<TokenExchangeResponse, AuthApiError> {
-        let (service_id, audience, scopes, issuer, subject) =
+        let (service_id, audience, scopes, workspace_roles, issuer, subject) =
             match self.trusted_issuers.authorize(&request) {
                 Ok((binding, verified)) => (
                     binding.service_id.clone(),
                     binding.audience.clone(),
                     binding.scopes.clone(),
+                    binding.workspace_role_bindings(),
                     verified.issuer,
                     verified.subject,
                 ),
@@ -1313,6 +1314,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             expires_in: request.issued_token_lifetime_secs,
             scope: scopes,
             principal,
+            workspace_roles,
         })
     }
 
