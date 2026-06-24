@@ -6,6 +6,7 @@
 - [Authorization engine](authorization-engine.md)
 - [Seeding and provisioning](seeding-and-provisioning.md)
 - [Local authorization, cloud license](local-authz-cloud-license.md)
+- [License and quota mechanism](license-quota-mechanism.md)
 - [Consumer integration](consumer-integration.md)
 - [Identity and auth server](auth-server.md)
 - [Third-party login provider setup](provider-setup.md)
