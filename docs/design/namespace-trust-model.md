@@ -3,7 +3,9 @@
 This document defines how `awaken-iam` owns namespace identity, ownership, and
 the namespace-to-signer binding that a publishing/registry consumer's signature
 and trust model depends on. It extends [IAM model](iam-model.md) at
-`ScopeRef::Namespace`.
+`ScopeRef::Namespace`. [ADR-0004](../adr/0004-namespace-signer-ownership.md)
+records that IAM is the single source of truth for this binding and the registry
+holds only a read-only projection of it, so there is no double-write.
 
 ## Split of responsibility
 
