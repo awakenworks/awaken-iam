@@ -1,9 +1,12 @@
 //! Shared IAM contract types.
 //!
 //! This crate is the stable seam used by product services. It contains DTOs and
-//! identifiers only; evaluation, persistence, and server code live elsewhere.
+//! identifiers, plus the pure, offline verification of the self-describing wire
+//! shapes they carry (for example a license-claim signature check against a
+//! pinned JWKS); policy evaluation, persistence, and server code live elsewhere.
 
 mod identity;
+mod license;
 mod protocol;
 mod trust;
 
@@ -17,6 +20,7 @@ pub use identity::{
     RefreshTokenChainId, RefreshTokenId, RefreshTokenView, Session, SessionId, SessionView,
     Timestamp, UserInfo,
 };
+pub use license::{LicenseClaim, LicenseSignature, LicenseVerifyError};
 pub use protocol::{
     ApprovalAuthority, ApprovalObligation, AuthorizationOutcome, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect, GrantSnapshot,
