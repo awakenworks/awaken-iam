@@ -109,6 +109,19 @@ impl AuthzApi {
         self.policy_version
     }
 
+    /// Advance the snapshot version without touching the grant policy.
+    ///
+    /// The seam an administrative mutation applied out-of-band (through the
+    /// [`PolicyAdminApi`](crate::PolicyAdminApi) over the same shared state) uses
+    /// to signal freshness: a policy-administration change — creating an org,
+    /// issuing a grant — must move the fence a synced consumer polls
+    /// [`snapshot`](Self::snapshot) against, even when it does not edit the
+    /// in-memory grant set this engine evaluates. Returns the new version.
+    pub fn bump_policy_version(&mut self) -> u64 {
+        self.policy_version += 1;
+        self.policy_version
+    }
+
     /// `POST /v1/authorize`: evaluate one authorization request into a reasoned
     /// outcome (decision, reason code, matched grant/role ids).
     pub fn authorize(&self, request: &AuthorizationRequest) -> AuthorizationOutcome {

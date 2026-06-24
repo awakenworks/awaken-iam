@@ -5,6 +5,7 @@
 //! shapes they carry (for example a license-claim signature check against a
 //! pinned JWKS); policy evaluation, persistence, and server code live elsewhere.
 
+mod admin;
 mod identity;
 mod license;
 mod protocol;
@@ -12,6 +13,7 @@ mod trust;
 
 use serde::{Deserialize, Serialize};
 
+pub use admin::{AdminMutationAck, GroupDto, OrgDto, RoleDto};
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,

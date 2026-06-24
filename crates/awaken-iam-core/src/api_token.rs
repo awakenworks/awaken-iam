@@ -395,8 +395,9 @@ mod tests {
     fn cleartext_renders_in_the_sk_ant_shape_and_parses_back() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
         let issued = minter
-            .mint(&mut directory, mint_request("tok_1", None))
+            .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
 
         // The Anthropic-compatible marker is the literal wire shape (ADR-0008
