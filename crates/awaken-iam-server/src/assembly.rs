@@ -28,9 +28,13 @@
 //! standalone wrapper the `iam-daemon` process is: it owns its pool's assembly
 //! and serves the canonical `/v1` API.
 
+use awaken_iam_contract::Timestamp;
 use awaken_iam_core::{EntitlementEngine, EntitlementProvider, RepoResult};
 
-use crate::{AuthApi, AuthzApi, IamStore, Liveness, MigrateReport, MigrationExecutor, Readiness};
+use crate::{
+    AuthApi, AuthzApi, IamStore, LicenseConfig, LicenseStatus, Liveness, MigrateReport,
+    MigrationExecutor, Readiness,
+};
 
 /// IAM's canonical table prefix inside whichever database hosts it.
 ///
@@ -244,6 +248,37 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         Self::assemble(deployment, pool, entitlements)
     }
 
+    /// Build an assembly whose entitlement plane is resolved from a license
+    /// config at instant `now`.
+    ///
+    /// Verifies the configured claim offline and installs the resolved provider
+    /// through the same injection point as [`with_entitlements`](Self::with_entitlements):
+    /// a claim that verifies installs the licensed provider, while a missing or
+    /// rejected claim installs default-allow so an unlicensed deployment keeps
+    /// full functionality. The returned [`LicenseStatus`] explains the outcome
+    /// (and carries the claim's `not_after` for the re-verify cadence — re-call
+    /// [`resolve`](crate::LicenseConfig::resolve) and
+    /// [`set_entitlements`](Self::set_entitlements) before it).
+    pub fn with_license(
+        deployment: Deployment,
+        pool: Pool,
+        license: &LicenseConfig,
+        now: &Timestamp,
+    ) -> RepoResult<(Self, LicenseStatus)> {
+        let resolved = license.resolve(now);
+        let assembly = Self::assemble(deployment, pool, resolved.provider)?;
+        Ok((assembly, resolved.status))
+    }
+
+    /// Replace the installed entitlement provider in place.
+    ///
+    /// The re-verify cadence seam: a host re-resolves its [`LicenseConfig`] with
+    /// the current time (claims expire at their `not_after`) and swaps the
+    /// resolved provider here without rebuilding the assembly.
+    pub fn set_entitlements(&mut self, entitlements: impl EntitlementProvider + 'static) {
+        self.authz.set_entitlements(entitlements);
+    }
+
     fn assemble(
         deployment: Deployment,
         pool: Pool,
@@ -399,6 +434,27 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
         Ok(Self {
             assembly: IamAssembly::with_entitlements(Deployment::Standalone, pool, entitlements)?,
         })
+    }
+
+    /// Start the daemon with its entitlement plane resolved from a license config
+    /// at instant `now`.
+    ///
+    /// Delegates to [`IamAssembly::with_license`]; the returned [`LicenseStatus`]
+    /// explains whether a license was installed and, if so, when it expires.
+    pub fn with_license(
+        pool: Pool,
+        license: &LicenseConfig,
+        now: &Timestamp,
+    ) -> RepoResult<(Self, LicenseStatus)> {
+        let (assembly, status) =
+            IamAssembly::with_license(Deployment::Standalone, pool, license, now)?;
+        Ok((Self { assembly }, status))
+    }
+
+    /// Replace the daemon's installed entitlement provider in place (re-verify
+    /// cadence seam). See [`IamAssembly::set_entitlements`].
+    pub fn set_entitlements(&mut self, entitlements: impl EntitlementProvider + 'static) {
+        self.assembly.set_entitlements(entitlements);
     }
 
     /// The underlying standalone assembly.
@@ -671,5 +727,92 @@ mod tests {
         .expect("daemon with entitlements");
         assert_eq!(daemon.assembly().deployment(), Deployment::Standalone);
         let _ = daemon.assembly_mut().authz_mut();
+    }
+
+    #[test]
+    fn license_config_wires_through_with_license_and_set_entitlements() {
+        use crate::{LicenseConfig, LicenseSource, LicenseStatus};
+        use awaken_iam_contract::{
+            AccountId, EntitlementDecision, EntitlementRequest, JsonWebKey, Jwks, LicenseClaim,
+            LicenseSignature, PrincipalRef, Timestamp,
+        };
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = Jwks {
+            keys: vec![JsonWebKey {
+                kty: "OKP".into(),
+                crv: "Ed25519".into(),
+                x: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+                kid: "lic-1".into(),
+                key_use: "sig".into(),
+                alg: "EdDSA".into(),
+            }],
+        };
+        let mut claim = LicenseClaim {
+            features: vec!["pack.publish".into()],
+            limits: Default::default(),
+            issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
+            not_after: Timestamp("2026-12-01T00:00:00Z".into()),
+            epoch: 1,
+            sig: LicenseSignature {
+                kid: "lic-1".into(),
+                value: String::new(),
+            },
+        };
+        claim.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&claim.signing_input()).to_bytes());
+
+        let config = LicenseConfig::new(
+            jwks,
+            0,
+            LicenseSource::Inline(serde_json::to_string(&claim).unwrap()),
+        );
+        let now = Timestamp("2026-07-01T00:00:00Z".into());
+        let entitled = |feature: &str| EntitlementRequest {
+            principal: PrincipalRef::Account {
+                account_id: AccountId("acct_1".into()),
+            },
+            entitlement: feature.into(),
+            resource: None,
+        };
+
+        // A verifying claim installs a licensed provider through with_license.
+        let (mut assembly, status) = IamAssembly::with_license(
+            Deployment::Embedded,
+            RecordingExecutor::new(),
+            &config,
+            &now,
+        )
+        .expect("assemble with license");
+        assert!(status.is_licensed());
+        assert_eq!(
+            assembly
+                .authz()
+                .check_entitlement(&entitled("pack.publish"))
+                .decision,
+            EntitlementDecision::Allow
+        );
+        assert_eq!(
+            assembly
+                .authz()
+                .check_entitlement(&entitled("model.strong_access"))
+                .decision,
+            EntitlementDecision::Deny
+        );
+
+        // The re-verify cadence seam swaps the provider in place; an unlicensed
+        // resolution falls back to default-allow without rebuilding the assembly.
+        let unlicensed = LicenseConfig::unlicensed().resolve(&now);
+        assert_eq!(unlicensed.status, LicenseStatus::Unlicensed);
+        assembly.set_entitlements(unlicensed.provider);
+        assert_eq!(
+            assembly
+                .authz()
+                .check_entitlement(&entitled("model.strong_access"))
+                .decision,
+            EntitlementDecision::Allow
+        );
     }
 }

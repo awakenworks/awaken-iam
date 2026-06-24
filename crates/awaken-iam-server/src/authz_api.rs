@@ -83,6 +83,15 @@ impl AuthzApi {
         }
     }
 
+    /// Replace the installed entitlement provider in place.
+    ///
+    /// The deploy-time re-install seam: a host that re-verifies a license on a
+    /// cadence (claims expire at their `not_after`) swaps the resolved provider
+    /// here without rebuilding the API or disturbing the authorization policy.
+    pub fn set_entitlements(&mut self, entitlements: impl EntitlementProvider + 'static) {
+        self.entitlements = Box::new(entitlements);
+    }
+
     /// Read-only access to the authorization core.
     pub fn core(&self) -> &IamCore {
         &self.core
