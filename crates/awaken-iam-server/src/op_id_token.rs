@@ -122,11 +122,11 @@ pub fn verify_id_token(token: &str, jwks: &Jwks) -> Result<OidcIdTokenClaims, Ac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access_token::{AccessTokenClaims, SigningKeyMaterial, verify_access_token};
+    use crate::access_token::{AccessTokenClaims, LocalSeedSigner, verify_access_token};
     use base64::Engine as _;
 
     fn authority() -> AccessTokenAuthority {
-        AccessTokenAuthority::new(SigningKeyMaterial::new("key-1", [7u8; 32]))
+        AccessTokenAuthority::new(LocalSeedSigner::new("key-1", [7u8; 32]))
     }
 
     fn request() -> MintIdToken {
