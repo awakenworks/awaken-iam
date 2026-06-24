@@ -29,9 +29,13 @@ use std::collections::HashSet;
 use awaken_iam_contract::{
     ActionKey, ApprovalAuthority, ApprovalObligation, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceId,
+    ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, GrantEffect,
+    GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceId,
     NamespaceOrgEdge, OrgId, PolicySnapshot, PrincipalRef, ResourceId, ResourceParentEdge,
     ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
+
+use crate::GroupId;
 
 /// Identifier of a role (a reusable bundle of grants).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,7 +94,7 @@ impl ActionPattern {
     }
 }
 
-/// Subject a grant applies to: a concrete principal or a role.
+/// Subject a grant applies to: a concrete principal, a role, or a group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantSubject {
     /// A grant attached directly to a principal.
@@ -98,6 +102,12 @@ pub enum GrantSubject {
     /// A grant carried by a role; it applies to any principal bound to the role
     /// at a covering scope.
     Role(RoleId),
+    /// A grant carried by a group; it applies to any principal in the group's
+    /// **live roster** at evaluation. Membership is the single source of truth,
+    /// so a principal joining or leaving the group gains or loses the grant
+    /// immediately, with no re-expansion. A group is never a principal — the
+    /// grant reaches the group's members, never "the group" itself.
+    Group(GroupId),
 }
 
 /// A single grant: it permits (or denies) an action pattern at a scope for a
@@ -126,6 +136,23 @@ pub struct RoleBinding {
     /// Principal that holds the role.
     pub principal: PrincipalRef,
     /// Role being granted to the principal.
+    pub role: RoleId,
+    /// Scope at which the binding applies.
+    pub scope: ScopeRef,
+}
+
+/// Binds a group's live roster to a role at a scope.
+///
+/// Every principal in the group's roster holds the role for requests at the
+/// binding scope and anything beneath it, resolved dynamically at evaluation — a
+/// roster change takes effect immediately. This binding is the kernel of a
+/// product **Team**: a [`Group`](crate::Group) roster plus a container scope plus
+/// this binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRoleBinding {
+    /// Group whose roster holds the role.
+    pub group: GroupId,
+    /// Role being granted to the group's members.
     pub role: RoleId,
     /// Scope at which the binding applies.
     pub scope: ScopeRef,
@@ -373,11 +400,14 @@ impl ScopeGraph {
     }
 }
 
-/// The grants, role bindings, and scope graph evaluated against a request.
+/// The grants, role bindings, group rosters, and scope graph evaluated against a
+/// request.
 #[derive(Debug, Default)]
 pub struct PolicySet {
     grants: Vec<Grant>,
     role_bindings: Vec<RoleBinding>,
+    group_rosters: HashMap<GroupId, Vec<PrincipalRef>>,
+    group_role_bindings: Vec<GroupRoleBinding>,
     scope_graph: ScopeGraph,
 }
 
@@ -396,6 +426,57 @@ impl PolicySet {
     /// Bind a principal to a role at a scope.
     pub fn bind_role(&mut self, binding: RoleBinding) -> &mut Self {
         self.role_bindings.push(binding);
+        self
+    }
+
+    /// Replace a group's live roster with `members`, deduplicated in insertion
+    /// order. This is the single source of truth a [`GrantSubject::Group`] grant
+    /// and a [`GroupRoleBinding`] resolve against at evaluation.
+    pub fn set_group_roster(
+        &mut self,
+        group: GroupId,
+        members: impl IntoIterator<Item = PrincipalRef>,
+    ) -> &mut Self {
+        let mut roster: Vec<PrincipalRef> = Vec::new();
+        for member in members {
+            if !roster.contains(&member) {
+                roster.push(member);
+            }
+        }
+        self.group_rosters.insert(group, roster);
+        self
+    }
+
+    /// Add `principal` to a group's roster, returning whether it was newly added.
+    ///
+    /// The principal gains every grant and group role binding the group holds
+    /// immediately — membership is resolved live, never expanded into per-member
+    /// grants.
+    pub fn add_group_member(&mut self, group: GroupId, principal: PrincipalRef) -> bool {
+        let roster = self.group_rosters.entry(group).or_default();
+        if roster.contains(&principal) {
+            return false;
+        }
+        roster.push(principal);
+        true
+    }
+
+    /// Remove `principal` from a group's roster, returning whether it was present.
+    ///
+    /// The principal loses every grant and group role binding the group holds
+    /// immediately on the next evaluation.
+    pub fn remove_group_member(&mut self, group: &GroupId, principal: &PrincipalRef) -> bool {
+        let Some(roster) = self.group_rosters.get_mut(group) else {
+            return false;
+        };
+        let before = roster.len();
+        roster.retain(|member| member != principal);
+        roster.len() != before
+    }
+
+    /// Bind a group's roster to a role at a scope.
+    pub fn bind_group_role(&mut self, binding: GroupRoleBinding) -> &mut Self {
+        self.group_role_bindings.push(binding);
         self
     }
 
@@ -421,12 +502,34 @@ impl PolicySet {
         &self.scope_graph
     }
 
+    /// Whether `principal` is in `group`'s live roster.
+    fn group_contains(&self, group: &GroupId, principal: &PrincipalRef) -> bool {
+        self.group_rosters
+            .get(group)
+            .is_some_and(|roster| roster.contains(principal))
+    }
+
     /// Roles held by `principal` for a request at `scope`, in policy order with
     /// duplicates removed.
+    ///
+    /// A principal holds a role both through a direct [`RoleBinding`] and through
+    /// any [`GroupRoleBinding`] whose group lists the principal in its live
+    /// roster, so a group membership change is reflected on the next evaluation.
     fn held_roles(&self, principal: &PrincipalRef, scope: &ScopeRef) -> Vec<RoleId> {
         let mut roles: Vec<RoleId> = Vec::new();
         for binding in &self.role_bindings {
             if &binding.principal != principal {
+                continue;
+            }
+            if !self.scope_graph.covers(&binding.scope, scope) {
+                continue;
+            }
+            if !roles.contains(&binding.role) {
+                roles.push(binding.role.clone());
+            }
+        }
+        for binding in &self.group_role_bindings {
+            if !self.group_contains(&binding.group, principal) {
                 continue;
             }
             if !self.scope_graph.covers(&binding.scope, scope) {
@@ -463,6 +566,15 @@ impl PolicySet {
                         continue;
                     }
                     Some(role)
+                }
+                GrantSubject::Group(group) => {
+                    // The grant reaches every principal in the group's live
+                    // roster; it carries no role, so it contributes only its
+                    // grant id to the trace.
+                    if !self.group_contains(group, principal) {
+                        continue;
+                    }
+                    None
                 }
             };
             if !grant.action_pattern.matches(action) {
@@ -650,6 +762,9 @@ impl PolicySet {
                     GrantSubject::Role(role) => GrantSubjectRef::Role {
                         role_id: role.0.clone(),
                     },
+                    GrantSubject::Group(group) => GrantSubjectRef::Group {
+                        group_id: group.0.clone(),
+                    },
                 },
                 action_pattern: grant.action_pattern.0.clone(),
                 scope: grant.scope.clone(),
@@ -665,10 +780,33 @@ impl PolicySet {
                 scope: binding.scope.clone(),
             })
             .collect();
+        // Group rosters are sorted by id so the snapshot is deterministic
+        // regardless of map iteration order; member order within a roster is
+        // preserved.
+        let mut group_rosters: Vec<GroupRosterSnapshot> = self
+            .group_rosters
+            .iter()
+            .map(|(group, members)| GroupRosterSnapshot {
+                group_id: group.0.clone(),
+                members: members.clone(),
+            })
+            .collect();
+        group_rosters.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+        let group_role_bindings = self
+            .group_role_bindings
+            .iter()
+            .map(|binding| GroupRoleBindingSnapshot {
+                group_id: binding.group.0.clone(),
+                role_id: binding.role.0.clone(),
+                scope: binding.scope.clone(),
+            })
+            .collect();
         PolicySnapshot {
             version,
             grants,
             role_bindings,
+            group_rosters,
+            group_role_bindings,
             scope_graph: self.scope_graph.to_snapshot(),
         }
     }
@@ -692,6 +830,9 @@ impl PolicySet {
                     GrantSubjectRef::Role { role_id } => {
                         GrantSubject::Role(RoleId(role_id.clone()))
                     }
+                    GrantSubjectRef::Group { group_id } => {
+                        GrantSubject::Group(GroupId(group_id.clone()))
+                    }
                 },
                 action_pattern: ActionPattern(grant.action_pattern.clone()),
                 scope: grant.scope.clone(),
@@ -701,6 +842,19 @@ impl PolicySet {
         for binding in &snapshot.role_bindings {
             policy.bind_role(RoleBinding {
                 principal: binding.principal.clone(),
+                role: RoleId(binding.role_id.clone()),
+                scope: binding.scope.clone(),
+            });
+        }
+        for roster in &snapshot.group_rosters {
+            policy.set_group_roster(
+                GroupId(roster.group_id.clone()),
+                roster.members.iter().cloned(),
+            );
+        }
+        for binding in &snapshot.group_role_bindings {
+            policy.bind_group_role(GroupRoleBinding {
+                group: GroupId(binding.group_id.clone()),
                 role: RoleId(binding.role_id.clone()),
                 scope: binding.scope.clone(),
             });
@@ -1570,5 +1724,168 @@ mod tests {
             &candidates,
         );
         assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn group_grant_reaches_members_and_not_outsiders() {
+        let mut policy = PolicySet::new();
+        policy.set_group_roster(GroupId("eng".into()), [account("ada")]);
+        policy.add_grant(Grant {
+            id: GrantId("g_eng".into()),
+            subject: GrantSubject::Group(GroupId("eng".into())),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        // A member inherits the group's grant...
+        let member = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
+        assert_eq!(member.decision, AuthorizationDecision::Allow);
+        assert_eq!(member.reason, DecisionReason::AllowedByGrant);
+        assert_eq!(member.matched_grants, vec![GrantId("g_eng".into())]);
+        // ...the grant carries no role, so the trace records none.
+        assert!(member.matched_roles.is_empty());
+
+        // ...an outsider does not.
+        let outsider = policy.evaluate(&request(account("bob"), "pack.publish", ScopeRef::Global));
+        assert_eq!(outsider.decision, AuthorizationDecision::Deny);
+        assert_eq!(outsider.reason, DecisionReason::DefaultDeny);
+    }
+
+    #[test]
+    fn joining_or_leaving_a_group_changes_permissions_immediately() {
+        let mut policy = PolicySet::new();
+        policy.add_grant(Grant {
+            id: GrantId("g_eng".into()),
+            subject: GrantSubject::Group(GroupId("eng".into())),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+
+        let req = || request(account("ada"), "pack.publish", ScopeRef::Global);
+        // Not yet a member: denied.
+        assert_eq!(
+            policy.evaluate(&req()).decision,
+            AuthorizationDecision::Deny
+        );
+
+        // Joining the group grants the permission on the next evaluation, with no
+        // re-expansion into per-member grants.
+        assert!(policy.add_group_member(GroupId("eng".into()), account("ada")));
+        assert_eq!(
+            policy.evaluate(&req()).decision,
+            AuthorizationDecision::Allow
+        );
+
+        // Leaving revokes it again immediately.
+        assert!(policy.remove_group_member(&GroupId("eng".into()), &account("ada")));
+        assert_eq!(
+            policy.evaluate(&req()).decision,
+            AuthorizationDecision::Deny
+        );
+    }
+
+    #[test]
+    fn group_role_binding_lets_members_use_the_role_grants() {
+        let mut policy = PolicySet::new();
+        // A Team: a group roster + a scope + a group role binding.
+        policy.set_group_roster(GroupId("eng".into()), [account("ada")]);
+        policy.bind_group_role(GroupRoleBinding {
+            group: GroupId("eng".into()),
+            role: RoleId("publisher".into()),
+            scope: ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+        });
+        policy.add_grant(Grant {
+            id: GrantId("g_pub".into()),
+            subject: GrantSubject::Role(RoleId("publisher".into())),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+            effect: Effect::Allow,
+        });
+
+        let trace = policy.evaluate(&request(
+            account("ada"),
+            "pack.publish",
+            ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+        ));
+        assert_eq!(trace.decision, AuthorizationDecision::Allow);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_pub".into())]);
+        assert_eq!(trace.matched_roles, vec![RoleId("publisher".into())]);
+
+        // Drop the member from the roster: the role and its grant fall away.
+        policy.remove_group_member(&GroupId("eng".into()), &account("ada"));
+        let revoked = policy.evaluate(&request(
+            account("ada"),
+            "pack.publish",
+            ScopeRef::Namespace {
+                namespace_id: NamespaceId("acme".into()),
+            },
+        ));
+        assert_eq!(revoked.decision, AuthorizationDecision::Deny);
+    }
+
+    #[test]
+    fn group_deny_grant_still_takes_precedence() {
+        let mut policy = PolicySet::new();
+        policy.set_group_roster(GroupId("eng".into()), [account("ada")]);
+        policy.add_grant(Grant {
+            id: GrantId("g_allow".into()),
+            subject: GrantSubject::Principal(account("ada")),
+            action_pattern: ActionPattern("pack.*".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+        policy.add_grant(Grant {
+            id: GrantId("g_group_deny".into()),
+            subject: GrantSubject::Group(GroupId("eng".into())),
+            action_pattern: ActionPattern("pack.publish".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Deny,
+        });
+
+        let trace = policy.evaluate(&request(account("ada"), "pack.publish", ScopeRef::Global));
+        assert_eq!(trace.decision, AuthorizationDecision::Deny);
+        assert_eq!(trace.reason, DecisionReason::DeniedByGrant);
+        assert_eq!(trace.matched_grants, vec![GrantId("g_group_deny".into())]);
+    }
+
+    #[test]
+    fn synced_snapshot_resolves_group_membership_identically() {
+        let mut policy = PolicySet::new();
+        policy.set_group_roster(GroupId("eng".into()), [account("ada")]);
+        policy.add_grant(Grant {
+            id: GrantId("g_eng".into()),
+            subject: GrantSubject::Group(GroupId("eng".into())),
+            action_pattern: ActionPattern("pack.*".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        });
+        policy.bind_group_role(GroupRoleBinding {
+            group: GroupId("eng".into()),
+            role: RoleId("publisher".into()),
+            scope: ScopeRef::Global,
+        });
+
+        let snapshot = policy.snapshot(3);
+        assert_eq!(snapshot.group_rosters.len(), 1);
+        assert_eq!(snapshot.group_role_bindings.len(), 1);
+        let local = PolicySet::from_snapshot(&snapshot);
+
+        for (principal, action) in [(account("ada"), "pack.read"), (account("bob"), "pack.read")] {
+            let req = request(principal, action, ScopeRef::Global);
+            // A consumer evaluating from the synced snapshot resolves the live
+            // roster exactly as the server does.
+            assert_eq!(
+                local.evaluate(&req).to_outcome(),
+                policy.evaluate(&req).to_outcome()
+            );
+        }
     }
 }

@@ -54,10 +54,14 @@ Mapping from Oversight Next's actor model:
 
 Rationale:
 
-- **`Team` is never a principal.** A request is never made "as a Team". Teams are
-  membership targets: a team binds a role at a scope, and that binding expands
-  into grants for each member principal (see `Membership` in the
-  [authorization engine](authorization-engine.md)). Keeping `Team` out of
+- **`Team` is never a principal.** A request is never made "as a Team". A Team is
+  composed of a `Group` (its roster) + a `ScopeRef` (its container) + a group role
+  binding. The binding does **not** expand into per-member grants; instead the
+  engine resolves the requesting principal's group memberships from the **live
+  roster** at evaluation and includes any grant or role the group holds at a
+  covering scope (see the group subject in the
+  [authorization engine](authorization-engine.md)). So a user who joins or leaves
+  the Team gains or loses its permissions immediately. Keeping `Team` out of
   `PrincipalRef` keeps the request shape unambiguous — every request resolves to
   exactly one acting identity, and "no principal means deny".
 - **The rich actor kinds collapse to `Service`.** IAM does not need to know the

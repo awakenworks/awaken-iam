@@ -34,24 +34,35 @@ GrantTemplate {
 
 Grant {
   id,
-  subject,           # PrincipalRef | RoleBinding { role_id, principal }
+  subject,           # Principal | Role(role_id) | Group(group_id)
   action_pattern,
   scope,             # the ScopeRef the grant is anchored at
   effect,            # allow | require_approval
   condition?,        # optional, intentionally small (see below)
 }
 
-Membership {
-  principal,         # Account / Service / ApiToken
+RoleBinding {
+  subject,           # a Principal, or a Group (its whole roster)
   scope,             # Org / Namespace / Workspace / Project
   role_id,
 }
+
+GroupRoster {
+  group_id,
+  members,           # principals in the group's live roster
+}
 ```
 
-`Membership` is sugar: it expands into `Grant`s by binding `role_id`'s templates
-to the member principal at the membership scope. Keeping it explicit lets the
-store index "who is a member of X" without scanning all grants (a query any
-membership-based model needs).
+A grant or role binding may target a **`Group`**. The group's `members` roster is
+the **single source of truth**: at evaluation the engine resolves the requesting
+principal's group memberships from the live roster and includes any grant a
+covering group holds (and any role a covering group binds) at a covering scope.
+This supersedes the older *static expansion into per-member grants*: membership is
+never copied into per-member grants, so joining or leaving a group changes
+effective permissions immediately, with no re-expansion. A `Group` is **never a
+principal** — no request is made "as a group"; the group's grants and bindings
+reach its member principals. A product **Team** is composed as a `Group` (roster)
++ a `ScopeRef` (container) + a group role binding.
 
 ## Snapshot
 
@@ -60,7 +71,9 @@ AuthzSnapshot {
   version,                 # monotonic fence; bump on any write
   roles:      Map<RoleId, Role>,
   grants:     [Grant],     # indexed by (scope, action head)
-  memberships:[Membership],
+  role_bindings:[RoleBinding],
+  group_rosters:[GroupRoster],   # live membership, resolved at evaluation
+  group_role_bindings:[RoleBinding], # bindings whose subject is a Group
   scope_index: ScopeGraph, # parent edges for ancestor walk
 }
 ```
@@ -86,8 +99,10 @@ they receive only the decision. Both paths run the identical evaluation code.
    same walk. A grant anchored at any ancestor applies to descendants.
 3. **Collect candidate grants.** From the snapshot, take grants whose `scope` is
    on the chain and whose `action_pattern` matches `request.action`
-   (exact, then suffix glob). Include grants reached via the principal's
-   memberships (role-template expansion).
+   (exact, then suffix glob). Include grants reached via the principal's role
+   bindings and via the **live group rosters** the principal belongs to — both a
+   group grant and a group role binding follow the roster dynamically, so a
+   membership change is reflected on the next evaluation with no re-expansion.
 4. **Evaluate conditions.** Drop grants whose optional `condition` is not
    satisfied by the request context.
 5. **Apply precedence and decide.** See below.

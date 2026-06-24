@@ -30,6 +30,9 @@ pub use protocol::{
     ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
     PolicySnapshot, ResourceParentEdge, ResourceProvision, RoleBindingSnapshot, ScopeGraphSnapshot,
     WorkspaceOrgEdge,
+    EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef,
+    GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceOrgEdge, PolicySnapshot,
+    ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,

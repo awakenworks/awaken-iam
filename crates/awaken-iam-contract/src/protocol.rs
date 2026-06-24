@@ -136,6 +136,13 @@ pub enum GrantSubjectRef {
         /// Role id carrying the grant.
         role_id: String,
     },
+    /// A grant carried by a group and used by any principal in the group's live
+    /// roster. The roster is the single source of truth, so the grant follows
+    /// membership the instant a principal joins or leaves the group.
+    Group {
+        /// Group id whose roster the grant follows.
+        group_id: String,
+    },
 }
 
 /// Wire shape of a single grant in a policy snapshot.
@@ -159,6 +166,36 @@ pub struct RoleBindingSnapshot {
     /// Principal that holds the role.
     pub principal: PrincipalRef,
     /// Role granted to the principal.
+    pub role_id: String,
+    /// Scope at which the binding applies.
+    pub scope: ScopeRef,
+}
+
+/// Wire shape of a group's live roster in a policy snapshot.
+///
+/// The roster is the single source of truth for membership: a synced consumer
+/// resolves a principal's groups from these entries at evaluation, so joining or
+/// leaving a group changes effective permissions immediately with no
+/// re-expansion. A `Group` is never a principal — these members are the
+/// principals the group's grants and role bindings reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRosterSnapshot {
+    /// Group id whose roster this captures.
+    pub group_id: String,
+    /// Member principals, in stable order.
+    pub members: Vec<PrincipalRef>,
+}
+
+/// Wire shape of a group role binding in a policy snapshot.
+///
+/// A group role binding lets every principal in the group's roster use the
+/// role's grants at the binding scope and anything beneath it — the kernel of a
+/// product **Team** (`Group` roster + a scope + this binding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRoleBindingSnapshot {
+    /// Group whose roster holds the role.
+    pub group_id: String,
+    /// Role granted to the group's members.
     pub role_id: String,
     /// Scope at which the binding applies.
     pub scope: ScopeRef,
@@ -274,6 +311,13 @@ pub struct PolicySnapshot {
     pub grants: Vec<GrantSnapshot>,
     /// All role bindings in policy order.
     pub role_bindings: Vec<RoleBindingSnapshot>,
+    /// Live group rosters resolved at evaluation. Defaulted for snapshots minted
+    /// before groups became a first-class subject.
+    #[serde(default)]
+    pub group_rosters: Vec<GroupRosterSnapshot>,
+    /// Group role bindings in policy order. Defaulted for older snapshots.
+    #[serde(default)]
+    pub group_role_bindings: Vec<GroupRoleBindingSnapshot>,
     /// Scope-graph parent links.
     pub scope_graph: ScopeGraphSnapshot,
 }
@@ -435,6 +479,17 @@ mod tests {
                 role_id: "publisher".into(),
                 scope: ScopeRef::Global,
             }],
+            group_rosters: vec![GroupRosterSnapshot {
+                group_id: "eng".into(),
+                members: vec![PrincipalRef::Account {
+                    account_id: AccountId("acct_1".into()),
+                }],
+            }],
+            group_role_bindings: vec![GroupRoleBindingSnapshot {
+                group_id: "eng".into(),
+                role_id: "publisher".into(),
+                scope: ScopeRef::Global,
+            }],
             scope_graph: ScopeGraphSnapshot {
                 namespace_orgs: vec![NamespaceOrgEdge {
                     namespace_id: NamespaceId("acme".into()),
@@ -543,5 +598,12 @@ mod tests {
         let json = serde_json::to_string(&provision).unwrap();
         let parsed: ResourceProvision = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, provision);
+    fn snapshot_without_group_fields_defaults_to_empty() {
+        // A snapshot minted before groups became a subject omits the new fields;
+        // it must still deserialize, with empty group rosters and bindings.
+        let legacy = r#"{"version":1,"grants":[],"role_bindings":[],"scope_graph":{"namespace_orgs":[],"workspace_orgs":[],"resource_parents":[]}}"#;
+        let parsed: PolicySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.group_rosters.is_empty());
+        assert!(parsed.group_role_bindings.is_empty());
     }
 }
