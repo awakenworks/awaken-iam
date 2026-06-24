@@ -30,8 +30,8 @@ use awaken_iam_contract::{
     ActionKey, ApprovalAuthority, ApprovalObligation, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot,
     GroupRosterSnapshot, NamespaceId, NamespaceOrgEdge, OrgId, PolicySnapshot, PrincipalRef,
-    ResourceId, ResourceParentEdge, ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef,
-    WorkspaceId, WorkspaceOrgEdge,
+    ResourceId, ResourceParentEdge, ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot,
+    ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::GroupId;

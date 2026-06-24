@@ -13,11 +13,11 @@ use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, R
 use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId,
-    PolicySnapshot, PrincipalRef, ResourceId, ResourceModelRegistered,
-    ResourceModelRegistration, ResourceParentEdge, ResourceType, ResourceTypeRegistration,
-    ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
-    SignerKeyStatus, SignerSetSnapshot, Timestamp,
+    EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId, PolicySnapshot,
+    PrincipalRef, ResourceId, ResourceModelRegistered, ResourceModelRegistration,
+    ResourceParentEdge, ResourceType, ResourceTypeRegistration, ScopeRef, SignerKey,
+    SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, SignerSetSnapshot,
+    Timestamp,
 };
 use awaken_iam_core::{
     ActionPattern, Effect, EntitlementCatalog, EntitlementEngine, Grant, GrantId, GrantSubject,

@@ -757,7 +757,6 @@ mod tests {
         assert!(redirect.url.contains("scope=openid%20offline_access"));
     }
 
-
     #[test]
     fn token_response_must_be_valid_json() {
         let provider = provider(RoutingTransport {
