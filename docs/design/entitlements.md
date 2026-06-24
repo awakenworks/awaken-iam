@@ -6,6 +6,14 @@ separate from authorization. It extends
 [IAM model](iam-model.md#authorization-vs-entitlement) and replaces the
 placeholder `entitlement_default_allow() -> Allow` stub.
 
+> **Open seam, closed licensing.** This plane is an injection seam. The open repo
+> ships only the generic evaluation and the `default_allow` no-op, so a
+> self-hosted build is fully functional and unlicensed. A licensed implementation
+> — signed offline-verifiable licenses, quota leases, billing — is a *proprietary*
+> concern injected at deploy time by a commercial platform, and is documented
+> there, not here. The open repo never carries the licensing mechanism or its
+> threat model.
+
 ## Why a separate plane
 
 Authorization and entitlement answer different questions and fail for different
