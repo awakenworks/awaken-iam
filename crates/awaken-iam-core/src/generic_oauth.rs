@@ -757,41 +757,11 @@ mod tests {
         assert!(redirect.url.contains("scope=openid%20offline_access"));
     }
 
-    #[test]
-    fn authorization_url_requires_an_authorization_endpoint() {
-        let provider = provider(ok_transport());
-        let mut cfg = config(IdentityProviderKind::Oidc);
-        cfg.authorization_endpoint = None;
-        let err = provider
-            .authorization_url(&cfg, &auth_request())
-            .expect_err("missing authorization endpoint");
-        assert_eq!(
-            err,
-            ProviderError::MissingConfiguration {
-                field: "authorization_endpoint"
-            }
-        );
-    }
-
-    #[test]
-    fn redeem_requires_a_token_endpoint() {
-        let provider = provider(ok_transport());
-        let mut cfg = config(IdentityProviderKind::Oidc);
-        cfg.token_endpoint = None;
-        let err = provider
-            .exchange_callback(&cfg, &callback("auth-code"))
-            .expect_err("missing token endpoint");
-        assert_eq!(
-            err,
-            ProviderError::MissingConfiguration {
-                field: "token_endpoint"
-            }
-        );
-    }
 
     #[test]
     fn token_response_must_be_valid_json() {
         let provider = provider(RoutingTransport {
+            discovery_body: Vec::new(),
             token_body: b"not-json".to_vec(),
             userinfo_body: Vec::new(),
             fail: None,
@@ -807,6 +777,7 @@ mod tests {
         // Missing access_token, then an empty one, both reject as exchange errors.
         for body in [&b"{}"[..], br#"{"access_token":""}"#] {
             let provider = provider(RoutingTransport {
+                discovery_body: Vec::new(),
                 token_body: body.to_vec(),
                 userinfo_body: ok_transport().userinfo_body,
                 fail: None,
@@ -821,6 +792,7 @@ mod tests {
     #[test]
     fn userinfo_response_must_be_valid_json() {
         let provider = provider(RoutingTransport {
+            discovery_body: Vec::new(),
             token_body: ok_transport().token_body,
             userinfo_body: b"<html>".to_vec(),
             fail: None,
@@ -863,6 +835,7 @@ mod tests {
     #[test]
     fn userinfo_must_include_a_subject() {
         let provider = provider(RoutingTransport {
+            discovery_body: Vec::new(),
             token_body: ok_transport().token_body,
             userinfo_body: br#"{"sub":""}"#.to_vec(),
             fail: None,

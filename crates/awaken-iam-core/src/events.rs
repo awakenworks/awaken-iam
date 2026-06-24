@@ -482,6 +482,7 @@ mod tests {
                         reason: DecisionReason::DefaultDeny,
                         matched_grants: Vec::new(),
                         matched_roles: Vec::new(),
+                        obligation: None,
                     },
                 ),
             }
@@ -500,6 +501,7 @@ mod tests {
                     reason: DecisionReason::AllowedByGrant,
                     matched_grants: vec![GrantId("g1".into())],
                     matched_roles: Vec::new(),
+                    obligation: None,
                 },
             ),
         };
@@ -549,6 +551,7 @@ mod tests {
                     reason: DecisionReason::AllowedByGrant,
                     matched_grants: vec![GrantId("g1".into()), GrantId("g2".into())],
                     matched_roles: vec![RoleId("publisher".into())],
+                    obligation: None,
                 },
             ),
         };
@@ -595,6 +598,7 @@ mod tests {
                             reason: DecisionReason::DefaultDeny,
                             matched_grants: Vec::new(),
                             matched_roles: Vec::new(),
+                            obligation: None,
                         },
                     ),
                 },
@@ -803,6 +807,7 @@ mod tests {
                     reason: DecisionReason::DefaultDeny,
                     matched_grants: Vec::new(),
                     matched_roles: Vec::new(),
+                    obligation: None,
                 },
             ),
         };

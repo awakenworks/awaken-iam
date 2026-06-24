@@ -193,6 +193,7 @@ impl<T: AuthzTransport> SnapshotCache<T> {
                 reason: REASON_UNSYNCED.to_owned(),
                 matched_grants: Vec::new(),
                 matched_roles: Vec::new(),
+                obligation: None,
             },
         }
     }
@@ -314,6 +315,20 @@ mod tests {
             self.since_fetches.set(self.since_fetches.get() + 1);
             let current = self.version.get();
             Ok((current > since).then(|| snapshot(current)))
+        }
+
+        fn register_resource_model(
+            &self,
+            _registration: &awaken_iam_contract::ResourceModelRegistration,
+        ) -> Result<awaken_iam_contract::ResourceModelRegistered, RemoteError> {
+            unimplemented!("snapshot cache is authorization-only")
+        }
+
+        fn fetch_signers(
+            &self,
+            _namespace_id: &awaken_iam_contract::NamespaceId,
+        ) -> Result<awaken_iam_contract::SignerSetSnapshot, RemoteError> {
+            unimplemented!("snapshot cache is authorization-only")
         }
     }
 

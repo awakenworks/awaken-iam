@@ -63,16 +63,10 @@ use awaken_iam_contract::{
 use awaken_iam_core::{
     AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange, EntropySource,
     EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt,
-    MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
-    OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory,
-    RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, TokenRedemption,
-    parse_presented_refresh_token,
-    AuthorizationUrlRequest, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
-    IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt, MintRefreshToken,
-    OAuthAuthorizationServer, OAuthChallengeService, OAuthProviderError, OsEntropy, ProviderError,
-    RefreshTokenDirectory, RefreshTokenMinter, RotateRefreshToken, SessionDirectory,
-    TokenRedemption, parse_presented_refresh_token,
-    parse_presented_refresh_token,
+    MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer,
+    OAuthChallengeService, OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError,
+    RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient, RotateRefreshToken,
+    SessionDirectory, TokenRedemption, parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -782,17 +776,9 @@ pub enum AuthApiError {
     /// request (unknown client, bad redirect URI, PKCE failure, expired code, …).
     #[error(transparent)]
     OAuthProvider(#[from] OAuthProviderError),
-    /// Redeeming a downstream authorization code failed (unknown/expired code,
-    /// client authentication, redirect-URI, or PKCE).
-    #[error(transparent)]
-    OAuthProvider(#[from] OAuthProviderError),
     /// Assembling the OIDC `id_token` for a redeemed grant failed.
     #[error(transparent)]
     IdToken(#[from] IdTokenError),
-    /// Authenticating the client at the downstream OP token endpoint failed
-    /// (unknown client or invalid client authentication).
-    #[error(transparent)]
-    OAuthProvider(#[from] OAuthProviderError),
 }
 
 /// Browser-facing third-party auth API over the login session loop.
@@ -1437,7 +1423,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// the redeeming client. Subject and scope come from the grant, never the
     /// request, so a client cannot widen its own authority. Both tokens are signed
     /// by the active key and verify against [`jwks`](Self::jwks).
-    pub fn redeem_authorization_code<C: EntropySource>(
+    pub fn redeem_op_code<C: EntropySource>(
         &mut self,
         provider: &mut OAuthAuthorizationServer<C>,
         redemption: &TokenRedemption,

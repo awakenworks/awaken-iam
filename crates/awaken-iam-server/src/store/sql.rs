@@ -164,6 +164,9 @@ fn encode_grant_subject(subject: &GrantSubject) -> RepoResult<String> {
         GrantSubject::Role(role) => GrantSubjectRef::Role {
             role_id: role.0.clone(),
         },
+        GrantSubject::Group(group) => GrantSubjectRef::Group {
+            group_id: group.0.clone(),
+        },
     };
     json_encode(&dto, "grant subject")
 }
@@ -173,6 +176,7 @@ fn decode_grant_subject(raw: &str) -> RepoResult<GrantSubject> {
     Ok(match dto {
         GrantSubjectRef::Principal { principal } => GrantSubject::Principal(principal),
         GrantSubjectRef::Role { role_id } => GrantSubject::Role(RoleId(role_id)),
+        GrantSubjectRef::Group { group_id } => GrantSubject::Group(GroupId(group_id)),
     })
 }
 

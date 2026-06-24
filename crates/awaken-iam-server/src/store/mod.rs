@@ -28,4 +28,3 @@ pub use sqlite::{
     SqliteBackend, in_memory_store as sqlite_in_memory_store,
     migrated_store as sqlite_migrated_store,
 };
-pub use sqlite::SqliteExecutor;

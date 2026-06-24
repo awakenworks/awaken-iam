@@ -8,7 +8,6 @@ mod snapshot;
 #[cfg(feature = "http")]
 pub use http::{DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig};
 mod outbox;
-mod remote;
 
 pub use outbox::{
     DrainReport, InMemoryOutbox, OutboxError, OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore,

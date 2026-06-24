@@ -16,8 +16,8 @@
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    NamespaceId, PolicySnapshot, SignerSetSnapshot,
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+    NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+    SignerSetSnapshot,
 };
 
 use crate::IamClient;

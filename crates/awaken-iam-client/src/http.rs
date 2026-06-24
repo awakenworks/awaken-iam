@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
+    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -220,6 +221,27 @@ impl AuthzTransport for HttpAuthzTransport {
 
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
         let response = self.send_with_retry(|| self.client.get(self.url("/v1/authz/snapshot")))?;
+        Self::decode(response)
+    }
+
+    fn register_resource_model(
+        &self,
+        registration: &ResourceModelRegistration,
+    ) -> Result<ResourceModelRegistered, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authz/resource-model"))
+                .json(registration)
+        })?;
+        Self::decode(response)
+    }
+
+    fn fetch_signers(
+        &self,
+        namespace_id: &NamespaceId,
+    ) -> Result<SignerSetSnapshot, RemoteError> {
+        let path = format!("/v1/namespaces/{}/signers", namespace_id.0);
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         Self::decode(response)
     }
 }

@@ -707,6 +707,9 @@ mod tests {
         ));
         let audit = AuditSink::events(pap.store()).unwrap();
         assert_eq!(audit[0].action, "resource_model.register");
+    }
+
+    #[test]
     fn version_is_backed_by_the_store_fence() {
         let mut pap = pap();
         // Each successful mutation advances the store fence, and the cached

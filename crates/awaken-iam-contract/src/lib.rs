@@ -18,21 +18,12 @@ pub use identity::{
     Timestamp, UserInfo,
 };
 pub use protocol::{
-    AuthorizationOutcome, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef, NamespaceOrgEdge,
-    PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, SignerSetSnapshot,
-    WorkspaceOrgEdge,
     ApprovalAuthority, ApprovalObligation, AuthorizationOutcome, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect, GrantSnapshot,
-    GrantSubjectRef, NamespaceOrgEdge, PolicySnapshot, ResourceParentEdge, RoleBindingSnapshot,
-    ScopeGraphSnapshot, WorkspaceOrgEdge,
+    GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceOrgEdge,
     PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, ResourceParentEdge,
-    ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
-    PolicySnapshot, ResourceParentEdge, ResourceProvision, RoleBindingSnapshot, ScopeGraphSnapshot,
-    WorkspaceOrgEdge,
-    EntitlementCheckResponse, GrantEffect, GrantSnapshot, GrantSubjectRef,
-    GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceOrgEdge, PolicySnapshot,
-    ResourceParentEdge, RoleBindingSnapshot, ScopeGraphSnapshot, WorkspaceOrgEdge,
+    ResourceProvision, ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot,
+    SignerSetSnapshot, WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,
