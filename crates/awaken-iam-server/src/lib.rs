@@ -56,17 +56,24 @@ use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,
 };
-use awaken_iam_core::{EntitlementEngine, IamCore};
+use awaken_iam_core::{EntitlementEngine, EntitlementProvider, IamCore};
 
 /// Minimal in-process server facade used by tests and future adapters.
 ///
 /// Authorization and entitlement are held as separate planes: grant evaluation
-/// lives in [`IamCore`] and never consults the [`EntitlementEngine`], and the
-/// engine never consults grants. Both are evaluated independently per request.
-#[derive(Debug, Default)]
+/// lives in [`IamCore`] and never consults the entitlement plane, and the
+/// injectable [`EntitlementProvider`] never consults grants. Both are evaluated
+/// independently per request.
+#[derive(Debug)]
 pub struct IamServer {
     core: IamCore,
-    entitlements: EntitlementEngine,
+    entitlements: Box<dyn EntitlementProvider>,
+}
+
+impl Default for IamServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IamServer {
@@ -74,15 +81,17 @@ impl IamServer {
     pub fn new() -> Self {
         Self {
             core: IamCore::new(),
-            entitlements: EntitlementEngine::default_allow(),
+            entitlements: Box::new(EntitlementEngine::default_allow()),
         }
     }
 
-    /// Create an IAM server facade backed by a specific entitlement engine.
-    pub fn with_entitlements(entitlements: EntitlementEngine) -> Self {
+    /// Create an IAM server facade backed by a specific entitlement provider.
+    /// The deploy-time seam: an open [`EntitlementEngine`] or a closed, licensed
+    /// provider plugs in here.
+    pub fn with_entitlements(entitlements: impl EntitlementProvider + 'static) -> Self {
         Self {
             core: IamCore::new(),
-            entitlements,
+            entitlements: Box::new(entitlements),
         }
     }
 }

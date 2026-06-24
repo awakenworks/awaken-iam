@@ -401,12 +401,87 @@ pub enum EntitlementMode {
     Remote(Box<dyn EntitlementResolver>),
 }
 
-/// Entitlement evaluation engine — the real `check_entitlement` path.
+/// Injectable entitlement plane: the deploy-time seam every product service
+/// evaluates against.
+///
+/// Authorization and entitlement are distinct planes; this trait is the
+/// entitlement side. The control plane ships open implementations behind it —
+/// [`EntitlementEngine::default_allow`] and [`EntitlementEngine::local`] — and a
+/// closed, licensed implementation (held in awaken-cloud) can plug in at deploy
+/// through the same `with_entitlements` injection point without changing any
+/// call site. Implementations must be `Send + Sync` so a provider can be shared
+/// across requests behind a `Box<dyn EntitlementProvider>`.
+///
+/// Only [`evaluate`](EntitlementProvider::evaluate) is required; the metering
+/// answers default to "no ceiling defined" and the usage-aware check defaults to
+/// the usage-agnostic [`evaluate`](EntitlementProvider::evaluate), so a provider
+/// that does not model quotas stays minimal.
+pub trait EntitlementProvider: fmt::Debug + Send + Sync {
+    /// Evaluate a request into a reasoned [`EntitlementOutcome`].
+    fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome;
+
+    /// Evaluate a request into the contract Allow/Deny decision. Defaults to the
+    /// decision of [`evaluate`](EntitlementProvider::evaluate).
+    fn check_entitlement(&self, request: &EntitlementRequest) -> EntitlementDecision {
+        self.evaluate(request).decision
+    }
+
+    /// Answer the quota ceiling this provider defines for a feature/SKU key.
+    /// Defaults to "no ceiling defined".
+    fn quota(&self, _principal: &PrincipalRef, _feature: &str) -> Option<Quota> {
+        None
+    }
+
+    /// Answer the rate-limit definition this provider defines for a feature/SKU
+    /// key. Defaults to "no rate limit defined".
+    fn rate_limit(&self, _principal: &PrincipalRef, _feature: &str) -> Option<RateLimit> {
+        None
+    }
+
+    /// Evaluate a request together with the caller-metered `observed_usage`.
+    /// Defaults to the usage-agnostic [`evaluate`](EntitlementProvider::evaluate)
+    /// so a provider that does not model quotas keeps its decision.
+    fn check_quota(
+        &self,
+        request: &EntitlementRequest,
+        _observed_usage: u64,
+    ) -> EntitlementOutcome {
+        self.evaluate(request)
+    }
+}
+
+/// A boxed provider is itself a provider, so a deployment holding a
+/// `Box<dyn EntitlementProvider>` can pass it straight to any `with_entitlements`
+/// injection point.
+impl EntitlementProvider for Box<dyn EntitlementProvider> {
+    fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
+        (**self).evaluate(request)
+    }
+
+    fn check_entitlement(&self, request: &EntitlementRequest) -> EntitlementDecision {
+        (**self).check_entitlement(request)
+    }
+
+    fn quota(&self, principal: &PrincipalRef, feature: &str) -> Option<Quota> {
+        (**self).quota(principal, feature)
+    }
+
+    fn rate_limit(&self, principal: &PrincipalRef, feature: &str) -> Option<RateLimit> {
+        (**self).rate_limit(principal, feature)
+    }
+
+    fn check_quota(&self, request: &EntitlementRequest, observed_usage: u64) -> EntitlementOutcome {
+        (**self).check_quota(request, observed_usage)
+    }
+}
+
+/// Entitlement evaluation engine — the open, in-process [`EntitlementProvider`].
 ///
 /// Held separately from the authorization core so the two planes never share
-/// state. Construct it in the mode a deployment needs and call
-/// [`EntitlementEngine::check_entitlement`] (or [`EntitlementEngine::evaluate`]
-/// for the reasoned outcome).
+/// state. Construct it in the mode a deployment needs and evaluate through the
+/// [`EntitlementProvider`] seam ([`check_entitlement`](EntitlementProvider::check_entitlement)
+/// for the decision, [`evaluate`](EntitlementProvider::evaluate) for the reasoned
+/// outcome).
 #[derive(Debug, Default)]
 pub struct EntitlementEngine {
     mode: EntitlementMode,
@@ -499,6 +574,31 @@ impl EntitlementEngine {
             EntitlementMode::Local(catalog) => catalog.evaluate_quota(request, observed_usage),
             EntitlementMode::Remote(resolver) => resolver.resolve_quota(request, observed_usage),
         }
+    }
+}
+
+/// The engine is the control plane's open [`EntitlementProvider`]; the trait impl
+/// forwards to the inherent mode-dispatching methods so direct callers and the
+/// deploy-time `Box<dyn EntitlementProvider>` seam share one evaluation path.
+impl EntitlementProvider for EntitlementEngine {
+    fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
+        EntitlementEngine::evaluate(self, request)
+    }
+
+    fn check_entitlement(&self, request: &EntitlementRequest) -> EntitlementDecision {
+        EntitlementEngine::check_entitlement(self, request)
+    }
+
+    fn quota(&self, principal: &PrincipalRef, feature: &str) -> Option<Quota> {
+        EntitlementEngine::quota(self, principal, feature)
+    }
+
+    fn rate_limit(&self, principal: &PrincipalRef, feature: &str) -> Option<RateLimit> {
+        EntitlementEngine::rate_limit(self, principal, feature)
+    }
+
+    fn check_quota(&self, request: &EntitlementRequest, observed_usage: u64) -> EntitlementOutcome {
+        EntitlementEngine::check_quota(self, request, observed_usage)
     }
 }
 
@@ -736,5 +836,47 @@ mod tests {
         assert_eq!(outcome.decision, EntitlementDecision::Deny);
         assert_eq!(outcome.reason, EntitlementReason::Remote);
         assert!(matches!(engine.mode(), EntitlementMode::Remote(_)));
+    }
+
+    /// Stand-in for the closed, licensed provider that awaken-cloud plugs in at
+    /// deploy: a bespoke type implementing only the required `evaluate`, sharing
+    /// the trait's quota defaults.
+    #[derive(Debug)]
+    struct LicensedStub;
+
+    impl EntitlementProvider for LicensedStub {
+        fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
+            if request.entitlement == "licensed.feature" {
+                EntitlementOutcome::allow(EntitlementReason::Remote)
+            } else {
+                EntitlementOutcome::deny(EntitlementReason::Remote)
+            }
+        }
+    }
+
+    #[test]
+    fn custom_provider_plugs_into_the_seam() {
+        let provider: Box<dyn EntitlementProvider> = Box::new(LicensedStub);
+        let allowed = provider.evaluate(&request(account("acct_1"), "licensed.feature", None));
+        assert_eq!(allowed.decision, EntitlementDecision::Allow);
+        let denied = provider.check_entitlement(&request(account("acct_1"), "other", None));
+        assert_eq!(denied, EntitlementDecision::Deny);
+        // Defaulted metering answers flow through the boxed seam.
+        assert_eq!(provider.quota(&account("acct_1"), "licensed.feature"), None);
+        assert_eq!(
+            provider.check_quota(
+                &request(account("acct_1"), "licensed.feature", None),
+                u64::MAX
+            ),
+            EntitlementOutcome::allow(EntitlementReason::Remote)
+        );
+    }
+
+    #[test]
+    fn engine_evaluates_through_the_provider_trait() {
+        let provider: &dyn EntitlementProvider = &EntitlementEngine::default_allow();
+        let outcome = provider.evaluate(&request(account("acct_1"), "anything", None));
+        assert_eq!(outcome.decision, EntitlementDecision::Allow);
+        assert_eq!(outcome.reason, EntitlementReason::DefaultAllow);
     }
 }

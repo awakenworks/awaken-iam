@@ -24,7 +24,7 @@
 //! identical. [`IamDaemon`] is the thin standalone wrapper the `iam-daemon`
 //! process is: it owns its pool's assembly and serves the canonical `/v1` API.
 
-use awaken_iam_core::{EntitlementEngine, RepoResult};
+use awaken_iam_core::{EntitlementEngine, EntitlementProvider, RepoResult};
 
 use crate::{AuthApi, AuthzApi, IamStore, Liveness, MigrateReport, MigrationExecutor, Readiness};
 
@@ -191,15 +191,16 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         )
     }
 
-    /// Build an assembly for an explicit deployment and entitlement engine.
+    /// Build an assembly for an explicit deployment and entitlement provider.
     ///
     /// The general constructor [`embedded`](Self::embedded) and
     /// [`standalone`](Self::standalone) delegate to; a deployment that ships a
-    /// configured plan catalog supplies its own [`EntitlementEngine`] here.
+    /// configured plan catalog or a closed, licensed provider supplies its own
+    /// [`EntitlementProvider`] here.
     pub fn with_entitlements(
         deployment: Deployment,
         pool: Pool,
-        entitlements: EntitlementEngine,
+        entitlements: impl EntitlementProvider + 'static,
     ) -> RepoResult<Self> {
         Self::assemble(deployment, pool, entitlements)
     }
@@ -207,7 +208,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     fn assemble(
         deployment: Deployment,
         pool: Pool,
-        entitlements: EntitlementEngine,
+        entitlements: impl EntitlementProvider + 'static,
     ) -> RepoResult<Self> {
         let mut store = IamStore::with_prefix(pool, IAM_TABLE_PREFIX)?;
         let migrate_report = store.migrate()?;
@@ -343,8 +344,11 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
         })
     }
 
-    /// Start the daemon with an explicit entitlement engine.
-    pub fn with_entitlements(pool: Pool, entitlements: EntitlementEngine) -> RepoResult<Self> {
+    /// Start the daemon with an explicit entitlement provider.
+    pub fn with_entitlements(
+        pool: Pool,
+        entitlements: impl EntitlementProvider + 'static,
+    ) -> RepoResult<Self> {
         Ok(Self {
             assembly: IamAssembly::with_entitlements(Deployment::Standalone, pool, entitlements)?,
         })
