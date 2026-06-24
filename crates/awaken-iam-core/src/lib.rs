@@ -2,6 +2,7 @@
 
 mod api_token;
 mod authorization;
+mod consumer_namespace;
 mod directory;
 mod entitlement;
 mod events;
@@ -32,6 +33,10 @@ pub use api_token::{
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
     GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
+};
+pub use consumer_namespace::{
+    ConsumerNamespaces, MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES, action_namespace,
+    managed_agents, oversight,
 };
 pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
