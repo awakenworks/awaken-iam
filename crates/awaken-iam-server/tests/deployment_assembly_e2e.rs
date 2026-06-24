@@ -147,11 +147,12 @@ fn embedded_and_standalone_decide_identically_from_one_assembly() {
 }
 
 #[test]
-fn both_deployments_mount_the_same_canonical_v1_routes() {
+fn both_deployments_mount_the_shared_v1_surface() {
     let embedded = IamAssembly::embedded(RecordingExecutor::new()).expect("embedded");
     let daemon = IamDaemon::start(RecordingExecutor::new()).expect("daemon");
-    assert_eq!(embedded.routes(), daemon.routes());
-    // The mounted tree spans both halves of /v1 from the one assembly.
+
+    // The shared /v1 surface both deployments mount spans both halves of /v1 from
+    // the one assembly.
     let routes = embedded.routes();
     assert!(routes.contains(&RouteSpec {
         method: awaken_iam_server::HttpMethod::Post,
@@ -161,6 +162,30 @@ fn both_deployments_mount_the_same_canonical_v1_routes() {
         method: awaken_iam_server::HttpMethod::Get,
         path: "/v1/session",
     }));
+
+    // Every embedded route is also mounted by the standalone daemon: the shared
+    // surface is identical, the daemon only adds to it.
+    for spec in embedded.routes() {
+        assert!(
+            daemon.routes().contains(&spec),
+            "standalone must also mount the shared route {}",
+            spec.path
+        );
+    }
+
+    // The policy-administration management seam is standalone-only: the daemon
+    // serves /v1/admin/* over the wire, the embedded host does not.
+    assert!(daemon.routes().contains(&RouteSpec {
+        method: awaken_iam_server::HttpMethod::Post,
+        path: "/v1/admin/orgs",
+    }));
+    assert!(
+        embedded
+            .routes()
+            .iter()
+            .all(|r| !r.path.starts_with("/v1/admin")),
+        "embedded must not mount the admin seam over HTTP"
+    );
 }
 
 #[test]

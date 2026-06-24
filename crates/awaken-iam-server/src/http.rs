@@ -355,6 +355,10 @@ mod tests {
                     .method("POST")
                     .header("content-type", "application/json")
                     .body(Body::from("{}")),
+                HttpMethod::Put => builder
+                    .method("PUT")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}")),
                 HttpMethod::Delete => builder.method("DELETE").body(Body::empty()),
             }
             .unwrap();

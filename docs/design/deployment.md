@@ -90,19 +90,25 @@ scope decides *whose rows they hold*.
 
 ## Assembly
 
-Both modes reuse the same `awaken-iam-server` assembly; only the pool and the
-router host differ.
+Both modes reuse the same `awaken-iam-server` assembly and the same canonical
+`/v1` route manifest; they differ only by the pool, the router host, and one
+seam: the standalone daemon additionally serves the `/v1/admin/*`
+administration control plane so the remote console can manage policy over the
+wire, whereas the embedded host administers in-process and does not expose that
+seam (the Administration Point split in [ADR-0002](../adr/0002-iam-consolidation.md)).
 
 ```text
 embedded:   host builds the shared pool (Postgres) or opens a SQLite connection
             -> IamStore::with_prefix(pool, "iam"); store.migrate()  (runs iam.* bundles)
             -> mount IAM /v1 routes onto the host router
             -> in-process callers use the local IamClient (no network hop)
+            -> policy administration stays in-process (no /v1/admin/* seam)
 
 standalone: iam-daemon builds its own pool (Postgres for cloud/HA)
             -> IamStore::with_prefix(pool, "iam"); store.migrate()
-            -> serve the canonical /v1 API
-            -> remote callers use the remote IamClient
+            -> serve the canonical /v1 API plus the /v1/admin/* admin seam
+            -> remote callers use the remote IamClient; the console administers
+               policy over /v1/admin/*
 ```
 
 `store.migrate()` renders each bundle's dialect-neutral DDL for the active

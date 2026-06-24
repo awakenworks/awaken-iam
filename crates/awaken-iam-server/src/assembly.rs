@@ -17,12 +17,16 @@
 //!             -> remote callers use the remote IamClient
 //! ```
 //!
-//! [`IamAssembly`] is the shared body both modes reuse. The only differences are
-//! the [`Deployment`] tag (which the host inspects to wire the client SDK's
-//! `local | remote` mode to match) and which pool it was handed; the migration
-//! bundles, the table prefix, and the mounted [`routes`](IamAssembly::routes) are
-//! identical. [`IamDaemon`] is the thin standalone wrapper the `iam-daemon`
-//! process is: it owns its pool's assembly and serves the canonical `/v1` API.
+//! [`IamAssembly`] is the shared body both modes reuse. The differences are the
+//! [`Deployment`] tag (which the host inspects to wire the client SDK's
+//! `local | remote` mode to match), which pool it was handed, and whether the
+//! policy-administration management seam is mounted: the migration bundles, the
+//! table prefix, and the shared `/v1` surface are identical, while the
+//! standalone daemon additionally serves the `/v1/admin/*` routes the remote
+//! control plane administers policy through (an embedded host uses the in-process
+//! [`PolicyAdminApi`](crate::PolicyAdminApi) instead). [`IamDaemon`] is the thin
+//! standalone wrapper the `iam-daemon` process is: it owns its pool's assembly
+//! and serves the canonical `/v1` API.
 
 use awaken_iam_core::{EntitlementEngine, EntitlementProvider, RepoResult};
 
@@ -68,6 +72,8 @@ pub enum HttpMethod {
     Get,
     /// `POST`.
     Post,
+    /// `PUT`.
+    Put,
     /// `DELETE`.
     Delete,
 }
@@ -97,6 +103,13 @@ impl RouteSpec {
     const fn post(path: &'static str) -> Self {
         Self {
             method: HttpMethod::Post,
+            path,
+        }
+    }
+
+    const fn put(path: &'static str) -> Self {
+        Self {
+            method: HttpMethod::Put,
             path,
         }
     }
@@ -139,6 +152,32 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::post("/v1/authz/resource-model"),
     RouteSpec::get("/v1/authz/snapshot"),
+];
+
+/// The policy-administration routes ([`PolicyAdminApi`](crate::PolicyAdminApi)).
+///
+/// This is the console <-> remote-daemon management seam: a remote control plane
+/// (cloud-console) administers the authorization model — organizations, groups,
+/// roles, grants, and memberships — over the wire against the standalone daemon.
+/// It is *not* an IAM-as-a-product surface; an embedded host administers the same
+/// model through the in-process [`PolicyAdminApi`](crate::PolicyAdminApi) with no
+/// network hop, so [`routes`](IamAssembly::routes) mounts this surface only in the
+/// [`Standalone`](Deployment::Standalone) deployment.
+const ADMIN_ROUTES: &[RouteSpec] = &[
+    RouteSpec::post("/v1/admin/orgs"),
+    RouteSpec::put("/v1/admin/orgs/{id}"),
+    RouteSpec::delete("/v1/admin/orgs/{id}"),
+    RouteSpec::get("/v1/admin/orgs"),
+    RouteSpec::post("/v1/admin/groups"),
+    RouteSpec::put("/v1/admin/groups/{id}"),
+    RouteSpec::delete("/v1/admin/groups/{id}"),
+    RouteSpec::post("/v1/admin/roles"),
+    RouteSpec::put("/v1/admin/roles/{id}"),
+    RouteSpec::delete("/v1/admin/roles/{id}"),
+    RouteSpec::post("/v1/admin/grants"),
+    RouteSpec::delete("/v1/admin/grants/{id}"),
+    RouteSpec::post("/v1/admin/memberships"),
+    RouteSpec::delete("/v1/admin/memberships"),
 ];
 
 /// The operational health probes the load balancer and orchestrator route on.
@@ -286,19 +325,27 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         self.authz
     }
 
-    /// The canonical `/v1` routes this assembly mounts (auth then authz).
     /// The canonical routes this assembly mounts: the `/v1` surface (auth then
-    /// authz) followed by the operational health probes.
+    /// authz), the standalone-only policy-administration seam, then the
+    /// operational health probes.
     ///
-    /// Both deployments mount the identical manifest; embedded mounts it onto the
-    /// host router, standalone serves it directly.
+    /// Both deployments mount the shared `/v1` surface — embedded onto the host
+    /// router, standalone directly. The policy-administration routes
+    /// ([`ADMIN_ROUTES`]) are the console <-> remote-daemon management seam and
+    /// are mounted only in the [`Standalone`](Deployment::Standalone) deployment;
+    /// an embedded host administers the same model through the in-process
+    /// [`PolicyAdminApi`](crate::PolicyAdminApi) rather than over HTTP.
     pub fn routes(&self) -> Vec<RouteSpec> {
-        AUTH_ROUTES
+        let mut routes: Vec<RouteSpec> = AUTH_ROUTES
             .iter()
             .chain(AUTHZ_ROUTES.iter())
-            .chain(OPS_ROUTES.iter())
             .copied()
-            .collect()
+            .collect();
+        if self.deployment == Deployment::Standalone {
+            routes.extend(ADMIN_ROUTES.iter().copied());
+        }
+        routes.extend(OPS_ROUTES.iter().copied());
+        routes
     }
 
     /// Liveness probe (`/healthz`): the process is up.
@@ -432,15 +479,27 @@ mod tests {
         let embedded = IamAssembly::embedded(RecordingExecutor::new()).expect("embedded");
         let daemon = IamDaemon::start(RecordingExecutor::new()).expect("daemon");
         assert_eq!(daemon.assembly().deployment(), Deployment::Standalone);
-        // Same prefix, same bundle plan, same mounted routes — only the pool and
-        // the deployment tag differ.
+        // Same prefix, same bundle plan — only the pool and the deployment tag
+        // differ. The shared `/v1` surface is identical; the standalone daemon
+        // additionally mounts the policy-administration management seam.
         assert_eq!(daemon.assembly().prefix(), embedded.prefix());
         assert_eq!(
             daemon.assembly().store().plan(),
             embedded.store().plan(),
             "both deployments render the identical iam.* plan"
         );
-        assert_eq!(daemon.routes(), embedded.routes());
+        // The daemon's manifest is the embedded surface plus the admin routes.
+        assert_eq!(
+            daemon.routes().len(),
+            embedded.routes().len() + ADMIN_ROUTES.len()
+        );
+        for spec in embedded.routes() {
+            assert!(
+                daemon.routes().contains(&spec),
+                "standalone must also mount the shared route {}",
+                spec.path
+            );
+        }
     }
 
     #[test]
@@ -484,6 +543,47 @@ mod tests {
                 || r.path == "/healthz"
                 || r.path == "/readyz"
         }));
+    }
+
+    #[test]
+    fn standalone_mounts_the_admin_seam_but_embedded_does_not() {
+        let embedded = IamAssembly::embedded(RecordingExecutor::new()).expect("embedded");
+        let daemon = IamDaemon::start(RecordingExecutor::new()).expect("daemon");
+
+        // The policy-administration surface is the console <-> remote-daemon seam:
+        // the standalone daemon serves every /v1/admin/* route over the wire.
+        let standalone = daemon.routes();
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/orgs")));
+        assert!(standalone.contains(&RouteSpec::put("/v1/admin/orgs/{id}")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/admin/orgs/{id}")));
+        assert!(standalone.contains(&RouteSpec::get("/v1/admin/orgs")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/groups")));
+        assert!(standalone.contains(&RouteSpec::put("/v1/admin/groups/{id}")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/admin/groups/{id}")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/roles")));
+        assert!(standalone.contains(&RouteSpec::put("/v1/admin/roles/{id}")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/admin/roles/{id}")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/grants")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/admin/grants/{id}")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/memberships")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/admin/memberships")));
+        assert_eq!(
+            standalone
+                .iter()
+                .filter(|r| r.path.starts_with("/v1/admin"))
+                .count(),
+            ADMIN_ROUTES.len()
+        );
+
+        // An embedded host administers the model in-process and does not expose
+        // the admin routes on the host router.
+        assert!(
+            embedded
+                .routes()
+                .iter()
+                .all(|r| !r.path.starts_with("/v1/admin")),
+            "embedded must not mount the admin seam over HTTP"
+        );
     }
 
     #[test]
