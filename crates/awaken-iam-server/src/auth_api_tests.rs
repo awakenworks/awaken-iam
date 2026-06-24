@@ -672,10 +672,10 @@ fn mint_request() -> MintAccessToken {
     }
 }
 
-#[test]
-fn minted_access_token_is_asymmetric_and_verifies_against_published_jwks() {
+#[tokio::test]
+async fn minted_access_token_is_asymmetric_and_verifies_against_published_jwks() {
     let mut api = api();
-    let token = api.mint_access_token(mint_request()).unwrap();
+    let token = api.mint_access_token(mint_request()).await.unwrap();
 
     // The token is signed by the active key and verifies against the JWKS
     // alone — no shared secret is needed by the verifier.
@@ -690,20 +690,20 @@ fn minted_access_token_is_asymmetric_and_verifies_against_published_jwks() {
     assert!(claims.jti.starts_with("jti_"));
 
     // Two mints get distinct jti values.
-    let other = api.mint_access_token(mint_request()).unwrap();
+    let other = api.mint_access_token(mint_request()).await.unwrap();
     let other_claims = crate::verify_access_token(&other, &api.jwks()).unwrap();
     assert_ne!(claims.jti, other_claims.jti);
 }
 
-#[test]
-fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
+#[tokio::test]
+async fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
     let mut api = api();
     let old_kid = api.active_signing_kid().to_owned();
-    let old_token = api.mint_access_token(mint_request()).unwrap();
+    let old_token = api.mint_access_token(mint_request()).await.unwrap();
 
     api.rotate_signing_key("iam-access-key-2");
     assert_eq!(api.active_signing_kid(), "iam-access-key-2");
-    let new_token = api.mint_access_token(mint_request()).unwrap();
+    let new_token = api.mint_access_token(mint_request()).await.unwrap();
 
     // Both tokens verify while the old key is still published.
     let jwks = api.jwks();
@@ -719,7 +719,7 @@ fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
     crate::verify_access_token(&new_token, &pruned).unwrap();
 }
 
-fn issue_grant(api: &mut AuthApi<SequentialEntropy>) -> TokenGrant {
+async fn issue_grant(api: &mut AuthApi<SequentialEntropy>) -> TokenGrant {
     api.issue_token_grant(IssueTokenGrant {
         account_id: AccountId("acct_1".into()),
         issuer: "https://iam.example".into(),
@@ -731,6 +731,7 @@ fn issue_grant(api: &mut AuthApi<SequentialEntropy>) -> TokenGrant {
         now: Timestamp("2026-06-19T00:00:00Z".into()),
         refresh_expires_at: Timestamp("2026-07-19T00:00:00Z".into()),
     })
+    .await
     .unwrap()
 }
 
@@ -762,11 +763,11 @@ fn op_provider() -> OAuthAuthorizationServer<SequentialEntropy> {
     OAuthAuthorizationServer::new(registry, SequentialEntropy::default())
 }
 
-#[test]
-fn op_refresh_grant_authenticates_the_client_then_rotates() {
+#[tokio::test]
+async fn op_refresh_grant_authenticates_the_client_then_rotates() {
     let mut api = api();
     let provider = op_provider();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     let rotated = api
         .op_refresh_token_grant(
@@ -775,6 +776,7 @@ fn op_refresh_grant_authenticates_the_client_then_rotates() {
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
+        .await
         .unwrap();
 
     // The presented token is rotated under the same chain and a fresh, verifiable
@@ -793,11 +795,11 @@ fn op_refresh_grant_authenticates_the_client_then_rotates() {
     );
 }
 
-#[test]
-fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
+#[tokio::test]
+async fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
     let mut api = api();
     let provider = op_provider();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     let rotated = api
         .op_refresh_token_grant(
@@ -806,15 +808,16 @@ fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
             None,
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
+        .await
         .unwrap();
     assert_ne!(first.refresh_token, rotated.refresh_token);
 }
 
-#[test]
-fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
+#[tokio::test]
+async fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
     let mut api = api();
     let provider = op_provider();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     let err = api
         .op_refresh_token_grant(
@@ -823,6 +826,7 @@ fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
             Some("wrong"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
@@ -838,15 +842,16 @@ fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
         )
+        .await
         .unwrap();
     assert_ne!(first.refresh_token, rotated.refresh_token);
 }
 
-#[test]
-fn op_refresh_grant_rejects_an_unknown_client() {
+#[tokio::test]
+async fn op_refresh_grant_rejects_an_unknown_client() {
     let mut api = api();
     let provider = op_provider();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     let err = api
         .op_refresh_token_grant(
@@ -855,6 +860,7 @@ fn op_refresh_grant_rejects_an_unknown_client() {
             Some("anything"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
@@ -862,11 +868,11 @@ fn op_refresh_grant_rejects_an_unknown_client() {
     ));
 }
 
-#[test]
-fn op_refresh_grant_revokes_the_chain_on_replay() {
+#[tokio::test]
+async fn op_refresh_grant_revokes_the_chain_on_replay() {
     let mut api = api();
     let provider = op_provider();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     // Legitimate rotation through the OP endpoint.
     let _second = api
@@ -876,6 +882,7 @@ fn op_refresh_grant_revokes_the_chain_on_replay() {
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
+        .await
         .unwrap();
 
     // Replaying the retired token — even with valid client auth — is a theft
@@ -887,6 +894,7 @@ fn op_refresh_grant_revokes_the_chain_on_replay() {
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
         )
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
@@ -894,10 +902,10 @@ fn op_refresh_grant_revokes_the_chain_on_replay() {
     ));
 }
 
-#[test]
-fn issuing_a_grant_returns_a_verifiable_access_token_and_a_refresh_token() {
+#[tokio::test]
+async fn issuing_a_grant_returns_a_verifiable_access_token_and_a_refresh_token() {
     let mut api = api();
-    let grant = issue_grant(&mut api);
+    let grant = issue_grant(&mut api).await;
 
     // The access token verifies against the published JWKS and the denylist.
     let claims = api.verify_access_token(&grant.access_token).unwrap();
@@ -917,13 +925,14 @@ fn issuing_a_grant_returns_a_verifiable_access_token_and_a_refresh_token() {
     );
 }
 
-#[test]
-fn refreshing_rotates_the_token_and_mints_a_fresh_access_token() {
+#[tokio::test]
+async fn refreshing_rotates_the_token_and_mints_a_fresh_access_token() {
     let mut api = api();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     let rotated = api
         .refresh_token_grant(refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"))
+        .await
         .unwrap();
 
     // A new refresh token is issued and differs from the presented one.
@@ -949,19 +958,21 @@ fn refreshing_rotates_the_token_and_mints_a_fresh_access_token() {
     );
 }
 
-#[test]
-fn replaying_a_retired_refresh_token_revokes_the_chain() {
+#[tokio::test]
+async fn replaying_a_retired_refresh_token_revokes_the_chain() {
     let mut api = api();
-    let first = issue_grant(&mut api);
+    let first = issue_grant(&mut api).await;
 
     // Legitimate rotation: the client now holds the successor.
     let _second = api
         .refresh_token_grant(refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"))
+        .await
         .unwrap();
 
     // Replaying the now-retired first token is a theft signal.
     let err = api
         .refresh_token_grant(refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"))
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
@@ -986,6 +997,7 @@ fn replaying_a_retired_refresh_token_revokes_the_chain() {
             &_second.refresh_token,
             "2026-06-20T02:00:00Z",
         ))
+        .await
         .unwrap_err();
     assert!(matches!(
         dead,
@@ -993,10 +1005,10 @@ fn replaying_a_retired_refresh_token_revokes_the_chain() {
     ));
 }
 
-#[test]
-fn rfc7009_revoke_kills_the_refresh_chain() {
+#[tokio::test]
+async fn rfc7009_revoke_kills_the_refresh_chain() {
     let mut api = api();
-    let grant = issue_grant(&mut api);
+    let grant = issue_grant(&mut api).await;
 
     let outcome = api.revoke_token(RevokeToken {
         token: grant.refresh_token.clone(),
@@ -1013,6 +1025,7 @@ fn rfc7009_revoke_kills_the_refresh_chain() {
     // A revoked refresh token can no longer be rotated.
     let err = api
         .refresh_token_grant(refresh_grant(&grant.refresh_token, "2026-06-20T01:00:00Z"))
+        .await
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1020,10 +1033,10 @@ fn rfc7009_revoke_kills_the_refresh_chain() {
     ));
 }
 
-#[test]
-fn rfc7009_revoke_kills_an_access_token_by_jti() {
+#[tokio::test]
+async fn rfc7009_revoke_kills_an_access_token_by_jti() {
     let mut api = api();
-    let grant = issue_grant(&mut api);
+    let grant = issue_grant(&mut api).await;
 
     // Before revocation the token verifies.
     api.verify_access_token(&grant.access_token).unwrap();
@@ -1175,8 +1188,8 @@ fn op_request() -> OpCodeRedemption {
     }
 }
 
-#[test]
-fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
+#[tokio::test]
+async fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
     let mut api = api();
     register_downstream_client(&mut api);
     let (result, cookie) = logged_in_session(&mut api);
@@ -1200,7 +1213,7 @@ fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
 
     // `POST /v1/oauth/token` (authorization_code): redeem the code for a grant.
     let code = code_from_redirect(&authorized.redirect_to);
-    let grant = api.redeem_authorization_code(redeem(&code)).unwrap();
+    let grant = api.redeem_authorization_code(redeem(&code)).await.unwrap();
 
     // The minted access token authenticates the end-user's account and carries
     // the granted scopes; it verifies against the published JWKS.
@@ -1244,30 +1257,34 @@ fn downstream_authorize_rejects_an_unregistered_client() {
     );
 }
 
-#[test]
-fn downstream_authorization_code_is_single_use() {
+#[tokio::test]
+async fn downstream_authorization_code_is_single_use() {
     let mut api = api();
     register_downstream_client(&mut api);
     let (_result, cookie) = logged_in_session(&mut api);
     let authorized = api.authorize(downstream_authorize(&cookie)).unwrap();
     let code = code_from_redirect(&authorized.redirect_to);
 
-    api.redeem_authorization_code(redeem(&code)).unwrap();
+    api.redeem_authorization_code(redeem(&code)).await.unwrap();
     // Replaying the consumed code fails closed; it can never mint a second grant.
-    let err = api.redeem_authorization_code(redeem(&code)).unwrap_err();
+    let err = api
+        .redeem_authorization_code(redeem(&code))
+        .await
+        .unwrap_err();
     assert_eq!(
         err,
         AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)
     );
 }
 
-#[test]
-fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
+#[tokio::test]
+async fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
     let mut api = api();
     let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
 
     let grant = api
         .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
+        .await
         .expect("redeem");
 
     // The grant carries the down-scoped set and the authenticated account.
@@ -1299,32 +1316,35 @@ fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
     assert!(api.verify_access_token(&grant.id_token).is_err());
 }
 
-#[test]
-fn redeeming_without_a_request_nonce_omits_the_id_token_nonce() {
+#[tokio::test]
+async fn redeeming_without_a_request_nonce_omits_the_id_token_nonce() {
     let mut api = api();
     let (mut provider, issued) = op_provider_with_issued_code(None);
 
     let grant = api
         .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
+        .await
         .expect("redeem");
 
     let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
     assert_eq!(id.nonce, None);
 }
 
-#[test]
-fn a_replayed_code_fails_closed_through_the_provider() {
+#[tokio::test]
+async fn a_replayed_code_fails_closed_through_the_provider() {
     let mut api = api();
     let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
 
     // First redemption succeeds and consumes the single-use code.
     api.redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
+        .await
         .expect("first redeem");
 
     // A second redemption surfaces the provider's invalid-grant error and mints
     // nothing.
     let err = api
         .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
+        .await
         .unwrap_err();
     assert_eq!(
         err,

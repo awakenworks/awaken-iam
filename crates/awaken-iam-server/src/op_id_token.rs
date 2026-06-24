@@ -89,7 +89,7 @@ pub enum IdTokenError {
 /// The token is fenced into the `id_token` family by its `typ` header and carries
 /// the OIDC core claims a relying party verifies the subject from. The window is
 /// validated as strictly forward so a token can never be born already expired.
-pub fn mint_id_token(
+pub async fn mint_id_token(
     authority: &AccessTokenAuthority,
     request: MintIdToken,
 ) -> Result<String, IdTokenError> {
@@ -104,7 +104,7 @@ pub fn mint_id_token(
         iat: request.iat,
         nonce: request.nonce,
     };
-    Ok(authority.sign_jwt(ID_TOKEN_TYP, &claims)?)
+    Ok(authority.sign_jwt(ID_TOKEN_TYP, &claims).await?)
 }
 
 /// Verify an IAM-issued OIDC `id_token` against a published [`Jwks`], returning
@@ -140,10 +140,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn id_token_is_signed_and_verifies_against_published_jwks() {
+    #[tokio::test]
+    async fn id_token_is_signed_and_verifies_against_published_jwks() {
         let authority = authority();
-        let token = mint_id_token(&authority, request()).expect("mint");
+        let token = mint_id_token(&authority, request()).await.expect("mint");
         // header.payload.signature.
         assert_eq!(token.split('.').count(), 3);
 
@@ -156,12 +156,12 @@ mod tests {
         assert_eq!(claims.nonce.as_deref(), Some("nonce-1"));
     }
 
-    #[test]
-    fn a_nonceless_request_omits_nonce_from_the_wire() {
+    #[tokio::test]
+    async fn a_nonceless_request_omits_nonce_from_the_wire() {
         let authority = authority();
         let mut req = request();
         req.nonce = None;
-        let token = mint_id_token(&authority, req).expect("mint");
+        let token = mint_id_token(&authority, req).await.expect("mint");
         let payload = token.split('.').nth(1).unwrap();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -173,29 +173,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_zero_width_window_is_rejected() {
+    #[tokio::test]
+    async fn a_zero_width_window_is_rejected() {
         let authority = authority();
         let mut req = request();
         req.exp = req.iat;
         assert_eq!(
-            mint_id_token(&authority, req),
+            mint_id_token(&authority, req).await,
             Err(IdTokenError::InvalidWindow)
         );
     }
 
-    #[test]
-    fn an_id_token_does_not_verify_as_an_access_token() {
+    #[tokio::test]
+    async fn an_id_token_does_not_verify_as_an_access_token() {
         // Family fence: the distinct `typ` means an id_token presented to the
         // access-token verifier fails closed, never authenticating a service call.
         let authority = authority();
-        let token = mint_id_token(&authority, request()).expect("mint");
+        let token = mint_id_token(&authority, request()).await.expect("mint");
         let err = verify_access_token(&token, &authority.jwks()).unwrap_err();
         assert!(matches!(err, AccessTokenError::UnexpectedType { .. }));
     }
 
-    #[test]
-    fn an_access_token_does_not_verify_as_an_id_token() {
+    #[tokio::test]
+    async fn an_access_token_does_not_verify_as_an_id_token() {
         // The reverse fence: an access token presented as an id_token is rejected
         // on its `typ` before any claim is trusted.
         let authority = authority();
@@ -209,15 +209,16 @@ mod tests {
                 jti: "jti-1".into(),
                 scope: vec!["pack.read".into()],
             })
+            .await
             .expect("mint access");
         let err = verify_id_token(&access, &authority.jwks()).unwrap_err();
         assert!(matches!(err, AccessTokenError::UnexpectedType { .. }));
     }
 
-    #[test]
-    fn a_tampered_id_token_fails_closed() {
+    #[tokio::test]
+    async fn a_tampered_id_token_fails_closed() {
         let authority = authority();
-        let token = mint_id_token(&authority, request()).expect("mint");
+        let token = mint_id_token(&authority, request()).await.expect("mint");
         let mut parts: Vec<&str> = token.split('.').collect();
         let forged = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&OidcIdTokenClaims {

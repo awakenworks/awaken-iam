@@ -20,5 +20,10 @@ awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
 awaken-iam-server.workspace = true
 
+[dev-dependencies]
+# The capability-delegation integration test drives the now-async token minting
+# seam, so it runs on a Tokio test runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 [lints]
 workspace = true

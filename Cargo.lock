@@ -39,6 +39,7 @@ dependencies = [
  "awaken-iam-contract",
  "awaken-iam-core",
  "awaken-iam-server",
+ "tokio",
 ]
 
 [[package]]
@@ -81,6 +82,7 @@ dependencies = [
 name = "awaken-iam-server"
 version = "0.1.0-dev"
 dependencies = [
+ "async-trait",
  "awaken-iam-client",
  "awaken-iam-contract",
  "awaken-iam-core",

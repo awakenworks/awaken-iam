@@ -88,8 +88,8 @@ fn parent_capability(epoch: LeaseEpoch) -> MintCapability {
 /// End-to-end managed-agents cutover: the entitlement plane gates the parent run,
 /// then the parent delegates a strictly-narrower capability to a sub-agent the
 /// sandbox verifies on its own. The two planes compose; neither is reimplemented.
-#[test]
-fn managed_agent_gates_run_then_delegates_attenuated_capability() {
+#[tokio::test]
+async fn managed_agent_gates_run_then_delegates_attenuated_capability() {
     // --- Plane 1: entitlement gates the parent run (reused, already proven). ---
     let planner = agent("agent:planner");
     let free = agent("agent:free-runner");
@@ -121,7 +121,9 @@ fn managed_agent_gates_run_then_delegates_attenuated_capability() {
     // --- Plane 2: the cleared parent delegates to a sub-agent / sandbox. ---
     let authority = authority();
     let epoch = LeaseEpoch::initial();
-    let parent_token = mint_capability(&authority, parent_capability(epoch)).unwrap();
+    let parent_token = mint_capability(&authority, parent_capability(epoch))
+        .await
+        .unwrap();
 
     // The parent hands a sub-agent strictly less authority for a bounded time: a
     // subset scope, a distinct delegate subject, and an earlier expiry.
@@ -138,6 +140,7 @@ fn managed_agent_gates_run_then_delegates_attenuated_capability() {
             sub: Some("agent:planner/sub:summarize".into()),
         },
     )
+    .await
     .unwrap();
 
     // The sandbox verifies the delegated token holder-independently, using only
@@ -166,11 +169,13 @@ fn managed_agent_gates_run_then_delegates_attenuated_capability() {
 
 /// A sub-agent can never gain authority its parent lacked: attenuation only
 /// narrows scope and only shortens the bounded window — both fail closed.
-#[test]
-fn delegation_only_narrows_never_widens() {
+#[tokio::test]
+async fn delegation_only_narrows_never_widens() {
     let authority = authority();
     let epoch = LeaseEpoch::initial();
-    let parent_token = mint_capability(&authority, parent_capability(epoch)).unwrap();
+    let parent_token = mint_capability(&authority, parent_capability(epoch))
+        .await
+        .unwrap();
 
     // A scope the parent never held cannot be added by a child.
     let widened = attenuate(
@@ -186,6 +191,7 @@ fn delegation_only_narrows_never_widens() {
             sub: None,
         },
     )
+    .await
     .unwrap_err();
     assert_eq!(widened, CapabilityError::ScopeNotSubset);
 
@@ -203,6 +209,7 @@ fn delegation_only_narrows_never_widens() {
             sub: None,
         },
     )
+    .await
     .unwrap_err();
     assert_eq!(extended, CapabilityError::ExpiryNotBounded);
 }
@@ -210,11 +217,13 @@ fn delegation_only_narrows_never_widens() {
 /// Re-provisioning the sandbox advances the lease epoch, which fences every
 /// outstanding delegated token out at once — a stale sub-agent token stops
 /// verifying and a stale parent can no longer mint new sub-agents.
-#[test]
-fn advancing_the_sandbox_lease_revokes_outstanding_delegations() {
+#[tokio::test]
+async fn advancing_the_sandbox_lease_revokes_outstanding_delegations() {
     let authority = authority();
     let epoch = LeaseEpoch::initial();
-    let parent_token = mint_capability(&authority, parent_capability(epoch)).unwrap();
+    let parent_token = mint_capability(&authority, parent_capability(epoch))
+        .await
+        .unwrap();
     let child_token = attenuate(
         &authority,
         &parent_token,
@@ -228,6 +237,7 @@ fn advancing_the_sandbox_lease_revokes_outstanding_delegations() {
             sub: None,
         },
     )
+    .await
     .unwrap();
     let jwks = authority.jwks();
 
@@ -271,6 +281,7 @@ fn advancing_the_sandbox_lease_revokes_outstanding_delegations() {
             sub: None,
         },
     )
+    .await
     .unwrap_err();
     assert_eq!(stale, CapabilityError::EpochFenced);
 }

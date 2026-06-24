@@ -8,3 +8,5 @@
 | [0004](0004-consumers-reuse-iam-authz.md) | Consumers reuse the IAM authorization plane | Proposed |
 | [0004](0004-namespace-signer-ownership.md) | Namespace-to-signer ownership is IAM's, not the registry's | Proposed |
 | [0005](0005-open-license-claim-verification.md) | License claim shape and offline verification are open; issuance stays closed | Proposed |
+| [0006](0006-async-signing-seam.md) | The token signing seam is async | Proposed |
+| [0007](0007-release-versioning-contract.md) | The repo is consumed at immutable version tags | Proposed |

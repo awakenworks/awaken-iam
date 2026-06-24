@@ -1220,7 +1220,10 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// The token is a compact JWT signed with the active key (EdDSA/Ed25519),
     /// carrying that key's `kid` in the header and a freshly minted `jti` so it
     /// can be revoked individually. Verifiers validate it against [`jwks`](Self::jwks).
-    pub fn mint_access_token(&mut self, request: MintAccessToken) -> Result<String, AuthApiError> {
+    pub async fn mint_access_token(
+        &mut self,
+        request: MintAccessToken,
+    ) -> Result<String, AuthApiError> {
         let claims = AccessTokenClaims {
             iss: request.issuer,
             sub: request.subject,
@@ -1230,7 +1233,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             jti: self.mint_id("jti"),
             scope: request.scopes,
         };
-        Ok(self.tokens.mint(&claims)?)
+        Ok(self.tokens.mint(&claims).await?)
     }
 
     /// `POST /v1/oauth/token` (`grant_type=…:token-exchange`): exchange an
@@ -1248,7 +1251,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// Every outcome is audited. The error fails closed and collapses to a coarse
     /// OAuth error code (see [`TokenExchangeError::oauth_error_code`]) so the wire
     /// response never distinguishes an unknown issuer from a missing binding.
-    pub fn exchange_token(
+    pub async fn exchange_token(
         &mut self,
         request: TokenExchangeRequest,
     ) -> Result<TokenExchangeResponse, AuthApiError> {
@@ -1280,7 +1283,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             jti: jti.clone(),
             scope: scopes.clone(),
         };
-        let access_token = match self.tokens.mint(&claims) {
+        let access_token = match self.tokens.mint(&claims).await {
             Ok(token) => token,
             Err(err) => {
                 let err = TokenExchangeError::from(err);
@@ -1365,7 +1368,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// The access token carries a freshly minted `jti` (so it is individually
     /// revocable) and the refresh token opens a new chain that later refreshes
     /// rotate. Both are returned once; only hashes are retained.
-    pub fn issue_token_grant(
+    pub async fn issue_token_grant(
         &mut self,
         request: IssueTokenGrant,
     ) -> Result<TokenGrant, AuthApiError> {
@@ -1385,14 +1388,16 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             },
         )?;
 
-        let (access_token, jti) = self.mint_access_with_jti(
-            request.issuer,
-            request.subject,
-            request.audience,
-            request.issued_at,
-            request.access_expires_at,
-            request.scopes,
-        )?;
+        let (access_token, jti) = self
+            .mint_access_with_jti(
+                request.issuer,
+                request.subject,
+                request.audience,
+                request.issued_at,
+                request.access_expires_at,
+                request.scopes,
+            )
+            .await?;
 
         self.audit.push(AuthAuditEvent::RefreshTokenIssued {
             account_id: request.account_id,
@@ -1423,7 +1428,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// the redeeming client. Subject and scope come from the grant, never the
     /// request, so a client cannot widen its own authority. Both tokens are signed
     /// by the active key and verify against [`jwks`](Self::jwks).
-    pub fn redeem_op_code<C: EntropySource>(
+    pub async fn redeem_op_code<C: EntropySource>(
         &mut self,
         provider: &mut OAuthAuthorizationServer<C>,
         redemption: &TokenRedemption,
@@ -1432,14 +1437,16 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let grant = provider.redeem_code(redemption, request.now)?;
         let subject = grant.account_id.0.clone();
 
-        let (access_token, access_token_jti) = self.mint_access_with_jti(
-            request.issuer.clone(),
-            subject.clone(),
-            request.access_audience,
-            request.issued_at,
-            request.access_expires_at,
-            grant.scopes.clone(),
-        )?;
+        let (access_token, access_token_jti) = self
+            .mint_access_with_jti(
+                request.issuer.clone(),
+                subject.clone(),
+                request.access_audience,
+                request.issued_at,
+                request.access_expires_at,
+                grant.scopes.clone(),
+            )
+            .await?;
 
         let id_token = mint_id_token(
             &self.tokens,
@@ -1452,7 +1459,8 @@ impl<E: EntropySource + Clone> AuthApi<E> {
                 exp: request.id_token_expires_at,
                 nonce: grant.nonce,
             },
-        )?;
+        )
+        .await?;
 
         Ok(OpTokenGrant {
             access_token,
@@ -1470,7 +1478,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// chain; replay of an already-retired token revokes the whole chain as a
     /// theft signal and fails closed. The new access token inherits the chain's
     /// stored subject/audience/scope — never client-supplied claims.
-    pub fn refresh_token_grant(
+    pub async fn refresh_token_grant(
         &mut self,
         request: RefreshGrant,
     ) -> Result<TokenGrant, AuthApiError> {
@@ -1517,14 +1525,16 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             .unwrap_or_else(|| RefreshTokenId(String::new()));
 
         let token = &rotated.token;
-        let (access_token, jti) = self.mint_access_with_jti(
-            request.issuer,
-            token.subject.clone(),
-            token.audience.clone(),
-            request.issued_at,
-            request.access_expires_at,
-            token.scope.clone(),
-        )?;
+        let (access_token, jti) = self
+            .mint_access_with_jti(
+                request.issuer,
+                token.subject.clone(),
+                token.audience.clone(),
+                request.issued_at,
+                request.access_expires_at,
+                token.scope.clone(),
+            )
+            .await?;
 
         self.audit.push(AuthAuditEvent::RefreshTokenRotated {
             account_id: token.account_id.clone(),
@@ -1557,7 +1567,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// revoking the whole chain when an already-retired token is replayed. The new
     /// access token inherits the chain's stored subject/audience/scope, never
     /// client-supplied claims.
-    pub fn op_refresh_token_grant<C: EntropySource>(
+    pub async fn op_refresh_token_grant<C: EntropySource>(
         &mut self,
         provider: &OAuthAuthorizationServer<C>,
         client_id: &str,
@@ -1565,7 +1575,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         request: RefreshGrant,
     ) -> Result<TokenGrant, AuthApiError> {
         provider.authenticate_client(client_id, client_secret)?;
-        self.refresh_token_grant(request)
+        self.refresh_token_grant(request).await
     }
 
     /// `POST /v1/oauth/revoke` (RFC 7009): revoke a presented token.
@@ -1676,7 +1686,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// token (with a fresh `jti`, so it is individually revocable) and opens a new
     /// refresh-token chain for the granted account and scopes; the access token's
     /// audience is the redeeming client. Both secrets are returned once.
-    pub fn redeem_authorization_code(
+    pub async fn redeem_authorization_code(
         &mut self,
         request: RedeemAuthorizationCode,
     ) -> Result<TokenGrant, AuthApiError> {
@@ -1703,14 +1713,16 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             },
         )?;
 
-        let (access_token, jti) = self.mint_access_with_jti(
-            request.issuer,
-            account_id.0.clone(),
-            audience,
-            request.issued_at,
-            request.access_expires_at,
-            scopes,
-        )?;
+        let (access_token, jti) = self
+            .mint_access_with_jti(
+                request.issuer,
+                account_id.0.clone(),
+                audience,
+                request.issued_at,
+                request.access_expires_at,
+                scopes,
+            )
+            .await?;
 
         self.audit.push(AuthAuditEvent::RefreshTokenIssued {
             account_id: account_id.clone(),
@@ -1734,7 +1746,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     }
 
     /// Mint a signed access token and return it alongside its minted `jti`.
-    fn mint_access_with_jti(
+    async fn mint_access_with_jti(
         &mut self,
         issuer: String,
         subject: String,
@@ -1753,7 +1765,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             jti: jti.clone(),
             scope: scopes,
         };
-        let token = self.tokens.mint(&claims)?;
+        let token = self.tokens.mint(&claims).await?;
         Ok((token, jti))
     }
 

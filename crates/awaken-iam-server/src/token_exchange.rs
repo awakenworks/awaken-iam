@@ -417,8 +417,8 @@ mod tests {
         registry
     }
 
-    fn assertion(authority: &AccessTokenAuthority, claims: &UpstreamClaims) -> String {
-        authority.sign_claims(claims).unwrap()
+    async fn assertion(authority: &AccessTokenAuthority, claims: &UpstreamClaims) -> String {
+        authority.sign_claims(claims).await.unwrap()
     }
 
     fn request(subject_token: String) -> TokenExchangeRequest {
@@ -442,11 +442,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn authorizes_a_trusted_assertion_to_its_bound_principal() {
+    #[tokio::test]
+    async fn authorizes_a_trusted_assertion_to_its_bound_principal() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
-        let token = assertion(&authority, &valid_claims());
+        let token = assertion(&authority, &valid_claims()).await;
 
         let (binding, verified) = registry.authorize(&request(token)).unwrap();
         assert_eq!(binding.service_id, "svc_ci_publisher");
@@ -455,50 +455,50 @@ mod tests {
         assert_eq!(verified.subject, "repo:acme/app:ref:refs/heads/main");
     }
 
-    #[test]
-    fn an_untrusted_issuer_fails_closed() {
+    #[tokio::test]
+    async fn an_untrusted_issuer_fails_closed() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
         let mut claims = valid_claims();
         claims.iss = "https://sts.evil.example".into();
-        let token = assertion(&authority, &claims);
+        let token = assertion(&authority, &claims).await;
 
         let err = registry.authorize(&request(token)).unwrap_err();
         assert_eq!(err, TokenExchangeError::UntrustedIssuer);
         assert_eq!(err.oauth_error_code(), "invalid_grant");
     }
 
-    #[test]
-    fn an_assertion_signed_by_an_unknown_key_fails_closed() {
+    #[tokio::test]
+    async fn an_assertion_signed_by_an_unknown_key_fails_closed() {
         let registry = registry(issuer_authority().jwks());
         // A forger signs a well-formed assertion with a different key.
         let forger = AccessTokenAuthority::new(LocalSeedSigner::new("ext-key-1", [1u8; 32]));
-        let token = assertion(&forger, &valid_claims());
+        let token = assertion(&forger, &valid_claims()).await;
 
         let err = registry.authorize(&request(token)).unwrap_err();
         assert_eq!(err, TokenExchangeError::InvalidSignature);
     }
 
-    #[test]
-    fn a_rejected_audience_fails_closed() {
+    #[tokio::test]
+    async fn a_rejected_audience_fails_closed() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
         let mut claims = valid_claims();
         claims.aud = "https://other.example".into();
-        let token = assertion(&authority, &claims);
+        let token = assertion(&authority, &claims).await;
 
         let err = registry.authorize(&request(token)).unwrap_err();
         assert_eq!(err, TokenExchangeError::AudienceRejected);
     }
 
-    #[test]
-    fn an_expired_or_not_yet_valid_assertion_fails_closed() {
+    #[tokio::test]
+    async fn an_expired_or_not_yet_valid_assertion_fails_closed() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
 
         let mut expired = valid_claims();
         expired.exp = 500; // now is 1_000
-        let token = assertion(&authority, &expired);
+        let token = assertion(&authority, &expired).await;
         assert_eq!(
             registry.authorize(&request(token)).unwrap_err(),
             TokenExchangeError::AssertionNotActive
@@ -506,20 +506,20 @@ mod tests {
 
         let mut future = valid_claims();
         future.nbf = Some(1_500); // now is 1_000
-        let token = assertion(&authority, &future);
+        let token = assertion(&authority, &future).await;
         assert_eq!(
             registry.authorize(&request(token)).unwrap_err(),
             TokenExchangeError::AssertionNotActive
         );
     }
 
-    #[test]
-    fn a_verified_subject_without_a_binding_fails_closed() {
+    #[tokio::test]
+    async fn a_verified_subject_without_a_binding_fails_closed() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
         let mut claims = valid_claims();
         claims.sub = "repo:acme/app:ref:refs/heads/feature".into();
-        let token = assertion(&authority, &claims);
+        let token = assertion(&authority, &claims).await;
 
         assert_eq!(
             registry.authorize(&request(token)).unwrap_err(),
@@ -527,11 +527,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unsupported_grant_or_subject_token_type_fails_closed() {
+    #[tokio::test]
+    async fn an_unsupported_grant_or_subject_token_type_fails_closed() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
-        let token = assertion(&authority, &valid_claims());
+        let token = assertion(&authority, &valid_claims()).await;
 
         let mut wrong_grant = request(token.clone());
         wrong_grant.grant_type = "authorization_code".into();
@@ -547,8 +547,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_disabled_issuer_is_not_trusted() {
+    #[tokio::test]
+    async fn a_disabled_issuer_is_not_trusted() {
         let authority = issuer_authority();
         let mut registry = registry(authority.jwks());
         registry.upsert(TrustedIssuer {
@@ -558,18 +558,18 @@ mod tests {
             bindings: vec![],
             enabled: false,
         });
-        let token = assertion(&authority, &valid_claims());
+        let token = assertion(&authority, &valid_claims()).await;
         assert_eq!(
             registry.authorize(&request(token)).unwrap_err(),
             TokenExchangeError::UntrustedIssuer
         );
     }
 
-    #[test]
-    fn a_requested_audience_must_match_the_binding() {
+    #[tokio::test]
+    async fn a_requested_audience_must_match_the_binding() {
         let authority = issuer_authority();
         let registry = registry(authority.jwks());
-        let token = assertion(&authority, &valid_claims());
+        let token = assertion(&authority, &valid_claims()).await;
         let mut req = request(token);
         req.audience = Some("other-service".into());
         let err = registry.authorize(&req).unwrap_err();

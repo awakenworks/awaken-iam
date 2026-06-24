@@ -23,6 +23,7 @@ ROOT_MD_ALLOWLIST = {
     "AGENTS.md",
     "CLAUDE.md",
     "NOTICE.md",
+    "RELEASING.md",
 }
 
 FORBIDDEN_STEMS = (
