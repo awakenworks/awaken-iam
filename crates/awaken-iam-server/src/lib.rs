@@ -12,6 +12,7 @@ mod op_id_token;
 mod session;
 mod store;
 mod token_exchange;
+mod upstream_http;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
@@ -50,6 +51,10 @@ pub use token_exchange::{
     SUBJECT_TOKEN_TYPE_ID_TOKEN, SUBJECT_TOKEN_TYPE_JWT, TOKEN_EXCHANGE_GRANT_TYPE,
     TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, TrustedIssuer,
     TrustedIssuerRegistry, WorkloadBinding,
+};
+pub use upstream_http::{
+    DEFAULT_GITHUB_API_BASE, DEFAULT_GITHUB_USER_AGENT, DEFAULT_TIMEOUT, ReqwestGithubTransport,
+    ReqwestHttpTransport,
 };
 
 use awaken_iam_client::IamClient;

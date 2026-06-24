@@ -86,6 +86,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "postgres",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
