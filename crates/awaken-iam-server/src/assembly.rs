@@ -184,6 +184,35 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::delete("/v1/admin/memberships"),
 ];
 
+/// The Anthropic-compatible Admin API surface (ADR-0008 decision 6).
+///
+/// These render the same one model the `/v1/admin/*` routes administer, but in
+/// the Anthropic Claude platform's shape: `/v1/organizations/...` paths and
+/// verbs, `x-api-key` / `Bearer org:admin` auth, typed object envelopes, cursor
+/// pagination, and prefixed ids. Member / workspace-member / API-key /
+/// service-account operations are [`RoleBinding`](crate::AnthropicAdminApi) edits
+/// over the policy PAP; federation issuers/rules project the trusted-issuer
+/// token-exchange model. Like [`ADMIN_ROUTES`] it is the console <-> daemon
+/// management seam, mounted only in the [`Standalone`](Deployment::Standalone)
+/// deployment.
+const ORG_ADMIN_ROUTES: &[RouteSpec] = &[
+    RouteSpec::get("/v1/organizations/users"),
+    RouteSpec::get("/v1/organizations/users/{user_id}"),
+    RouteSpec::post("/v1/organizations/users/{user_id}"),
+    RouteSpec::delete("/v1/organizations/users/{user_id}"),
+    RouteSpec::get("/v1/organizations/workspaces/{workspace_id}/members"),
+    RouteSpec::post("/v1/organizations/workspaces/{workspace_id}/members"),
+    RouteSpec::get("/v1/organizations/workspaces/{workspace_id}/members/{user_id}"),
+    RouteSpec::delete("/v1/organizations/workspaces/{workspace_id}/members/{user_id}"),
+    RouteSpec::get("/v1/organizations/api_keys"),
+    RouteSpec::post("/v1/organizations/api_keys/{api_key_id}"),
+    RouteSpec::get("/v1/organizations/service_accounts"),
+    RouteSpec::post("/v1/organizations/service_accounts"),
+    RouteSpec::delete("/v1/organizations/service_accounts/{service_account_id}"),
+    RouteSpec::get("/v1/organizations/federation_issuers"),
+    RouteSpec::get("/v1/organizations/federation_rules"),
+];
+
 /// The operational health probes the load balancer and orchestrator route on.
 ///
 /// Unversioned by convention (`/healthz`, `/readyz`) so probes are stable across
@@ -378,6 +407,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
             .collect();
         if self.deployment == Deployment::Standalone {
             routes.extend(ADMIN_ROUTES.iter().copied());
+            routes.extend(ORG_ADMIN_ROUTES.iter().copied());
         }
         routes.extend(OPS_ROUTES.iter().copied());
         routes
@@ -544,10 +574,11 @@ mod tests {
             embedded.store().plan(),
             "both deployments render the identical iam.* plan"
         );
-        // The daemon's manifest is the embedded surface plus the admin routes.
+        // The daemon's manifest is the embedded surface plus the admin and the
+        // Anthropic-compatible org-admin routes.
         assert_eq!(
             daemon.routes().len(),
-            embedded.routes().len() + ADMIN_ROUTES.len()
+            embedded.routes().len() + ADMIN_ROUTES.len() + ORG_ADMIN_ROUTES.len()
         );
         for spec in embedded.routes() {
             assert!(
@@ -639,6 +670,40 @@ mod tests {
                 .iter()
                 .all(|r| !r.path.starts_with("/v1/admin")),
             "embedded must not mount the admin seam over HTTP"
+        );
+    }
+
+    #[test]
+    fn standalone_mounts_the_anthropic_org_admin_surface() {
+        let embedded = IamAssembly::embedded(RecordingExecutor::new()).expect("embedded");
+        let daemon = IamDaemon::start(RecordingExecutor::new()).expect("daemon");
+        let standalone = daemon.routes();
+
+        // The Anthropic-compatible surface lives under /v1/organizations and is
+        // served only by the standalone daemon.
+        assert!(standalone.contains(&RouteSpec::get("/v1/organizations/users")));
+        assert!(standalone.contains(&RouteSpec::delete("/v1/organizations/users/{user_id}")));
+        assert!(standalone.contains(&RouteSpec::get(
+            "/v1/organizations/workspaces/{workspace_id}/members"
+        )));
+        assert!(standalone.contains(&RouteSpec::get("/v1/organizations/api_keys")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/organizations/service_accounts")));
+        assert!(standalone.contains(&RouteSpec::get("/v1/organizations/federation_issuers")));
+        assert!(standalone.contains(&RouteSpec::get("/v1/organizations/federation_rules")));
+        assert_eq!(
+            standalone
+                .iter()
+                .filter(|r| r.path.starts_with("/v1/organizations"))
+                .count(),
+            ORG_ADMIN_ROUTES.len()
+        );
+
+        assert!(
+            embedded
+                .routes()
+                .iter()
+                .all(|r| !r.path.starts_with("/v1/organizations")),
+            "embedded must not mount the org-admin surface over HTTP"
         );
     }
 
