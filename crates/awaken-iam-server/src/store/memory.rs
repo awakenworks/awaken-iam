@@ -990,6 +990,149 @@ mod tests {
     }
 
     #[test]
+    fn external_claims_update_requires_an_existing_link() {
+        let store = InMemoryStore::new();
+        // Updating claims for an unlinked identity fails closed.
+        assert!(matches!(
+            store.update_claims(external("e1", "a", "sub")),
+            Err(RepoError::NotFound(_))
+        ));
+        store.link(external("e1", "a", "sub")).unwrap();
+        let mut refreshed = external("e1", "a", "sub");
+        refreshed.claims.email = Some("ada@acme.example".into());
+        store.update_claims(refreshed).unwrap();
+        let key = ExternalIdentityKey {
+            provider_key: IdentityProviderKey("fake".into()),
+            subject: ExternalSubject("sub".into()),
+        };
+        assert_eq!(
+            store
+                .get_by_key(&key)
+                .unwrap()
+                .unwrap()
+                .claims
+                .email
+                .as_deref(),
+            Some("ada@acme.example")
+        );
+    }
+
+    #[test]
+    fn session_and_login_flow_reads_and_missing_updates() {
+        let store = InMemoryStore::new();
+        // Updating a session that was never created fails closed.
+        let session = Session {
+            id: SessionId("ghost".into()),
+            account_id: AccountId("a".into()),
+            token_hash: "h".into(),
+            external_identity_id: None,
+            created_at: ts("2026-06-19T00:00:00Z"),
+            last_seen_at: ts("2026-06-19T00:00:00Z"),
+            expires_at: ts("2026-06-20T00:00:00Z"),
+            revoked_at: None,
+        };
+        assert!(matches!(
+            SessionRepo::update(&store, session),
+            Err(RepoError::NotFound(_))
+        ));
+        assert_eq!(
+            SessionRepo::get(&store, &SessionId("ghost".into())).unwrap(),
+            None
+        );
+
+        // A login flow is resolvable by id through the standalone getter.
+        let flow = OAuthLoginState {
+            id: OAuthLoginStateId("l1".into()),
+            provider_key: IdentityProviderKey("fake".into()),
+            state_hash: "sh".into(),
+            nonce_hash: None,
+            pkce_verifier_hash: None,
+            return_to: None,
+            created_at: ts("2026-06-19T00:00:00Z"),
+            expires_at: ts("2026-06-19T00:10:00Z"),
+            consumed_at: None,
+        };
+        store.start(flow).unwrap();
+        assert!(
+            LoginFlowRepo::get(&store, &OAuthLoginStateId("l1".into()))
+                .unwrap()
+                .is_some()
+        );
+        // Consuming an unknown flow fails closed.
+        assert!(matches!(
+            store.mark_consumed(
+                &OAuthLoginStateId("absent".into()),
+                ts("2026-06-19T00:05:00Z")
+            ),
+            Err(RepoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn api_token_prefix_conflict_and_missing_update_fail_closed() {
+        let store = InMemoryStore::new();
+        let base = ApiToken {
+            id: ApiTokenId("tok_1".into()),
+            prefix: ApiTokenPrefix("pfx".into()),
+            principal: PrincipalRef::Service {
+                service_id: "ci".into(),
+            },
+            secret_hash: "$argon2id$hash".into(),
+            scope: Vec::new(),
+            created_at: ts("2026-06-19T00:00:00Z"),
+            expires_at: None,
+            revoked_at: None,
+        };
+        ApiTokenRepo::create(&store, base.clone()).unwrap();
+        // A distinct id that reuses an existing prefix is a conflict on its own.
+        let mut clashing = base.clone();
+        clashing.id = ApiTokenId("tok_2".into());
+        assert!(matches!(
+            ApiTokenRepo::create(&store, clashing),
+            Err(RepoError::Conflict(_))
+        ));
+        // Updating a token id that does not exist fails closed.
+        let mut ghost = base;
+        ghost.id = ApiTokenId("ghost".into());
+        assert!(matches!(
+            ApiTokenRepo::update(&store, ghost),
+            Err(RepoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resource_edges_and_plan_reads_round_trip() {
+        let store = InMemoryStore::new();
+        // The Debug projection redacts the contents.
+        assert!(format!("{store:?}").contains("InMemoryStore"));
+
+        let edge = ResourceEdge {
+            resource_type: awaken_iam_contract::ResourceType("pack".into()),
+            resource_id: awaken_iam_contract::ResourceId("r1".into()),
+            parent: ScopeRef::Org {
+                org_id: OrgId("acme".into()),
+            },
+        };
+        store.put_edge(edge).unwrap();
+        assert_eq!(ResourceModelRepo::list_edges(&store).unwrap().len(), 1);
+
+        PlanRepo::put(
+            &store,
+            Plan::new(PlanId("pro".into()), PlanTier::Pro, ["pack.read"]),
+        )
+        .unwrap();
+        assert!(
+            PlanRepo::get(&store, &PlanId("pro".into()))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            PlanRepo::get(&store, &PlanId("absent".into())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn audit_events_append_in_order() {
         let store = InMemoryStore::new();
         store
