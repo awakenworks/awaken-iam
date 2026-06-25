@@ -30,6 +30,8 @@ pre-commit:
     adr-immutability:
       glob: "docs/adr/*.md"
       run: python3 scripts/ci/check_adr_immutability.py --self-test && python3 scripts/ci/check_adr_immutability.py --staged
+    migrations:
+      run: python3 scripts/ci/check_migrations.py --self-test && python3 scripts/ci/check_migrations.py --staged
 
 pre-push:
   parallel: false
@@ -42,6 +44,8 @@ pre-push:
       run: python3 scripts/ci/check_file_length.py --self-test && python3 scripts/ci/check_file_length.py
     adr-immutability:
       run: python3 scripts/ci/check_adr_immutability.py --base origin/main
+    migrations:
+      run: python3 scripts/ci/check_migrations.py --self-test && python3 scripts/ci/check_migrations.py --audit
     test:
       run: cargo test --workspace
 

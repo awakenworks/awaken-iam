@@ -7,6 +7,7 @@
 //! database edge over the migration plan. See
 //! [deployment](../../../../docs/design/deployment.md).
 
+mod bundles;
 mod fence;
 mod health;
 mod memory;
@@ -15,12 +16,13 @@ mod postgres;
 mod sql;
 mod sqlite;
 
+pub use bundles::{BundleScope, bundles};
 pub use fence::{Fence, FenceStore};
 pub use health::{Liveness, Readiness};
 pub use memory::InMemoryStore;
 pub use migration::{
-    BundleScope, Dialect, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,
-    PlannedMigration, RecordingExecutor, bundles,
+    Dialect, IamStore, MigrateReport, Migration, MigrationBundle, MigrationExecutor,
+    PlannedMigration, RecordingExecutor,
 };
 pub use postgres::{PostgresBackend, migrated_store as postgres_migrated_store};
 pub use sql::{SqlConn, SqlParam, SqlRow, SqlStore};
