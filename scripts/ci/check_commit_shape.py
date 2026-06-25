@@ -5,7 +5,7 @@ Usage: check_commit_shape.py COMMIT_MSG_FILE
 
 Format: ``<emoji> <type>(<scope>): <subject>``
 - subject <= 100 chars
-- no AI-generation markers or Co-Authored-By trailers
+- no AI-generation markers, Co-Authored-By trailers, or external tool provenance (``via …``, ``Tool:``, ``Platform:``)
 - no project-management vocabulary
 """
 
@@ -36,6 +36,14 @@ FORBIDDEN_SUBSTRINGS = (
     "co-authored-by:",
     "generated with",
     "🤖",
+)
+
+# External tool / agent provenance markers, matched per line.
+EXTERNAL_TOOL_PATTERNS = (
+    re.compile(r"^via \[[^]]+\]\(https?://[^)]+\)$"),
+    re.compile(r"^via https?://"),
+    re.compile(r"^Tool: [A-Za-z0-9._-]+$"),
+    re.compile(r"^Platform: [A-Za-z0-9._-]+$"),
 )
 
 PM_TERMS = ("sprint", "phase ", "owner:", "assignee", "eta", "estimate")
@@ -72,6 +80,9 @@ def main(argv: list[str]) -> int:
     for token in FORBIDDEN_SUBSTRINGS:
         if token in lowered:
             errors.append(f"forbidden marker: {token!r}")
+    for line in content:
+        if any(pattern.match(line.strip()) for pattern in EXTERNAL_TOOL_PATTERNS):
+            errors.append(f"external tool provenance marker not allowed: {line.strip()!r}")
     for token in PM_TERMS:
         if token in lowered:
             errors.append(f"project-management term not allowed: {token!r}")
