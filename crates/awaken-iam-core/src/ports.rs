@@ -172,6 +172,21 @@ pub trait RoleRepo: Send + Sync {
     fn remove(&self, id: &RoleId) -> RepoResult<()>;
 }
 
+/// Seed (upsert) a set of role definitions into `repo`.
+///
+/// The product-neutral seeding *mechanism*: idempotently upsert each role so a
+/// deployment can call this on every boot without duplicating or drifting roles,
+/// and roles under other ids are untouched. The catalog itself — which roles
+/// carry which patterns — is policy the caller supplies; a preset pack such as
+/// `awaken-iam-preset` builds it, while the kernel only drives the loop and
+/// never names a product's roles.
+pub fn seed_roles(repo: &dyn RoleRepo, roles: impl IntoIterator<Item = RoleDef>) -> RepoResult<()> {
+    for role in roles {
+        repo.upsert(role)?;
+    }
+    Ok(())
+}
+
 /// Persistence for authorization [`Grant`] rows.
 pub trait GrantRepo: Send + Sync {
     /// Insert or replace a grant.

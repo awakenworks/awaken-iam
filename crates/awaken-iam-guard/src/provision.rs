@@ -22,7 +22,8 @@
 //! (or runs a co-located store) needs this function.
 
 use awaken_iam_contract::Timestamp;
-use awaken_iam_core::{RepoError, RoleRepo, seed_named_roles, seed_runtime_roles};
+use awaken_iam_core::{RepoError, RoleRepo};
+use awaken_iam_preset::{seed_named_roles, seed_runtime_roles};
 
 /// Error returned by [`provision`].
 #[derive(Debug, thiserror::Error)]

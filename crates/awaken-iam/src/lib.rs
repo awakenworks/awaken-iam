@@ -24,7 +24,7 @@ pub use awaken_iam_contract::{
     SignerKeyStatus, Timestamp, WorkspaceId,
 };
 pub use awaken_iam_core::{
-    ANTHROPIC_ROLE_IDS, AWAKEN_RUNTIME_NAMESPACES, AWAKEN_RUNTIME_ROLE_IDS, ActionPattern,
+    ActionPattern,
     AuditEvent, AuditLedger, AuditSink, AuthorizedGrant, BeginLogin, ConsumerNamespaces,
     DecisionTrace, DomainEvent, Effect, EntitlementCatalog, EntitlementEngine, EntitlementMode,
     EntitlementOutcome, EntitlementProvider, EntitlementReason, EntitlementResolver, EntropySource,
@@ -36,8 +36,13 @@ pub use awaken_iam_core::{
     PkceMethod, Plan, PlanId, PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient,
     RepoError, RepoResult, ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding, RoleDef,
     RoleId, SessionDirectory, SessionMinter, ShadowAuthorizer, ShadowOutcome, ShadowReport,
-    TokenRedemption, TrustError, action_namespace, apply_resource_provision, awaken_runtime,
-    hash_session_token, managed_agents, oversight, runtime_role_catalog, seed_named_roles,
+    TokenRedemption, TrustError, action_namespace, apply_resource_provision, hash_session_token,
+    seed_roles,
+};
+pub use awaken_iam_preset::{
+    ANTHROPIC_ROLE_IDS, AWAKEN_RUNTIME_NAMESPACES, AWAKEN_RUNTIME_ROLE_IDS,
+    MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES, ROLE_NAMESPACES, awaken_runtime,
+    managed_agents, named_role_catalog, oversight, runtime_role_catalog, seed_named_roles,
     seed_runtime_roles,
 };
 pub use awaken_iam_server::{

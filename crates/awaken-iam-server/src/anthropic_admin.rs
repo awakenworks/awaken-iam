@@ -944,7 +944,7 @@ where
 mod tests {
     use super::*;
     use crate::InMemoryStore;
-    use awaken_iam_core::seed_named_roles;
+    use awaken_iam_preset::seed_named_roles;
 
     fn at() -> Timestamp {
         Timestamp("2026-06-23T00:00:00Z".to_owned())

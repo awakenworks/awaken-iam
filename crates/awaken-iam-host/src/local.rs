@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_contract::{ApiTokenId, PrincipalRef, Timestamp, WorkspaceId};
 use awaken_iam_core::{
     ApiTokenDirectory, ApiTokenMinter, EntitlementEngine, IamError, IssuedApiToken, MintApiToken,
-    OsEntropy, RoleId, seed_named_roles, seed_runtime_roles,
+    OsEntropy, RoleId,
 };
+use awaken_iam_preset::{seed_named_roles, seed_runtime_roles};
 use awaken_iam_server::{
     AccessTokenAuthority, AuthzApi, LocalSeedSigner, SqliteBackend, sqlite_migrated_store,
 };

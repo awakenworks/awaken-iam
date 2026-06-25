@@ -18,7 +18,6 @@ mod provider;
 mod provision;
 mod refresh_token;
 mod resource_model;
-mod role_catalog;
 mod session;
 mod shadow;
 pub mod smoke;
@@ -34,10 +33,7 @@ pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
     GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
 };
-pub use consumer_namespace::{
-    AWAKEN_RUNTIME_NAMESPACES, ConsumerNamespaces, MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES,
-    action_namespace, awaken_runtime, managed_agents, oversight,
-};
+pub use consumer_namespace::{ConsumerNamespaces, action_namespace};
 pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
     EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
@@ -74,7 +70,7 @@ pub use oauth_provider::{
 pub use ports::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo,
     LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo,
-    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint,
+    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint, seed_roles,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
@@ -86,10 +82,6 @@ pub use refresh_token::{
     RotateRefreshToken, parse_presented_refresh_token,
 };
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
-pub use role_catalog::{
-    ANTHROPIC_ROLE_IDS, AWAKEN_RUNTIME_ROLE_IDS, ROLE_NAMESPACES, named_role_catalog,
-    runtime_role_catalog, seed_named_roles, seed_runtime_roles,
-};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, ShadowReport};
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};

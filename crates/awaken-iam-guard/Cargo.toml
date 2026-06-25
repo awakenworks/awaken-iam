@@ -12,6 +12,7 @@ description = "Framework-neutral resolve/authorize/provision guard for cross-pro
 [dependencies]
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
+awaken-iam-preset.workspace = true
 awaken-iam-client.workspace = true
 thiserror.workspace = true
 serde.workspace = true

@@ -12,6 +12,7 @@ description = "Assembly + auth middleware layer for embedding or connecting Awak
 [dependencies]
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
+awaken-iam-preset.workspace = true
 awaken-iam-client = { workspace = true, features = ["http"] }
 awaken-iam-server.workspace = true
 thiserror.workspace = true
