@@ -12,6 +12,14 @@ publish.workspace = true
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
 awaken-iam-client.workspace = true
+# The shared, scope-partitioned migration mechanism (bundles, checksums, the
+# plan() decision, dialect-token rendering, the fail-closed ledger fence). Only
+# the driver-agnostic pure core is used (default features): awaken-iam's own
+# backends drive it with their sync `postgres` / rusqlite 0.40 clients, whereas
+# the crate's optional `postgres`/`sqlite` runner shells target async sqlx and
+# rusqlite 0.32 — different driver generations, so the shells are deliberately
+# left off.
+awaken-scoped-migration = { git = "https://github.com/awakenworks/awaken-foundation.git", rev = "f90f6bcf6b2b2d98610dfc5dfdaa9f9c5ccd8494" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

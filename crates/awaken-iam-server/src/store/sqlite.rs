@@ -12,14 +12,20 @@
 //! for an in-memory database, whose schema would otherwise be invisible to a
 //! second connection.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, TransactionBehavior, params_from_iter};
 
+use awaken_scoped_migration::{
+    AppliedMigration, LEDGER_VERSION, MigrationBundle, check_ledger_version, plan,
+    render as render_ddl,
+};
+
 use awaken_iam_core::{RepoError, RepoResult};
 
-use super::migration::{Dialect, IamStore, MigrationExecutor, PlannedMigration};
+use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
 use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore};
 
 /// A SQLite connection usable as both a migration executor and a repository
@@ -95,6 +101,54 @@ fn values(params: &[SqlParam]) -> Vec<Value> {
         .collect()
 }
 
+impl SqliteBackend {
+    /// The per-prefix ledger and its companion version-marker table names.
+    fn ledger_tables(prefix: &str) -> (String, String) {
+        (
+            format!("{prefix}_schema_migrations"),
+            format!("{prefix}_schema_migrations_meta"),
+        )
+    }
+
+    /// Create the ledger and the version-marker table, seeding the marker exactly
+    /// once with [`LEDGER_VERSION`]. Mirrors the foundation SQLite shell so an IAM
+    /// ledger is identical in shape to any other consumer's.
+    fn ensure_ledger(conn: &Connection, prefix: &str) -> RepoResult<()> {
+        let (ledger, meta) = Self::ledger_tables(prefix);
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {ledger} (\
+             bundle_id TEXT NOT NULL, \
+             version INTEGER NOT NULL, \
+             checksum TEXT NOT NULL, \
+             description TEXT NOT NULL, \
+             applied_at TEXT NOT NULL DEFAULT (datetime('now')), \
+             applied_by TEXT NOT NULL, \
+             PRIMARY KEY (bundle_id, version))"
+        ))
+        .map_err(backend_err)?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {meta} (ledger_version INTEGER NOT NULL)"
+        ))
+        .map_err(backend_err)?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {meta} (ledger_version) \
+                 SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM {meta})"
+            ),
+            params_from_iter([Value::Integer(LEDGER_VERSION)]),
+        )
+        .map_err(backend_err)?;
+        let found: i64 = conn
+            .query_row(
+                &format!("SELECT ledger_version FROM {meta} LIMIT 1"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend_err)?;
+        check_ledger_version(&ledger, found).map_err(migration_err)
+    }
+}
+
 impl SqlConn for SqliteBackend {
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
@@ -134,50 +188,90 @@ impl MigrationExecutor for SqliteBackend {
         Dialect::Sqlite
     }
 
-    fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(ledger_ddl).map_err(backend_err)
-    }
-
-    fn recorded_checksum(
-        &self,
-        ledger: &str,
-        bundle: &str,
-        id: &str,
-    ) -> RepoResult<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!("SELECT checksum FROM {ledger} WHERE bundle = ? AND id = ?");
-        let mut stmt = conn.prepare(&sql).map_err(backend_err)?;
-        let mut rows = stmt
-            .query(params_from_iter([
-                Value::Text(bundle.to_owned()),
-                Value::Text(id.to_owned()),
-            ]))
-            .map_err(backend_err)?;
-        match rows.next().map_err(backend_err)? {
-            Some(row) => Ok(Some(row.get::<usize, String>(0).map_err(backend_err)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn apply(&mut self, ledger: &str, migration: &PlannedMigration) -> RepoResult<()> {
+    fn run_migrations(
+        &mut self,
+        prefix: &str,
+        bundles: &[MigrationBundle],
+    ) -> RepoResult<Vec<AppliedMigration>> {
+        let dialect = Dialect::Sqlite;
+        let (ledger, _meta) = Self::ledger_tables(prefix);
         let mut conn = self.conn.lock().unwrap();
-        // BEGIN IMMEDIATE reserves the single writer up front — SQLite's
-        // single-applier guard (ADR-0003): a competing applier blocks here rather
-        // than racing the DDL.
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend_err)?;
-        tx.execute_batch(&migration.sql).map_err(backend_err)?;
-        tx.execute(
-            &format!("INSERT INTO {ledger} (bundle, id, checksum) VALUES (?, ?, ?)"),
-            params_from_iter([
-                Value::Text(migration.bundle.to_owned()),
-                Value::Text(migration.id.to_owned()),
-                Value::Text(migration.checksum.clone()),
-            ]),
-        )
-        .map_err(backend_err)?;
-        tx.commit().map_err(backend_err)
+        Self::ensure_ledger(&conn, prefix)?;
+
+        let mut applied = Vec::new();
+        for bundle in bundles {
+            // BEGIN IMMEDIATE reserves the single writer up front — SQLite's
+            // single-applier guard (ADR-0003): it takes the write lock before the
+            // ledger is read, so a competing applier blocks here rather than racing
+            // the DDL, then verifies. Commit/rollback releases it on every path.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend_err)?;
+
+            let recorded = read_applied(&tx, &ledger, bundle.bundle_id())?;
+            let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+            for migration in pending {
+                let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
+                tx.execute_batch(&sql).map_err(backend_err)?;
+                let checksum = migration.checksum_for(dialect);
+                let description = migration.ledger_description();
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {ledger} \
+                         (bundle_id, version, checksum, description, applied_by) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)"
+                    ),
+                    rusqlite::params![
+                        bundle.bundle_id(),
+                        migration.version(),
+                        checksum,
+                        description,
+                        "awaken-iam",
+                    ],
+                )
+                .map_err(backend_err)?;
+                applied.push(AppliedMigration {
+                    bundle_id: bundle.bundle_id().to_owned(),
+                    version: migration.version(),
+                    checksum,
+                    description,
+                });
+            }
+            tx.commit().map_err(backend_err)?;
+        }
+        Ok(applied)
     }
+
+    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
+        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let conn = self.conn.lock().unwrap();
+        read_applied(&conn, &ledger, bundle_id)
+    }
+}
+
+/// Read the recorded `(version -> checksum)` map for `bundle_id`. Works over a
+/// plain connection or an open transaction (both deref to `&Connection`), so the
+/// apply path reads under its `BEGIN IMMEDIATE` guard and readiness reads outside
+/// one.
+fn read_applied(
+    conn: &Connection,
+    ledger: &str,
+    bundle_id: &str,
+) -> RepoResult<BTreeMap<i64, String>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT version, checksum FROM {ledger} WHERE bundle_id = ?1 ORDER BY version"
+        ))
+        .map_err(backend_err)?;
+    let rows = stmt
+        .query_map([bundle_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(backend_err)?;
+    let mut applied = BTreeMap::new();
+    for row in rows {
+        let (version, checksum) = row.map_err(backend_err)?;
+        applied.insert(version, checksum);
+    }
+    Ok(applied)
 }

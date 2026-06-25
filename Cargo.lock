@@ -86,6 +86,7 @@ dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
  "awaken-iam-core",
+ "awaken-scoped-migration",
  "axum",
  "base64",
  "ed25519-dalek",
@@ -98,6 +99,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "awaken-scoped-migration"
+version = "0.1.0-dev"
+source = "git+https://github.com/awakenworks/awaken-foundation.git?rev=f90f6bcf6b2b2d98610dfc5dfdaa9f9c5ccd8494#f90f6bcf6b2b2d98610dfc5dfdaa9f9c5ccd8494"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror",
 ]
 
 [[package]]

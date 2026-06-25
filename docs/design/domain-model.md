@@ -105,7 +105,7 @@ Ports the core declares (the server provides adapters): `AccountRepo`,
 `RoleRepo`, `GrantRepo`, `MembershipRepo`, `NamespaceRepo`, `PlanRepo`,
 `SubscriptionRepo`, `ResourceModelRepo`, `AuditSink`. An in-memory adapter backs
 tests and local mode; a database adapter backs the service. The database adapter
-owns IAM's schema as scope-partitioned `awaken-sql-migration` bundles — the
+owns IAM's schema as scope-partitioned `awaken-scoped-migration` bundles — the
 discipline that lets IAM deploy embedded or standalone. See
 [deployment](deployment.md).
 

@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn assembling_over_a_drifted_ledger_fails_closed() {
         let mut executor = RecordingExecutor::new();
-        executor.force_checksum("iam.identity", "0001_identity", "deadbeef");
+        executor.force_checksum("iam.identity", 1, "deadbeef");
         let result = IamAssembly::embedded(executor);
         assert!(result.is_err(), "drift must abort assembly, not be skipped");
     }

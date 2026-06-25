@@ -53,3 +53,7 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# awaken-foundation hosts the shared, proven foundation-tier crates (here:
+# awaken-scoped-migration). It is a first-party AwakenWorks source, pinned by rev
+# in the consuming crate's manifest, so allow-list it explicitly past unknown-git.
+allow-git = ["https://github.com/awakenworks/awaken-foundation"]
