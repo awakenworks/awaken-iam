@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true
+awaken-iam-preset.workspace = true
 awaken-iam-client.workspace = true
 # The shared, scope-partitioned migration mechanism (bundles, checksums, the
 # plan() decision, dialect-token rendering, the fail-closed ledger fence). Only

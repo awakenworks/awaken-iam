@@ -1,25 +1,27 @@
 //! Seeded named role catalog (ADR-0008 decision 2).
 //!
-//! Ships a product-agnostic catalog of [`RoleDef`]s whose ids are the Anthropic
-//! Claude platform role names and whose action patterns encode each role's
+//! Ships the Anthropic Claude platform's catalog of [`RoleDef`]s whose ids are
+//! the platform role names and whose action patterns encode each role's
 //! authority — `developer ⇒ apikey.*`, `billing ⇒ billing.*`, and so on. The
-//! catalog is **seed data, not engine code** (ADR-0002 #3): the kernel stays
-//! neutral, the names live here as data, and a deployment may extend the catalog
-//! with custom roles after seeding.
+//! catalog is **seed data, not engine code** (ADR-0002 #3): the kernel in
+//! [`awaken_iam_core`] stays neutral, the names live here as data, and a
+//! deployment may extend the catalog with custom roles after seeding.
 //!
 //! Anthropic's two-level role inheritance is not modelled here — it falls out of
-//! [`ScopeGraph::covers`](crate::ScopeGraph) at evaluation, where an `Org`-scoped
-//! [`RoleBinding`](crate::RoleBinding) is held at every workspace beneath it. This
-//! module only supplies the *grant sets*; the binding scope decides reach.
+//! [`ScopeGraph::covers`](awaken_iam_core::ScopeGraph) at evaluation, where an
+//! `Org`-scoped [`RoleBinding`](awaken_iam_core::RoleBinding) is held at every
+//! workspace beneath it. This module only supplies the *grant sets*; the binding
+//! scope decides reach.
 //!
 //! The model forbids a [`RoleDef`] from carrying the catch-all `*` pattern
-//! ([`RoleDef::validate`]), so the org `admin` role is seeded as the union of
-//! every namespace the catalog touches rather than a literal `*` — it is a
-//! superuser over the seeded action surface without a hidden global wildcard.
+//! ([`RoleDef::validate`](awaken_iam_core::RoleDef)), so the org `admin` role is
+//! seeded as the union of every namespace the catalog touches rather than a
+//! literal `*` — it is a superuser over the seeded action surface without a
+//! hidden global wildcard.
 
 use awaken_iam_contract::Timestamp;
 
-use crate::{ActionPattern, RepoResult, RoleDef, RoleId, RoleRepo};
+use awaken_iam_core::{ActionPattern, RepoResult, RoleDef, RoleId, RoleRepo, seed_roles};
 
 /// Action-key namespaces the seeded catalog grants authority over.
 ///
@@ -149,8 +151,8 @@ const SEED_ROLES: &[SeedRole] = &[
 ///
 /// The result is pure data — ordered as [`ANTHROPIC_ROLE_IDS`] — that a
 /// deployment loads into its [`RoleRepo`] (see [`seed_named_roles`]). Every role
-/// satisfies [`RoleDef::validate`]: each carries at least one pattern and none
-/// carries the catch-all `*`.
+/// satisfies [`RoleDef::validate`](awaken_iam_core::RoleDef): each carries at
+/// least one pattern and none carries the catch-all `*`.
 pub fn named_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
     SEED_ROLES
         .iter()
@@ -172,12 +174,11 @@ pub fn named_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
 ///
 /// Idempotent: re-seeding overwrites each role in place, so a deployment can call
 /// this on every boot without duplicating or drifting roles. Custom roles a
-/// deployment adds under other ids are untouched.
+/// deployment adds under other ids are untouched. The upsert loop itself is the
+/// kernel's product-neutral [`seed_roles`] mechanism; this function only chooses
+/// the Anthropic catalog as its policy input.
 pub fn seed_named_roles(repo: &dyn RoleRepo, now: &Timestamp) -> RepoResult<()> {
-    for role in named_role_catalog(now) {
-        repo.upsert(role)?;
-    }
-    Ok(())
+    seed_roles(repo, named_role_catalog(now))
 }
 
 #[cfg(test)]
@@ -269,14 +270,13 @@ mod tests {
     #[test]
     fn seeding_a_repo_is_idempotent_and_loads_every_role() {
         // A minimal in-memory RoleRepo to exercise the loader without the server.
-        use crate::RoleId as Id;
         use std::collections::BTreeMap;
         use std::sync::Mutex;
 
         #[derive(Default)]
         struct MemRoles(Mutex<BTreeMap<String, RoleDef>>);
         impl RoleRepo for MemRoles {
-            fn get(&self, id: &Id) -> RepoResult<Option<RoleDef>> {
+            fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
                 Ok(self.0.lock().unwrap().get(&id.0).cloned())
             }
             fn upsert(&self, role: RoleDef) -> RepoResult<()> {
@@ -286,7 +286,7 @@ mod tests {
             fn list(&self) -> RepoResult<Vec<RoleDef>> {
                 Ok(self.0.lock().unwrap().values().cloned().collect())
             }
-            fn remove(&self, id: &Id) -> RepoResult<()> {
+            fn remove(&self, id: &RoleId) -> RepoResult<()> {
                 self.0.lock().unwrap().remove(&id.0);
                 Ok(())
             }
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(repo.list().unwrap().len(), ANTHROPIC_ROLE_IDS.len());
 
         for id in ANTHROPIC_ROLE_IDS {
-            assert!(repo.get(&Id(id.to_owned())).unwrap().is_some());
+            assert!(repo.get(&RoleId(id.to_owned())).unwrap().is_some());
         }
     }
 }

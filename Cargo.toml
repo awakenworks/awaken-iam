@@ -4,6 +4,7 @@ members = [
     "crates/awaken-iam",
     "crates/awaken-iam-contract",
     "crates/awaken-iam-core",
+    "crates/awaken-iam-preset",
     "crates/awaken-iam-client",
     "crates/awaken-iam-server",
     "xtask",
@@ -22,6 +23,7 @@ publish = false
 awaken-iam = { path = "crates/awaken-iam", version = "0.1.0-dev" }
 awaken-iam-contract = { path = "crates/awaken-iam-contract", version = "0.1.0-dev" }
 awaken-iam-core = { path = "crates/awaken-iam-core", version = "0.1.0-dev" }
+awaken-iam-preset = { path = "crates/awaken-iam-preset", version = "0.1.0-dev" }
 awaken-iam-client = { path = "crates/awaken-iam-client", version = "0.1.0-dev" }
 awaken-iam-server = { path = "crates/awaken-iam-server", version = "0.1.0-dev" }
 

@@ -11,26 +11,20 @@
 //! `Org` scope), and is confined to one by a narrower role — a *binding* choice,
 //! never a second config.
 //!
-//! This module is the **convention as data** (matching the role-catalog seed,
-//! ADR-0002 #3): the kernel stays neutral and pattern matching is unchanged. A
-//! [`ConsumerNamespaces`] names the namespaces a product owns and offers the two
-//! operations the convention needs — render the grant set that reaches the whole
-//! product surface ([`ConsumerNamespaces::glob_patterns`]) and check that a
-//! registered model keeps its actions inside that surface
-//! ([`ConsumerNamespaces::confines`]).
+//! This module is the **product-neutral mechanism** (matching the role-catalog
+//! split, ADR-0002 #3): the kernel stays neutral and pattern matching is
+//! unchanged. A [`ConsumerNamespaces`] names the namespaces a product owns and
+//! offers the two operations the convention needs — render the grant set that
+//! reaches the whole product surface ([`ConsumerNamespaces::glob_patterns`]) and
+//! check that a registered model keeps its actions inside that surface
+//! ([`ConsumerNamespaces::confines`]). The specific ADR-named consumers
+//! (`managed_agents`, `oversight`) live in the `awaken-iam-preset` crate as
+//! policy data, declared through this same mechanism.
 
 use awaken_iam_contract::ActionKey;
 
 use crate::ActionPattern;
 use crate::resource_model::ResourceModel;
-
-/// Action-key namespace the managed-agents consumer owns.
-pub const MANAGED_AGENTS_NAMESPACES: [&str; 1] = ["agent"];
-
-/// Action-key namespaces the Oversight consumer owns.
-///
-/// Sorted, so it lines up with [`ConsumerNamespaces::namespaces`].
-pub const OVERSIGHT_NAMESPACES: [&str; 2] = ["issue", "oversight"];
 
 /// The namespace (leading dotted segment) of an action key.
 ///
@@ -46,9 +40,10 @@ pub fn action_namespace(action: &ActionKey) -> &str {
 
 /// A consumer's declared action-key namespaces — the product surface it owns.
 ///
-/// Construct one for a product (or use [`managed_agents`] / [`oversight`] for the
-/// two ADR-named consumers) and use it to render the product's grant set or to
-/// assert a registered [`ResourceModel`] stays within the product's surface.
+/// Construct one for a product (the `awaken-iam-preset` crate ships the two
+/// ADR-named consumers, `managed_agents` and `oversight`, built this way) and
+/// use it to render the product's grant set or to assert a registered
+/// [`ResourceModel`] stays within the product's surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerNamespaces {
     consumer: String,
@@ -135,21 +130,18 @@ impl ConsumerNamespaces {
     }
 }
 
-/// The managed-agents consumer convention: the `agent.*` namespace.
-pub fn managed_agents() -> ConsumerNamespaces {
-    ConsumerNamespaces::new("managed-agents", MANAGED_AGENTS_NAMESPACES)
-}
-
-/// The Oversight consumer convention: the `oversight.*` and `issue.*` namespaces.
-pub fn oversight() -> ConsumerNamespaces {
-    ConsumerNamespaces::new("oversight", OVERSIGHT_NAMESPACES)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resource_model::ResourceTypeDef;
     use awaken_iam_contract::ResourceType;
+
+    /// A throwaway two-namespace consumer, standing in for any product that
+    /// declares its surface through this mechanism (the named Anthropic
+    /// consumers are tested in `awaken-iam-preset`).
+    fn sample() -> ConsumerNamespaces {
+        ConsumerNamespaces::new("sample", ["beta", "alpha"])
+    }
 
     #[test]
     fn action_namespace_is_the_leading_segment() {
@@ -163,78 +155,38 @@ mod tests {
     }
 
     #[test]
-    fn the_named_consumers_own_their_adr_namespaces() {
-        let agents = managed_agents();
-        assert_eq!(agents.namespaces(), ["agent"]);
-        assert!(agents.owns_action(&ActionKey("agent.run".into())));
-        assert!(!agents.owns_action(&ActionKey("oversight.approval.grant".into())));
-
-        let oversight = oversight();
-        // Sorted, de-duplicated: issue before oversight.
-        assert_eq!(oversight.namespaces(), ["issue", "oversight"]);
-        assert!(oversight.owns_action(&ActionKey("issue.advance".into())));
-        assert!(oversight.owns_action(&ActionKey("oversight.approval.grant".into())));
-        assert!(!oversight.owns_action(&ActionKey("agent.run".into())));
-    }
-
-    #[test]
     fn declarations_normalize_to_a_stable_set() {
         // Input order and duplicates do not change the declared set.
-        let one = ConsumerNamespaces::new("oversight", ["oversight", "issue", "issue"]);
-        let two = ConsumerNamespaces::new("oversight", ["issue", "oversight"]);
+        let one = ConsumerNamespaces::new("sample", ["beta", "alpha", "alpha"]);
+        let two = ConsumerNamespaces::new("sample", ["alpha", "beta"]);
         assert_eq!(one, two);
-        assert_eq!(one.namespaces(), ["issue", "oversight"]);
+        assert_eq!(one.namespaces(), ["alpha", "beta"]);
     }
 
     #[test]
-    fn glob_patterns_render_one_glob_per_namespace() {
+    fn glob_patterns_render_one_sorted_glob_per_namespace() {
         assert_eq!(
-            managed_agents().glob_patterns(),
-            vec![ActionPattern("agent.*".into())]
-        );
-        assert_eq!(
-            oversight().glob_patterns(),
+            sample().glob_patterns(),
             vec![
-                ActionPattern("issue.*".into()),
-                ActionPattern("oversight.*".into()),
+                ActionPattern("alpha.*".into()),
+                ActionPattern("beta.*".into()),
             ]
         );
         // A glob reaches the product's whole surface, including the bare key.
-        let glob = &managed_agents().glob_patterns()[0];
-        assert!(glob.matches(&ActionKey("agent".into())));
-        assert!(glob.matches(&ActionKey("agent.run".into())));
-        assert!(!glob.matches(&ActionKey("oversight.read".into())));
+        let glob = &sample().glob_patterns()[0];
+        assert!(glob.matches(&ActionKey("alpha".into())));
+        assert!(glob.matches(&ActionKey("alpha.run".into())));
+        assert!(!glob.matches(&ActionKey("beta.read".into())));
     }
 
-    #[test]
-    fn a_cross_product_role_carries_both_namespace_globs() {
-        // Decision 8's cross-product key: one role whose grants cross both
-        // namespaces is just the union of the two consumers' glob sets.
-        let mut crossing: Vec<ActionPattern> = managed_agents().glob_patterns();
-        crossing.extend(oversight().glob_patterns());
-        assert!(crossing.contains(&ActionPattern("agent.*".into())));
-        assert!(crossing.contains(&ActionPattern("oversight.*".into())));
-        assert!(crossing.contains(&ActionPattern("issue.*".into())));
-        // Every action either product registers is reached by some pattern;
-        // a foreign namespace is reached by none (default-deny holds).
-        let reaches = |action: &str| {
-            let key = ActionKey(action.into());
-            crossing.iter().any(|pattern| pattern.matches(&key))
-        };
-        assert!(reaches("agent.run"));
-        assert!(reaches("oversight.approval.grant"));
-        assert!(reaches("issue.advance"));
-        assert!(!reaches("pack.publish"));
-    }
-
-    fn agent_model() -> ResourceModel {
+    fn alpha_model() -> ResourceModel {
         let mut model = ResourceModel::new();
         model.register_resource_type(ResourceTypeDef {
-            resource_type: ResourceType("agent".into()),
+            resource_type: ResourceType("alpha".into()),
             parent_type: None,
             actions: vec![
-                ActionKey("agent.run".into()),
-                ActionKey("agent.configure".into()),
+                ActionKey("alpha.run".into()),
+                ActionKey("alpha.configure".into()),
             ],
         });
         model
@@ -242,21 +194,20 @@ mod tests {
 
     #[test]
     fn confines_accepts_a_model_inside_the_product_surface() {
-        assert_eq!(managed_agents().confines(&agent_model()), Ok(()));
-        assert!(managed_agents().foreign_actions(&agent_model()).is_empty());
+        assert_eq!(sample().confines(&alpha_model()), Ok(()));
+        assert!(sample().foreign_actions(&alpha_model()).is_empty());
     }
 
     #[test]
     fn confines_reports_an_action_that_leaked_into_a_sibling_surface() {
-        let mut model = agent_model();
-        // A stray Oversight action registered under the managed-agents model.
-        model.register_action(ActionKey("oversight.approval.grant".into()));
+        let mut model = alpha_model();
+        // A stray action outside the consumer's declared namespaces.
+        model.register_action(ActionKey("gamma.approve".into()));
 
         assert_eq!(
-            managed_agents().confines(&model),
-            Err(vec![ActionKey("oversight.approval.grant".into())])
+            sample().confines(&model),
+            Err(vec![ActionKey("gamma.approve".into())])
         );
-        // The Oversight consumer would, of course, accept it.
-        assert!(oversight().owns_action(&ActionKey("oversight.approval.grant".into())));
+        assert!(!sample().owns_action(&ActionKey("gamma.approve".into())));
     }
 }

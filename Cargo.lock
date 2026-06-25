@@ -38,6 +38,7 @@ dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
  "awaken-iam-core",
+ "awaken-iam-preset",
  "awaken-iam-server",
  "tokio",
 ]
@@ -79,6 +80,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "awaken-iam-preset"
+version = "0.1.0-dev"
+dependencies = [
+ "awaken-iam-contract",
+ "awaken-iam-core",
+]
+
+[[package]]
 name = "awaken-iam-server"
 version = "0.1.0-dev"
 dependencies = [
@@ -86,6 +95,7 @@ dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
  "awaken-iam-core",
+ "awaken-iam-preset",
  "awaken-scoped-migration",
  "axum",
  "base64",

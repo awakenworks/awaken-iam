@@ -42,7 +42,8 @@
 //! verification or subject-pattern matching without a wire break.
 
 use awaken_iam_contract::{Jwks, PrincipalRef, ScopeRef, WorkspaceId};
-use awaken_iam_core::{ANTHROPIC_ROLE_IDS, RoleBinding, RoleId};
+use awaken_iam_core::{RoleBinding, RoleId};
+use awaken_iam_preset::ANTHROPIC_ROLE_IDS;
 use serde::Deserialize;
 
 use crate::access_token::{AccessTokenError, decode_unverified_claims, verify_signed_claims};

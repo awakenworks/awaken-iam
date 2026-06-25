@@ -35,7 +35,11 @@ pub use awaken_iam_core::{
     RateWindow, RegisteredClient, ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding,
     RoleId, SessionDirectory, SessionMinter, ShadowAuthorizer, ShadowOutcome, ShadowReport,
     TokenRedemption, TrustError, action_namespace, apply_resource_provision, hash_session_token,
-    managed_agents, oversight,
+    seed_roles,
+};
+pub use awaken_iam_preset::{
+    ANTHROPIC_ROLE_IDS, MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES, ROLE_NAMESPACES,
+    managed_agents, named_role_catalog, oversight, seed_named_roles,
 };
 pub use awaken_iam_server::{
     AccessTokenAuthority, AccessTokenError, AttenuateCapability, AuthApi, AuthApiError,
