@@ -191,10 +191,10 @@ fn both_deployments_mount_the_shared_v1_surface() {
 #[test]
 fn a_drifted_ledger_aborts_assembly_in_both_modes() {
     let mut embedded_executor = RecordingExecutor::new();
-    embedded_executor.force_checksum("iam.authz", "0001_authz", "deadbeef");
+    embedded_executor.force_checksum("iam.authz", 1, "deadbeef");
     assert!(IamAssembly::embedded(embedded_executor).is_err());
 
     let mut standalone_executor = RecordingExecutor::new();
-    standalone_executor.force_checksum("iam.authz", "0001_authz", "deadbeef");
+    standalone_executor.force_checksum("iam.authz", 1, "deadbeef");
     assert!(IamDaemon::start(standalone_executor).is_err());
 }

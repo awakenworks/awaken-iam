@@ -1,13 +1,19 @@
 //! Scope-partitioned, self-contained schema migration bundles.
 //!
 //! IAM owns its schema as append-only, checksum-verified migration bundles, one
-//! per subdomain scope, adopting the `awaken-sql-migration` pattern. Two rules
-//! keep the bundles split-or-aggregate safe (see
+//! per subdomain scope. The bundle/checksum/plan **mechanism** is the shared
+//! [`awaken-scoped-migration`](awaken_scoped_migration) foundation crate; this
+//! module only declares IAM's bundles and the thin per-backend glue that drives
+//! the crate's pure core against IAM's own database drivers. Two rules keep the
+//! bundles split-or-aggregate safe (see
 //! [deployment](../../../../docs/design/deployment.md)):
 //!
 //! 1. No bundle hard-couples to another bundle; bundles version independently.
 //! 2. No cross-component foreign key. References *between* IAM subdomains are by
 //!    id resolved in the domain, never a DB-level FK across bundles.
+//!
+//! Both are enforced by [`awaken_scoped_migration::lint`] over [`bundles`] (see
+//! the test below), not by hand.
 //!
 //! The store is constructed with a table prefix —
 //! [`IamStore::with_prefix`]`(pool, "iam")` yields `iam_accounts`,
@@ -17,73 +23,39 @@
 //! database) from one codebase. The pool itself is supplied by the host through
 //! a [`MigrationExecutor`]; this module is pool-agnostic so the core stays
 //! storage-free and each backend executor (Postgres, SQLite) is a thin edge
-//! adapter over the plan.
+//! adapter over the foundation crate's [`plan`](awaken_scoped_migration::plan).
 //!
-//! DDL is authored **dialect-neutral**: a step's template uses the prefix token
-//! and a small portable type-token vocabulary (e.g. `{json}`, `{timestamptz}`,
-//! `{blob}`), which the backend executor renders to that dialect alongside the
-//! prefix; a step that cannot be expressed neutrally may carry a per-dialect
-//! override. See [ADR-0003](../../../../docs/adr/0003-storage-backends.md).
+//! DDL is authored **dialect-neutral** using the foundation crate's portable
+//! token vocabulary (`{prefix}`, `{json}`, `{timestamptz}`, `{now}`, `{blob}`,
+//! `{pk_autoinc}`), which each backend renders to its dialect via
+//! [`awaken_scoped_migration::render`] alongside the prefix. See
+//! [ADR-0003](../../../../docs/adr/0003-storage-backends.md).
+//!
+//! ## Why the foundation crate's *core* and not its runner shells
+//!
+//! `awaken-scoped-migration` ships optional `postgres` (async `sqlx`) and
+//! `sqlite` (`rusqlite` 0.32) runner shells. IAM's backends use the *synchronous*
+//! `postgres` client and `rusqlite` 0.40 — different driver generations — so IAM
+//! depends on the crate with **default features** (the driver-agnostic pure core)
+//! and writes its own thin shells here, exactly mirroring the pattern the crate's
+//! own shells follow.
 
-use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use awaken_iam_core::{RepoError, RepoResult};
 
-/// The token every bundle's DDL uses where the configured table prefix belongs.
-const PREFIX_TOKEN: &str = "{prefix}";
+pub use awaken_scoped_migration::{
+    AppliedMigration, Dialect, Migration, MigrationBundle, MigrationError,
+};
+use awaken_scoped_migration::{plan as plan_bundle, render, sql_identifier};
 
-/// Portable type-token vocabulary (ADR-0003).
+/// Map a foundation [`MigrationError`] onto the IAM repository error taxonomy.
 ///
-/// Each row is `(token, postgres, sqlite)`. A bundle's DDL is authored
-/// dialect-neutral using these tokens wherever a backend-specific column type or
-/// function belongs; the active backend's [`Dialect`] renders each to its
-/// concrete form alongside the table prefix. Only tokens actually used by the
-/// shipped bundles need a row, but the set is kept small and stable so adding a
-/// backend is a column in this table, not a schema rewrite.
-const TYPE_TOKENS: &[(&str, &str, &str)] = &[
-    ("{json}", "JSONB", "TEXT"),
-    ("{timestamptz}", "TIMESTAMPTZ", "TEXT"),
-    ("{now}", "now()", "CURRENT_TIMESTAMP"),
-    ("{blob}", "BYTEA", "BLOB"),
-    (
-        "{pk_autoinc}",
-        "BIGSERIAL PRIMARY KEY",
-        "INTEGER PRIMARY KEY AUTOINCREMENT",
-    ),
-];
-
-/// Ledger DDL template, rendered per dialect like any bundle step.
-const LEDGER_TEMPLATE: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_schema_migrations (\
- bundle TEXT NOT NULL, \
- id TEXT NOT NULL, \
- checksum TEXT NOT NULL, \
- applied_at {timestamptz} NOT NULL DEFAULT {now}, \
- PRIMARY KEY (bundle, id))";
-
-/// SQL backend a deployment renders and applies the migration plan against.
-///
-/// The backend choice is configuration, not a code fork (see
-/// [ADR-0003](../../../../docs/adr/0003-storage-backends.md)): the same bundles,
-/// ledger discipline, and `MigrationExecutor` seam drive either, and only the
-/// dialect-token rendering and the single-applier guard differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Dialect {
-    /// PostgreSQL — the standalone / cloud / multi-node HA backend.
-    #[default]
-    Postgres,
-    /// SQLite — the embedded / local / single-node backend.
-    Sqlite,
-}
-
-impl Dialect {
-    /// Render a single type token to this dialect's concrete form.
-    fn render_token(self, postgres: &'static str, sqlite: &'static str) -> &'static str {
-        match self {
-            Dialect::Postgres => postgres,
-            Dialect::Sqlite => sqlite,
-        }
-    }
+/// The whole migration mechanism reports through one error type; at the IAM edge
+/// every variant is an opaque backend failure (a drifted checksum, an unreachable
+/// ledger, an invalid prefix), surfaced verbatim so the cause is preserved.
+pub(crate) fn migration_err(err: MigrationError) -> RepoError {
+    RepoError::Backend(err.to_string())
 }
 
 /// Component-scope partition a migration bundle belongs to.
@@ -126,87 +98,144 @@ impl BundleScope {
     }
 }
 
-/// A single append-only DDL step within a bundle.
+/// The canonical IAM migration bundles, one per subdomain scope, built on the
+/// shared [`MigrationBundle`] value type.
 ///
-/// `up_sql` is a dialect-neutral DDL template that uses the [`PREFIX_TOKEN`]
-/// wherever a table name is built, and portable type tokens (e.g. `{json}`,
-/// `{timestamptz}`, `{blob}`) wherever a backend-specific column type belongs, so
-/// the same statement renders against any prefix and either backend (see
-/// [ADR-0003](../../../../docs/adr/0003-storage-backends.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Migration {
-    /// Stable, ordered id unique within the owning bundle (e.g. `0001_init`).
-    pub id: &'static str,
-    /// Human-readable description for tooling and audit output.
-    pub desc: &'static str,
-    /// Prefix- and type-token-templated DDL applied for this step.
-    pub up_sql: &'static str,
+/// Each bundle's migrations are versioned `1, 2, …` within the bundle (the
+/// foundation crate renders the readable `V0001` label and checksums over it).
+/// The bundle ids are the [`BundleScope`] dotted ids. The DDL bodies are static
+/// and tested by the [`lint`](awaken_scoped_migration::lint) check below, so the
+/// per-`Migration` construction cannot fail in practice; an `expect` keeps the
+/// public signature infallible.
+pub fn bundles() -> Vec<MigrationBundle> {
+    vec![
+        bundle(
+            BundleScope::Identity,
+            vec![
+                (
+                    1,
+                    "accounts, external identities, sessions, login flows",
+                    IDENTITY_0001,
+                ),
+                (2, "long-lived principal-scoped API tokens", IDENTITY_0002),
+                (3, "downstream OAuth provider clients", IDENTITY_0003),
+                (
+                    4,
+                    "bind API tokens to a workspace; drop per-token scope",
+                    IDENTITY_0004,
+                ),
+            ],
+        ),
+        bundle(
+            BundleScope::Authz,
+            vec![
+                (1, "grants, role bindings, resource model edges", AUTHZ_0001),
+                (
+                    2,
+                    "organizations, groups, reusable role definitions",
+                    AUTHZ_0002,
+                ),
+                (
+                    3,
+                    "shared-store freshness fence for HA policy/epoch versioning",
+                    AUTHZ_0003,
+                ),
+            ],
+        ),
+        bundle(
+            BundleScope::Entitlement,
+            vec![(
+                1,
+                "plans and per-principal subscription assignments",
+                ENTITLEMENT_0001,
+            )],
+        ),
+        bundle(
+            BundleScope::Audit,
+            vec![(1, "append-only audit event log", AUDIT_0001)],
+        ),
+    ]
 }
 
-impl Migration {
-    /// Construct a migration step.
-    pub const fn new(id: &'static str, desc: &'static str, up_sql: &'static str) -> Self {
-        Self { id, desc, up_sql }
-    }
+/// Assemble one scope's bundle from `(version, description, ddl)` triples.
+fn bundle(scope: BundleScope, steps: Vec<(i64, &'static str, &'static str)>) -> MigrationBundle {
+    let migrations = steps
+        .into_iter()
+        .map(|(version, description, sql)| {
+            Migration::new(version, description, sql)
+                .unwrap_or_else(|err| panic!("invalid {} migration: {err}", scope.id()))
+        })
+        .collect();
+    MigrationBundle::new(scope.id(), migrations)
+        .unwrap_or_else(|err| panic!("invalid {} bundle: {err}", scope.id()))
 }
 
-impl Migration {
-    /// Content checksum over the canonical (un-prefixed) DDL template.
-    ///
-    /// The checksum is taken over the template, not the rendered SQL, so the
-    /// recorded identity of a migration is stable across deployments that use
-    /// different prefixes. Drift in an already-applied step is detected by
-    /// comparing this value against the ledger.
-    pub fn checksum(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.id.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(self.up_sql.as_bytes());
-        let digest = hasher.finalize();
-        let mut hex = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            hex.push_str(&format!("{byte:02x}"));
-        }
-        hex
-    }
-}
-
-/// An append-only, checksum-verified sequence of migrations for one scope.
-#[derive(Debug, Clone)]
-pub struct MigrationBundle {
-    /// Component scope this bundle owns.
-    pub scope: BundleScope,
-    /// Ordered migrations; never reordered or edited in place once shipped.
-    pub migrations: Vec<Migration>,
-}
-
-impl MigrationBundle {
-    /// Construct a bundle for the given scope with the supplied ordered migrations.
-    pub fn new(scope: BundleScope, migrations: Vec<Migration>) -> Self {
-        Self { scope, migrations }
-    }
-}
-
-/// A migration rendered for a concrete table prefix, ready to apply.
+/// A migration rendered for a concrete table prefix and dialect, ready to apply.
+///
+/// The flattened, ordered view of [`bundles`] a store exposes for inspection
+/// (the readiness plan length, deployment-parity equality). The `checksum` is the
+/// foundation-template identity, stable across dialects for a portable migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedMigration {
     /// Owning bundle id (e.g. `iam.identity`).
-    pub bundle: &'static str,
-    /// Migration id within the bundle.
-    pub id: &'static str,
-    /// Checksum of the canonical template.
+    pub bundle: String,
+    /// Migration version within the bundle.
+    pub version: i64,
+    /// Checksum of the canonical template under the active dialect.
     pub checksum: String,
     /// Prefix- and dialect-rendered DDL to execute for the active backend.
     pub sql: String,
 }
 
+/// Summary of an [`IamStore::migrate`] run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateReport {
+    /// Steps applied this run.
+    pub applied: usize,
+    /// Steps skipped because they were already recorded.
+    pub skipped: usize,
+}
+
+/// Executor seam a deployment provides to apply IAM's bundles and read its
+/// ledger.
+///
+/// The Postgres and SQLite backends implement this over their own driver; tests
+/// use the in-memory [`RecordingExecutor`]. Each implementation owns the
+/// backend-specific apply transaction and single-applier guard, delegating the
+/// *decision* of what to apply to [`awaken_scoped_migration::plan`] — so the
+/// shared mechanism (ordering, checksums, drift detection, the ledger fence) is
+/// identical across backends and only the driver edge differs.
+pub trait MigrationExecutor {
+    /// The SQL backend this executor applies and checksums migrations under.
+    fn dialect(&self) -> Dialect;
+
+    /// Apply every pending migration across `bundles` under `prefix`, in order,
+    /// idempotently, under the backend's single-applier guard.
+    ///
+    /// Already-applied steps whose recorded checksum matches are skipped; a step
+    /// whose recorded checksum differs is a drift error (bundles are append-only).
+    /// Returns the steps applied this run.
+    fn run_migrations(
+        &mut self,
+        prefix: &str,
+        bundles: &[MigrationBundle],
+    ) -> RepoResult<Vec<AppliedMigration>>;
+
+    /// Read the recorded `(version -> checksum)` map for `bundle_id` under
+    /// `prefix`, the input [`awaken_scoped_migration::plan`] verifies against.
+    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>>;
+}
+
 /// Storage adapter that owns IAM's schema for a given table prefix.
 ///
-/// `Pool` is the host-supplied connection handle (a `PgPool` in the Postgres
-/// deployment, a SQLite connection in the single-node deployment, the recording
-/// executor in tests). The store never opens or owns
-/// the pool's lifecycle in embedded mode — it owns its *schema within* the
-/// shared database, isolated by the distinct prefix and its own ledger.
+/// `Pool` is the host-supplied migration executor (a [`PostgresBackend`] /
+/// [`SqliteBackend`] in real deployments, the [`RecordingExecutor`] in tests).
+/// The store never opens or owns the pool's lifecycle in embedded mode — it owns
+/// its *schema within* the shared database, isolated by the distinct prefix and
+/// its own ledger.
+///
+/// [`PostgresBackend`]: super::PostgresBackend
+/// [`SqliteBackend`]: super::SqliteBackend
 #[derive(Debug, Clone)]
 pub struct IamStore<Pool> {
     prefix: String,
@@ -216,20 +245,11 @@ pub struct IamStore<Pool> {
 impl<Pool> IamStore<Pool> {
     /// Construct a store over `pool`, isolating IAM's tables behind `prefix`.
     ///
-    /// `prefix` must be a bare identifier fragment (lowercase letters, digits,
-    /// and underscore); it is concatenated into table names, so anything else
-    /// is rejected to keep the rendered DDL injection-free.
+    /// `prefix` is validated by [`awaken_scoped_migration::sql_identifier`]
+    /// (leading ASCII letter, then `[A-Za-z0-9_]`); it is concatenated into table
+    /// names, so anything else is rejected to keep the rendered DDL injection-free.
     pub fn with_prefix(pool: Pool, prefix: impl Into<String>) -> RepoResult<Self> {
-        let prefix = prefix.into();
-        if prefix.is_empty()
-            || !prefix
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        {
-            return Err(RepoError::Backend(format!(
-                "invalid table prefix {prefix:?}: expected [a-z0-9_]+"
-            )));
-        }
+        let prefix = sql_identifier(&prefix.into()).map_err(migration_err)?;
         Ok(Self { prefix, pool })
     }
 
@@ -251,44 +271,28 @@ impl<Pool> IamStore<Pool> {
     /// The ledger table name: `<prefix>_schema_migrations`.
     ///
     /// Each component keeps its own ledger so siblings sharing a database never
-    /// contend on a single migration table. The name carries only the prefix —
-    /// no type tokens — so it is dialect-independent.
+    /// contend on a single migration table.
     pub fn ledger_table(&self) -> String {
-        format!("{PREFIX_TOKEN}_schema_migrations").replace(PREFIX_TOKEN, &self.prefix)
-    }
-
-    /// Render a DDL template for `dialect`: substitute the table prefix, then
-    /// every [`TYPE_TOKENS`] entry to its dialect-specific form.
-    fn render_ddl(&self, template: &str, dialect: Dialect) -> String {
-        let mut sql = template.replace(PREFIX_TOKEN, &self.prefix);
-        for (token, postgres, sqlite) in TYPE_TOKENS {
-            sql = sql.replace(token, dialect.render_token(postgres, sqlite));
-        }
-        sql
+        format!("{}_schema_migrations", self.prefix)
     }
 }
 
 impl<Pool: MigrationExecutor> IamStore<Pool> {
-    /// DDL that creates this store's ledger if it does not already exist,
-    /// rendered for the executor's backend [`Dialect`].
-    pub fn ledger_ddl(&self) -> String {
-        self.render_ddl(LEDGER_TEMPLATE, self.pool.dialect())
-    }
-
     /// The full ordered set of migrations rendered for this prefix and the
-    /// executor's backend [`Dialect`]. The `checksum` is the neutral-template
-    /// identity (ADR-0003 decision 5), so it is stable across dialects even
-    /// though the rendered `sql` differs.
+    /// executor's backend [`Dialect`].
+    ///
+    /// The `checksum` is the neutral-template identity, so it is stable across
+    /// dialects even though the rendered `sql` differs.
     pub fn plan(&self) -> Vec<PlannedMigration> {
         let dialect = self.pool.dialect();
         let mut planned = Vec::new();
         for bundle in bundles() {
-            for migration in &bundle.migrations {
+            for migration in bundle.migrations() {
                 planned.push(PlannedMigration {
-                    bundle: bundle.scope.id(),
-                    id: migration.id,
-                    checksum: migration.checksum(),
-                    sql: self.render_ddl(migration.up_sql, dialect),
+                    bundle: bundle.bundle_id().to_owned(),
+                    version: migration.version(),
+                    checksum: migration.checksum_for(dialect),
+                    sql: render(migration.sql_for(dialect), dialect, &self.prefix),
                 });
             }
         }
@@ -297,52 +301,17 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
 
     /// Apply every pending migration in order, verifying already-applied steps.
     ///
-    /// Idempotent: a step whose ledger checksum matches is skipped. A step whose
-    /// recorded checksum differs from the shipped template is a drift error —
-    /// bundles are append-only, so an applied step must never change.
-    ///
-    /// Concurrent node startup is safe: the run is wrapped in the executor's
-    /// backend-neutral [single-applier guard](MigrationExecutor::acquire_applier_guard)
-    /// so exactly one node applies a pending bundle while the others wait and then
-    /// verify the ledger (the Postgres adapter holds a `pg_advisory_lock`; SQLite
-    /// is a single writer). The guard is always released — including on a drift or
-    /// apply error — so a failed run never strands the lock.
+    /// Idempotent and fail-closed: delegates the apply to the executor, which runs
+    /// the foundation crate's plan under its single-applier guard so concurrent
+    /// node startup is safe and a drifted step aborts the run.
     pub fn migrate(&mut self) -> RepoResult<MigrateReport> {
-        self.pool.acquire_applier_guard()?;
-        let result = self.migrate_guarded();
-        let released = self.pool.release_applier_guard();
-        match result {
-            Ok(report) => released.map(|()| report),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// The migration body run while the single-applier guard is held.
-    fn migrate_guarded(&mut self) -> RepoResult<MigrateReport> {
-        let ledger = self.ledger_table();
-        let ledger_ddl = self.ledger_ddl();
-        self.pool.ensure_ledger(&ledger_ddl)?;
-
-        let mut applied = 0usize;
-        let mut skipped = 0usize;
-        for step in self.plan() {
-            match self.pool.recorded_checksum(&ledger, step.bundle, step.id)? {
-                Some(existing) if existing == step.checksum => {
-                    skipped += 1;
-                }
-                Some(existing) => {
-                    return Err(RepoError::Backend(format!(
-                        "migration {}::{} drifted: ledger checksum {existing} != shipped {}",
-                        step.bundle, step.id, step.checksum
-                    )));
-                }
-                None => {
-                    self.pool.apply(&ledger, &step)?;
-                    applied += 1;
-                }
-            }
-        }
-        Ok(MigrateReport { applied, skipped })
+        let bundles = bundles();
+        let total: usize = bundles.iter().map(|b| b.migrations().len()).sum();
+        let applied = self.pool.run_migrations(&self.prefix, &bundles)?;
+        Ok(MigrateReport {
+            applied: applied.len(),
+            skipped: total - applied.len(),
+        })
     }
 
     /// Whether every planned migration is recorded with a matching checksum.
@@ -352,10 +321,16 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
     /// ledger, proves the store is reachable. A pending step, a drifted checksum,
     /// or an unreadable ledger all report *not applied* — readiness fails closed.
     pub fn migrations_applied(&self) -> RepoResult<bool> {
-        let ledger = self.ledger_table();
-        for step in self.plan() {
-            match self.pool.recorded_checksum(&ledger, step.bundle, step.id)? {
-                Some(existing) if existing == step.checksum => {}
+        let dialect = self.pool.dialect();
+        for bundle in bundles() {
+            // An unreadable ledger errors here → not ready (fail closed).
+            let applied = self
+                .pool
+                .applied_versions(&self.prefix, bundle.bundle_id())?;
+            // A pending step (non-empty plan) or a drift/unknown-version error
+            // (Err) both mean this node is not fully migrated.
+            match plan_bundle(&bundle, &applied, dialect) {
+                Ok(pending) if pending.is_empty() => {}
                 _ => return Ok(false),
             }
         }
@@ -363,110 +338,51 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
     }
 }
 
-/// Summary of a [`IamStore::migrate`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MigrateReport {
-    /// Steps applied this run.
-    pub applied: usize,
-    /// Steps skipped because they were already recorded.
-    pub skipped: usize,
-}
-
-/// Executor seam a deployment provides to apply the rendered plan.
-///
-/// The Postgres deployment implements this over a `PgPool`; tests use the
-/// in-memory [`RecordingExecutor`]. Keeping the seam here lets the same plan and
-/// ledger discipline drive embedded and standalone identically.
-pub trait MigrationExecutor {
-    /// The SQL backend this executor applies against.
-    ///
-    /// Drives dialect-token rendering of the plan. Defaults to
-    /// [`Dialect::Postgres`] so existing executors need no change; a SQLite
-    /// executor overrides it.
-    fn dialect(&self) -> Dialect {
-        Dialect::Postgres
-    }
-
-    /// Acquire the backend-neutral single-applier guard before applying pending
-    /// migrations, blocking until it is held.
-    ///
-    /// HA runs N identical nodes that may start concurrently against one shared
-    /// store; the guard ensures exactly one applies a pending bundle while the
-    /// others wait and then verify the ledger
-    /// (see [high availability](../../../../docs/design/high-availability.md)).
-    /// The Postgres adapter implements it with a `pg_advisory_lock`; SQLite is a
-    /// single writer and the in-memory adapter is single-process, so the default
-    /// is a no-op. Always paired with [`release_applier_guard`](Self::release_applier_guard).
-    fn acquire_applier_guard(&mut self) -> RepoResult<()> {
-        Ok(())
-    }
-
-    /// Release the single-applier guard once the migration run completes.
-    ///
-    /// Called after every run — success *or* failure — so a drift or apply error
-    /// never strands the lock for the other waiting nodes.
-    fn release_applier_guard(&mut self) -> RepoResult<()> {
-        Ok(())
-    }
-
-    /// Create the ledger table if absent.
-    fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()>;
-    /// Return the recorded checksum for an applied `(bundle, id)`, if any.
-    fn recorded_checksum(&self, ledger: &str, bundle: &str, id: &str)
-    -> RepoResult<Option<String>>;
-    /// Execute a migration's DDL and record it in the ledger atomically.
-    fn apply(&mut self, ledger: &str, migration: &PlannedMigration) -> RepoResult<()>;
-}
-
 /// In-memory [`MigrationExecutor`] for tests and the local adapter.
 ///
-/// It records the rendered DDL it was asked to run and the ledger rows it
-/// wrote, so tests can assert ordering, idempotence, and drift handling without
+/// It drives the same foundation [`plan`](awaken_scoped_migration::plan) the real
+/// backends do over an in-memory ledger, recording the rendered DDL it was asked
+/// to run, so tests can assert ordering, idempotence, and drift handling without
 /// a live database.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RecordingExecutor {
-    ledger_created: bool,
-    /// Ledger rows keyed by `(bundle, id)` to their recorded checksum.
-    ledger: Vec<(String, String, String)>,
-    /// Backend dialect the plan is rendered against.
+    /// Recorded ledger rows keyed by `(bundle_id, version)` to their checksum.
+    ledger: BTreeMap<(String, i64), String>,
+    /// Backend dialect the plan is rendered and checksummed against.
     dialect: Dialect,
-    /// DDL statements executed in order.
+    /// DDL statements executed in order (the ledger DDL, then each applied body).
     pub executed: Vec<String>,
-    /// Times the single-applier guard was acquired.
-    pub guard_acquired: usize,
-    /// Times the single-applier guard was released.
-    pub guard_released: usize,
-    /// Whether the guard is currently held; asserts apply happens under it.
-    guard_held: bool,
+    /// Whether the ledger DDL has been recorded this executor's lifetime.
+    ledger_created: bool,
+}
+
+impl Default for RecordingExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RecordingExecutor {
-    /// A fresh executor with an empty ledger, rendering for the default
-    /// ([`Dialect::Postgres`]) backend.
+    /// A fresh executor with an empty ledger, rendering for the
+    /// [`Dialect::Postgres`] backend.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_dialect(Dialect::Postgres)
     }
 
     /// A fresh executor that renders the plan for a specific backend dialect.
     pub fn with_dialect(dialect: Dialect) -> Self {
         Self {
+            ledger: BTreeMap::new(),
             dialect,
-            ..Self::default()
+            executed: Vec::new(),
+            ledger_created: false,
         }
     }
 
     /// Overwrite a ledger row's checksum to simulate a drifted prior apply.
-    pub fn force_checksum(&mut self, bundle: &str, id: &str, checksum: &str) {
-        if let Some(row) = self
-            .ledger
-            .iter_mut()
-            .find(|(b, i, _)| b == bundle && i == id)
-        {
-            row.2 = checksum.to_owned();
-        } else {
-            self.ledger
-                .push((bundle.to_owned(), id.to_owned(), checksum.to_owned()));
-        }
+    pub fn force_checksum(&mut self, bundle_id: &str, version: i64, checksum: &str) {
+        self.ledger
+            .insert((bundle_id.to_owned(), version), checksum.to_owned());
     }
 }
 
@@ -475,124 +391,53 @@ impl MigrationExecutor for RecordingExecutor {
         self.dialect
     }
 
-    fn acquire_applier_guard(&mut self) -> RepoResult<()> {
-        if self.guard_held {
-            return Err(RepoError::Backend(
-                "single-applier guard re-entered while held".into(),
-            ));
-        }
-        self.guard_held = true;
-        self.guard_acquired += 1;
-        Ok(())
-    }
-
-    fn release_applier_guard(&mut self) -> RepoResult<()> {
-        self.guard_held = false;
-        self.guard_released += 1;
-        Ok(())
-    }
-
-    fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()> {
+    fn run_migrations(
+        &mut self,
+        prefix: &str,
+        bundles: &[MigrationBundle],
+    ) -> RepoResult<Vec<AppliedMigration>> {
         if !self.ledger_created {
-            self.executed.push(ledger_ddl.to_owned());
+            self.executed.push(format!(
+                "CREATE TABLE IF NOT EXISTS {prefix}_schema_migrations (...)"
+            ));
             self.ledger_created = true;
         }
-        Ok(())
+        let dialect = self.dialect;
+        let mut applied = Vec::new();
+        for bundle in bundles {
+            let recorded = self.applied_versions(prefix, bundle.bundle_id())?;
+            let pending = plan_bundle(bundle, &recorded, dialect).map_err(migration_err)?;
+            for migration in pending {
+                self.executed
+                    .push(render(migration.sql_for(dialect), dialect, prefix));
+                let checksum = migration.checksum_for(dialect);
+                self.ledger.insert(
+                    (bundle.bundle_id().to_owned(), migration.version()),
+                    checksum.clone(),
+                );
+                applied.push(AppliedMigration {
+                    bundle_id: bundle.bundle_id().to_owned(),
+                    version: migration.version(),
+                    checksum,
+                    description: migration.ledger_description(),
+                });
+            }
+        }
+        Ok(applied)
     }
 
-    fn recorded_checksum(
+    fn applied_versions(
         &self,
-        _ledger: &str,
-        bundle: &str,
-        id: &str,
-    ) -> RepoResult<Option<String>> {
+        _prefix: &str,
+        bundle_id: &str,
+    ) -> RepoResult<BTreeMap<i64, String>> {
         Ok(self
             .ledger
             .iter()
-            .find(|(b, i, _)| b == bundle && i == id)
-            .map(|(_, _, checksum)| checksum.clone()))
+            .filter(|((bundle, _), _)| bundle == bundle_id)
+            .map(|((_, version), checksum)| (*version, checksum.clone()))
+            .collect())
     }
-
-    fn apply(&mut self, _ledger: &str, migration: &PlannedMigration) -> RepoResult<()> {
-        debug_assert!(
-            self.guard_held,
-            "migration applied without holding the single-applier guard"
-        );
-        self.executed.push(migration.sql.clone());
-        self.ledger.push((
-            migration.bundle.to_owned(),
-            migration.id.to_owned(),
-            migration.checksum.clone(),
-        ));
-        Ok(())
-    }
-}
-
-/// The canonical IAM migration bundles, one per subdomain scope.
-pub fn bundles() -> Vec<MigrationBundle> {
-    vec![
-        MigrationBundle::new(
-            BundleScope::Identity,
-            vec![
-                Migration::new(
-                    "0001_identity",
-                    "accounts, external identities, sessions, login flows",
-                    IDENTITY_0001,
-                ),
-                Migration::new(
-                    "0002_api_tokens",
-                    "long-lived principal-scoped API tokens",
-                    IDENTITY_0002,
-                ),
-                Migration::new(
-                    "0003_oauth_clients",
-                    "downstream OAuth provider clients",
-                    IDENTITY_0003,
-                ),
-                Migration::new(
-                    "0004_api_token_workspace",
-                    "bind API tokens to a workspace; drop per-token scope",
-                    IDENTITY_0004,
-                ),
-            ],
-        ),
-        MigrationBundle::new(
-            BundleScope::Authz,
-            vec![
-                Migration::new(
-                    "0001_authz",
-                    "grants, role bindings, resource model edges",
-                    AUTHZ_0001,
-                ),
-                Migration::new(
-                    "0002_directory",
-                    "organizations, groups, reusable role definitions",
-                    AUTHZ_0002,
-                ),
-                Migration::new(
-                    "0003_fence",
-                    "shared-store freshness fence for HA policy/epoch versioning",
-                    AUTHZ_0003,
-                ),
-            ],
-        ),
-        MigrationBundle::new(
-            BundleScope::Entitlement,
-            vec![Migration::new(
-                "0001_entitlement",
-                "plans and per-principal subscription assignments",
-                ENTITLEMENT_0001,
-            )],
-        ),
-        MigrationBundle::new(
-            BundleScope::Audit,
-            vec![Migration::new(
-                "0001_audit",
-                "append-only audit event log",
-                AUDIT_0001,
-            )],
-        ),
-    ]
 }
 
 // --- iam.identity DDL ------------------------------------------------------
@@ -731,6 +576,7 @@ CREATE TABLE {prefix}_roles (\
  action_patterns {json} NOT NULL, \
  created_at TEXT NOT NULL, \
  updated_at TEXT NOT NULL);";
+
 // The shared-store freshness fence: the policy `version` and token `epoch` that
 // HA advances in the store (rule 3) instead of per-node memory, so a bump on one
 // node is visible to every node on the next read. A single pinned row (id = 1)
@@ -784,11 +630,20 @@ mod tests {
 
     #[test]
     fn bundles_partition_by_the_subdomain_scopes() {
-        let scopes: Vec<&str> = bundles().iter().map(|b| b.scope.id()).collect();
+        let all = bundles();
+        let scopes: Vec<&str> = all.iter().map(|b| b.bundle_id()).collect();
         assert_eq!(
             scopes,
             ["iam.identity", "iam.authz", "iam.entitlement", "iam.audit"]
         );
+    }
+
+    #[test]
+    fn bundles_pass_the_foundation_lint() {
+        // The append-only ordering, distinct bundle ids, and bundle-independence
+        // (no migration references a table another bundle owns) are enforced by
+        // the shared crate's lint over the whole set, not by hand.
+        awaken_scoped_migration::lint(&bundles()).expect("iam bundles must lint clean");
     }
 
     #[test]
@@ -801,15 +656,8 @@ mod tests {
         assert!(plan.iter().any(|m| m.sql.contains("iam_oauth_clients")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_grants")));
         assert!(plan.iter().any(|m| m.sql.contains("iam_plans")));
-        // No unrendered template tokens leak into the executed SQL — neither the
-        // prefix token nor any type token.
-        assert!(plan.iter().all(|m| !m.sql.contains(PREFIX_TOKEN)));
-        for (token, _, _) in TYPE_TOKENS {
-            assert!(
-                plan.iter().all(|m| !m.sql.contains(token)),
-                "type token {token} leaked into rendered SQL"
-            );
-        }
+        // No unrendered template tokens leak into the executed SQL.
+        assert!(plan.iter().all(|m| !m.sql.contains('{')));
     }
 
     #[test]
@@ -827,22 +675,13 @@ mod tests {
         assert!(pg_sql.contains("claims JSONB"));
         assert!(!lite_sql.contains("JSONB"));
         assert!(lite_sql.contains("claims TEXT"));
-
-        // The ledger timestamp default differs per dialect.
-        assert!(pg.ledger_ddl().contains("TIMESTAMPTZ"));
-        assert!(pg.ledger_ddl().contains("now()"));
-        assert!(lite.ledger_ddl().contains("CURRENT_TIMESTAMP"));
-        assert!(!lite.ledger_ddl().contains("TIMESTAMPTZ"));
     }
 
     #[test]
     fn checksum_is_dialect_independent_but_rendered_sql_is_not() {
-        // ADR-0003 decision 5: the migration's recorded identity is the neutral
-        // template, so the checksum is the same on either backend even though the
-        // rendered SQL is dialect-specific. A migration that carries no type token
-        // (e.g. a portable `ALTER TABLE` that names only TEXT columns) renders
-        // identically on both backends, so divergence is asserted across the plan
-        // as a whole rather than for every single step.
+        // The migration's recorded identity is the neutral template, so the
+        // checksum is the same on either backend even though the rendered SQL is
+        // dialect-specific.
         let pg = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Postgres), "iam")
             .expect("valid prefix");
         let lite = IamStore::with_prefix(RecordingExecutor::with_dialect(Dialect::Sqlite), "iam")
@@ -854,7 +693,7 @@ mod tests {
             assert_eq!(
                 a.checksum, b.checksum,
                 "{}::{} identity drifted",
-                a.bundle, a.id
+                a.bundle, a.version
             );
             any_diverged |= a.sql != b.sql;
         }
@@ -887,42 +726,13 @@ mod tests {
 
     #[test]
     fn invalid_prefixes_are_rejected() {
+        // Empty, a leading digit, and an injection attempt are all rejected by the
+        // shared identifier validation.
         assert!(IamStore::with_prefix(RecordingExecutor::new(), "").is_err());
         assert!(IamStore::with_prefix(RecordingExecutor::new(), "iam_accounts; DROP").is_err());
-        assert!(IamStore::with_prefix(RecordingExecutor::new(), "IAM").is_err());
-    }
-
-    #[test]
-    fn no_bundle_declares_a_cross_component_foreign_key() {
-        // The whole point of the bundles: references between subdomains are by
-        // id resolved in the domain, never a DB-level FK. Assert the DDL never
-        // declares one.
-        for bundle in bundles() {
-            for migration in &bundle.migrations {
-                let sql = migration.up_sql.to_uppercase();
-                assert!(
-                    !sql.contains("FOREIGN KEY") && !sql.contains("REFERENCES"),
-                    "{}::{} declares a foreign key",
-                    bundle.scope.id(),
-                    migration.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn checksums_are_stable_and_per_migration() {
-        let plan = store("iam").plan();
-        // Stable across renders/prefixes.
-        let again = store("other").plan();
-        for (a, b) in plan.iter().zip(again.iter()) {
-            assert_eq!(a.checksum, b.checksum);
-        }
-        // Distinct migrations have distinct checksums.
-        let mut sums: Vec<&str> = plan.iter().map(|m| m.checksum.as_str()).collect();
-        sums.sort_unstable();
-        sums.dedup();
-        assert_eq!(sums.len(), plan.len());
+        assert!(IamStore::with_prefix(RecordingExecutor::new(), "1iam").is_err());
+        // A bare lowercase identifier is accepted.
+        assert!(IamStore::with_prefix(RecordingExecutor::new(), "iam").is_ok());
     }
 
     #[test]
@@ -936,7 +746,7 @@ mod tests {
         assert_eq!(second.applied, 0);
         assert_eq!(second.skipped, store.plan().len());
 
-        // Ledger DDL ran exactly once; every bundle's DDL ran exactly once.
+        // The ledger DDL ran exactly once.
         let ledger_runs = store
             .pool()
             .executed
@@ -949,35 +759,10 @@ mod tests {
     #[test]
     fn migrate_detects_checksum_drift_in_an_applied_step() {
         let mut executor = RecordingExecutor::new();
-        executor.force_checksum("iam.identity", "0001_identity", "deadbeef");
+        executor.force_checksum("iam.identity", 1, "deadbeef");
         let mut store = IamStore::with_prefix(executor, "iam").expect("valid prefix");
         let err = store.migrate().expect_err("drift must fail closed");
-        assert!(matches!(err, RepoError::Backend(msg) if msg.contains("drifted")));
-    }
-
-    #[test]
-    fn migrate_holds_the_single_applier_guard_around_the_run() {
-        let mut store = store("iam");
-        store.migrate().expect("migrate");
-        // The guard wrapped the whole run: acquired once, released once, balanced.
-        assert_eq!(store.pool().guard_acquired, 1);
-        assert_eq!(store.pool().guard_released, 1);
-        // A second (idempotent) run takes and releases the guard again.
-        store.migrate().expect("second migrate");
-        assert_eq!(store.pool().guard_acquired, 2);
-        assert_eq!(store.pool().guard_released, 2);
-    }
-
-    #[test]
-    fn migrate_releases_the_guard_even_when_a_step_drifts() {
-        // A failed run must never strand the lock, or every other node deadlocks
-        // waiting on a guard the failed applier never released.
-        let mut executor = RecordingExecutor::new();
-        executor.force_checksum("iam.identity", "0001_identity", "deadbeef");
-        let mut store = IamStore::with_prefix(executor, "iam").expect("valid prefix");
-        store.migrate().expect_err("drift fails");
-        assert_eq!(store.pool().guard_acquired, 1);
-        assert_eq!(store.pool().guard_released, 1);
+        assert!(matches!(err, RepoError::Backend(msg) if msg.contains("checksum mismatch")));
     }
 
     #[test]
@@ -995,9 +780,7 @@ mod tests {
         store.migrate().expect("migrate");
         // Corrupt one recorded checksum: readiness must report not-applied, never
         // a hopeful ready over a ledger it can no longer trust.
-        store
-            .pool_mut()
-            .force_checksum("iam.authz", "0003_fence", "deadbeef");
+        store.pool_mut().force_checksum("iam.authz", 3, "deadbeef");
         assert!(!store.migrations_applied().expect("probe"));
     }
 
@@ -1021,22 +804,37 @@ mod tests {
             ("now()", "raw Postgres function; use {now}"),
         ];
         for bundle in bundles() {
-            for m in &bundle.migrations {
+            for m in bundle.migrations() {
                 assert!(
-                    !m.desc.is_empty(),
+                    !m.description().is_empty(),
                     "{}::{} has empty description",
-                    bundle.scope.id(),
-                    m.id
+                    bundle.bundle_id(),
+                    m.label()
                 );
                 for (pat, reason) in banned {
                     assert!(
-                        !m.up_sql.contains(pat),
+                        !m.sql_for(Dialect::Postgres).contains(pat),
                         "{}::{} contains forbidden pattern {pat:?}: {reason}",
-                        bundle.scope.id(),
-                        m.id
+                        bundle.bundle_id(),
+                        m.label()
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn checksums_are_stable_and_per_migration() {
+        let plan = store("iam").plan();
+        // Stable across renders/prefixes.
+        let again = store("other").plan();
+        for (a, b) in plan.iter().zip(again.iter()) {
+            assert_eq!(a.checksum, b.checksum);
+        }
+        // Distinct migrations have distinct checksums.
+        let mut sums: Vec<&str> = plan.iter().map(|m| m.checksum.as_str()).collect();
+        sums.sort_unstable();
+        sums.dedup();
+        assert_eq!(sums.len(), plan.len());
     }
 }

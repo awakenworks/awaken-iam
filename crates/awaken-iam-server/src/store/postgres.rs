@@ -10,16 +10,21 @@
 //!
 //! The client is `!Sync`, so it lives behind a [`Mutex`]; clones share it.
 
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use postgres::error::SqlState;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls};
 
+use awaken_scoped_migration::{
+    AppliedMigration, LEDGER_VERSION, MigrationBundle, check_ledger_version, plan,
+    render as render_ddl,
+};
+
 use awaken_iam_core::{RepoError, RepoResult};
 
-use super::migration::{Dialect, IamStore, MigrationExecutor, PlannedMigration};
+use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
 use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore};
 
 /// A Postgres connection usable as both a migration executor and a repository
@@ -101,12 +106,52 @@ fn refs(params: &[SqlParam]) -> Vec<&(dyn ToSql + Sync)> {
         .collect()
 }
 
-/// Stable, cross-process advisory-lock key for a ledger's migrations, so every
-/// node applying the same component's bundles contends on one lock.
-fn advisory_key(ledger: &str) -> i64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    ledger.hash(&mut hasher);
-    hasher.finish() as i64
+impl PostgresBackend {
+    /// The per-prefix ledger and its companion version-marker table names.
+    fn ledger_tables(prefix: &str) -> (String, String) {
+        (
+            format!("{prefix}_schema_migrations"),
+            format!("{prefix}_schema_migrations_meta"),
+        )
+    }
+
+    /// Create the ledger and the version-marker table, seeding the marker exactly
+    /// once with [`LEDGER_VERSION`]. Mirrors the foundation Postgres shell so an
+    /// IAM ledger is byte-identical to any other consumer's.
+    fn ensure_ledger(client: &mut Client, prefix: &str) -> RepoResult<()> {
+        let (ledger, meta) = Self::ledger_tables(prefix);
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {ledger} (\
+                 bundle_id TEXT NOT NULL, \
+                 version BIGINT NOT NULL, \
+                 checksum TEXT NOT NULL, \
+                 description TEXT NOT NULL, \
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 applied_by TEXT NOT NULL, \
+                 PRIMARY KEY (bundle_id, version))"
+            ))
+            .map_err(backend_err)?;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {meta} (ledger_version BIGINT NOT NULL)"
+            ))
+            .map_err(backend_err)?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {meta} (ledger_version) \
+                     SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM {meta})"
+                ),
+                &[&LEDGER_VERSION],
+            )
+            .map_err(backend_err)?;
+        let found: i64 = client
+            .query_one(&format!("SELECT ledger_version FROM {meta} LIMIT 1"), &[])
+            .map_err(backend_err)?
+            .get(0);
+        check_ledger_version(&ledger, found).map_err(migration_err)
+    }
 }
 
 impl SqlConn for PostgresBackend {
@@ -146,53 +191,120 @@ impl MigrationExecutor for PostgresBackend {
         Dialect::Postgres
     }
 
-    fn ensure_ledger(&mut self, ledger_ddl: &str) -> RepoResult<()> {
+    fn run_migrations(
+        &mut self,
+        prefix: &str,
+        bundles: &[MigrationBundle],
+    ) -> RepoResult<Vec<AppliedMigration>> {
+        let dialect = Dialect::Postgres;
+        let (ledger, _meta) = Self::ledger_tables(prefix);
         let mut client = self.client.lock().unwrap();
-        client.batch_execute(ledger_ddl).map_err(backend_err)
-    }
+        Self::ensure_ledger(&mut client, prefix)?;
 
-    fn recorded_checksum(
-        &self,
-        ledger: &str,
-        bundle: &str,
-        id: &str,
-    ) -> RepoResult<Option<String>> {
-        let mut client = self.client.lock().unwrap();
-        let sql = format!("SELECT checksum FROM {ledger} WHERE bundle = $1 AND id = $2");
-        let rows = client.query(&sql, &[&bundle, &id]).map_err(backend_err)?;
-        match rows.first() {
-            Some(row) => Ok(Some(row.try_get::<usize, String>(0).map_err(backend_err)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn apply(&mut self, ledger: &str, migration: &PlannedMigration) -> RepoResult<()> {
-        let mut client = self.client.lock().unwrap();
-        let mut tx = client.transaction().map_err(backend_err)?;
-        // Transaction-scoped advisory lock: the single-applier guard (ADR-0003).
-        // It auto-releases at commit/rollback, so a competing applier waits here
-        // and then finds the step already recorded.
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&advisory_key(ledger)])
+        let mut applied = Vec::new();
+        for bundle in bundles {
+            let mut tx = client.transaction().map_err(backend_err)?;
+            // Transaction-scoped advisory lock keyed on the ledger and bundle id —
+            // the single-applier guard (ADR-0003), released automatically at
+            // commit/rollback. Held across the ledger read and the apply, it makes
+            // exactly one node apply a pending bundle while the others wait, then
+            // verify; a failed run never strands it.
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+                &[&ledger, &bundle.bundle_id()],
+            )
             .map_err(backend_err)?;
-        tx.batch_execute(&migration.sql).map_err(backend_err)?;
-        tx.execute(
-            &format!("INSERT INTO {ledger} (bundle, id, checksum) VALUES ($1, $2, $3)"),
-            &[&migration.bundle, &migration.id, &migration.checksum],
+
+            let recorded = read_applied(&mut tx, &ledger, bundle.bundle_id())?;
+            let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+            for migration in pending {
+                let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
+                tx.batch_execute(&sql).map_err(backend_err)?;
+                let checksum = migration.checksum_for(dialect);
+                let description = migration.ledger_description();
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {ledger} \
+                         (bundle_id, version, checksum, description, applied_by) \
+                         VALUES ($1, $2, $3, $4, $5)"
+                    ),
+                    &[
+                        &bundle.bundle_id(),
+                        &migration.version(),
+                        &checksum,
+                        &description,
+                        &"awaken-iam",
+                    ],
+                )
+                .map_err(backend_err)?;
+                applied.push(AppliedMigration {
+                    bundle_id: bundle.bundle_id().to_owned(),
+                    version: migration.version(),
+                    checksum,
+                    description,
+                });
+            }
+            tx.commit().map_err(backend_err)?;
+        }
+        Ok(applied)
+    }
+
+    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
+        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let mut client = self.client.lock().unwrap();
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT version, checksum FROM {ledger} \
+                     WHERE bundle_id = $1 ORDER BY version"
+                ),
+                &[&bundle_id],
+            )
+            .map_err(backend_err)?;
+        let mut applied = BTreeMap::new();
+        for row in &rows {
+            let version: i64 = row.try_get(0).map_err(backend_err)?;
+            let checksum: String = row.try_get(1).map_err(backend_err)?;
+            applied.insert(version, checksum);
+        }
+        Ok(applied)
+    }
+}
+
+/// Read the recorded `(version -> checksum)` map for `bundle_id` inside an open
+/// transaction, so the read and the subsequent apply share the advisory guard.
+fn read_applied(
+    tx: &mut postgres::Transaction<'_>,
+    ledger: &str,
+    bundle_id: &str,
+) -> RepoResult<BTreeMap<i64, String>> {
+    let rows = tx
+        .query(
+            &format!(
+                "SELECT version, checksum FROM {ledger} \
+                 WHERE bundle_id = $1 ORDER BY version"
+            ),
+            &[&bundle_id],
         )
         .map_err(backend_err)?;
-        tx.commit().map_err(backend_err)
+    let mut applied = BTreeMap::new();
+    for row in &rows {
+        let version: i64 = row.try_get(0).map_err(backend_err)?;
+        let checksum: String = row.try_get(1).map_err(backend_err)?;
+        applied.insert(version, checksum);
     }
+    Ok(applied)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::render as render_placeholders;
 
     #[test]
     fn render_numbers_plain_and_json_placeholders_in_order() {
         let sql = "INSERT INTO t (a, b, c) VALUES (?, ?j, ?)";
         assert_eq!(
-            render(sql),
+            render_placeholders(sql),
             "INSERT INTO t (a, b, c) VALUES ($1, $2::jsonb, $3)"
         );
     }
@@ -201,20 +313,8 @@ mod tests {
     fn render_casts_every_json_parameter_to_jsonb() {
         let sql = "UPDATE t SET a = ?j, b = ?j WHERE c = ?j AND d = ?";
         assert_eq!(
-            render(sql),
+            render_placeholders(sql),
             "UPDATE t SET a = $1::jsonb, b = $2::jsonb WHERE c = $3::jsonb AND d = $4"
-        );
-    }
-
-    #[test]
-    fn advisory_key_is_stable_and_per_ledger() {
-        assert_eq!(
-            advisory_key("iam_schema_migrations"),
-            advisory_key("iam_schema_migrations")
-        );
-        assert_ne!(
-            advisory_key("iam_schema_migrations"),
-            advisory_key("iamx_schema_migrations")
         );
     }
 }

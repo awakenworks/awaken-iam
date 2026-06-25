@@ -7,9 +7,9 @@
 - **standalone** — its own process with its own database.
 
 One mechanism makes both safe: IAM owns **scope-partitioned, self-contained
-migration bundles** with no cross-component coupling, adopting the
-`awaken-sql-migration` pattern. The deployment choice is then just *which pool
-and router host IAM*, not a code fork.
+migration bundles** with no cross-component coupling, built on the shared
+`awaken-scoped-migration` foundation crate. The deployment choice is then just
+*which pool and router host IAM*, not a code fork.
 
 The database **backend** is likewise a choice, not a fork. IAM supports at least
 **Postgres** and **SQLite** behind the same repository ports; the backend is an
@@ -128,7 +128,7 @@ deployment by changing configuration, not code.
 
 ## Crate placement
 
-The backend adapters (Postgres and SQLite) and the `awaken-sql-migration`
+The backend adapters (Postgres and SQLite) and the `awaken-scoped-migration`
 dependency live in the server layer (`awaken-iam-server`, or a small
 `awaken-iam-store` module it owns). Each backend is a thin edge adapter over the
 shared repository ports and a `MigrationExecutor`; they differ only in the
