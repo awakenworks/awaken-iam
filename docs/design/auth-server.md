@@ -16,9 +16,23 @@ product web app ──PKCE──▶ awaken-iam (OpenID Provider) ──OAuth─�
 ```
 
 IAM is an **OpenID Provider (OP)** to product clients and an **OAuth client (RP)**
-to Google/GitHub. Products never hold Google/GitHub secrets or talk to them
-directly — they redirect to IAM and trust IAM-issued identity. One integration,
-one place to rotate secrets, one audit point.
+to Google/GitHub. Products never hold Google/GitHub secrets, never talk to them
+directly, and never choose the upstream provider on the user's behalf — they
+redirect to IAM's single OP authorization endpoint and trust IAM-issued identity.
+One integration, one place to rotate secrets, one audit point.
+
+The production issuer for AwakenWorks-hosted identity is
+`https://accounts.awakenworks.com`. Product consoles and commercial account
+management live under `https://cloud.awakenworks.com`, but the OIDC issuer stays
+stable at the accounts host so relying-party configuration and token validation
+do not move when the console evolves.
+
+Those domains are production defaults, not hard-coded constants. A deployment may
+configure its issuer, public client ids, redirect-uri allowlist, scopes, session
+cookie policy, provider registry, and JWKS/key rotation policy. The discovery
+document is generated from that deployment configuration, so product clients read
+`authorization_endpoint`, `token_endpoint`, `userinfo_endpoint`, and `jwks_uri`
+from `/.well-known/openid-configuration` instead of constructing URLs.
 
 ## Provider adapter (genericity)
 
@@ -54,7 +68,34 @@ IdPs.
 > claims come from the user/emails API, and email may be private). The adapter
 > hides that difference; account identity is `(provider, subject)` regardless.
 
-## Login flow
+## Product login flow
+
+Product clients integrate only with the OP surface advertised by
+`/.well-known/openid-configuration`:
+
+```text
+1. GET  /.well-known/openid-configuration
+        discovers authorization_endpoint, token_endpoint, userinfo_endpoint,
+        and jwks_uri for the issuer, e.g. https://accounts.awakenworks.com.
+2. GET  /v1/oauth/authorize?client_id&redirect_uri&response_type=code
+        &scope=openid email profile&state&code_challenge
+        starts the unified login. IAM may show an account chooser, provider
+        picker, enterprise SSO routing, or an already-authenticated session.
+3.      IAM completes whichever upstream provider flow the user chose.
+4.      IAM redirects back to the product's registered redirect_uri with a code.
+5. POST /v1/oauth/token
+        the product redeems the code with PKCE, then calls /v1/oauth/userinfo.
+```
+
+The product never calls a provider-specific login URL as its normal entrypoint.
+That keeps GitHub, Google, enterprise SSO, account chooser, and future factors
+inside IAM's bounded context.
+
+## Provider login subflow
+
+Provider-specific routes are IAM-internal browser routes used after the unified
+authorization endpoint has selected a provider, or operator/debug deep links.
+They are not the discovery `authorization_endpoint` for product clients.
 
 ```text
 1. GET  /v1/auth/login/{provider}?client_id&redirect_uri&code_challenge
@@ -75,7 +116,8 @@ IdPs.
                                   -> EmailMatchPending; re-resolve with explicit
                                      confirmation to link, else nothing changes
           e. otherwise            -> create Account + ExternalIdentity
-5.      IAM establishes a Session and returns to the product redirect_uri.
+5.      IAM establishes a Session and returns to the unified authorization flow,
+        which then issues the product authorization code.
 ```
 
 Identity is keyed by `(provider, subject)` only; email is never an identity key.
@@ -131,6 +173,7 @@ One canonical tree, learned from the reference's normalization ADR — never two
 paths for one job:
 
 ```http
+GET    /v1/oauth/authorize              # unified OP authorization endpoint
 GET    /v1/auth/login/{provider}
 GET    /v1/auth/callback/{provider}
 GET    /v1/session                      # current session
@@ -146,6 +189,12 @@ GET    /.well-known/openid-configuration
 
 Authorization and entitlement endpoints live alongside under the same `/v1` tree;
 see [remote protocol](remote-protocol.md).
+
+Implementation note: `/.well-known/openid-configuration` must advertise
+`/v1/oauth/authorize` as `authorization_endpoint`. Advertising
+`/v1/auth/login/{provider}` or an unparameterized provider-login route is a
+contract bug because a relying party does not know which upstream provider a user
+will choose.
 
 ## Federated workload identity (token exchange)
 

@@ -136,6 +136,17 @@ login uses the same model: the fake provider emits a deterministic provider key
 and subject, then IAM resolves that provider+subject to the linked account and
 creates a session.
 
+Hosted AwakenWorks identity uses `https://accounts.awakenworks.com` as the stable
+OIDC issuer. Product applications discover and start login through that issuer's
+`/v1/oauth/authorize` endpoint; provider-specific routes such as
+`/v1/auth/login/{provider}` are IAM-owned subflows after account/provider
+selection, not product integration points.
+
+The hosted issuer is the production default. Self-hosted or regional deployments
+may configure a different issuer, client registry, redirect-uri allowlist, scopes,
+provider set, and signing-key/JWKS policy. Clients must follow discovery output
+rather than assuming the default AwakenWorks host.
+
 The login loop carries two invariants. An `OAuthLoginState` challenge is
 single-use: it is started once and consumed at most once, and an expired
 challenge cannot be consumed. A `Session` authenticates only while it is
