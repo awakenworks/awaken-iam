@@ -344,4 +344,53 @@ mod tests {
         // the shared crate's lint over the whole set, not by hand.
         awaken_scoped_migration::lint(&bundles()).expect("iam bundles must lint clean");
     }
+
+    #[test]
+    fn bundle_scope_id_is_the_stable_dotted_handle() {
+        assert_eq!(BundleScope::Identity.id(), "iam.identity");
+        assert_eq!(BundleScope::Authz.id(), "iam.authz");
+        assert_eq!(BundleScope::Entitlement.id(), "iam.entitlement");
+        assert_eq!(BundleScope::Audit.id(), "iam.audit");
+    }
+
+    #[test]
+    fn bundle_scope_all_lists_every_scope_in_apply_order() {
+        // Apply order is significant: a bundle must never depend on a table
+        // owned by a later bundle.
+        let all = BundleScope::all();
+        assert_eq!(
+            all,
+            [
+                BundleScope::Identity,
+                BundleScope::Authz,
+                BundleScope::Entitlement,
+                BundleScope::Audit,
+            ]
+        );
+        let ids: Vec<&str> = all.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids,
+            ["iam.identity", "iam.authz", "iam.entitlement", "iam.audit"]
+        );
+    }
+
+    #[test]
+    fn every_bundle_has_a_unique_dotted_id_and_at_least_one_migration() {
+        // The lint already enforces this; restated here so the invariant is
+        // explicit at the API surface too.
+        let all = bundles();
+        let mut seen = std::collections::HashSet::new();
+        for bundle in &all {
+            assert!(
+                seen.insert(bundle.bundle_id().to_owned()),
+                "duplicate bundle id {}",
+                bundle.bundle_id()
+            );
+            assert!(
+                !bundle.migrations().is_empty(),
+                "bundle {} has no migrations",
+                bundle.bundle_id()
+            );
+        }
+    }
 }

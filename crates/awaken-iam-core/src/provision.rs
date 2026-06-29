@@ -186,4 +186,21 @@ mod tests {
         assert_eq!(authz.list().unwrap().len(), 1);
         assert_eq!(authz.list_edges().unwrap().len(), 1);
     }
+
+    #[test]
+    fn fake_authz_get_returns_seeded_grants_and_remove_yields_not_found() {
+        // The fake port's get/remove round-trip the same shape a real
+        // GrantRepo exposes: get returns Some/None by id, remove yields
+        // NotFound for an unknown id and Ok(()) for a known one.
+        let authz = FakeAuthz::default();
+        apply_resource_provision(&provision(), &authz, &authz).unwrap();
+
+        let id = GrantId("g_issue_42_owner".into());
+        assert!(authz.get(&id).unwrap().is_some());
+
+        // Removing twice: first succeeds, second yields NotFound.
+        authz.remove(&id).unwrap();
+        assert!(authz.get(&id).unwrap().is_none());
+        assert!(matches!(authz.remove(&id), Err(RepoError::NotFound(_))));
+    }
 }
