@@ -65,10 +65,13 @@ pub const FEDERATION_ISSUER_ID_PREFIX: &str = "fdis_";
 /// Id prefix for a federation rule, matching Anthropic `fdrl_`.
 pub const FEDERATION_RULE_ID_PREFIX: &str = "fdrl_";
 
-/// Default page size when a list request omits `limit`.
+/// Default page size when a list request omits `limit`. Matches Anthropic's
+/// documented default of 20.
 pub const DEFAULT_PAGE_LIMIT: usize = 20;
-/// Largest page size a list request may ask for.
-pub const MAX_PAGE_LIMIT: usize = 100;
+/// Largest page size a list request may ask for. Anthropic's Admin API
+/// documents the `limit` range as 1–1000, so the cap is 1000 to accept every
+/// page size a compatible client may send.
+pub const MAX_PAGE_LIMIT: usize = 1000;
 
 /// Concrete action a caller must be authorized for to use this surface; the
 /// `org:admin` posture resolves to an `authorize(admin, "org.admin.*", Org{..})`
@@ -159,8 +162,9 @@ pub enum WorkspaceRole {
     WorkspaceAdmin,
     /// Manages workspace API keys, files, and skills.
     WorkspaceDeveloper,
-    /// Read-only on API keys; manages files and skills.
-    WorkspaceLimitedDeveloper,
+    /// Read-only on API keys; manages files and skills. Anthropic names this
+    /// `workspace_restricted_developer` on the wire.
+    WorkspaceRestrictedDeveloper,
     /// Read-only workspace member.
     WorkspaceUser,
     /// Workspace billing.
@@ -173,7 +177,7 @@ impl WorkspaceRole {
         match self {
             WorkspaceRole::WorkspaceAdmin => "workspace_admin",
             WorkspaceRole::WorkspaceDeveloper => "workspace_developer",
-            WorkspaceRole::WorkspaceLimitedDeveloper => "workspace_limited_developer",
+            WorkspaceRole::WorkspaceRestrictedDeveloper => "workspace_restricted_developer",
             WorkspaceRole::WorkspaceUser => "workspace_user",
             WorkspaceRole::WorkspaceBilling => "workspace_billing",
         }
@@ -189,7 +193,7 @@ impl WorkspaceRole {
         match role.0.as_str() {
             "workspace_admin" => Ok(WorkspaceRole::WorkspaceAdmin),
             "workspace_developer" => Ok(WorkspaceRole::WorkspaceDeveloper),
-            "workspace_limited_developer" => Ok(WorkspaceRole::WorkspaceLimitedDeveloper),
+            "workspace_restricted_developer" => Ok(WorkspaceRole::WorkspaceRestrictedDeveloper),
             "workspace_user" => Ok(WorkspaceRole::WorkspaceUser),
             "workspace_billing" => Ok(WorkspaceRole::WorkspaceBilling),
             other => Err(AdminApiError::UnknownRole(other.to_owned())),

@@ -678,7 +678,10 @@ mod tests {
         for (scope, role) in [
             ("workspace:admin", "workspace_admin"),
             ("workspace:developer", "workspace_developer"),
-            ("workspace:limited_developer", "workspace_limited_developer"),
+            (
+                "workspace:restricted_developer",
+                "workspace_restricted_developer",
+            ),
             ("workspace:user", "workspace_user"),
             ("workspace:billing", "workspace_billing"),
         ] {

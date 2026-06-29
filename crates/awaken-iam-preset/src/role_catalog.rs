@@ -80,7 +80,7 @@ pub const ANTHROPIC_ROLE_IDS: [&str; 10] = [
     "claude_code_user",
     "workspace_admin",
     "workspace_developer",
-    "workspace_limited_developer",
+    "workspace_restricted_developer",
     "workspace_user",
     "workspace_billing",
 ];
@@ -159,8 +159,8 @@ const SEED_ROLES: &[SeedRole] = &[
         patterns: &["apikey.*", "file.*", "skill.*", "workspace.read"],
     },
     SeedRole {
-        id: "workspace_limited_developer",
-        display_name: "Workspace Limited Developer",
+        id: "workspace_restricted_developer",
+        display_name: "Workspace Restricted Developer",
         patterns: &["apikey.read", "file.*", "skill.*", "workspace.read"],
     },
     SeedRole {

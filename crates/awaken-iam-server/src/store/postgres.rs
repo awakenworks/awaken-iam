@@ -73,8 +73,17 @@ fn backend_err(err: postgres::Error) -> RepoError {
 }
 
 /// Rewrite the portable placeholder dialect to Postgres numbered parameters:
-/// `?` becomes `$n` and a JSON parameter `?j` becomes `$n::jsonb`, casting the
-/// bound text into the column's `jsonb` type.
+/// `?` becomes `$n` and a JSON parameter `?j` becomes `$n::text::jsonb`.
+///
+/// The double cast is deliberate. Every [`SqlParam`] is bound as a Rust
+/// `String`, whose driver `ToSql` only serializes to text-like types. A bare
+/// `$n::jsonb` makes PostgreSQL infer the parameter's own type as `jsonb`
+/// (the cast target propagates to the placeholder), and the driver then refuses
+/// to serialize a `String` as `jsonb` — `error serializing parameter`. Casting
+/// through text first (`$n::text::jsonb`) pins the *parameter* type to `text`,
+/// which a `String` serializes to cleanly, and PostgreSQL casts the text to the
+/// column's `jsonb` type server-side. SQLite has no jsonb type, so it collapses
+/// `?j` back to a plain `?`; the two backends store the identical JSON text.
 fn render(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 16);
     let mut next = 1usize;
@@ -83,7 +92,7 @@ fn render(sql: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'?' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'j' {
-                out.push_str(&format!("${next}::jsonb"));
+                out.push_str(&format!("${next}::text::jsonb"));
                 i += 2;
             } else {
                 out.push_str(&format!("${next}"));
@@ -305,16 +314,17 @@ mod tests {
         let sql = "INSERT INTO t (a, b, c) VALUES (?, ?j, ?)";
         assert_eq!(
             render_placeholders(sql),
-            "INSERT INTO t (a, b, c) VALUES ($1, $2::jsonb, $3)"
+            "INSERT INTO t (a, b, c) VALUES ($1, $2::text::jsonb, $3)"
         );
     }
 
     #[test]
-    fn render_casts_every_json_parameter_to_jsonb() {
+    fn render_casts_every_json_parameter_through_text_to_jsonb() {
         let sql = "UPDATE t SET a = ?j, b = ?j WHERE c = ?j AND d = ?";
         assert_eq!(
             render_placeholders(sql),
-            "UPDATE t SET a = $1::jsonb, b = $2::jsonb WHERE c = $3::jsonb AND d = $4"
+            "UPDATE t SET a = $1::text::jsonb, b = $2::text::jsonb \
+             WHERE c = $3::text::jsonb AND d = $4"
         );
     }
 }
