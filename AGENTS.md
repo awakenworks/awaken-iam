@@ -5,7 +5,7 @@ Shared instructions for AI agents working in this repository.
 ## Project
 
 - **Name:** Awaken IAM — shared identity, authorization, scope, and entitlement control plane.
-- **Version:** `0.1.0-dev` (pre-release; APIs unstable, crates unpublished).
+- **Version:** `0.1.1` (tagged release; APIs unstable, crates unpublished; next dev cycle is `0.1.2-dev`).
 - **File size limit:** keep source files under ~2000 lines; split before then.
 
 ## Core rules
