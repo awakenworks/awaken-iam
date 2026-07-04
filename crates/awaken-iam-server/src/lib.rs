@@ -4,6 +4,7 @@ mod access_token;
 mod admin_api;
 mod admin_http;
 mod anthropic_admin;
+mod approval_discharge;
 mod assembly;
 mod auth_api;
 mod authz_api;
@@ -31,6 +32,9 @@ pub use anthropic_admin::{
     Page, SERVICE_ACCOUNT_ID_PREFIX, ServiceAccount, WORKSPACE_ID_PREFIX, WorkspaceMember,
     WorkspaceRole, admin_authorization_request, project_federation_issuers,
     project_federation_rules,
+};
+pub use approval_discharge::{
+    ApprovalDischargeService, DischargeError, DischargeOutcome, DischargeRequest,
 };
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
