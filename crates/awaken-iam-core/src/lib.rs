@@ -35,8 +35,8 @@ pub use authorization::{
     GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
 };
 pub use consumer_namespace::{
-    ConsumerNamespaces, MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES, action_namespace,
-    managed_agents, oversight,
+    AWAKEN_RUNTIME_NAMESPACES, ConsumerNamespaces, MANAGED_AGENTS_NAMESPACES, OVERSIGHT_NAMESPACES,
+    action_namespace, awaken_runtime, managed_agents, oversight,
 };
 pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
 pub use entitlement::{
@@ -86,7 +86,10 @@ pub use refresh_token::{
     RotateRefreshToken, parse_presented_refresh_token,
 };
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
-pub use role_catalog::{ANTHROPIC_ROLE_IDS, ROLE_NAMESPACES, named_role_catalog, seed_named_roles};
+pub use role_catalog::{
+    ANTHROPIC_ROLE_IDS, AWAKEN_RUNTIME_ROLE_IDS, ROLE_NAMESPACES, named_role_catalog,
+    runtime_role_catalog, seed_named_roles, seed_runtime_roles,
+};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
 pub use shadow::{DecisionSource, Divergence, ShadowAuthorizer, ShadowOutcome, ShadowReport};
 pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};

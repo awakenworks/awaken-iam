@@ -32,6 +32,17 @@ pub const MANAGED_AGENTS_NAMESPACES: [&str; 1] = ["agent"];
 /// Sorted, so it lines up with [`ConsumerNamespaces::namespaces`].
 pub const OVERSIGHT_NAMESPACES: [&str; 2] = ["issue", "oversight"];
 
+/// Action-key namespaces the awaken-runtime consumer owns.
+///
+/// The runtime orchestrates agents (`agent`), manages interactive sessions
+/// (`session`), and controls tool invocations (`tool`). These three namespaces
+/// are the complete runtime surface; `agent` is shared with the managed-agents
+/// consumer declaration, which is intentional — the runtime product subsumes
+/// agent orchestration rather than delegating to a separate consumer.
+///
+/// Sorted, so it lines up with [`ConsumerNamespaces::namespaces`].
+pub const AWAKEN_RUNTIME_NAMESPACES: [&str; 3] = ["agent", "session", "tool"];
+
 /// The namespace (leading dotted segment) of an action key.
 ///
 /// `agent.run` -> `agent`, `oversight.approval.grant` -> `oversight`, and a
@@ -145,6 +156,18 @@ pub fn oversight() -> ConsumerNamespaces {
     ConsumerNamespaces::new("oversight", OVERSIGHT_NAMESPACES)
 }
 
+/// The awaken-runtime consumer convention: the `agent.*`, `session.*`, and
+/// `tool.*` namespaces.
+///
+/// awaken-1.0.0-dev startup provisioning calls this to obtain the runtime's
+/// declared surface and seed the corresponding role preset via
+/// [`crate::seed_runtime_roles`]. The runtime owns the full agent-session-tool
+/// surface; callers that only need the agent sub-surface may continue using
+/// [`managed_agents`] instead.
+pub fn awaken_runtime() -> ConsumerNamespaces {
+    ConsumerNamespaces::new("awaken-runtime", AWAKEN_RUNTIME_NAMESPACES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +198,14 @@ mod tests {
         assert!(oversight.owns_action(&ActionKey("issue.advance".into())));
         assert!(oversight.owns_action(&ActionKey("oversight.approval.grant".into())));
         assert!(!oversight.owns_action(&ActionKey("agent.run".into())));
+
+        let runtime = awaken_runtime();
+        // Sorted, de-duplicated: agent, session, tool.
+        assert_eq!(runtime.namespaces(), ["agent", "session", "tool"]);
+        assert!(runtime.owns_action(&ActionKey("agent.run".into())));
+        assert!(runtime.owns_action(&ActionKey("session.create".into())));
+        assert!(runtime.owns_action(&ActionKey("tool.invoke".into())));
+        assert!(!runtime.owns_action(&ActionKey("oversight.approval.grant".into())));
     }
 
     #[test]
@@ -199,11 +230,34 @@ mod tests {
                 ActionPattern("oversight.*".into()),
             ]
         );
+        assert_eq!(
+            awaken_runtime().glob_patterns(),
+            vec![
+                ActionPattern("agent.*".into()),
+                ActionPattern("session.*".into()),
+                ActionPattern("tool.*".into()),
+            ]
+        );
         // A glob reaches the product's whole surface, including the bare key.
         let glob = &managed_agents().glob_patterns()[0];
         assert!(glob.matches(&ActionKey("agent".into())));
         assert!(glob.matches(&ActionKey("agent.run".into())));
         assert!(!glob.matches(&ActionKey("oversight.read".into())));
+    }
+
+    #[test]
+    fn awaken_runtime_subsumes_managed_agents_namespace() {
+        // The runtime declares `agent` in addition to its own namespaces; a role
+        // whose grants span the runtime surface also covers the agent namespace
+        // that managed_agents() declares — the two consumer declarations overlap
+        // intentionally: the runtime product subsumes agent orchestration.
+        let runtime = awaken_runtime();
+        assert!(runtime.owns_action(&ActionKey("agent.run".into())));
+        assert!(runtime.owns_action(&ActionKey("agent.configure".into())));
+        // managed_agents() is the narrower declaration; awaken_runtime() is the
+        // full runtime surface.
+        assert_eq!(managed_agents().namespaces(), ["agent"]);
+        assert!(awaken_runtime().namespaces().contains(&"agent".to_owned()));
     }
 
     #[test]

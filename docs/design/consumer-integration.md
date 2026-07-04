@@ -127,7 +127,8 @@ wildcards in a key (wildcards belong to grant *patterns*, not requests).
 | Owner | Domains | Examples |
 |---|---|---|
 | **IAM (structural)** | `org.*`, `namespace.*`, `workspace.*`, `project.*` | `org.manage`, `namespace.signer.use`, `workspace.configure`, `project.read` |
-| **Product (local)** | product-defined | `issue.advance`, `flow.install`, `agent.run`, `connector.use` |
+| **IAM (catalog-seeded, consumer-declared)** | `agent.*`, `session.*`, `tool.*` | `agent.run`, `session.create`, `tool.invoke` |
+| **Product (local)** | product-defined | `issue.advance`, `flow.install`, `connector.use` |
 
 Rules:
 
@@ -137,9 +138,15 @@ Rules:
   [IAM model](iam-model.md#actionkey).
 - **Structural domains are IAM's.** Actions over orgs, namespaces, workspaces, and
   projects are part of the shared scope/identity plane and are evaluated by IAM.
-- **Product domains are the product's.** Action vocabularies like `issue.*` or
-  agent runtime verbs are product-local. When a consumer keeps its own
-  authorization engine (see Oversight Next below), IAM never sees those keys.
+- **Catalog-seeded consumer namespaces are IAM-owned by declaration.** A consumer
+  declares its action namespaces via [`ConsumerNamespaces`] and seeds a matching
+  role preset through `awaken-iam-core`. The awaken-runtime consumer (`awaken_runtime()`)
+  declares `agent.*`, `session.*`, and `tool.*` this way; those namespaces are
+  **catalog-owned** (G16), not product-local — the catalog carries the grant sets and
+  the runtime derives its vocab from preset instead of hand-rolling it.
+- **Product domains are the product's.** Action vocabularies specific to a single
+  product that are not catalog-seeded remain product-local. When a consumer keeps its
+  own authorization engine (see Oversight Next below), IAM never sees those keys.
 - **Unknown actions default-deny.** There is no superuser wildcard; a grant must
   list its action patterns explicitly, so an unrecognized action simply matches no
   grant and is denied.
@@ -150,10 +157,10 @@ Rules:
 |---|---|---|
 | Acting identity | `PrincipalRef` (Account / Service / ApiToken) | rich actor taxonomy (`User`/`Agent`/`ProcessAgent`/`System`/`Team`) |
 | Scope | `ScopeRef` | product resource hierarchy beyond the scope graph |
-| Action | `ActionKey` (open string) + structural domains | product action vocabularies |
+| Action | `ActionKey` (open string) + structural domains + catalog-seeded consumer namespaces (`agent.*`, `session.*`, `tool.*`) | non-catalog product action vocabularies |
 | Decision | `AuthorizationDecision { Allow, Deny }` | approval workflow execution |
 | Entitlement | `EntitlementRequest`/`EntitlementDecision` | runtime capabilities, credentials |
-| Roles | grant-bundle roles | product workflow/stage roles |
+| Roles | grant-bundle roles + catalog-seeded consumer presets (`runtime_admin`, `runtime_user`) | product workflow/stage roles |
 | Authorization of product domain actions | `authorize` over a registered `ResourceModel` (ADR-0004) | product action vocabulary, approval workflow execution |
 
 ## Consumption modes
@@ -198,13 +205,20 @@ signer grant blocks the publish even when `pack.publish` is held, proving both
 `authorize()` checks are independently required and that entitlement is its own
 plane.
 
-### Awaken Next — entitlement gating only
+### Awaken Next — consumer namespaces + entitlement gating
 
-Awaken Next delegates **entitlement gating only**. A run is gated by
-`check_entitlement` against the IAM plan/SKU plane; runtime capability gating and
-credentials stay in-repo and never route through IAM. A principal whose plan lacks
-the feature fails closed, and an absent in-repo capability also blocks the run —
-that second decision is made locally, not by IAM.
+Awaken Next declares its action surface via the **awaken-runtime consumer
+namespaces** (`awaken_runtime()`: `agent.*`, `session.*`, `tool.*`) and seeds a
+matching role preset (`runtime_admin`, `runtime_user`) during startup provisioning
+via `seed_runtime_roles()`. This keeps the runtime's action vocab **catalog-owned
+(G16)**: awaken-1.0.0-dev derives its grant vocabulary from the preset rather than
+hand-rolling names.
+
+Beyond action/role seeding, Awaken Next delegates **entitlement gating**. A run is
+gated by `check_entitlement` against the IAM plan/SKU plane; runtime capability
+gating and credentials stay in-repo and never route through IAM. A principal whose
+plan lacks the feature fails closed, and an absent in-repo capability also blocks
+the run — that second decision is made locally, not by IAM.
 
 Per [ADR-0004](../adr/0004-consumers-reuse-iam-authz.md), managed agents widen
 this from entitlement-only to also reusing IAM's **attenuated capability tokens**

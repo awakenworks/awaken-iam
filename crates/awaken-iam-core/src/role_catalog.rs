@@ -1,16 +1,34 @@
 //! Seeded named role catalog (ADR-0008 decision 2).
 //!
-//! Ships a product-agnostic catalog of [`RoleDef`]s whose ids are the Anthropic
-//! Claude platform role names and whose action patterns encode each role's
-//! authority — `developer ⇒ apikey.*`, `billing ⇒ billing.*`, and so on. The
-//! catalog is **seed data, not engine code** (ADR-0002 #3): the kernel stays
-//! neutral, the names live here as data, and a deployment may extend the catalog
-//! with custom roles after seeding.
+//! Ships two distinct seeded catalogs of [`RoleDef`]s, both as **seed data, not
+//! engine code** (ADR-0002 #3): the kernel stays neutral, the names live here as
+//! data, and a deployment may extend either catalog with custom roles after seeding.
+//!
+//! ## Anthropic platform catalog ([`named_role_catalog`] / [`seed_named_roles`])
+//!
+//! The platform-level roles whose ids are the Anthropic Claude platform role names
+//! and whose action patterns encode each role's authority over the IAM structural
+//! and platform namespaces — `developer ⇒ apikey.*`, `billing ⇒ billing.*`, and
+//! so on. This catalog is product-agnostic: it covers only the structural action
+//! domains IAM owns (`org`, `workspace`, `apikey`, etc.) and carries no
+//! consumer-owned runtime verbs.
 //!
 //! Anthropic's two-level role inheritance is not modelled here — it falls out of
 //! [`ScopeGraph::covers`](crate::ScopeGraph) at evaluation, where an `Org`-scoped
 //! [`RoleBinding`](crate::RoleBinding) is held at every workspace beneath it. This
-//! module only supplies the *grant sets*; the binding scope decides reach.
+//! catalog only supplies the *grant sets*; the binding scope decides reach.
+//!
+//! ## awaken-runtime consumer catalog ([`runtime_role_catalog`] / [`seed_runtime_roles`])
+//!
+//! The awaken-runtime consumer's preset roles (`runtime_admin`, `runtime_user`)
+//! whose action patterns encode authority over the runtime's consumer-owned action
+//! namespaces (`agent.*`, `session.*`, `tool.*`) declared by
+//! [`crate::awaken_runtime`]. These roles are consumer-specific — they map the
+//! runtime's declared surface, not an IAM structural domain — and are kept separate
+//! from [`ANTHROPIC_ROLE_IDS`] so the platform catalog stays clean. awaken-1.0.0-dev
+//! startup provisioning seeds this catalog independently via [`seed_runtime_roles`].
+//!
+//! ## Shared constraint
 //!
 //! The model forbids a [`RoleDef`] from carrying the catch-all `*` pattern
 //! ([`RoleDef::validate`]), so the org `admin` role is seeded as the union of
@@ -20,6 +38,15 @@
 use awaken_iam_contract::Timestamp;
 
 use crate::{ActionPattern, RepoResult, RoleDef, RoleId, RoleRepo};
+
+/// The two awaken-runtime preset role ids — seeded by [`seed_runtime_roles`]
+/// during awaken-1.0.0-dev startup provisioning.
+///
+/// These roles map workspace-level authority over the runtime's action surface
+/// (`agent.*`, `session.*`, `tool.*`). They are separate from
+/// [`ANTHROPIC_ROLE_IDS`] so the Anthropic platform catalog stays clean; a
+/// deployment seeds both catalogs independently.
+pub const AWAKEN_RUNTIME_ROLE_IDS: [&str; 2] = ["runtime_admin", "runtime_user"];
 
 /// Action-key namespaces the seeded catalog grants authority over.
 ///
@@ -180,6 +207,60 @@ pub fn seed_named_roles(repo: &dyn RoleRepo, now: &Timestamp) -> RepoResult<()> 
     Ok(())
 }
 
+/// The grant sets for the awaken-runtime preset roles.
+///
+/// - `runtime_admin`: full authority over the runtime surface (`agent.*`,
+///   `session.*`, `tool.*`). Appropriate for a workspace admin binding on the
+///   runtime control plane.
+/// - `runtime_user`: basic runtime access — run an agent, open a session, and
+///   invoke a tool. Appropriate for a developer or end-user workspace binding.
+const RUNTIME_SEED_ROLES: &[SeedRole] = &[
+    SeedRole {
+        id: "runtime_admin",
+        display_name: "Runtime Admin",
+        patterns: &["agent.*", "session.*", "tool.*"],
+    },
+    SeedRole {
+        id: "runtime_user",
+        display_name: "Runtime User",
+        patterns: &["agent.run", "session.create", "tool.invoke"],
+    },
+];
+
+/// Build the awaken-runtime preset role catalog, stamping every role with `now`.
+///
+/// The result is pure data — ordered as [`AWAKEN_RUNTIME_ROLE_IDS`] — that
+/// awaken-1.0.0-dev startup provisioning loads into its [`RoleRepo`] (see
+/// [`seed_runtime_roles`]). Every role satisfies [`RoleDef::validate`].
+pub fn runtime_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
+    RUNTIME_SEED_ROLES
+        .iter()
+        .map(|seed| RoleDef {
+            id: RoleId(seed.id.to_owned()),
+            display_name: Some(seed.display_name.to_owned()),
+            action_patterns: seed
+                .patterns
+                .iter()
+                .map(|pattern| ActionPattern((*pattern).to_owned()))
+                .collect(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .collect()
+}
+
+/// Seed (upsert) the awaken-runtime preset roles into `repo`, stamping `now`.
+///
+/// Called during awaken-1.0.0-dev startup provisioning so the runtime does not
+/// hand-roll its vocab. Idempotent: re-seeding overwrites each role in place.
+/// Custom roles a deployment adds under other ids are untouched.
+pub fn seed_runtime_roles(repo: &dyn RoleRepo, now: &Timestamp) -> RepoResult<()> {
+    for role in runtime_role_catalog(now) {
+        repo.upsert(role)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +345,117 @@ mod tests {
             !admin.action_patterns.iter().any(|p| p.matches(&foreign)),
             "admin must not authorize an unseeded namespace via a hidden wildcard"
         );
+    }
+
+    #[test]
+    fn runtime_catalog_ids_are_exactly_the_preset_names() {
+        let catalog = runtime_role_catalog(&ts());
+        let ids: Vec<String> = catalog.iter().map(|role| role.id.0.clone()).collect();
+        assert_eq!(ids, AWAKEN_RUNTIME_ROLE_IDS);
+    }
+
+    #[test]
+    fn every_runtime_role_satisfies_its_invariants() {
+        for role in runtime_role_catalog(&ts()) {
+            assert_eq!(
+                role.validate(),
+                Ok(()),
+                "runtime role {} must validate",
+                role.id.0
+            );
+            assert!(
+                role.action_patterns.iter().all(|p| p.0 != "*"),
+                "runtime role {} carries the forbidden `*`",
+                role.id.0
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_admin_covers_full_runtime_surface() {
+        use awaken_iam_contract::ActionKey;
+
+        let catalog = runtime_role_catalog(&ts());
+        let admin = catalog.iter().find(|r| r.id.0 == "runtime_admin").unwrap();
+        for action in [
+            "agent.run",
+            "agent.configure",
+            "session.create",
+            "tool.invoke",
+        ] {
+            let key = ActionKey(action.into());
+            assert!(
+                admin.action_patterns.iter().any(|p| p.matches(&key)),
+                "runtime_admin must cover {action}"
+            );
+        }
+        // Must not cover a foreign namespace.
+        let foreign = ActionKey("oversight.approval.grant".into());
+        assert!(
+            !admin.action_patterns.iter().any(|p| p.matches(&foreign)),
+            "runtime_admin must not cover oversight namespace"
+        );
+    }
+
+    #[test]
+    fn runtime_user_covers_basic_runtime_actions() {
+        use awaken_iam_contract::ActionKey;
+
+        let catalog = runtime_role_catalog(&ts());
+        let user = catalog.iter().find(|r| r.id.0 == "runtime_user").unwrap();
+        for action in ["agent.run", "session.create", "tool.invoke"] {
+            let key = ActionKey(action.into());
+            assert!(
+                user.action_patterns.iter().any(|p| p.matches(&key)),
+                "runtime_user must cover {action}"
+            );
+        }
+        // runtime_user does not carry wildcard admin authority.
+        let admin_action = ActionKey("agent.configure".into());
+        assert!(
+            !user
+                .action_patterns
+                .iter()
+                .any(|p| p.matches(&admin_action)),
+            "runtime_user must not cover agent.configure"
+        );
+    }
+
+    #[test]
+    fn seeding_runtime_roles_is_idempotent() {
+        use crate::RoleId as Id;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MemRoles(Mutex<BTreeMap<String, RoleDef>>);
+        impl RoleRepo for MemRoles {
+            fn get(&self, id: &Id) -> RepoResult<Option<RoleDef>> {
+                Ok(self.0.lock().unwrap().get(&id.0).cloned())
+            }
+            fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+                self.0.lock().unwrap().insert(role.id.0.clone(), role);
+                Ok(())
+            }
+            fn list(&self) -> RepoResult<Vec<RoleDef>> {
+                Ok(self.0.lock().unwrap().values().cloned().collect())
+            }
+            fn remove(&self, id: &Id) -> RepoResult<()> {
+                self.0.lock().unwrap().remove(&id.0);
+                Ok(())
+            }
+        }
+
+        let repo = MemRoles::default();
+        seed_runtime_roles(&repo, &ts()).unwrap();
+        assert_eq!(repo.list().unwrap().len(), AWAKEN_RUNTIME_ROLE_IDS.len());
+
+        seed_runtime_roles(&repo, &ts()).unwrap();
+        assert_eq!(repo.list().unwrap().len(), AWAKEN_RUNTIME_ROLE_IDS.len());
+
+        for id in AWAKEN_RUNTIME_ROLE_IDS {
+            assert!(repo.get(&Id(id.to_owned())).unwrap().is_some());
+        }
     }
 
     #[test]
