@@ -40,7 +40,7 @@ pub use auth_api::{
     ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
     RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant, UnlinkIdentity,
 };
-pub use authz_api::AuthzApi;
+pub use authz_api::{AuthzApi, IntrospectionError};
 pub use capability_token::{
     AttenuateCapability, CapabilityCheck, CapabilityClaims, CapabilityError, LeaseEpoch,
     MintCapability, attenuate, mint_capability, verify_capability,

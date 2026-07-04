@@ -24,12 +24,13 @@ pub use identity::{
 };
 pub use license::{LicenseClaim, LicenseSignature, LicenseVerifyError};
 pub use protocol::{
-    ApprovalAuthority, ApprovalObligation, AuthorizationOutcome, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect, GrantSnapshot,
-    GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceOrgEdge,
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, ResourceParentEdge,
-    ResourceProvision, ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot,
-    SignerSetSnapshot, WorkspaceOrgEdge,
+    ApiTokenStatus, ApprovalAuthority, ApprovalObligation, AuthorizationOutcome,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect,
+    GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
+    NamespaceOrgEdge, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+    ResourceParentEdge, ResourceProvision, ResourceTypeRegistration, RoleBindingSnapshot,
+    ScopeGraphSnapshot, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,

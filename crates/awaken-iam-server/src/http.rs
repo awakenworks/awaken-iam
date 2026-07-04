@@ -14,6 +14,7 @@
 //! | `POST /v1/authorize/batch` | [`AuthzApi::authorize_batch`] |
 //! | `POST /v1/entitlements/check` | [`AuthzApi::check_entitlement`] |
 //! | `GET /v1/authz/snapshot` | [`AuthzApi::snapshot`] / [`AuthzApi::snapshot_since`] |
+//! | `POST /v1/tokens/introspect` | [`AuthzApi::introspect_token`] |
 //!
 //! Every served route reads the engines through a shared [`AuthzState`]; the
 //! authorization plane never mutates per request, so the engines are shared
@@ -28,6 +29,7 @@ use std::sync::Arc;
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
+    Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 use axum::{
     Json, Router,
@@ -61,6 +63,7 @@ pub fn authz_router(state: AuthzState) -> Router {
         .route("/v1/authorize/batch", post(authorize_batch))
         .route("/v1/entitlements/check", post(check_entitlement))
         .route("/v1/authz/snapshot", get(snapshot))
+        .route("/v1/tokens/introspect", post(introspect_token))
         .with_state(state)
 }
 
@@ -124,6 +127,52 @@ async fn snapshot(State(api): State<AuthzState>, Query(query): Query<SnapshotQue
         },
         None => Json::<PolicySnapshot>(api.snapshot()).into_response(),
     }
+}
+
+/// `POST /v1/tokens/introspect` — verify a bearer API token and return its
+/// principal + workspace, or `401 Unauthorized` for any invalid/expired/revoked token.
+async fn introspect_token(
+    State(api): State<AuthzState>,
+    Json(request): Json<TokenIntrospectionRequest>,
+) -> Response {
+    match api.introspect_token(&request, &now_timestamp()) {
+        Ok(response) => Json::<TokenIntrospectionResponse>(response).into_response(),
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Wall-clock instant as an RFC 3339 UTC [`Timestamp`] string.
+fn now_timestamp() -> Timestamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    Timestamp(format_rfc3339(secs))
+}
+
+/// Format whole seconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let time = secs % 86_400;
+    let (hour, minute, second) = (time / 3600, (time % 3600) / 60, time % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Convert days since 1970-01-01 to a civil `(year, month, day)` (Howard
+/// Hinnant's algorithm), valid for the entire representable range.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
 }
 
 #[cfg(test)]
@@ -324,6 +373,77 @@ mod tests {
         assert_eq!(body_json(response).await["status"], "ok");
     }
 
+    #[tokio::test]
+    async fn introspect_route_returns_401_for_unknown_token() {
+        let router = authz_router(Arc::new(AuthzApi::new()));
+        let body = serde_json::json!({ "token": "sk-ant-ZZZZZZZZ.deadbeef" });
+        let response = router
+            .oneshot(post("/v1/tokens/introspect", body))
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn introspect_route_resolves_a_registered_token() {
+        use awaken_iam_contract::{ApiTokenId, Timestamp};
+        use awaken_iam_contract::{ApiTokenStatus, WorkspaceId};
+        use awaken_iam_core::{
+            ApiTokenDirectory, ApiTokenMinter, EntropySource, MintApiToken, PolicySet, RoleId,
+        };
+
+        struct SeqEntropy(u8);
+        impl EntropySource for SeqEntropy {
+            fn fill_bytes(&mut self, buf: &mut [u8]) {
+                for b in buf.iter_mut() {
+                    *b = self.0;
+                    self.0 = self.0.wrapping_add(1);
+                }
+            }
+        }
+
+        let mut minter = ApiTokenMinter::new(SeqEntropy(0));
+        let mut dir = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+        let issued = minter
+            .mint(
+                &mut dir,
+                &mut policy,
+                MintApiToken {
+                    id: ApiTokenId("tok_http_test".into()),
+                    principal: PrincipalRef::Service {
+                        service_id: "fen".into(),
+                    },
+                    workspace: WorkspaceId("ws_fen".into()),
+                    role: RoleId("workspace_developer".into()),
+                    created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+                    expires_at: None,
+                },
+            )
+            .unwrap();
+
+        let mut api = AuthzApi::new();
+        api.register_api_token(issued.token.clone());
+        let router = authz_router(Arc::new(api));
+
+        let body = serde_json::json!({ "token": issued.secret });
+        let response = router
+            .oneshot(post("/v1/tokens/introspect", body))
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: TokenIntrospectionResponse =
+            serde_json::from_value(body_json(response).await).expect("decode introspection");
+        assert_eq!(
+            decoded.principal,
+            PrincipalRef::Service {
+                service_id: "fen".into()
+            }
+        );
+        assert_eq!(decoded.workspace, WorkspaceId("ws_fen".into()));
+        assert_eq!(decoded.status, ApiTokenStatus::Active);
+    }
+
     /// The router binds every authorization route the assembly's manifest
     /// declares: the manifest and the served surface stay in lockstep.
     #[tokio::test]
@@ -345,6 +465,10 @@ mod tests {
             RouteSpec {
                 method: HttpMethod::Get,
                 path: "/v1/authz/snapshot",
+            },
+            RouteSpec {
+                method: HttpMethod::Post,
+                path: "/v1/tokens/introspect",
             },
         ];
         for spec in authz_routes {

@@ -17,7 +17,7 @@ use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
     NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    SignerSetSnapshot,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 
 use crate::IamClient;
@@ -77,6 +77,26 @@ pub trait AuthzTransport {
     fn fetch_snapshot_since(&self, since: u64) -> Result<Option<PolicySnapshot>, RemoteError> {
         let snapshot = self.fetch_snapshot()?;
         Ok((snapshot.version > since).then_some(snapshot))
+    }
+
+    /// `POST /v1/tokens/introspect`: verify a bearer API token and resolve its
+    /// `principal` + `workspace` binding at the server's current wall clock.
+    ///
+    /// Returns `Err` when the token is invalid, revoked, or expired — the caller
+    /// never learns which branch; from its side the credential simply does not
+    /// authenticate. Token verification (argon2id) stays in IAM; this transport
+    /// method is the seam that keeps consumers from re-implementing it.
+    ///
+    /// The default implementation returns an unsupported error so existing
+    /// transports remain valid without providing the new method until they opt in.
+    fn introspect_token(
+        &self,
+        request: &TokenIntrospectionRequest,
+    ) -> Result<TokenIntrospectionResponse, RemoteError> {
+        let _ = request;
+        Err(RemoteError(
+            "introspect_token is not supported by this transport".into(),
+        ))
     }
 }
 
@@ -154,6 +174,20 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         namespace_id: &NamespaceId,
     ) -> Result<SignerSetSnapshot, RemoteError> {
         self.transport.fetch_signers(namespace_id)
+    }
+
+    /// Verify a bearer API token against the remote IAM server and resolve its
+    /// `principal` + `workspace`.
+    ///
+    /// Delegates to `POST /v1/tokens/introspect` via the transport. Returns `Err`
+    /// on an invalid/expired/revoked token or a transport failure. Token
+    /// verification (argon2id) stays in IAM — the consumer never holds the
+    /// `secret_hash` and never re-implements the check.
+    pub fn introspect_token(
+        &self,
+        request: &TokenIntrospectionRequest,
+    ) -> Result<TokenIntrospectionResponse, RemoteError> {
+        self.transport.introspect_token(request)
     }
 }
 
@@ -497,5 +531,91 @@ mod tests {
             client.check_entitlement_response(&ent_request()),
             Err(RemoteError("boom".into()))
         );
+    }
+
+    #[test]
+    fn default_introspect_token_returns_unsupported_error() {
+        use awaken_iam_contract::TokenIntrospectionRequest;
+        // StubTransport does not override introspect_token; the default impl
+        // returns a "not supported" error so existing transports stay valid.
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        let err = client
+            .introspect_token(&TokenIntrospectionRequest {
+                token: "sk-ant-test.token".into(),
+            })
+            .unwrap_err();
+        assert!(
+            err.0.contains("not supported"),
+            "unexpected error: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn introspect_token_surfaces_transport_response() {
+        use awaken_iam_contract::{
+            ApiTokenStatus, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceId,
+        };
+
+        struct IntrospectStub;
+        impl AuthzTransport for IntrospectStub {
+            fn authorize(
+                &self,
+                _: &AuthorizationRequest,
+            ) -> Result<AuthorizationOutcome, RemoteError> {
+                unreachable!()
+            }
+            fn authorize_batch(
+                &self,
+                _: &BatchAuthorizationRequest,
+            ) -> Result<BatchAuthorizationResponse, RemoteError> {
+                unreachable!()
+            }
+            fn check_entitlement(
+                &self,
+                _: &EntitlementRequest,
+            ) -> Result<EntitlementCheckResponse, RemoteError> {
+                unreachable!()
+            }
+            fn register_resource_model(
+                &self,
+                _: &ResourceModelRegistration,
+            ) -> Result<ResourceModelRegistered, RemoteError> {
+                unreachable!()
+            }
+            fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
+                unreachable!()
+            }
+            fn fetch_signers(&self, _: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
+                unreachable!()
+            }
+            fn introspect_token(
+                &self,
+                _request: &TokenIntrospectionRequest,
+            ) -> Result<TokenIntrospectionResponse, RemoteError> {
+                Ok(TokenIntrospectionResponse {
+                    principal: PrincipalRef::Service {
+                        service_id: "ci".into(),
+                    },
+                    workspace: WorkspaceId("ws_1".into()),
+                    status: ApiTokenStatus::Active,
+                })
+            }
+        }
+
+        let client = RemoteIamClient::new(IntrospectStub);
+        let response = client
+            .introspect_token(&TokenIntrospectionRequest {
+                token: "sk-ant-prefix.secret".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            response.principal,
+            PrincipalRef::Service {
+                service_id: "ci".into()
+            }
+        );
+        assert_eq!(response.workspace, WorkspaceId("ws_1".into()));
+        assert_eq!(response.status, ApiTokenStatus::Active);
     }
 }

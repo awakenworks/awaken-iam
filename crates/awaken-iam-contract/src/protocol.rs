@@ -18,6 +18,45 @@ use crate::{
     OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
 };
 
+/// Liveness status of an authenticated API token.
+///
+/// Only `active` is returned over HTTP (invalid/expired/revoked tokens yield a
+/// `401 Unauthorized` instead of a response body), but the field is present for
+/// forward-compatibility and to allow a single response shape for both online
+/// introspection and any future cached/offline paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTokenStatus {
+    /// Token is currently valid: unrevoked and not past its expiry.
+    Active,
+}
+
+/// Request body for `POST /v1/tokens/introspect`.
+///
+/// The caller presents the full cleartext bearer token; IAM resolves the
+/// principal and workspace without the caller ever holding the `secret_hash`.
+/// Token verification (argon2id) stays in IAM — consumers never re-implement it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenIntrospectionRequest {
+    /// The full cleartext bearer token (`sk-ant-<prefix>.<secret>`) to verify.
+    pub token: String,
+}
+
+/// Response body for `POST /v1/tokens/introspect` (200 OK).
+///
+/// Returned only for tokens that are live (unrevoked and unexpired).
+/// Invalid, expired, or revoked tokens yield `401 Unauthorized` instead, so
+/// when this struct is present the token is always `status: active`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenIntrospectionResponse {
+    /// Principal the token authenticates as.
+    pub principal: PrincipalRef,
+    /// Workspace the token is bound to for credential attribution.
+    pub workspace: WorkspaceId,
+    /// Liveness status — always `active` for a 200 response.
+    pub status: ApiTokenStatus,
+}
+
 /// The authority empowered to discharge a require-approval obligation.
 ///
 /// In the MVP this is the scope the deciding require-approval grant is anchored

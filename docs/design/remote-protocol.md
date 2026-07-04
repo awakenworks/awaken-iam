@@ -21,6 +21,24 @@ trait IamClient {
 }
 ```
 
+The remote transport layer is broken out as the `AuthzTransport` trait so that
+`RemoteIamClient<T>` can delegate each endpoint call to a swappable implementation
+(`HttpAuthzTransport` in production, stubs in tests). Methods on `AuthzTransport`
+correspond one-to-one with the HTTP endpoints below:
+
+| Transport method | HTTP endpoint |
+|---|---|
+| `authorize` | `POST /v1/authorize` |
+| `authorize_batch` | `POST /v1/authorize/batch` |
+| `check_entitlement` | `POST /v1/entitlements/check` |
+| `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
+| `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
+| `introspect_token` | `POST /v1/tokens/introspect` |
+
+`introspect_token` has a default implementation that returns an unsupported error,
+so existing `AuthzTransport` implementations remain valid without change. The
+production `HttpAuthzTransport` overrides it to call the endpoint below.
+
 ```toml
 [iam]
 mode = "remote"          # local | remote
@@ -47,6 +65,7 @@ POST /v1/entitlements/check
 GET  /v1/namespaces/{namespace_id}/signers
 GET  /v1/authz/snapshot?since={version}
 GET  /v1/session
+POST /v1/tokens/introspect
 ```
 
 ### POST /v1/authorize
@@ -71,6 +90,26 @@ Returns the versioned [`AuthzSnapshot`](authorization-engine.md#snapshot) for
 consumers that prefer to evaluate locally and only sync on the `version` fence. `since` lets the client skip an unchanged snapshot. Decisions
 computed from a synced snapshot are byte-identical to remote `authorize` calls —
 the evaluation code is shared, the transport differs.
+
+### POST /v1/tokens/introspect
+
+```jsonc
+// request
+{ "token": "sk-ant-<prefix>.<secret>" }
+// response (200 OK — token is live)
+{ "principal": {...PrincipalRef}, "workspace": "<workspace_id>",
+  "status": "active" }
+// error (401 Unauthorized — invalid, revoked, or expired)
+```
+
+Verifies a bearer API token and resolves its `principal` + `workspace` binding.
+Token verification (argon2id) stays in IAM; consumers never hold or re-implement
+the `secret_hash` check. Invalid, revoked, and expired tokens all return
+`401 Unauthorized` — no branch is distinguishable to the caller, per the
+no-information-leak rule. The `status` field is always `active` in a 200 response;
+it is present for forward-compatibility with any future offline/cached introspection
+path. Exposed on `AuthzTransport` as `introspect_token` (see the method table
+above).
 
 ## Caching and freshness
 

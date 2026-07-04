@@ -14,6 +14,7 @@
 //! | `POST /v1/entitlements/check` | [`AuthzApi::check_entitlement`] |
 //! | `POST /v1/authz/resource-model` | [`AuthzApi::register_resource_model`] |
 //! | `GET /v1/authz/snapshot` | [`AuthzApi::snapshot`] |
+//! | `POST /v1/tokens/introspect` | [`AuthzApi::introspect_token`] |
 //!
 //! Authorization and entitlement are held as independent planes: grant
 //! evaluation lives in [`IamCore`] and never consults the
@@ -23,24 +24,60 @@
 
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
-    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    SignerSetSnapshot,
+    ApiToken, ApiTokenStatus, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
+    EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot, ResourceModelRegistered,
+    ResourceModelRegistration, SignerSetSnapshot, Timestamp, TokenIntrospectionRequest,
+    TokenIntrospectionResponse,
 };
 use awaken_iam_core::{
-    EntitlementEngine, EntitlementProvider, IamCore, NamespaceTrustDirectory, PolicySet,
-    ResourceModel,
+    ApiTokenDirectory, EntitlementEngine, EntitlementProvider, IamCore, IamError,
+    NamespaceTrustDirectory, PolicySet, ResourceModel,
 };
+
+/// Failure returned by [`AuthzApi::introspect_token`].
+///
+/// Any of these outcomes yields `401 Unauthorized` over HTTP — the caller learns
+/// only that the credential does not authenticate, never which branch failed, so
+/// a probing attacker cannot distinguish an unknown prefix from a wrong secret.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IntrospectionError {
+    /// Token is syntactically invalid, refers to an unknown prefix, or the
+    /// secret does not match the stored hash.
+    #[error("token is invalid")]
+    Invalid,
+    /// Token has been explicitly revoked and can no longer authenticate.
+    #[error("token has been revoked")]
+    Revoked,
+    /// Token has passed its expiration timestamp.
+    #[error("token has expired")]
+    Expired,
+}
+
+impl From<IamError> for IntrospectionError {
+    fn from(err: IamError) -> Self {
+        match err {
+            IamError::ApiTokenRevoked { .. } => IntrospectionError::Revoked,
+            IamError::ApiTokenExpired { .. } => IntrospectionError::Expired,
+            _ => IntrospectionError::Invalid,
+        }
+    }
+}
 
 /// Authorization/entitlement protocol surface over an in-process [`IamCore`], an
 /// injectable [`EntitlementProvider`], and namespace [`NamespaceTrustDirectory`].
+///
+/// Also holds an in-memory [`ApiTokenDirectory`] for the token-introspection
+/// plane: API tokens registered via [`register_api_token`](AuthzApi::register_api_token)
+/// are verified by `POST /v1/tokens/introspect` so the consumer never holds the
+/// `secret_hash` and never re-implements the argon2id check.
 #[derive(Debug)]
 pub struct AuthzApi {
     core: IamCore,
     entitlements: Box<dyn EntitlementProvider>,
     trust: NamespaceTrustDirectory,
     policy_version: u64,
+    api_tokens: ApiTokenDirectory,
 }
 
 impl Default for AuthzApi {
@@ -58,6 +95,7 @@ impl AuthzApi {
             entitlements: Box::new(EntitlementEngine::default_allow()),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
+            api_tokens: ApiTokenDirectory::new(),
         }
     }
 
@@ -70,6 +108,7 @@ impl AuthzApi {
             entitlements: Box::new(entitlements),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
+            api_tokens: ApiTokenDirectory::new(),
         }
     }
 
@@ -80,6 +119,7 @@ impl AuthzApi {
             entitlements: Box::new(entitlements),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
+            api_tokens: ApiTokenDirectory::new(),
         }
     }
 
@@ -218,6 +258,42 @@ impl AuthzApi {
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// Register an API token row in the in-memory directory so it can be
+    /// verified by [`introspect_token`](Self::introspect_token).
+    ///
+    /// Called at daemon startup (loading from the SQL store) and on every
+    /// successful token mint. A duplicate id or prefix is silently ignored:
+    /// idempotency here matches the store's upsert semantics and lets a restart
+    /// replay the load without failing.
+    pub fn register_api_token(&mut self, token: ApiToken) {
+        let _ = self.api_tokens.create(token);
+    }
+
+    /// `POST /v1/tokens/introspect`: verify a bearer API token and resolve its
+    /// `principal` + `workspace` binding at `now`.
+    ///
+    /// Performs the full argon2id secret verification and liveness check
+    /// (revocation and expiry) in IAM so the consumer never holds `secret_hash`
+    /// and never re-implements the verification logic. An unknown prefix, a
+    /// wrong secret, a revoked token, or an expired token all map to
+    /// [`IntrospectionError`]; the HTTP layer translates every variant to
+    /// `401 Unauthorized` so a caller cannot distinguish which branch failed.
+    pub fn introspect_token(
+        &self,
+        request: &TokenIntrospectionRequest,
+        now: &Timestamp,
+    ) -> Result<TokenIntrospectionResponse, IntrospectionError> {
+        let token = self
+            .api_tokens
+            .authenticate(&request.token, now)
+            .map_err(IntrospectionError::from)?;
+        Ok(TokenIntrospectionResponse {
+            principal: token.principal.clone(),
+            workspace: token.workspace.clone(),
+            status: ApiTokenStatus::Active,
+        })
     }
 }
 
@@ -546,5 +622,106 @@ mod tests {
         assert_eq!(after.version, 5);
         let ids: Vec<&str> = after.signers.iter().map(|k| k.id.0.as_str()).collect();
         assert_eq!(ids, vec!["key_b"]);
+    }
+
+    #[test]
+    fn introspect_token_resolves_principal_and_workspace_for_a_live_token() {
+        use awaken_iam_contract::{
+            ApiTokenId, ApiTokenStatus, Timestamp, TokenIntrospectionRequest, WorkspaceId,
+        };
+        use awaken_iam_core::{
+            ApiTokenDirectory, ApiTokenMinter, EntropySource, MintApiToken, PolicySet, RoleId,
+        };
+
+        struct SequentialEntropy {
+            next: u8,
+        }
+        impl EntropySource for SequentialEntropy {
+            fn fill_bytes(&mut self, buf: &mut [u8]) {
+                for byte in buf.iter_mut() {
+                    *byte = self.next;
+                    self.next = self.next.wrapping_add(1);
+                }
+            }
+        }
+
+        let mut minter = ApiTokenMinter::new(SequentialEntropy { next: 0 });
+        let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+        let workspace = WorkspaceId("wrkspc_test".into());
+        let issued = minter
+            .mint(
+                &mut directory,
+                &mut policy,
+                MintApiToken {
+                    id: ApiTokenId("tok_introspect".into()),
+                    principal: PrincipalRef::Service {
+                        service_id: "ci".into(),
+                    },
+                    workspace: workspace.clone(),
+                    role: RoleId("workspace_developer".into()),
+                    created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+                    expires_at: None,
+                },
+            )
+            .unwrap();
+
+        // Load the token into the AuthzApi's directory.
+        let mut api = AuthzApi::new();
+        api.register_api_token(issued.token.clone());
+
+        let request = TokenIntrospectionRequest {
+            token: issued.secret.clone(),
+        };
+        let now = Timestamp("2026-06-19T12:00:00Z".into());
+        let response = api.introspect_token(&request, &now).unwrap();
+
+        assert_eq!(
+            response.principal,
+            PrincipalRef::Service {
+                service_id: "ci".into()
+            }
+        );
+        assert_eq!(response.workspace, workspace);
+        assert_eq!(response.status, ApiTokenStatus::Active);
+    }
+
+    #[test]
+    fn introspect_token_returns_invalid_for_unknown_or_wrong_secret() {
+        use awaken_iam_contract::{Timestamp, TokenIntrospectionRequest};
+
+        let api = AuthzApi::new();
+        let now = Timestamp("2026-06-19T12:00:00Z".into());
+        let err = api
+            .introspect_token(
+                &TokenIntrospectionRequest {
+                    token: "sk-ant-ZZZZZZZZ.deadbeef".into(),
+                },
+                &now,
+            )
+            .unwrap_err();
+        assert_eq!(err, IntrospectionError::Invalid);
+    }
+
+    #[test]
+    fn register_api_token_is_idempotent() {
+        use awaken_iam_contract::{ApiToken, ApiTokenId, ApiTokenPrefix, Timestamp, WorkspaceId};
+
+        let token = ApiToken {
+            id: ApiTokenId("tok_idem".into()),
+            prefix: ApiTokenPrefix("pfx_idem".into()),
+            principal: PrincipalRef::Service {
+                service_id: "svc".into(),
+            },
+            secret_hash: "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            workspace: WorkspaceId("ws".into()),
+            created_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            expires_at: None,
+            revoked_at: None,
+        };
+        let mut api = AuthzApi::new();
+        api.register_api_token(token.clone());
+        // Registering the same token a second time is a no-op, not a panic.
+        api.register_api_token(token);
     }
 }

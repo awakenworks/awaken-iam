@@ -22,6 +22,7 @@ use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
     PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -239,6 +240,18 @@ impl AuthzTransport for HttpAuthzTransport {
     fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
         let path = format!("/v1/namespaces/{}/signers", namespace_id.0);
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn introspect_token(
+        &self,
+        request: &TokenIntrospectionRequest,
+    ) -> Result<TokenIntrospectionResponse, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/tokens/introspect"))
+                .json(request)
+        })?;
         Self::decode(response)
     }
 }
@@ -465,5 +478,43 @@ mod tests {
         let recorded = server.requests();
         assert!(recorded[0].contains("x-iam-audience: packs-service"));
         assert!(recorded[0].contains("authorization: Bearer svc-token-abc"));
+    }
+
+    #[test]
+    fn introspect_token_posts_to_introspect_path_and_decodes_response() {
+        use awaken_iam_contract::{ApiTokenStatus, TokenIntrospectionRequest, WorkspaceId};
+        let body = r#"{"principal":{"kind":"service","service_id":"ci"},"workspace":"ws_1","status":"active"}"#;
+        let server = StubServer::start(vec![Reply::Ok(body.into())]);
+        let transport = transport(&server);
+
+        let request = TokenIntrospectionRequest {
+            token: "sk-ant-pfx.secret".into(),
+        };
+        let response = transport.introspect_token(&request).unwrap();
+        assert_eq!(
+            response.principal,
+            PrincipalRef::Service {
+                service_id: "ci".into()
+            }
+        );
+        assert_eq!(response.workspace, WorkspaceId("ws_1".into()));
+        assert_eq!(response.status, ApiTokenStatus::Active);
+
+        drop(transport);
+        assert!(server.requests()[0].starts_with("POST /v1/tokens/introspect "));
+    }
+
+    #[test]
+    fn introspect_token_surfaces_401_as_remote_error() {
+        use awaken_iam_contract::TokenIntrospectionRequest;
+        let server = StubServer::start(vec![Reply::Status(401)]);
+        let transport = transport(&server);
+
+        let err = transport
+            .introspect_token(&TokenIntrospectionRequest {
+                token: "sk-ant-bad.token".into(),
+            })
+            .unwrap_err();
+        assert!(err.0.contains("401"), "unexpected error: {}", err.0);
     }
 }
