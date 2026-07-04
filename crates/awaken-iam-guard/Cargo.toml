@@ -1,0 +1,26 @@
+[package]
+name = "awaken-iam-guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Framework-neutral resolve/authorize/provision guard for cross-product IAM reuse."
+
+[dependencies]
+awaken-iam-contract.workspace = true
+awaken-iam-core.workspace = true
+awaken-iam-client.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Tests exercise provision against the in-memory and SQLite store adapters.
+awaken-iam-server.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

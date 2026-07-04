@@ -6,6 +6,7 @@ members = [
     "crates/awaken-iam-core",
     "crates/awaken-iam-client",
     "crates/awaken-iam-server",
+    "crates/awaken-iam-guard",
     "xtask",
 ]
 
@@ -24,6 +25,7 @@ awaken-iam-contract = { path = "crates/awaken-iam-contract", version = "0.1.1" }
 awaken-iam-core = { path = "crates/awaken-iam-core", version = "0.1.1" }
 awaken-iam-client = { path = "crates/awaken-iam-client", version = "0.1.1" }
 awaken-iam-server = { path = "crates/awaken-iam-server", version = "0.1.1" }
+awaken-iam-guard = { path = "crates/awaken-iam-guard", version = "0.1.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
