@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn introspect_route_returns_401_for_unknown_token() {
         let router = authz_router(Arc::new(AuthzApi::new()));
-        let body = serde_json::json!({ "token": "sk-ant-ZZZZZZZZ.deadbeef" });
+        let body = serde_json::json!({ "token": "sk-awaken-ZZZZZZZZ.deadbeef" });
         let response = router
             .oneshot(post("/v1/tokens/introspect", body))
             .await

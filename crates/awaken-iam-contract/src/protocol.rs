@@ -38,7 +38,7 @@ pub enum ApiTokenStatus {
 /// Token verification (argon2id) stays in IAM — consumers never re-implement it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenIntrospectionRequest {
-    /// The full cleartext bearer token (`sk-ant-<prefix>.<secret>`) to verify.
+    /// The full cleartext bearer token (`sk-awaken-<prefix>.<secret>`) to verify.
     pub token: String,
 }
 

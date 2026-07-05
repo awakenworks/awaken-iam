@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn remote_client_resolves_valid_token_to_identity() {
         let client = RemoteIamClient::new(OkTransport);
-        let identity = resolve("sk-ant-valid.token", &client).unwrap();
+        let identity = resolve("sk-awaken-valid.token", &client).unwrap();
         assert_eq!(identity.workspace, WorkspaceId("ws_1".into()));
         assert!(matches!(
             identity.principal,
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn remote_client_fails_closed_on_transport_error() {
         let client = RemoteIamClient::new(ErrTransport);
-        let err = resolve("sk-ant-bad.token", &client).unwrap_err();
+        let err = resolve("sk-awaken-bad.token", &client).unwrap_err();
         assert_eq!(err, ResolveError::Invalid);
     }
 
@@ -209,7 +209,7 @@ mod tests {
     fn mode_switch_routes_to_remote_resolver() {
         let remote: IamClientMode<RemoteIamClient<ErrTransport>, RemoteIamClient<OkTransport>> =
             IamClientMode::Remote(RemoteIamClient::new(OkTransport));
-        let identity = resolve("sk-ant-valid.token", &remote).unwrap();
+        let identity = resolve("sk-awaken-valid.token", &remote).unwrap();
         assert_eq!(identity.workspace, WorkspaceId("ws_1".into()));
     }
 
@@ -248,7 +248,7 @@ mod tests {
         // not to an Allow or a different variant.
         let client = RemoteIamClient::new(ErrTransport);
         assert_eq!(
-            resolve("sk-ant-anything.x", &client),
+            resolve("sk-awaken-anything.x", &client),
             Err(ResolveError::Invalid)
         );
     }

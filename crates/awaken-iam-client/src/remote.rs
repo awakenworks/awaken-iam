@@ -541,7 +541,7 @@ mod tests {
         let client = RemoteIamClient::new(StubTransport { fail: false });
         let err = client
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-ant-test.token".into(),
+                token: "sk-awaken-test.token".into(),
             })
             .unwrap_err();
         assert!(
@@ -606,7 +606,7 @@ mod tests {
         let client = RemoteIamClient::new(IntrospectStub);
         let response = client
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-ant-prefix.secret".into(),
+                token: "sk-awaken-prefix.secret".into(),
             })
             .unwrap();
         assert_eq!(

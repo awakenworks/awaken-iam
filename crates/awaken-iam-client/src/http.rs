@@ -488,7 +488,7 @@ mod tests {
         let transport = transport(&server);
 
         let request = TokenIntrospectionRequest {
-            token: "sk-ant-pfx.secret".into(),
+            token: "sk-awaken-pfx.secret".into(),
         };
         let response = transport.introspect_token(&request).unwrap();
         assert_eq!(
@@ -512,7 +512,7 @@ mod tests {
 
         let err = transport
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-ant-bad.token".into(),
+                token: "sk-awaken-bad.token".into(),
             })
             .unwrap_err();
         assert!(err.0.contains("401"), "unexpected error: {}", err.0);

@@ -695,7 +695,7 @@ mod tests {
         let err = api
             .introspect_token(
                 &TokenIntrospectionRequest {
-                    token: "sk-ant-ZZZZZZZZ.deadbeef".into(),
+                    token: "sk-awaken-ZZZZZZZZ.deadbeef".into(),
                 },
                 &now,
             )

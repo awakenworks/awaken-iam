@@ -144,3 +144,26 @@ reintroduce the parallel model this ADR exists to avoid.
   federation-rule → workspace-role mapping; a per-consumer action-namespace
   convention (`agent.*`, `oversight.*`); and — sequenced separately — an
   `sk-ant-`-style API-key credential rendering.
+
+## Supersession note — credential rendering (decision 6)
+
+**Decision 6** recorded that the API-key credential rendering was a
+"contained, separately-sequenced change" still using `oiam_<prefix>.<secret>` at
+the time of writing, and that an `sk-ant-`-compatible rendering was tracked for
+future adoption. That deferred change has now been resolved differently:
+
+- **Adopted scheme:** `sk-awaken-<prefix>.<secret>` — an Awaken-branded secret-key
+  format that keeps the `sk-` convention but uses `awaken` as the brand segment
+  rather than `ant`, avoiding impersonation of Anthropic's own API-key prefix.
+- **Minting:** `render_token` always produces `sk-awaken-` tokens.
+- **Deprecation window:** `parse_presented_token` accepts both `sk-awaken-` (new,
+  tried first) and the legacy `sk-ant-` prefix during a transition period so that
+  previously-minted tokens remain valid while operators rotate.
+- **Secret scanning:** `.github/secret_scanning.yml` registers the `sk-awaken-`
+  regex so GitHub can detect leaked tokens under the new scheme.
+
+The Consequences entry "an `sk-ant-`-style API-key credential rendering" is
+therefore **closed**: the credential rendering is implemented as `sk-awaken-`, not
+`sk-ant-`. The `x-api-key: sk-ant-admin...` example in the Context section
+describes the upstream Anthropic Admin API surface (their key format), not Awaken's
+minted tokens, and remains accurate.

@@ -95,7 +95,7 @@ the evaluation code is shared, the transport differs.
 
 ```jsonc
 // request
-{ "token": "sk-ant-<prefix>.<secret>" }
+{ "token": "sk-awaken-<prefix>.<secret>" }
 // response (200 OK — token is live)
 { "principal": {...PrincipalRef}, "workspace": "<workspace_id>",
   "status": "active" }

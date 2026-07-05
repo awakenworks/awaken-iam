@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn resolve_returns_identity_from_token_resolver() {
         let client = AllowAll;
-        let identity = resolve("sk-ant-test.token", &client).unwrap();
+        let identity = resolve("sk-awaken-test.token", &client).unwrap();
         assert_eq!(identity.workspace, WorkspaceId("ws_1".into()));
         assert!(matches!(
             identity.principal,

@@ -6,7 +6,7 @@
 //! decision 3). A token is two halves: a public, non-secret
 //! *prefix* used to locate the row, and a high-entropy *secret* that is hashed
 //! with **argon2id** and stored only as its PHC hash. The full cleartext token
-//! (`sk-ant-<prefix>.<secret>`) is returned exactly once at mint time and is
+//! (`sk-awaken-<prefix>.<secret>`) is returned exactly once at mint time and is
 //! never recoverable afterwards — mirroring how sessions and login secrets are
 //! handled, but with a memory-hard hash because the secret is a long-lived
 //! credential rather than a short-TTL challenge.
@@ -33,15 +33,22 @@ use awaken_iam_contract::{
 
 use crate::{EntropySource, IamError, PolicySet, RoleBinding, RoleId};
 
-/// Scheme marker every rendered token carries, before the `<prefix>.<secret>`
+/// Scheme marker every newly-minted token carries, before the `<prefix>.<secret>`
 /// body, so a presented credential is recognizable and unambiguously parsed.
 ///
-/// Rendered in the Anthropic `sk-ant-`-compatible shape (ADR-0008 decision 6, an
-/// owned divergence): the marker is the only Anthropic-facing part of the
-/// credential; the `<prefix>.<secret>` body stays our own. base64url never
-/// contains `.`, and the marker is stripped literally before the body is split,
-/// so the parse is unambiguous even though the marker itself ends in `-`.
-const TOKEN_SCHEME: &str = "sk-ant-";
+/// Awaken-branded (`sk-awaken-`) to distinguish Awaken management tokens from
+/// real Anthropic provider keys (`sk-ant-…`). base64url never contains `.`, and
+/// the marker is stripped literally before the body is split, so the parse is
+/// unambiguous even though the marker itself ends in `-`.
+const TOKEN_SCHEME: &str = "sk-awaken-";
+
+/// Legacy scheme accepted during the deprecation window.
+///
+/// Tokens minted before the `sk-awaken-` migration carry this prefix; they are
+/// still verified but new tokens are never minted under it. Operators should
+/// rotate all existing tokens to invalidate the legacy scheme in their
+/// environment.
+const LEGACY_TOKEN_SCHEME: &str = "sk-ant-";
 
 /// Random bytes drawn for the public lookup prefix (64 bits).
 const PREFIX_BYTES: usize = 8;
@@ -84,9 +91,9 @@ pub struct MintApiToken {
 
 /// Result of minting a token: the persisted row plus its one-time cleartext.
 ///
-/// The `secret` is the full `sk-ant-<prefix>.<secret>` credential to hand to the
-/// caller exactly once; only the argon2id hash on [`IssuedApiToken::token`] is
-/// persisted.
+/// The `secret` is the full `sk-awaken-<prefix>.<secret>` credential to hand to
+/// the caller exactly once; only the argon2id hash on [`IssuedApiToken::token`]
+/// is persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedApiToken {
     /// The persisted token row (argon2id hash only).
@@ -297,8 +304,13 @@ fn render_token(prefix: &str, secret: &str) -> String {
 /// Returns `None` when the scheme marker is missing or either half is empty, so
 /// a malformed token never reaches the hash comparison. base64url never contains
 /// `.`, so the single split is unambiguous.
+///
+/// Accepts both `sk-awaken-` (current) and `sk-ant-` (legacy deprecation window)
+/// so operators can rotate existing tokens without a hard cutover.
 pub fn parse_presented_token(presented: &str) -> Option<(ApiTokenPrefix, String)> {
-    let body = presented.strip_prefix(TOKEN_SCHEME)?;
+    let body = presented
+        .strip_prefix(TOKEN_SCHEME)
+        .or_else(|| presented.strip_prefix(LEGACY_TOKEN_SCHEME))?;
     let (prefix, secret) = body.split_once('.')?;
     if prefix.is_empty() || secret.is_empty() {
         return None;
@@ -392,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn cleartext_renders_in_the_sk_ant_shape_and_parses_back() {
+    fn cleartext_renders_in_the_sk_awaken_shape_and_parses_back() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
         let mut policy = PolicySet::new();
@@ -400,9 +412,9 @@ mod tests {
             .mint(&mut directory, &mut policy, mint_request("tok_1", None))
             .unwrap();
 
-        // The Anthropic-compatible marker is the literal wire shape (ADR-0008
-        // decision 6), not just whatever TOKEN_SCHEME happens to hold.
-        assert!(issued.secret.starts_with("sk-ant-"));
+        // Awaken-branded marker, not the old Anthropic-compatible `sk-ant-`.
+        assert!(issued.secret.starts_with("sk-awaken-"));
+        assert!(!issued.secret.starts_with("sk-ant-"));
         assert!(!issued.secret.starts_with("oiam_"));
 
         // The marker is stripped and the body splits back into the stored prefix
@@ -410,6 +422,20 @@ mod tests {
         let (prefix, secret) = parse_presented_token(&issued.secret).unwrap();
         assert_eq!(prefix, issued.token.prefix);
         assert!(!secret.is_empty());
+    }
+
+    #[test]
+    fn legacy_sk_ant_tokens_are_accepted_during_deprecation_window() {
+        // parse_presented_token must accept the old sk-ant- scheme so operators
+        // can rotate tokens without a hard cutover.
+        let result = parse_presented_token("sk-ant-someprefix.somesecret");
+        assert!(result.is_some());
+        let (prefix, secret) = result.unwrap();
+        assert_eq!(prefix.0, "someprefix");
+        assert_eq!(secret, "somesecret");
+
+        // But a token with no recognised scheme marker is still rejected.
+        assert!(parse_presented_token("oiam_someprefix.somesecret").is_none());
     }
 
     #[test]
@@ -502,11 +528,17 @@ mod tests {
             .unwrap();
         let now = Timestamp("2026-06-19T06:00:00Z".into());
 
-        // A presented token for an unregistered prefix.
+        // A presented token for an unregistered prefix (new scheme).
         let unknown = directory
-            .authenticate("sk-ant-ZZZZZZZZ.deadbeef", &now)
+            .authenticate("sk-awaken-ZZZZZZZZ.deadbeef", &now)
             .unwrap_err();
         assert_eq!(unknown, IamError::ApiTokenInvalid);
+
+        // Legacy scheme with an unregistered prefix also fails closed.
+        let unknown_legacy = directory
+            .authenticate("sk-ant-ZZZZZZZZ.deadbeef", &now)
+            .unwrap_err();
+        assert_eq!(unknown_legacy, IamError::ApiTokenInvalid);
 
         // The right prefix but the wrong secret half collapses to the same error.
         let forged = format!("{TOKEN_SCHEME}{}.not-the-secret", issued.token.prefix.0);
