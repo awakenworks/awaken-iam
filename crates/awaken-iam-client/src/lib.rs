@@ -1,10 +1,14 @@
 //! Client-facing IAM traits.
 
+#[cfg(feature = "credential-cache")]
+mod cache;
 #[cfg(feature = "http")]
 mod http;
 mod remote;
 mod snapshot;
 
+#[cfg(feature = "credential-cache")]
+pub use cache::{CacheError, CachedCredential, Credential, CredentialCache, RedactedString};
 #[cfg(feature = "http")]
 pub use http::{DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig};
 mod outbox;

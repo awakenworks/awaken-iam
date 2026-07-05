@@ -50,6 +50,7 @@ dependencies = [
  "awaken-iam-core",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
