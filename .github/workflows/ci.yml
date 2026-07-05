@@ -53,6 +53,23 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal
           cargo +1.96.0 check --workspace --locked
 
+  # awaken-iam-server declares rusqlite as a range (`>=0.32, <0.41`) so that
+  # embedding graphs with their own rusqlite can unify on one libsqlite3-sys
+  # (see the comment on the dependency). Regular jobs resolve the range's top;
+  # this job pins the lockfile to the floor so a 0.40-only API can't sneak in
+  # and silently break consumers that resolve low.
+  rusqlite-floor:
+    name: rusqlite floor (0.32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Pin rusqlite to the range floor
+        run: cargo update -p rusqlite --precise 0.32.1
+      - name: Test the sqlite backend at the floor
+        run: cargo test -p awaken-iam-server
+
   backend:
     name: Backend
     runs-on: ubuntu-latest

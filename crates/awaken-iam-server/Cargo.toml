@@ -16,11 +16,11 @@ awaken-iam-client.workspace = true
 # The shared, scope-partitioned migration mechanism (bundles, checksums, the
 # plan() decision, dialect-token rendering, the fail-closed ledger fence). Only
 # the driver-agnostic pure core is used (default features): awaken-iam's own
-# backends drive it with their sync `postgres` / rusqlite 0.40 clients, whereas
-# the crate's optional `postgres`/`sqlite` runner shells target async sqlx and
-# rusqlite 0.32 — different driver generations, so the shells are deliberately
-# left off.
-awaken-scoped-migration = { git = "https://github.com/awakenworks/awaken-foundation.git", rev = "f90f6bcf6b2b2d98610dfc5dfdaa9f9c5ccd8494" }
+# backends drive it with their sync `postgres` / rusqlite clients, whereas the
+# crate's optional `postgres`/`sqlite-sqlx` runner shells target async sqlx (its
+# sync rusqlite shell lives in the sibling crate `awaken-scoped-migration-sqlite`,
+# foundation ADR-0005), so the shells are deliberately left off.
+awaken-scoped-migration = { git = "https://github.com/awakenworks/awaken-foundation.git", rev = "dfa512edd2e5b7e34ad0b05db01b973845f0f9e9" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,13 @@ async-trait = "0.1"
 base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = "2"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+# A *range*, deliberately not a hard `^0.x` pin: rusqlite pulls the native
+# `links = "sqlite3"` crate libsqlite3-sys, of which a graph may contain exactly
+# one version, so a hard pin here would deadlock any embedding graph that already
+# resolves a different rusqlite (mirrors awaken-foundation ADR-0005; the sqlite
+# store only uses API stable across the whole range). The floor is compile- and
+# test-guarded by the `rusqlite-floor` CI job; move both together.
+rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
 postgres = "0.19.14"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }

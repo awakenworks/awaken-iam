@@ -26,9 +26,10 @@
 //!
 //! ## Why the foundation crate's *core* and not its runner shells
 //!
-//! `awaken-scoped-migration` ships optional `postgres` (async `sqlx`) and
-//! `sqlite` (`rusqlite` 0.32) runner shells. IAM's backends use the *synchronous*
-//! `postgres` client and `rusqlite` 0.40 — different driver generations — so IAM
+//! `awaken-scoped-migration` ships optional async-`sqlx` runner shells
+//! (`postgres`, `sqlite-sqlx`); its synchronous rusqlite shell is the sibling
+//! crate `awaken-scoped-migration-sqlite` (foundation ADR-0005). IAM's backends
+//! use the *synchronous* `postgres` client and `rusqlite` directly, so IAM
 //! depends on the crate with **default features** (the driver-agnostic pure core)
 //! and writes its own thin shells here, exactly mirroring the pattern the crate's
 //! own shells follow.
