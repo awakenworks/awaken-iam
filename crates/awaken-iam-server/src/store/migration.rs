@@ -137,8 +137,17 @@ impl BundleScope {
 pub struct Migration {
     /// Stable, ordered id unique within the owning bundle (e.g. `0001_init`).
     pub id: &'static str,
+    /// Human-readable description for tooling and audit output.
+    pub desc: &'static str,
     /// Prefix- and type-token-templated DDL applied for this step.
     pub up_sql: &'static str,
+}
+
+impl Migration {
+    /// Construct a migration step.
+    pub const fn new(id: &'static str, desc: &'static str, up_sql: &'static str) -> Self {
+        Self { id, desc, up_sql }
+    }
 }
 
 impl Migration {
@@ -169,6 +178,13 @@ pub struct MigrationBundle {
     pub scope: BundleScope,
     /// Ordered migrations; never reordered or edited in place once shipped.
     pub migrations: Vec<Migration>,
+}
+
+impl MigrationBundle {
+    /// Construct a bundle for the given scope with the supplied ordered migrations.
+    pub fn new(scope: BundleScope, migrations: Vec<Migration>) -> Self {
+        Self { scope, migrations }
+    }
 }
 
 /// A migration rendered for a concrete table prefix, ready to apply.
@@ -515,58 +531,67 @@ impl MigrationExecutor for RecordingExecutor {
 /// The canonical IAM migration bundles, one per subdomain scope.
 pub fn bundles() -> Vec<MigrationBundle> {
     vec![
-        MigrationBundle {
-            scope: BundleScope::Identity,
-            migrations: vec![
-                Migration {
-                    id: "0001_identity",
-                    up_sql: IDENTITY_0001,
-                },
-                Migration {
-                    id: "0002_api_tokens",
-                    up_sql: IDENTITY_0002,
-                },
-                Migration {
-                    id: "0003_oauth_clients",
-                    up_sql: IDENTITY_0003,
-                },
-                Migration {
-                    id: "0004_api_token_workspace",
-                    up_sql: IDENTITY_0004,
-                },
+        MigrationBundle::new(
+            BundleScope::Identity,
+            vec![
+                Migration::new(
+                    "0001_identity",
+                    "accounts, external identities, sessions, login flows",
+                    IDENTITY_0001,
+                ),
+                Migration::new(
+                    "0002_api_tokens",
+                    "long-lived principal-scoped API tokens",
+                    IDENTITY_0002,
+                ),
+                Migration::new(
+                    "0003_oauth_clients",
+                    "downstream OAuth provider clients",
+                    IDENTITY_0003,
+                ),
+                Migration::new(
+                    "0004_api_token_workspace",
+                    "bind API tokens to a workspace; drop per-token scope",
+                    IDENTITY_0004,
+                ),
             ],
-        },
-        MigrationBundle {
-            scope: BundleScope::Authz,
-            migrations: vec![
-                Migration {
-                    id: "0001_authz",
-                    up_sql: AUTHZ_0001,
-                },
-                Migration {
-                    id: "0002_directory",
-                    up_sql: AUTHZ_0002,
-                },
-                Migration {
-                    id: "0003_fence",
-                    up_sql: AUTHZ_0003,
-                },
+        ),
+        MigrationBundle::new(
+            BundleScope::Authz,
+            vec![
+                Migration::new(
+                    "0001_authz",
+                    "grants, role bindings, resource model edges",
+                    AUTHZ_0001,
+                ),
+                Migration::new(
+                    "0002_directory",
+                    "organizations, groups, reusable role definitions",
+                    AUTHZ_0002,
+                ),
+                Migration::new(
+                    "0003_fence",
+                    "shared-store freshness fence for HA policy/epoch versioning",
+                    AUTHZ_0003,
+                ),
             ],
-        },
-        MigrationBundle {
-            scope: BundleScope::Entitlement,
-            migrations: vec![Migration {
-                id: "0001_entitlement",
-                up_sql: ENTITLEMENT_0001,
-            }],
-        },
-        MigrationBundle {
-            scope: BundleScope::Audit,
-            migrations: vec![Migration {
-                id: "0001_audit",
-                up_sql: AUDIT_0001,
-            }],
-        },
+        ),
+        MigrationBundle::new(
+            BundleScope::Entitlement,
+            vec![Migration::new(
+                "0001_entitlement",
+                "plans and per-principal subscription assignments",
+                ENTITLEMENT_0001,
+            )],
+        ),
+        MigrationBundle::new(
+            BundleScope::Audit,
+            vec![Migration::new(
+                "0001_audit",
+                "append-only audit event log",
+                AUDIT_0001,
+            )],
+        ),
     ]
 }
 
@@ -578,13 +603,13 @@ pub fn bundles() -> Vec<MigrationBundle> {
 // in the domain — deliberately no FK, so this bundle can deploy without the
 // others present.
 const IDENTITY_0001: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_accounts (\
+CREATE TABLE {prefix}_accounts (\
  id TEXT PRIMARY KEY, \
  status TEXT NOT NULL, \
  display_name TEXT, \
  created_at TEXT NOT NULL, \
  updated_at TEXT NOT NULL);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_external_identities (\
+CREATE TABLE {prefix}_external_identities (\
  id TEXT PRIMARY KEY, \
  account_id TEXT NOT NULL, \
  provider_key TEXT NOT NULL, \
@@ -593,9 +618,9 @@ CREATE TABLE IF NOT EXISTS {prefix}_external_identities (\
  first_seen_at TEXT NOT NULL, \
  last_seen_at TEXT NOT NULL, \
  UNIQUE (provider_key, subject));\n\
-CREATE INDEX IF NOT EXISTS {prefix}_external_identities_account_idx \
+CREATE INDEX {prefix}_external_identities_account_idx \
  ON {prefix}_external_identities (account_id);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_sessions (\
+CREATE TABLE {prefix}_sessions (\
  id TEXT PRIMARY KEY, \
  account_id TEXT NOT NULL, \
  token_hash TEXT NOT NULL UNIQUE, \
@@ -604,7 +629,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_sessions (\
  last_seen_at TEXT NOT NULL, \
  expires_at TEXT NOT NULL, \
  revoked_at TEXT);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_login_flows (\
+CREATE TABLE {prefix}_login_flows (\
  id TEXT PRIMARY KEY, \
  provider_key TEXT NOT NULL, \
  state_hash TEXT NOT NULL, \
@@ -621,7 +646,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_login_flows (\
 // is the JSON contract form, resolved in the domain with no FK into another
 // bundle. An optional `expires_at` and a `revoked_at` stamp carry liveness.
 const IDENTITY_0002: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_api_tokens (\
+CREATE TABLE {prefix}_api_tokens (\
  id TEXT PRIMARY KEY, \
  prefix TEXT NOT NULL UNIQUE, \
  principal {json} NOT NULL, \
@@ -630,7 +655,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_api_tokens (\
  created_at TEXT NOT NULL, \
  expires_at TEXT, \
  revoked_at TEXT);\n\
-CREATE INDEX IF NOT EXISTS {prefix}_api_tokens_principal_idx \
+CREATE INDEX {prefix}_api_tokens_principal_idx \
  ON {prefix}_api_tokens (principal);";
 
 // Downstream OAuth provider clients: the product clients allowed to integrate
@@ -640,7 +665,7 @@ CREATE INDEX IF NOT EXISTS {prefix}_api_tokens_principal_idx \
 // client's secret and is NULL for a public (PKCE-only) client — the cleartext
 // secret is never stored.
 const IDENTITY_0003: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_oauth_clients (\
+CREATE TABLE {prefix}_oauth_clients (\
  client_id TEXT PRIMARY KEY, \
  redirect_uris {json} NOT NULL, \
  allowed_scopes {json} NOT NULL, \
@@ -662,18 +687,18 @@ ALTER TABLE {prefix}_api_tokens ADD COLUMN workspace TEXT NOT NULL DEFAULT '';";
 // scopes are stored as their JSON contract form so the domain owns their
 // shape; no FK crosses into iam.identity or iam.entitlement.
 const AUTHZ_0001: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_grants (\
+CREATE TABLE {prefix}_grants (\
  id TEXT PRIMARY KEY, \
  subject {json} NOT NULL, \
  action_pattern TEXT NOT NULL, \
  scope {json} NOT NULL, \
  effect TEXT NOT NULL);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_role_bindings (\
+CREATE TABLE {prefix}_role_bindings (\
  principal {json} NOT NULL, \
  role TEXT NOT NULL, \
  scope {json} NOT NULL, \
  PRIMARY KEY (principal, role, scope));\n\
-CREATE TABLE IF NOT EXISTS {prefix}_resource_edges (\
+CREATE TABLE {prefix}_resource_edges (\
  resource_type TEXT NOT NULL, \
  resource_id TEXT NOT NULL, \
  parent {json} NOT NULL, \
@@ -685,22 +710,22 @@ CREATE TABLE IF NOT EXISTS {prefix}_resource_edges (\
 // FK across rows. Appended as a second authz step, leaving 0001 untouched so its
 // recorded identity never drifts.
 const AUTHZ_0002: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_orgs (\
+CREATE TABLE {prefix}_orgs (\
  id TEXT PRIMARY KEY, \
  display_name TEXT, \
  owner {json} NOT NULL, \
  created_at TEXT NOT NULL, \
  updated_at TEXT NOT NULL);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_groups (\
+CREATE TABLE {prefix}_groups (\
  id TEXT PRIMARY KEY, \
  org_id TEXT NOT NULL, \
  display_name TEXT, \
  members {json} NOT NULL, \
  created_at TEXT NOT NULL, \
  updated_at TEXT NOT NULL);\n\
-CREATE INDEX IF NOT EXISTS {prefix}_groups_org_idx \
+CREATE INDEX {prefix}_groups_org_idx \
  ON {prefix}_groups (org_id);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_roles (\
+CREATE TABLE {prefix}_roles (\
  id TEXT PRIMARY KEY, \
  display_name TEXT, \
  action_patterns {json} NOT NULL, \
@@ -713,7 +738,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_roles (\
 // revoke bumps `epoch`, each in the same transaction as the write it fences. No
 // FK crosses into another bundle. See high-availability.md.
 const AUTHZ_0003: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_fence (\
+CREATE TABLE {prefix}_fence (\
  id INTEGER PRIMARY KEY, \
  version BIGINT NOT NULL DEFAULT 1, \
  epoch BIGINT NOT NULL DEFAULT 0, \
@@ -725,13 +750,13 @@ CREATE TABLE IF NOT EXISTS {prefix}_fence (\
 // plan by id resolved in the domain — no FK to the plans table, keeping the
 // bundle aggregate-safe with the rest.
 const ENTITLEMENT_0001: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_plans (\
+CREATE TABLE {prefix}_plans (\
  id TEXT PRIMARY KEY, \
  tier TEXT NOT NULL, \
  features {json} NOT NULL, \
  limits {json} NOT NULL, \
  rates {json} NOT NULL);\n\
-CREATE TABLE IF NOT EXISTS {prefix}_subscriptions (\
+CREATE TABLE {prefix}_subscriptions (\
  principal {json} NOT NULL PRIMARY KEY, \
  plan_id TEXT NOT NULL);";
 
@@ -742,7 +767,7 @@ CREATE TABLE IF NOT EXISTS {prefix}_subscriptions (\
 // actor is the optional JSON principal form, absent when no principal is
 // attributable. Audit references nothing by FK — it is a flat, write-once log.
 const AUDIT_0001: &str = "\
-CREATE TABLE IF NOT EXISTS {prefix}_audit_events (\
+CREATE TABLE {prefix}_audit_events (\
  seq {pk_autoinc}, \
  at TEXT NOT NULL, \
  actor {json}, \
@@ -974,5 +999,44 @@ mod tests {
             .pool_mut()
             .force_checksum("iam.authz", "0003_fence", "deadbeef");
         assert!(!store.migrations_applied().expect("probe"));
+    }
+
+    /// `check_migrations --audit`: validates every shipped bundle against the
+    /// awaken-scoped-migration rules. Run directly via `cargo run -p xtask --
+    /// check-migrations --audit` or implicitly by `cargo test --workspace`.
+    #[test]
+    fn check_migrations_audit_passes() {
+        // Forbidden patterns in migration DDL templates.
+        // Portable type tokens ({json}, {timestamptz}, {now}, {pk_autoinc}) are
+        // all lowercase and do not contain these uppercase strings.
+        let banned: &[(&str, &str)] = &[
+            (
+                "IF NOT EXISTS",
+                "idempotency guard; the ledger handles this",
+            ),
+            ("JSONB", "raw Postgres type; use {json}"),
+            ("TIMESTAMPTZ", "raw Postgres type; use {timestamptz}"),
+            ("BIGSERIAL", "raw Postgres type; use {pk_autoinc}"),
+            (" SERIAL ", "raw Postgres type; use {pk_autoinc}"),
+            ("now()", "raw Postgres function; use {now}"),
+        ];
+        for bundle in bundles() {
+            for m in &bundle.migrations {
+                assert!(
+                    !m.desc.is_empty(),
+                    "{}::{} has empty description",
+                    bundle.scope.id(),
+                    m.id
+                );
+                for (pat, reason) in banned {
+                    assert!(
+                        !m.up_sql.contains(pat),
+                        "{}::{} contains forbidden pattern {pat:?}: {reason}",
+                        bundle.scope.id(),
+                        m.id
+                    );
+                }
+            }
+        }
     }
 }

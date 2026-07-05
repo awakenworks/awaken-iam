@@ -38,6 +38,8 @@ pre-push:
       run: cargo clippy --workspace --all-targets -- -D clippy::correctness
     guardrails:
       run: cargo run -p xtask -- guardrail-lints
+    check-migrations:
+      run: cargo run -p xtask -- check-migrations --audit
     file-length:
       run: python3 scripts/ci/check_file_length.py --self-test && python3 scripts/ci/check_file_length.py
     adr-immutability:

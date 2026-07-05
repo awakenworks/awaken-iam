@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         None | Some("guardrail-lints") => {
             run_guardrail_lints(args.iter().any(|a| a == "--self-check"))
         }
+        Some("check-migrations") => run_check_migrations_audit(),
         Some("help" | "--help" | "-h") => {
             print_help();
             ExitCode::SUCCESS
@@ -41,8 +42,44 @@ fn print_help() {
          COMMANDS:\n    \
          guardrail-lints              run every guardrail over the workspace\n    \
          guardrail-lints --self-check verify the enforcers against synthetic input\n    \
+         check-migrations --audit     audit migration bundles for portable DDL compliance\n    \
          help                         print this message"
     );
+}
+
+/// Run the migration DDL audit by invoking the dedicated cargo test.
+///
+/// The actual rule-checking lives in `migration::tests::check_migrations_audit_passes`
+/// (in `awaken-iam-server`) so the audit runs against the real runtime bundles, not
+/// a text approximation. This command is the named entry point for the pre-push hook
+/// and for developers who want to run just the audit.
+fn run_check_migrations_audit() -> ExitCode {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .args([
+            "test",
+            "--package",
+            "awaken-iam-server",
+            "--lib",
+            "--",
+            "migration::tests::check_migrations_audit_passes",
+            "--nocapture",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("check-migrations --audit: ok");
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("check-migrations --audit: audit test failed");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("check-migrations --audit: cannot spawn cargo: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_guardrail_lints(self_check: bool) -> ExitCode {
