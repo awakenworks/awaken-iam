@@ -92,6 +92,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "awaken-iam-host"
+version = "0.1.1"
+dependencies = [
+ "awaken-iam-client",
+ "awaken-iam-contract",
+ "awaken-iam-core",
+ "awaken-iam-server",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "awaken-iam-server"
 version = "0.1.1"
 dependencies = [
