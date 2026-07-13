@@ -636,3 +636,42 @@ async fn middleware_consults_scope_for_with_request_coordinates() {
         calls[0].1
     );
 }
+
+/// `from_local_authz` wraps a **product-owned** embed (its own directory,
+/// policy, grants, and bootstrap identity) into a Local-mode gate — the
+/// constructor a product with its own tenancy model uses instead of
+/// `embed_local`. The product's own token authenticates through the gate.
+#[test]
+fn from_local_authz_wraps_a_product_owned_embed() {
+    use awaken_iam_core::{ApiTokenDirectory, ApiTokenMinter, OsEntropy, PolicySet};
+    use std::sync::{Arc, Mutex};
+
+    let mut directory = ApiTokenDirectory::new();
+    let mut policy = PolicySet::new();
+    let principal = svc("svc-product");
+    let issued = ApiTokenMinter::new(OsEntropy)
+        .mint(
+            &mut directory,
+            &mut policy,
+            MintApiToken {
+                id: ApiTokenId("tok_product_1".into()),
+                principal: principal.clone(),
+                workspace: WorkspaceId("wrkspc_product".into()),
+                role: RoleId("admin".into()),
+                created_at: now_ts(),
+                expires_at: None,
+            },
+        )
+        .expect("mint into the product-owned directory");
+
+    let gate = awaken_iam_host::IamGate::from_local_authz(
+        Arc::new(Mutex::new(awaken_iam_host::AuthzApi::new())),
+        Arc::new(Mutex::new(directory)),
+    );
+
+    assert!(!gate.is_open(), "a product-owned gate is not open mode");
+    let resolved = gate
+        .authenticate_bearer(&issued.secret, &now_ts(), NOW_UNIX)
+        .expect("the product's own token authenticates through the wrapped gate");
+    assert_eq!(resolved, principal);
+}

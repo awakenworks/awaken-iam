@@ -78,6 +78,24 @@ impl IamGate {
         }
     }
 
+    /// Build a **Local**-mode gate around an already-assembled [`AuthzApi`] and
+    /// API-token [`ApiTokenDirectory`].
+    ///
+    /// Use this when the *product* owns its embed — its own bootstrap identity,
+    /// its seeded role→action grants, and its schema migration — and wants only
+    /// the gate + PEP over that state. [`embed_local`](crate::embed_local)
+    /// instead assembles a fresh default embed (a fixed bootstrap identity and,
+    /// by design, no product grants), which a product with its own tenancy model
+    /// and grant catalog cannot reuse losslessly. API-token authentication needs
+    /// no JWKS; add EdDSA JWT verification with [`with_audience`](Self::with_audience)
+    /// / [`with_issuer`](Self::with_issuer) if the product mints access tokens.
+    pub fn from_local_authz(
+        authz: Arc<Mutex<AuthzApi>>,
+        directory: Arc<Mutex<ApiTokenDirectory>>,
+    ) -> Self {
+        Self::local(authz, directory, None)
+    }
+
     pub(crate) fn remote(client: RemoteIamClient<HttpAuthzTransport>, jwks: Option<Jwks>) -> Self {
         Self {
             inner: Arc::new(GateInner::Remote { client, jwks }),
