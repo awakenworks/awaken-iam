@@ -679,3 +679,101 @@ fn from_local_state_wraps_a_product_owned_embed() {
     assert_eq!(resolved, principal);
     assert_eq!(workspace, Some(WorkspaceId("wrkspc_product".into())));
 }
+
+// ── ADR-0048: product-customizable PEP (credential extraction, error envelope,
+//    token-workspace stash) ───────────────────────────────────────────────────
+
+/// A `RouteActions` that authenticates via `x-api-key` (not `Authorization`),
+/// renders auth failures in a product envelope, and maps no action (authn +
+/// stash only).
+#[derive(Clone)]
+struct XApiKeyActions;
+
+impl RouteActions for XApiKeyActions {
+    fn action_for(&self, _method: &axum::http::Method, _path: &str) -> Option<ActionKey> {
+        None
+    }
+
+    fn extract_credential(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_owned())
+    }
+
+    fn render_auth_error(&self, error: &awaken_iam_host::AuthError) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let status = match error {
+            awaken_iam_host::AuthError::Forbidden => StatusCode::FORBIDDEN,
+            _ => StatusCode::UNAUTHORIZED,
+        };
+        (
+            status,
+            axum::Json(serde_json::json!({ "product_error": error.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+async fn token_workspace_handler(req: axum::extract::Request) -> String {
+    req.extensions()
+        .get::<awaken_iam_host::TokenWorkspace>()
+        .map(|w| w.0.0.clone())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// x-api-key auth + the token-workspace stash: a request carrying the admin
+/// token in `x-api-key` (no `Authorization` header) authenticates through the
+/// product's credential extractor, and the handler reads the token's home
+/// workspace from `TokenWorkspace` in the request extensions.
+#[tokio::test]
+async fn middleware_x_api_key_auth_and_token_workspace_stash() {
+    let handle = embed_local(&HostConfig::local_in_memory()).expect("embed_local");
+
+    let router = Router::new()
+        .route("/w", get(token_workspace_handler))
+        .layer(auth_layer(handle.gate.clone(), XApiKeyActions));
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/w")
+        .header("x-api-key", &handle.admin_token)
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.oneshot(req).await.expect("dispatch");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the x-api-key credential authenticates via the product extractor"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(
+        String::from_utf8(body.to_vec()).expect("utf8"),
+        "wrkspc_admin",
+        "handler reads the token's home workspace from TokenWorkspace"
+    );
+}
+
+/// The product error renderer replaces host's problem+json: a missing credential
+/// yields the product envelope with a 401.
+#[tokio::test]
+async fn middleware_uses_product_error_renderer() {
+    let handle = embed_local(&HostConfig::local_in_memory()).expect("embed_local");
+
+    let router = Router::new()
+        .route("/w", get(token_workspace_handler))
+        .layer(auth_layer(handle.gate.clone(), XApiKeyActions));
+
+    let resp = router.oneshot(get_request("/w")).await.expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+    assert!(
+        text.contains("product_error"),
+        "the product renderer replaced host's problem+json; got {text}"
+    );
+}

@@ -28,7 +28,7 @@ use std::task::{Context, Poll};
 
 use axum::{
     extract::Request,
-    http::{StatusCode, header::AUTHORIZATION},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use tower::{Layer, Service};
@@ -107,7 +107,37 @@ pub trait RouteActions: Send + Sync + 'static {
     ) -> ScopeRef {
         ScopeRef::Global
     }
+
+    /// Extract the bearer credential from the request headers, or `None` to
+    /// answer `401`.
+    ///
+    /// The default reads `Authorization: Bearer <token>`. Override to accept a
+    /// product-specific carrier as well (e.g. the `x-api-key` header the
+    /// Anthropic SDK sends), returning the raw token string.
+    fn extract_credential(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        let header = headers
+            .get(axum::http::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?;
+        header.strip_prefix("Bearer ").map(|token| token.to_owned())
+    }
+
+    /// Render an [`AuthError`] into the response the client sees.
+    ///
+    /// The default is host's problem+json shape. Override to answer in the
+    /// product's own error envelope (keep 401 for missing/invalid credentials
+    /// and 403 for a denied action, per [`AuthError`]'s status mapping).
+    fn render_auth_error(&self, error: &AuthError) -> Response {
+        error.clone().into_response()
+    }
 }
+
+/// The authenticated API token's home workspace, inserted into the request
+/// extensions by the auth middleware after authentication so
+/// [`RouteActions::scope_for`] and downstream handlers can read it. Absent for
+/// JWT (account-scoped) credentials.
+#[derive(Debug, Clone)]
+pub struct TokenWorkspace(pub awaken_iam_contract::WorkspaceId);
 
 /// Error variants surfaced by the auth middleware as HTTP responses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,16 +265,27 @@ where
                 return inner.call(req).await;
             }
 
-            let token = match extract_bearer(&req) {
+            let token = match state.actions.extract_credential(req.headers()) {
                 Some(t) => t,
-                None => return Ok(AuthError::MissingToken.into_response()),
+                None => return Ok(state.actions.render_auth_error(&AuthError::MissingToken)),
             };
 
             let (now_unix, now) = wall_clock_now();
-            let principal = match state.gate.authenticate_bearer(&token, &now, now_unix) {
-                Some(p) => p,
-                None => return Ok(AuthError::InvalidToken.into_response()),
-            };
+            let (principal, token_workspace) =
+                match state.gate.authenticate_scoped(&token, &now, now_unix) {
+                    Some(pair) => pair,
+                    None => return Ok(state.actions.render_auth_error(&AuthError::InvalidToken)),
+                };
+
+            // Stash the resolved identity BEFORE scope derivation so `scope_for`
+            // (and downstream handlers) can read it: the principal, and — for API
+            // tokens — the token's home workspace, which a product uses to scope
+            // a workspace-less route at the token's own workspace.
+            let mut req = req;
+            req.extensions_mut().insert(principal.clone());
+            if let Some(workspace) = token_workspace {
+                req.extensions_mut().insert(TokenWorkspace(workspace));
+            }
 
             let method = req.method().clone();
             let path = req.uri().path().to_owned();
@@ -262,19 +303,11 @@ where
                         scope,
                     });
                 if decision != AuthorizationDecision::Allow {
-                    return Ok(AuthError::Forbidden.into_response());
+                    return Ok(state.actions.render_auth_error(&AuthError::Forbidden));
                 }
             }
 
-            let mut req = req;
-            req.extensions_mut().insert(principal);
             inner.call(req).await
         })
     }
-}
-
-fn extract_bearer(req: &Request) -> Option<String> {
-    let header = req.headers().get(AUTHORIZATION)?.to_str().ok()?;
-    let token = header.strip_prefix("Bearer ")?;
-    Some(token.to_owned())
 }

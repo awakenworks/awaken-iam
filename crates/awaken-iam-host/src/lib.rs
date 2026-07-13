@@ -34,7 +34,9 @@ mod remote;
 pub use config::{HostConfig, HostConfigError, HostMode};
 pub use gate::{IamGate, LocalIamState};
 pub use local::{EmbedError, LocalHandle, embed_local};
-pub use middleware::{AuthError, IamAuthLayer, IamAuthService, RouteActions, auth_layer};
+pub use middleware::{
+    AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenWorkspace, auth_layer,
+};
 pub use remote::{ConnectError, RemoteHandle, connect_remote};
 
 // Convenience re-exports so callers rarely need to reach into sub-crates.
