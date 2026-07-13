@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_client::{HttpAuthzTransport, IamClient, RemoteIamClient};
 use awaken_iam_contract::{
     AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
-    EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest,
+    EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
 };
 use awaken_iam_core::ApiTokenDirectory;
 use awaken_iam_server::{AuthzApi, verify_access_token};
@@ -32,15 +32,29 @@ pub struct IamGate {
     pub(crate) issuer: Option<String>,
 }
 
+/// Product-owned local IAM state: the authorization engine and the API-token
+/// directory behind **one** lock.
+///
+/// Holding both under a single mutex lets a product's mint perform its paired
+/// write — the token row into `directory` and the principal→role binding into
+/// `authz`'s policy — without a concurrent `authenticate`/`authorize` observing
+/// one write but not the other. [`IamGate::from_local_state`] wraps this into a
+/// Local gate; the product keeps its own `Arc<Mutex<LocalIamState>>` to mint and
+/// hydrate through the same lock.
+pub struct LocalIamState {
+    /// Authorization engine (policy evaluation).
+    pub authz: AuthzApi,
+    /// API-token authentication directory.
+    pub directory: ApiTokenDirectory,
+}
+
 pub(crate) enum GateInner {
     /// No authentication or authorization; every request is allowed.
     Open,
     /// In-process IAM backed by a SQLite database.
     Local {
-        /// Authorization engine (policy evaluation).
-        authz: Arc<Mutex<AuthzApi>>,
-        /// API-token authentication directory (separate from AuthzApi's internal one).
-        directory: Arc<Mutex<ApiTokenDirectory>>,
+        /// Authorization engine + token directory behind one lock.
+        state: Arc<Mutex<LocalIamState>>,
         /// JWKS for EdDSA JWT verification (present when a seal key is configured).
         jwks: Option<Jwks>,
     },
@@ -62,38 +76,30 @@ impl IamGate {
         }
     }
 
-    pub(crate) fn local(
-        authz: Arc<Mutex<AuthzApi>>,
-        directory: Arc<Mutex<ApiTokenDirectory>>,
-        jwks: Option<Jwks>,
-    ) -> Self {
+    pub(crate) fn local(state: Arc<Mutex<LocalIamState>>, jwks: Option<Jwks>) -> Self {
         Self {
-            inner: Arc::new(GateInner::Local {
-                authz,
-                directory,
-                jwks,
-            }),
+            inner: Arc::new(GateInner::Local { state, jwks }),
             audience: None,
             issuer: None,
         }
     }
 
-    /// Build a **Local**-mode gate around an already-assembled [`AuthzApi`] and
-    /// API-token [`ApiTokenDirectory`].
+    /// Build a **Local**-mode gate around a product-owned [`LocalIamState`]
+    /// (its [`AuthzApi`] + API-token [`ApiTokenDirectory`] behind one lock).
     ///
     /// Use this when the *product* owns its embed — its own bootstrap identity,
     /// its seeded role→action grants, and its schema migration — and wants only
     /// the gate + PEP over that state. [`embed_local`](crate::embed_local)
     /// instead assembles a fresh default embed (a fixed bootstrap identity and,
     /// by design, no product grants), which a product with its own tenancy model
-    /// and grant catalog cannot reuse losslessly. API-token authentication needs
-    /// no JWKS; add EdDSA JWT verification with [`with_audience`](Self::with_audience)
-    /// / [`with_issuer`](Self::with_issuer) if the product mints access tokens.
-    pub fn from_local_authz(
-        authz: Arc<Mutex<AuthzApi>>,
-        directory: Arc<Mutex<ApiTokenDirectory>>,
-    ) -> Self {
-        Self::local(authz, directory, None)
+    /// and grant catalog cannot reuse losslessly. The product keeps a clone of
+    /// the `Arc` to mint and hydrate through the same lock the gate reads under,
+    /// so its paired writes stay atomic to the gate. API-token authentication
+    /// needs no JWKS; add EdDSA JWT verification with
+    /// [`with_audience`](Self::with_audience) / [`with_issuer`](Self::with_issuer)
+    /// if the product mints access tokens.
+    pub fn from_local_state(state: Arc<Mutex<LocalIamState>>) -> Self {
+        Self::local(state, None)
     }
 
     pub(crate) fn remote(client: RemoteIamClient<HttpAuthzTransport>, jwks: Option<Jwks>) -> Self {
@@ -141,18 +147,36 @@ impl IamGate {
         now: &Timestamp,
         now_unix: i64,
     ) -> Option<PrincipalRef> {
+        self.authenticate_scoped(token, now, now_unix)
+            .map(|(principal, _)| principal)
+    }
+
+    /// Authenticate a bearer credential, returning the principal **and** its
+    /// workspace binding when the credential carries one.
+    ///
+    /// API tokens are minted at a workspace, so a resolved API token yields
+    /// `Some(workspace)`; JWT access tokens are account-scoped and yield `None`.
+    /// A product whose authorization scopes a workspace-less route at the
+    /// *token's* home workspace needs this binding — [`authenticate_bearer`]
+    /// drops it. Fail-closed like `authenticate_bearer`.
+    pub fn authenticate_scoped(
+        &self,
+        token: &str,
+        now: &Timestamp,
+        now_unix: i64,
+    ) -> Option<(PrincipalRef, Option<WorkspaceId>)> {
         match self.inner.as_ref() {
             GateInner::Open => None,
-            GateInner::Local {
-                directory, jwks, ..
-            } => {
+            GateInner::Local { state, jwks } => {
                 if is_api_token(token) {
-                    let dir = directory.lock().expect("directory lock");
-                    dir.authenticate(token, now)
+                    let guard = state.lock().expect("local state lock");
+                    guard
+                        .directory
+                        .authenticate(token, now)
                         .ok()
-                        .map(|t| t.principal.clone())
+                        .map(|t| (t.principal.clone(), Some(t.workspace.clone())))
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix)
+                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
                 } else {
                     None
                 }
@@ -162,9 +186,12 @@ impl IamGate {
                     let req = TokenIntrospectionRequest {
                         token: token.to_owned(),
                     };
-                    client.introspect_token(&req).ok().map(|r| r.principal)
+                    client
+                        .introspect_token(&req)
+                        .ok()
+                        .map(|r| (r.principal, None))
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix)
+                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
                 } else {
                     None
                 }
@@ -207,9 +234,9 @@ impl IamClient for IamGate {
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         match self.inner.as_ref() {
             GateInner::Open => AuthorizationDecision::Allow,
-            GateInner::Local { authz, .. } => {
-                let guard = authz.lock().expect("authz lock");
-                guard.authorize(&request).decision
+            GateInner::Local { state, .. } => {
+                let guard = state.lock().expect("local state lock");
+                guard.authz.authorize(&request).decision
             }
             GateInner::Remote { client, .. } => client.authorize(request),
         }
@@ -218,9 +245,9 @@ impl IamClient for IamGate {
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
         match self.inner.as_ref() {
             GateInner::Open => EntitlementDecision::Allow,
-            GateInner::Local { authz, .. } => {
-                let guard = authz.lock().expect("authz lock");
-                guard.check_entitlement(&request).decision
+            GateInner::Local { state, .. } => {
+                let guard = state.lock().expect("local state lock");
+                guard.authz.check_entitlement(&request).decision
             }
             GateInner::Remote { client, .. } => client.check_entitlement(request),
         }

@@ -10,7 +10,7 @@ use awaken_iam_server::{
     AccessTokenAuthority, AuthzApi, LocalSeedSigner, SqliteBackend, sqlite_migrated_store,
 };
 
-use crate::{HostConfig, gate::IamGate};
+use crate::{HostConfig, gate::IamGate, gate::LocalIamState};
 
 /// Error returned by [`embed_local`] and [`LocalHandle`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -35,10 +35,8 @@ pub struct LocalHandle {
     pub gate: IamGate,
     /// API-token minter backed by the OS CSPRNG.
     pub minter: ApiTokenMinter<OsEntropy>,
-    /// Shared token directory (also held by the gate for bearer verification).
-    directory: Arc<Mutex<ApiTokenDirectory>>,
-    /// Shared authorization engine (also held by the gate for policy evaluation).
-    authz: Arc<Mutex<AuthzApi>>,
+    /// Shared local IAM state (authz + directory), also held by the gate.
+    state: Arc<Mutex<LocalIamState>>,
     /// Cleartext bootstrap admin token.
     pub admin_token: String,
     /// JWT signing authority (present when [`HostConfig::seal_key`] is set).
@@ -48,18 +46,19 @@ pub struct LocalHandle {
 impl LocalHandle {
     /// Mint a new API token and register it with the gate.
     pub fn mint_api_token(&mut self, request: MintApiToken) -> Result<IssuedApiToken, EmbedError> {
-        let mut dir = self.directory.lock().expect("directory lock");
-        let mut authz = self.authz.lock().expect("authz lock");
+        let mut guard = self.state.lock().expect("local state lock");
+        let LocalIamState { authz, directory } = &mut *guard;
         self.minter
-            .mint(&mut dir, authz.policy_mut(), request)
+            .mint(directory, authz.policy_mut(), request)
             .map_err(EmbedError::from)
     }
 
     /// Revoke an API token by id.
     pub fn revoke_api_token(&self, id: &ApiTokenId, now: Timestamp) -> Result<(), EmbedError> {
-        self.directory
+        self.state
             .lock()
-            .expect("directory lock")
+            .expect("local state lock")
+            .directory
             .revoke(id, now)
             .map_err(EmbedError::from)
     }
@@ -75,30 +74,27 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
     seed_named_roles(&store, &now).map_err(|e| EmbedError::Seeding(e.to_string()))?;
     seed_runtime_roles(&store, &now).map_err(|e| EmbedError::Seeding(e.to_string()))?;
 
-    let directory = Arc::new(Mutex::new(ApiTokenDirectory::new()));
+    let mut directory = ApiTokenDirectory::new();
     let mut minter = ApiTokenMinter::new(OsEntropy);
 
     let mut authz = AuthzApi::with_entitlements(EntitlementEngine::default_allow());
 
-    let issued = {
-        let mut dir = directory.lock().expect("directory lock");
-        minter
-            .mint(
-                &mut dir,
-                authz.policy_mut(),
-                MintApiToken {
-                    id: ApiTokenId("tok_bootstrap_admin".into()),
-                    principal: PrincipalRef::Service {
-                        service_id: "iam-host-bootstrap".into(),
-                    },
-                    workspace: WorkspaceId("wrkspc_admin".into()),
-                    role: RoleId("admin".into()),
-                    created_at: Timestamp("2026-01-01T00:00:00Z".into()),
-                    expires_at: None,
+    let issued = minter
+        .mint(
+            &mut directory,
+            authz.policy_mut(),
+            MintApiToken {
+                id: ApiTokenId("tok_bootstrap_admin".into()),
+                principal: PrincipalRef::Service {
+                    service_id: "iam-host-bootstrap".into(),
                 },
-            )
-            .map_err(EmbedError::from)?
-    };
+                workspace: WorkspaceId("wrkspc_admin".into()),
+                role: RoleId("admin".into()),
+                created_at: Timestamp("2026-01-01T00:00:00Z".into()),
+                expires_at: None,
+            },
+        )
+        .map_err(EmbedError::from)?;
 
     let jwt_authority = cfg
         .seal_key
@@ -106,9 +102,9 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
 
     let jwks = jwt_authority.as_ref().map(|a| a.jwks());
 
-    let authz = Arc::new(Mutex::new(authz));
+    let state = Arc::new(Mutex::new(LocalIamState { authz, directory }));
 
-    let gate = IamGate::local(Arc::clone(&authz), Arc::clone(&directory), jwks)
+    let gate = IamGate::local(Arc::clone(&state), jwks)
         .with_audience_opt(cfg.audience.clone())
         .with_issuer_opt(cfg.issuer.clone());
 
@@ -119,8 +115,7 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
     Ok(LocalHandle {
         gate,
         minter,
-        directory,
-        authz,
+        state,
         admin_token: issued.secret,
         jwt_authority,
     })

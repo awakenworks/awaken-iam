@@ -637,22 +637,24 @@ async fn middleware_consults_scope_for_with_request_coordinates() {
     );
 }
 
-/// `from_local_authz` wraps a **product-owned** embed (its own directory,
-/// policy, grants, and bootstrap identity) into a Local-mode gate — the
+/// `from_local_state` wraps a **product-owned** embed (its own directory, policy,
+/// grants, and bootstrap identity, behind one lock) into a Local-mode gate — the
 /// constructor a product with its own tenancy model uses instead of
-/// `embed_local`. The product's own token authenticates through the gate.
+/// `embed_local`. The product's own token authenticates through the gate, and
+/// `authenticate_scoped` recovers the token's workspace binding.
 #[test]
-fn from_local_authz_wraps_a_product_owned_embed() {
-    use awaken_iam_core::{ApiTokenDirectory, ApiTokenMinter, OsEntropy, PolicySet};
+fn from_local_state_wraps_a_product_owned_embed() {
+    use awaken_iam_core::{ApiTokenDirectory, ApiTokenMinter, OsEntropy};
+    use awaken_iam_host::{IamGate, LocalIamState};
     use std::sync::{Arc, Mutex};
 
     let mut directory = ApiTokenDirectory::new();
-    let mut policy = PolicySet::new();
+    let mut authz = awaken_iam_host::AuthzApi::new();
     let principal = svc("svc-product");
     let issued = ApiTokenMinter::new(OsEntropy)
         .mint(
             &mut directory,
-            &mut policy,
+            authz.policy_mut(),
             MintApiToken {
                 id: ApiTokenId("tok_product_1".into()),
                 principal: principal.clone(),
@@ -662,16 +664,18 @@ fn from_local_authz_wraps_a_product_owned_embed() {
                 expires_at: None,
             },
         )
-        .expect("mint into the product-owned directory");
+        .expect("mint into the product-owned state");
 
-    let gate = awaken_iam_host::IamGate::from_local_authz(
-        Arc::new(Mutex::new(awaken_iam_host::AuthzApi::new())),
-        Arc::new(Mutex::new(directory)),
-    );
+    let gate = IamGate::from_local_state(Arc::new(Mutex::new(LocalIamState {
+        authz,
+        directory,
+    })));
 
     assert!(!gate.is_open(), "a product-owned gate is not open mode");
-    let resolved = gate
-        .authenticate_bearer(&issued.secret, &now_ts(), NOW_UNIX)
+    // authenticate_scoped recovers principal AND the token's workspace binding.
+    let (resolved, workspace) = gate
+        .authenticate_scoped(&issued.secret, &now_ts(), NOW_UNIX)
         .expect("the product's own token authenticates through the wrapped gate");
     assert_eq!(resolved, principal);
+    assert_eq!(workspace, Some(WorkspaceId("wrkspc_product".into())));
 }
