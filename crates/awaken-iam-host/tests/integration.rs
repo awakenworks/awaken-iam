@@ -550,3 +550,89 @@ async fn middleware_inserts_principal_into_extensions() {
         "principal service_id must not be empty"
     );
 }
+
+// ── ADR-0048: per-request scope derivation (RouteActions::scope_for) ──────────
+
+/// The default `scope_for` authorizes at `Global`, preserving the pre-scope
+/// behavior for any `RouteActions` impl that does not override it. This is what
+/// keeps the extension backward-compatible: existing impls (and the middleware
+/// tests above) are unchanged.
+#[test]
+fn default_scope_for_is_global() {
+    let uri: axum::http::Uri = "/v1/anything?x=1".parse().unwrap();
+    let scope = NoActions.scope_for(
+        &axum::http::Method::GET,
+        &uri,
+        &axum::http::Extensions::new(),
+    );
+    assert_eq!(scope, ScopeRef::Global);
+}
+
+/// A `RouteActions` that records every `scope_for` call and derives a workspace
+/// scope from the `/w/{workspace}/...` path prefix — the shape a product uses to
+/// enforce per-tenant authorization.
+#[derive(Clone, Default)]
+struct RecordingActions {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl RouteActions for RecordingActions {
+    fn action_for(&self, _method: &axum::http::Method, _path: &str) -> Option<ActionKey> {
+        // Require *some* action so the middleware consults `scope_for`.
+        Some(ActionKey("agent.run".into()))
+    }
+
+    fn scope_for(
+        &self,
+        method: &axum::http::Method,
+        uri: &axum::http::Uri,
+        _extensions: &axum::http::Extensions,
+    ) -> ScopeRef {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((method.to_string(), uri.to_string()));
+        match uri
+            .path()
+            .strip_prefix("/w/")
+            .and_then(|rest| rest.split('/').next())
+        {
+            Some(id) if !id.is_empty() => ScopeRef::Workspace {
+                workspace_id: WorkspaceId(id.to_owned()),
+            },
+            _ => ScopeRef::Global,
+        }
+    }
+}
+
+/// The middleware consults `scope_for` with the request's real method+uri before
+/// authorizing — the hook a product uses to enforce per-workspace tenancy. The
+/// admin token authenticates and the route maps to an action, so `scope_for`
+/// runs; embed installs no grants so the request is denied (deny-by-default),
+/// but the derivation ran with the real coordinates.
+#[tokio::test]
+async fn middleware_consults_scope_for_with_request_coordinates() {
+    let cfg = HostConfig::local_in_memory();
+    let handle = embed_local(&cfg).expect("embed_local");
+    let actions = RecordingActions::default();
+    let seen = std::sync::Arc::clone(&actions.seen);
+
+    let router = Router::new()
+        .route("/w/wrkspc_acme/threads", get(|| async { "ok" }))
+        .layer(auth_layer(handle.gate.clone(), actions));
+
+    let resp = router
+        .oneshot(bearer_request("/w/wrkspc_acme/threads", &handle.admin_token))
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 1, "scope_for consulted exactly once");
+    assert_eq!(calls[0].0, "GET", "scope_for saw the real method");
+    assert!(
+        calls[0].1.contains("/w/wrkspc_acme/threads"),
+        "scope_for saw the real request uri; got {}",
+        calls[0].1
+    );
+}

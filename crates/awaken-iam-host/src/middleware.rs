@@ -83,6 +83,30 @@ pub trait RouteActions: Send + Sync + 'static {
     /// Return the [`ActionKey`] required to access `(method, path)`, or `None`
     /// if no authorization check is needed for this route.
     fn action_for(&self, method: &axum::http::Method, path: &str) -> Option<ActionKey>;
+
+    /// Derive the authorization **scope** for this request.
+    ///
+    /// The default returns [`ScopeRef::Global`], preserving the pre-scope
+    /// behavior where every mapped action is authorized platform-wide. Override
+    /// it to authorize **per-tenant**: return e.g. `ScopeRef::Workspace { .. }`
+    /// parsed from the path or query, so a principal whose `RoleBinding` is
+    /// confined to one workspace is *denied* on another — the middleware feeds
+    /// this scope straight into `gate.authorize`, so the returned value is the
+    /// scope the grant lookup runs at.
+    ///
+    /// `extensions` carries the request's typed extensions, letting a product's
+    /// own *preceding* layer inject an already-computed scope (e.g. a workspace
+    /// parsed out of the request body, which this trait deliberately never
+    /// reads) for this method to read back — keeping the middleware body-agnostic
+    /// while still supporting body-carried tenancy.
+    fn scope_for(
+        &self,
+        _method: &axum::http::Method,
+        _uri: &axum::http::Uri,
+        _extensions: &axum::http::Extensions,
+    ) -> ScopeRef {
+        ScopeRef::Global
+    }
 }
 
 /// Error variants surfaced by the auth middleware as HTTP responses.
@@ -225,13 +249,17 @@ where
             let method = req.method().clone();
             let path = req.uri().path().to_owned();
             if let Some(action) = state.actions.action_for(&method, &path) {
+                // Per-request scope: `RouteActions::scope_for` derives it from the
+                // request (path/query/extensions); the default is `Global`, so
+                // consumers that do not override it keep the pre-scope behavior.
+                let scope = state.actions.scope_for(&method, req.uri(), req.extensions());
                 let decision = state
                     .gate
                     .authorize(awaken_iam_contract::AuthorizationRequest {
                         principal: principal.clone(),
                         on_behalf_of: Vec::new(),
                         action,
-                        scope: ScopeRef::Global,
+                        scope,
                     });
                 if decision != AuthorizationDecision::Allow {
                     return Ok(AuthError::Forbidden.into_response());
