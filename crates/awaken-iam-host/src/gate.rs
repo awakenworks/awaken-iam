@@ -13,7 +13,7 @@ use awaken_iam_contract::{
     AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
     EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
 };
-use awaken_iam_core::ApiTokenDirectory;
+use awaken_iam_core::{ApiTokenDirectory, IamError};
 use awaken_iam_server::{AuthzApi, verify_access_token};
 
 /// Combined authentication + authorization gate.
@@ -30,6 +30,20 @@ pub struct IamGate {
     pub(crate) audience: Option<String>,
     /// Optional issuer claim to validate on JWT tokens.
     pub(crate) issuer: Option<String>,
+}
+
+/// Why a bearer credential failed to authenticate.
+///
+/// Returned by [`IamGate::authenticate_detailed`] so a product can answer the
+/// distinct 401 reasons its API documents instead of one opaque failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthReject {
+    /// The credential is past its expiry.
+    Expired,
+    /// The credential was revoked.
+    Revoked,
+    /// The credential does not exist, does not verify, or is malformed.
+    Invalid,
 }
 
 /// Product-owned local IAM state: the authorization engine and the API-token
@@ -158,27 +172,48 @@ impl IamGate {
     /// `Some(workspace)`; JWT access tokens are account-scoped and yield `None`.
     /// A product whose authorization scopes a workspace-less route at the
     /// *token's* home workspace needs this binding — [`authenticate_bearer`]
-    /// drops it. Fail-closed like `authenticate_bearer`.
+    /// drops it. Fail-closed like `authenticate_bearer`; use
+    /// [`authenticate_detailed`](Self::authenticate_detailed) to distinguish
+    /// *why* a credential failed.
     pub fn authenticate_scoped(
         &self,
         token: &str,
         now: &Timestamp,
         now_unix: i64,
     ) -> Option<(PrincipalRef, Option<WorkspaceId>)> {
+        self.authenticate_detailed(token, now, now_unix).ok()
+    }
+
+    /// Authenticate a bearer credential, surfacing *why* it failed.
+    ///
+    /// Like [`authenticate_scoped`](Self::authenticate_scoped) on success, but on
+    /// failure returns an [`AuthReject`] so a product can answer the distinct
+    /// 401s its API documents (expired vs revoked vs invalid) rather than one
+    /// opaque "invalid". JWT/introspection failures collapse to
+    /// [`AuthReject::Invalid`] (their sub-reasons are not exposed by the verifier).
+    pub fn authenticate_detailed(
+        &self,
+        token: &str,
+        now: &Timestamp,
+        now_unix: i64,
+    ) -> Result<(PrincipalRef, Option<WorkspaceId>), AuthReject> {
         match self.inner.as_ref() {
-            GateInner::Open => None,
+            GateInner::Open => Err(AuthReject::Invalid),
             GateInner::Local { state, jwks } => {
                 if is_api_token(token) {
                     let guard = state.lock().expect("local state lock");
-                    guard
-                        .directory
-                        .authenticate(token, now)
-                        .ok()
-                        .map(|t| (t.principal.clone(), Some(t.workspace.clone())))
+                    match guard.directory.authenticate(token, now) {
+                        Ok(t) => Ok((t.principal.clone(), Some(t.workspace.clone()))),
+                        Err(IamError::ApiTokenExpired { .. }) => Err(AuthReject::Expired),
+                        Err(IamError::ApiTokenRevoked { .. }) => Err(AuthReject::Revoked),
+                        Err(_) => Err(AuthReject::Invalid),
+                    }
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
+                    self.verify_jwt(token, jwks, now_unix)
+                        .map(|p| (p, None))
+                        .ok_or(AuthReject::Invalid)
                 } else {
-                    None
+                    Err(AuthReject::Invalid)
                 }
             }
             GateInner::Remote { client, jwks } => {
@@ -190,10 +225,13 @@ impl IamGate {
                         .introspect_token(&req)
                         .ok()
                         .map(|r| (r.principal, None))
+                        .ok_or(AuthReject::Invalid)
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
+                    self.verify_jwt(token, jwks, now_unix)
+                        .map(|p| (p, None))
+                        .ok_or(AuthReject::Invalid)
                 } else {
-                    None
+                    Err(AuthReject::Invalid)
                 }
             }
         }

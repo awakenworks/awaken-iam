@@ -32,7 +32,7 @@ mod middleware;
 mod remote;
 
 pub use config::{HostConfig, HostConfigError, HostMode};
-pub use gate::{IamGate, LocalIamState};
+pub use gate::{AuthReject, IamGate, LocalIamState};
 pub use local::{EmbedError, LocalHandle, embed_local};
 pub use middleware::{
     AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenWorkspace, auth_layer,
@@ -40,7 +40,7 @@ pub use middleware::{
 pub use remote::{ConnectError, RemoteHandle, connect_remote};
 
 // Convenience re-exports so callers rarely need to reach into sub-crates.
-pub use awaken_iam_client::{IamClientMode, RemoteIamClient};
+pub use awaken_iam_client::{IamClient, IamClientMode, RemoteIamClient};
 pub use awaken_iam_contract::{ActionKey, JsonWebKey, Jwks, PrincipalRef, ScopeRef, WorkspaceId};
 pub use awaken_iam_server::AuthzApi;
 pub use awaken_iam_server::{

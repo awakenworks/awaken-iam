@@ -777,3 +777,51 @@ async fn middleware_uses_product_error_renderer() {
         "the product renderer replaced host's problem+json; got {text}"
     );
 }
+
+/// `authenticate_detailed` surfaces the distinct 401 reasons: a valid token
+/// resolves, an expired one rejects as Expired, and garbage rejects as Invalid.
+#[test]
+fn authenticate_detailed_surfaces_reject_reasons() {
+    use awaken_iam_host::AuthReject;
+
+    let cfg = HostConfig::local_in_memory();
+    let mut handle = embed_local(&cfg).expect("embed_local");
+
+    // A token that is already expired (expiry strictly after creation, both past).
+    let expired = handle
+        .mint_api_token(MintApiToken {
+            id: ApiTokenId("tok_expired".into()),
+            principal: svc("svc-expired"),
+            workspace: WorkspaceId("wrkspc_test".into()),
+            role: RoleId("admin".into()),
+            created_at: Timestamp("2020-01-01T00:00:00Z".into()),
+            expires_at: Some(Timestamp("2020-01-02T00:00:00Z".into())),
+        })
+        .expect("mint expired token");
+
+    let now = now_ts(); // 2026 — well past the 2020 expiry
+    assert_eq!(
+        handle
+            .gate
+            .authenticate_detailed(&expired.secret, &now, NOW_UNIX)
+            .unwrap_err(),
+        AuthReject::Expired,
+        "an expired token rejects as Expired"
+    );
+    assert_eq!(
+        handle
+            .gate
+            .authenticate_detailed("sk-awaken-nope.not-real", &now, NOW_UNIX)
+            .unwrap_err(),
+        AuthReject::Invalid,
+        "a forged token rejects as Invalid"
+    );
+    // The bootstrap admin still authenticates cleanly.
+    assert!(
+        handle
+            .gate
+            .authenticate_detailed(&handle.admin_token, &now, NOW_UNIX)
+            .is_ok(),
+        "the bootstrap admin authenticates"
+    );
+}
