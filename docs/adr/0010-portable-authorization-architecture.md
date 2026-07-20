@@ -221,6 +221,38 @@ example, running an Agent does not imply permission to read every referenced
 Memory or File. Bulk/list APIs use a visibility query or scope-constrained
 repository query; they do not load all tenants and filter after serialization.
 
+#### Scope applicability is one versioned PAP configuration
+
+Whether an action targets an organization, workspace, project, or leaf resource
+is policy data, not a convention repeated in handlers. The PAP owns one signed,
+versioned authorization profile per consumer namespace:
+
+```text
+AuthorizationProfile {
+  namespace, version, lifecycle,
+  resource_types: [{ type, parent_type, allowed_parent_scope_kinds }],
+  actions: [{ action, target_resource_type, allowed_scope_kinds }],
+  role_grants, inheritance_rules
+}
+```
+
+For example, `project.read` targets `Project`, while `file.read` targets a
+`Resource(file, id)` whose registered parent may be a Project or Workspace. The
+PEP submits the concrete target coordinate; the PDP validates that its kind is
+allowed by the active profile before evaluating grants. A resource service does
+not decide that a Project operation is "close enough" to Workspace scope.
+
+Profiles are administered through the PAP as immutable revisions with
+`draft -> validated -> active -> retired` lifecycle. Activation atomically
+replaces the namespace's previous active revision; rollback reactivates a known
+revision. Local/embedded mode loads the exact same profile document or a signed
+snapshot. Remote mode reads the active revision from awaken-iam. Environment
+variables may select a profile or endpoint, but may not redefine individual
+action/scope rules. The existing `ResourceModelRegistration` and monotonic
+`policy_version` are the transport/evaluation foundation; the PAP must expose
+whole-profile validate, activate, fetch, and rollback operations rather than
+requiring consumers to perform a series of additive mutations.
+
 ### 7. Reuse contracts and conformance suites, not a cross-repository framework
 
 Cross-repository reuse is split into small packages:
