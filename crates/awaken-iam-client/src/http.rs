@@ -19,9 +19,11 @@
 use std::time::Duration;
 
 use awaken_iam_contract::{
-    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
+    ActivateAuthorizationProfile, AuthorizationOutcome, AuthorizationProfile,
+    AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    EntitlementCheckResponse, EntitlementRequest, NamespaceId, PolicySnapshot,
+    ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
     TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 use reqwest::StatusCode;
@@ -252,6 +254,65 @@ impl AuthzTransport for HttpAuthzTransport {
                 .post(self.url("/v1/tokens/introspect"))
                 .json(request)
         })?;
+        Self::decode(response)
+    }
+
+    fn create_profile(
+        &self,
+        request: &CreateAuthorizationProfile,
+    ) -> Result<AuthorizationProfile, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/authz/profiles"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
+    fn validate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+    ) -> Result<AuthorizationProfileValidation, RemoteError> {
+        let path = format!(
+            "/v1/admin/authz/profiles/{}/{revision}/validate",
+            namespace.0
+        );
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn activate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        let path = format!(
+            "/v1/admin/authz/profiles/{}/{revision}/activate",
+            namespace.0
+        );
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn rollback_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        let path = format!(
+            "/v1/admin/authz/profiles/{}/{revision}/rollback",
+            namespace.0
+        );
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn active_profile(&self, namespace: &NamespaceId) -> Result<AuthorizationProfile, RemoteError> {
+        let path = format!("/v1/admin/authz/profiles/{}/active", namespace.0);
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         Self::decode(response)
     }
 }
@@ -488,7 +549,7 @@ mod tests {
         let transport = transport(&server);
 
         let request = TokenIntrospectionRequest {
-            token: "sk-awaken-pfx.secret".into(),
+            token: String::from("sk-awaken-pfx.secret"),
         };
         let response = transport.introspect_token(&request).unwrap();
         assert_eq!(
@@ -512,7 +573,7 @@ mod tests {
 
         let err = transport
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-awaken-bad.token".into(),
+                token: String::from("sk-awaken-bad.token"),
             })
             .unwrap_err();
         assert!(err.0.contains("401"), "unexpected error: {}", err.0);

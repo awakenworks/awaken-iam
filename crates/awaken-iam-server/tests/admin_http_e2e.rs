@@ -84,6 +84,140 @@ async fn body_json(response: Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("decode json")
 }
 
+fn profile_body(scope_kind: &str) -> serde_json::Value {
+    let scope = if scope_kind == "resource" {
+        serde_json::json!({"kind":"resource","resource_type":"memory"})
+    } else {
+        serde_json::json!({"kind":scope_kind})
+    };
+    serde_json::json!({
+        "namespace": "awaken.runtime",
+        "document": {
+            "resource_model": {
+                "resource_types": [],
+                "actions": ["memory.read"],
+                "edges": []
+            },
+            "action_scope_rules": [{
+                "action": "memory.read",
+                "allowed_scope_kinds": [scope]
+            }],
+            "grants": [{
+                "id": "g_memory",
+                "subject": {"kind":"principal","principal":{"kind":"service","service_id":"runtime"}},
+                "action_pattern": "memory.*",
+                "scope": {"kind":"global"},
+                "effect": "allow"
+            }]
+        },
+        "created_at": "2026-07-20T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn profile_pap_replaces_scope_rules_and_rolls_back_over_http() {
+    let router = daemon();
+    let created = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles",
+            profile_body("workspace"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(body_json(created).await["revision"], 1);
+
+    let validated = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles/awaken.runtime/1/validate",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(validated.status(), StatusCode::OK);
+    assert_eq!(body_json(validated).await["valid"], true);
+
+    let activated = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles/awaken.runtime/1/activate",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let allowed = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/authorize",
+            serde_json::json!({
+                "principal":{"kind":"service","service_id":"runtime"},
+                "action":"memory.read",
+                "scope":{"kind":"workspace","workspace_id":"ws"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(allowed).await["decision"], "allow");
+
+    let denied = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/authorize",
+            serde_json::json!({
+                "principal":{"kind":"service","service_id":"runtime"},
+                "action":"memory.read",
+                "scope":{"kind":"project","workspace_id":"ws","project_id":"p"}
+            }),
+        ))
+        .await
+        .unwrap();
+    let denied = body_json(denied).await;
+    assert_eq!(denied["decision"], "deny");
+    assert_eq!(denied["reason"], "scope_kind_not_allowed");
+
+    let second = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles",
+            profile_body("project"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(second).await["revision"], 2);
+    router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles/awaken.runtime/2/validate",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let replaced = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles/awaken.runtime/2/activate",
+            serde_json::json!({"expected_active_revision":1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK);
+
+    let rolled_back = router
+        .clone()
+        .oneshot(authed_post(
+            "/v1/admin/authz/profiles/awaken.runtime/1/rollback",
+            serde_json::json!({"expected_active_revision":2}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.status(), StatusCode::OK);
+    assert_eq!(body_json(rolled_back).await["active_revision"], 1);
+}
+
 #[tokio::test]
 async fn admin_crud_is_served_over_http_and_advances_the_snapshot_version() {
     let router = daemon();

@@ -68,9 +68,10 @@ pub use oauth_provider::{
     TokenRedemption,
 };
 pub use ports::{
-    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, GrantRepo, GroupRepo,
-    LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo,
-    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint, seed_roles,
+    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
+    ExternalIdentityRepo, GrantRepo, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo,
+    RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo,
+    external_identity_id_hint, seed_roles,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
@@ -347,6 +348,12 @@ impl IamCore {
     /// Read-only access to the policy.
     pub fn policy(&self) -> &PolicySet {
         &self.policy
+    }
+
+    /// Atomically replace the evaluator's complete authorization policy. The
+    /// PAP calls this only with a validated immutable profile revision.
+    pub fn replace_policy(&mut self, policy: PolicySet) {
+        self.policy = policy;
     }
 
     /// Evaluate authorization and return only the allow/deny decision.

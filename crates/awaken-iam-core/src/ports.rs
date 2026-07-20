@@ -14,9 +14,9 @@
 //! foreign key — see [deployment](../../../docs/design/deployment.md).
 
 use awaken_iam_contract::{
-    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity, ExternalIdentityId,
-    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session,
-    SessionId, Timestamp,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
+    ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId, OAuthLoginState,
+    OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp,
 };
 
 use crate::{
@@ -217,6 +217,39 @@ pub trait ResourceModelRepo: Send + Sync {
     fn put_edge(&self, edge: ResourceEdge) -> RepoResult<()>;
     /// List every registered parent edge.
     fn list_edges(&self) -> RepoResult<Vec<ResourceEdge>>;
+}
+
+/// Persistence for immutable authorization-profile revisions and the atomic
+/// active-head pointer of each consumer namespace.
+pub trait AuthorizationProfileRepo: Send + Sync {
+    /// Store a new draft revision. Namespace/revision is unique and immutable.
+    fn create_profile(&self, profile: AuthorizationProfile) -> RepoResult<()>;
+    /// Resolve one revision, projecting the active-head state when applicable.
+    fn get_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+    ) -> RepoResult<Option<AuthorizationProfile>>;
+    /// List every revision in ascending revision order.
+    fn list_profiles(&self, namespace: &NamespaceId) -> RepoResult<Vec<AuthorizationProfile>>;
+    /// Advance a draft to validated after deterministic validation succeeds.
+    fn set_profile_lifecycle(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        lifecycle: ProfileLifecycle,
+    ) -> RepoResult<()>;
+    /// Atomically compare-and-set the active revision, returning its predecessor.
+    fn activate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+    ) -> RepoResult<Option<u64>>;
+    /// Resolve the active revision for a namespace.
+    fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>>;
+    /// List the active profile of every namespace for process-start hydration.
+    fn active_profiles(&self) -> RepoResult<Vec<AuthorizationProfile>>;
 }
 
 // ---------------------------------------------------------------------------

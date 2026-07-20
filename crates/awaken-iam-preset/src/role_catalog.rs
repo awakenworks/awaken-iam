@@ -134,7 +134,7 @@ const SEED_ROLES: &[SeedRole] = &[
     SeedRole {
         id: "user",
         display_name: "Member",
-        patterns: &["workspace.read"],
+        patterns: &["workspace.read", "project.read"],
     },
     SeedRole {
         id: "claude_code_user",
@@ -147,6 +147,7 @@ const SEED_ROLES: &[SeedRole] = &[
         display_name: "Workspace Admin",
         patterns: &[
             "workspace.*",
+            "project.*",
             "apikey.*",
             "service_account.*",
             "file.*",
@@ -156,17 +157,29 @@ const SEED_ROLES: &[SeedRole] = &[
     SeedRole {
         id: "workspace_developer",
         display_name: "Workspace Developer",
-        patterns: &["apikey.*", "file.*", "skill.*", "workspace.read"],
+        patterns: &[
+            "apikey.*",
+            "file.*",
+            "skill.*",
+            "workspace.read",
+            "project.*",
+        ],
     },
     SeedRole {
         id: "workspace_restricted_developer",
         display_name: "Workspace Restricted Developer",
-        patterns: &["apikey.read", "file.*", "skill.*", "workspace.read"],
+        patterns: &[
+            "apikey.read",
+            "file.*",
+            "skill.*",
+            "workspace.read",
+            "project.read",
+        ],
     },
     SeedRole {
         id: "workspace_user",
         display_name: "Workspace User",
-        patterns: &["file.read", "skill.read", "workspace.read"],
+        patterns: &["file.read", "skill.read", "workspace.read", "project.read"],
     },
     SeedRole {
         id: "workspace_billing",

@@ -182,6 +182,13 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::delete("/v1/admin/grants/{id}"),
     RouteSpec::post("/v1/admin/memberships"),
     RouteSpec::delete("/v1/admin/memberships"),
+    RouteSpec::post("/v1/admin/authz/profiles"),
+    RouteSpec::get("/v1/admin/authz/profiles/{namespace}"),
+    RouteSpec::get("/v1/admin/authz/profiles/{namespace}/active"),
+    RouteSpec::get("/v1/admin/authz/profiles/{namespace}/{revision}"),
+    RouteSpec::post("/v1/admin/authz/profiles/{namespace}/{revision}/validate"),
+    RouteSpec::post("/v1/admin/authz/profiles/{namespace}/{revision}/activate"),
+    RouteSpec::post("/v1/admin/authz/profiles/{namespace}/{revision}/rollback"),
 ];
 
 /// The Anthropic-compatible Admin API surface (ADR-0008 decision 6).
@@ -654,6 +661,10 @@ mod tests {
         assert!(standalone.contains(&RouteSpec::delete("/v1/admin/grants/{id}")));
         assert!(standalone.contains(&RouteSpec::post("/v1/admin/memberships")));
         assert!(standalone.contains(&RouteSpec::delete("/v1/admin/memberships")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/authz/profiles")));
+        assert!(standalone.contains(&RouteSpec::post(
+            "/v1/admin/authz/profiles/{namespace}/{revision}/activate"
+        )));
         assert_eq!(
             standalone
                 .iter()

@@ -14,8 +14,10 @@
 //! silently widens access to an allow).
 
 use awaken_iam_contract::{
-    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    ActivateAuthorizationProfile, AuthorizationDecision, AuthorizationOutcome,
+    AuthorizationProfile, AuthorizationProfileActivated, AuthorizationProfileValidation,
+    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
+    CreateAuthorizationProfile, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
     NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
@@ -96,6 +98,56 @@ pub trait AuthzTransport {
         let _ = request;
         Err(RemoteError(
             "introspect_token is not supported by this transport".into(),
+        ))
+    }
+
+    fn create_profile(
+        &self,
+        _request: &CreateAuthorizationProfile,
+    ) -> Result<AuthorizationProfile, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
+        ))
+    }
+
+    fn validate_profile(
+        &self,
+        _namespace: &NamespaceId,
+        _revision: u64,
+    ) -> Result<AuthorizationProfileValidation, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
+        ))
+    }
+
+    fn activate_profile(
+        &self,
+        _namespace: &NamespaceId,
+        _revision: u64,
+        _request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
+        ))
+    }
+
+    fn rollback_profile(
+        &self,
+        _namespace: &NamespaceId,
+        _revision: u64,
+        _request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
+        ))
+    }
+
+    fn active_profile(
+        &self,
+        _namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfile, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
         ))
     }
 }
@@ -188,6 +240,48 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         request: &TokenIntrospectionRequest,
     ) -> Result<TokenIntrospectionResponse, RemoteError> {
         self.transport.introspect_token(request)
+    }
+
+    pub fn create_profile(
+        &self,
+        request: &CreateAuthorizationProfile,
+    ) -> Result<AuthorizationProfile, RemoteError> {
+        self.transport.create_profile(request)
+    }
+
+    pub fn validate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+    ) -> Result<AuthorizationProfileValidation, RemoteError> {
+        self.transport.validate_profile(namespace, revision)
+    }
+
+    pub fn activate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        self.transport
+            .activate_profile(namespace, revision, request)
+    }
+
+    pub fn rollback_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        request: &ActivateAuthorizationProfile,
+    ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        self.transport
+            .rollback_profile(namespace, revision, request)
+    }
+
+    pub fn active_profile(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfile, RemoteError> {
+        self.transport.active_profile(namespace)
     }
 }
 
@@ -541,7 +635,7 @@ mod tests {
         let client = RemoteIamClient::new(StubTransport { fail: false });
         let err = client
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-awaken-test.token".into(),
+                token: String::from("sk-awaken-test.token"),
             })
             .unwrap_err();
         assert!(
@@ -606,7 +700,7 @@ mod tests {
         let client = RemoteIamClient::new(IntrospectStub);
         let response = client
             .introspect_token(&TokenIntrospectionRequest {
-                token: "sk-awaken-prefix.secret".into(),
+                token: String::from("sk-awaken-prefix.secret"),
             })
             .unwrap();
         assert_eq!(

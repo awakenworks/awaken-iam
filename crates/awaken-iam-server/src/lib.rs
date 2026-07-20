@@ -13,6 +13,7 @@ pub mod http;
 mod license;
 mod oauth_client_admin;
 mod op_id_token;
+mod profile_admin;
 mod session;
 mod store;
 mod token_exchange;
@@ -57,6 +58,7 @@ pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClien
 pub use op_id_token::{
     ID_TOKEN_TYP, IdTokenError, MintIdToken, OidcIdTokenClaims, mint_id_token, verify_id_token,
 };
+pub use profile_admin::{AuthorizationProfileAdmin, ProfileAdminError};
 pub use session::{
     DEFAULT_SESSION_COOKIE_NAME, EstablishedSession, SameSite, SessionCookieConfig, SessionGateway,
 };

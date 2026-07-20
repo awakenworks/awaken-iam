@@ -108,6 +108,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "shared-store freshness fence for HA policy/epoch versioning",
                     AUTHZ_0003,
                 ),
+                (
+                    4,
+                    "immutable authorization profiles and atomic active heads",
+                    AUTHZ_0004,
+                ),
             ],
         ),
         bundle(
@@ -292,6 +297,21 @@ CREATE TABLE {prefix}_fence (\
  version BIGINT NOT NULL DEFAULT 1, \
  epoch BIGINT NOT NULL DEFAULT 0, \
  updated_at TEXT NOT NULL);";
+
+// Immutable documents are separate from the one-row namespace head. Profile
+// activation is consequently a single compare-and-set on the head row.
+const AUTHZ_0004: &str = "\
+CREATE TABLE {prefix}_authorization_profiles (\
+ namespace TEXT NOT NULL, \
+ revision TEXT NOT NULL, \
+ lifecycle TEXT NOT NULL, \
+ document {json} NOT NULL, \
+ checksum TEXT NOT NULL, \
+ created_at TEXT NOT NULL, \
+ PRIMARY KEY (namespace, revision));\n\
+CREATE TABLE {prefix}_authorization_profile_heads (\
+ namespace TEXT PRIMARY KEY, \
+ active_revision TEXT NOT NULL);";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //

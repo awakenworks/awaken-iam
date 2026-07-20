@@ -13,6 +13,19 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+fn test_database(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "awaken-iam-daemon-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create daemon test directory");
+    dir.join("iam.sqlite")
+}
+
 fn locate_daemon_binary() -> Option<std::path::PathBuf> {
     // 1. CARGO_BIN_EXE_iam-daemon (set by Cargo when running integration tests
     //    for the same crate, including the instrumented binary when run
@@ -72,9 +85,11 @@ async fn iam_daemon_binary_boots_and_serves_healthz_and_snapshot() {
     drop(listener);
 
     let admin_cred = "ci-subprocess-token";
+    let database = test_database("boot");
     let mut cmd = Command::new(&binary);
     cmd.env("IAM_BIND_ADDR", format!("127.0.0.1:{port}"))
         .env("IAM_ADMIN_TOKEN", admin_cred)
+        .env("IAM_DATABASE_PATH", &database)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // Forward the LLVM profile env so the instrumented binary writes its
@@ -160,6 +175,7 @@ async fn iam_daemon_binary_boots_and_serves_healthz_and_snapshot() {
     let _ = child.kill();
     std::thread::sleep(std::time::Duration::from_millis(200));
     let _ = child.wait();
+    std::fs::remove_dir_all(database.parent().unwrap()).expect("remove daemon test directory");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -174,9 +190,11 @@ async fn iam_daemon_binary_rejects_unknown_admin_token_with_403() {
     let port = listener.local_addr().expect("local_addr").port();
     drop(listener);
 
+    let database = test_database("auth");
     let mut cmd = Command::new(&binary);
     cmd.env("IAM_BIND_ADDR", format!("127.0.0.1:{port}"))
         .env("IAM_ADMIN_TOKEN", "the-real-token")
+        .env("IAM_DATABASE_PATH", &database)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (key, value) in std::env::vars() {
@@ -218,4 +236,5 @@ async fn iam_daemon_binary_rejects_unknown_admin_token_with_403() {
     // reaping, so the .profraw file is fully written.
     std::thread::sleep(std::time::Duration::from_millis(200));
     let _ = child.wait();
+    std::fs::remove_dir_all(database.parent().unwrap()).expect("remove daemon test directory");
 }

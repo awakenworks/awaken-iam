@@ -293,7 +293,9 @@ where
                 // Per-request scope: `RouteActions::scope_for` derives it from the
                 // request (path/query/extensions); the default is `Global`, so
                 // consumers that do not override it keep the pre-scope behavior.
-                let scope = state.actions.scope_for(&method, req.uri(), req.extensions());
+                let scope = state
+                    .actions
+                    .scope_for(&method, req.uri(), req.extensions());
                 let decision = state
                     .gate
                     .authorize(awaken_iam_contract::AuthorizationRequest {

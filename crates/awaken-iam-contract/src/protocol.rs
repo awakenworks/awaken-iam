@@ -357,6 +357,10 @@ pub struct PolicySnapshot {
     pub group_role_bindings: Vec<GroupRoleBindingSnapshot>,
     /// Scope-graph parent links.
     pub scope_graph: ScopeGraphSnapshot,
+    /// Active, immutable authorization profiles whose action/scope rules the
+    /// local evaluator must enforce. Empty preserves pre-profile compatibility.
+    #[serde(default)]
+    pub active_profiles: Vec<crate::AuthorizationProfile>,
 }
 
 /// A namespace's active signer set, served under the policy version fence.
@@ -546,6 +550,7 @@ mod tests {
                     },
                 }],
             },
+            active_profiles: Vec::new(),
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let parsed: PolicySnapshot = serde_json::from_str(&json).unwrap();

@@ -1,7 +1,7 @@
 # ADR-0010 - Portable authorization control plane and resource-service integration
 
-- **Status:** Proposed
-- **Implementation:** in-progress across consumers
+- **Status:** Accepted
+- **Implementation:** done
 - **Date:** 2026-07-20
 - **Related:** ADR-0002, ADR-0004, ADR-0008, ADR-0009,
   [consumer integration](../design/consumer-integration.md)
@@ -252,6 +252,39 @@ action/scope rules. The existing `ResourceModelRegistration` and monotonic
 `policy_version` are the transport/evaluation foundation; the PAP must expose
 whole-profile validate, activate, fetch, and rollback operations rather than
 requiring consumers to perform a series of additive mutations.
+
+The implemented wire surface is:
+
+```text
+POST /v1/admin/authz/profiles
+POST /v1/admin/authz/profiles/{namespace}/{revision}/validate
+POST /v1/admin/authz/profiles/{namespace}/{revision}/activate
+POST /v1/admin/authz/profiles/{namespace}/{revision}/rollback
+GET  /v1/admin/authz/profiles/{namespace}
+GET  /v1/admin/authz/profiles/{namespace}/{revision}
+GET  /v1/admin/authz/profiles/{namespace}/active
+```
+
+Profile documents include the resource model, exact action/scope rules, grants,
+role bindings, group rosters, and group role bindings. Revisions are immutable
+and checksummed. The durable store keeps documents separately from one
+`authorization_profile_heads` row per namespace. Activation and rollback use a
+single compare-and-set of that head, so optimistic concurrency is atomic on
+SQLite and Postgres. At startup the daemon hydrates all active namespace heads
+before binding its socket. `PolicySnapshot.active_profiles` carries the same
+documents to an embedded/local evaluator.
+
+The migration proceeds through four observable phases:
+
+1. **A — shadow:** construct and validate a revision while the prior policy
+   continues serving decisions; compare decisions with the shared shadow
+   authorizer.
+2. **B — review:** retain divergence evidence and refuse activation until the
+   resource/action/scope validation report is clean.
+3. **C — enforce:** atomically activate the validated revision; the PDP rejects
+   `scope_kind_not_allowed` before matching any grant.
+4. **D — retire legacy:** consumers remove their public `DEFAULT_SCOPE` and
+   additive policy mutation paths after embedded/remote conformance passes.
 
 ### 7. Reuse contracts and conformance suites, not a cross-repository framework
 

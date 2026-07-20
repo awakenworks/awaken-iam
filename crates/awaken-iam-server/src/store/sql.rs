@@ -17,17 +17,18 @@
 //! columns are read back with `CAST(col AS TEXT)`, portable across both.
 
 use awaken_iam_contract::{
-    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
-    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, GrantSubjectRef,
-    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
-    ResourceType, Session, SessionId, Timestamp, WorkspaceId,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
+    AuthorizationProfileDocument, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
+    ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, NamespaceId, OAuthLoginState,
+    OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ResourceId, ResourceType, Session,
+    SessionId, Timestamp, WorkspaceId,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
-    Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo, LoginFlowRepo, OrgRepo,
-    Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit, RepoError, RepoResult,
-    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo,
-    SessionRepo,
+    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
+    Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId,
+    GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota,
+    RateLimit, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
+    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -275,6 +276,53 @@ fn decode_resource_edge(row: &SqlRow) -> RepoResult<ResourceEdge> {
         resource_type: ResourceType(req(row, 0, "edge.resource_type")?),
         resource_id: ResourceId(req(row, 1, "edge.resource_id")?),
         parent: json_decode(&req(row, 2, "edge.parent")?, "edge parent")?,
+    })
+}
+
+fn revision_key(revision: u64) -> String {
+    format!("{revision:020}")
+}
+
+fn parse_revision(raw: &str) -> RepoResult<u64> {
+    raw.parse()
+        .map_err(|err| RepoError::Backend(format!("decode profile revision: {err}")))
+}
+
+fn lifecycle_name(lifecycle: ProfileLifecycle) -> &'static str {
+    match lifecycle {
+        ProfileLifecycle::Draft => "draft",
+        ProfileLifecycle::Validated => "validated",
+        ProfileLifecycle::Active => "active",
+        ProfileLifecycle::Retired => "retired",
+    }
+}
+
+fn decode_lifecycle(raw: &str) -> RepoResult<ProfileLifecycle> {
+    match raw {
+        "draft" => Ok(ProfileLifecycle::Draft),
+        "validated" => Ok(ProfileLifecycle::Validated),
+        "active" => Ok(ProfileLifecycle::Active),
+        "retired" => Ok(ProfileLifecycle::Retired),
+        _ => Err(RepoError::Backend(format!(
+            "decode profile lifecycle: unknown value {raw:?}"
+        ))),
+    }
+}
+
+fn decode_profile(row: &SqlRow) -> RepoResult<AuthorizationProfile> {
+    let namespace = req(row, 0, "profile namespace")?;
+    let revision = req(row, 1, "profile revision")?;
+    let lifecycle = req(row, 2, "profile lifecycle")?;
+    let document = req(row, 3, "profile document")?;
+    let checksum = req(row, 4, "profile checksum")?;
+    let created_at = req(row, 5, "profile created_at")?;
+    Ok(AuthorizationProfile {
+        namespace: NamespaceId(namespace),
+        revision: parse_revision(&revision)?,
+        lifecycle: decode_lifecycle(&lifecycle)?,
+        document: json_decode::<AuthorizationProfileDocument>(&document, "profile document")?,
+        checksum,
+        created_at: Timestamp(created_at),
     })
 }
 
@@ -1006,6 +1054,190 @@ impl<B: SqlConn> ResourceModelRepo for SqlStore<B> {
             .iter()
             .map(decode_resource_edge)
             .collect()
+    }
+}
+
+impl<B: SqlConn> AuthorizationProfileRepo for SqlStore<B> {
+    fn create_profile(&self, profile: AuthorizationProfile) -> RepoResult<()> {
+        let document = json_encode(&profile.document, "authorization profile document")?;
+        let sql = format!(
+            "INSERT INTO {} (namespace, revision, lifecycle, document, checksum, created_at) \
+             VALUES (?, ?, ?, ?j, ?, ?)",
+            self.table("authorization_profiles")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(profile.namespace.0),
+                p(revision_key(profile.revision)),
+                p(lifecycle_name(profile.lifecycle)),
+                p(document),
+                p(profile.checksum),
+                p(profile.created_at.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+    ) -> RepoResult<Option<AuthorizationProfile>> {
+        let sql = format!(
+            "SELECT namespace, revision, lifecycle, CAST(document AS TEXT), checksum, created_at \
+             FROM {} WHERE namespace = ? AND revision = ?",
+            self.table("authorization_profiles")
+        );
+        let rows = self
+            .backend
+            .query(&sql, &[p(namespace.0.clone()), p(revision_key(revision))])?;
+        let mut profile = rows.first().map(decode_profile).transpose()?;
+        if let Some(profile) = &mut profile
+            && self.active_revision(namespace)? == Some(revision)
+        {
+            profile.lifecycle = ProfileLifecycle::Active;
+        }
+        Ok(profile)
+    }
+
+    fn list_profiles(&self, namespace: &NamespaceId) -> RepoResult<Vec<AuthorizationProfile>> {
+        let sql = format!(
+            "SELECT namespace, revision, lifecycle, CAST(document AS TEXT), checksum, created_at \
+             FROM {} WHERE namespace = ? ORDER BY revision",
+            self.table("authorization_profiles")
+        );
+        let active = self.active_revision(namespace)?;
+        self.backend
+            .query(&sql, &[p(namespace.0.clone())])?
+            .iter()
+            .map(|row| {
+                let mut profile = decode_profile(row)?;
+                if active == Some(profile.revision) {
+                    profile.lifecycle = ProfileLifecycle::Active;
+                }
+                Ok(profile)
+            })
+            .collect()
+    }
+
+    fn set_profile_lifecycle(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        lifecycle: ProfileLifecycle,
+    ) -> RepoResult<()> {
+        let sql = format!(
+            "UPDATE {} SET lifecycle = ? WHERE namespace = ? AND revision = ?",
+            self.table("authorization_profiles")
+        );
+        let affected = self.backend.execute(
+            &sql,
+            &[
+                p(lifecycle_name(lifecycle)),
+                p(namespace.0.clone()),
+                p(revision_key(revision)),
+            ],
+        )?;
+        if affected == 0 {
+            return Err(RepoError::NotFound("profile revision not found".into()));
+        }
+        Ok(())
+    }
+
+    fn activate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+    ) -> RepoResult<Option<u64>> {
+        let target = self
+            .get_profile(namespace, revision)?
+            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+        if target.lifecycle == ProfileLifecycle::Draft {
+            return Err(RepoError::Conflict(
+                "profile revision is not validated".into(),
+            ));
+        }
+        let previous = self.active_revision(namespace)?;
+        if previous != expected_active_revision {
+            return Err(RepoError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        let affected = match expected_active_revision {
+            None => {
+                let sql = format!(
+                    "INSERT INTO {} (namespace, active_revision) VALUES (?, ?) \
+                     ON CONFLICT (namespace) DO NOTHING",
+                    self.table("authorization_profile_heads")
+                );
+                self.backend
+                    .execute(&sql, &[p(namespace.0.clone()), p(revision_key(revision))])?
+            }
+            Some(expected) => {
+                let sql = format!(
+                    "UPDATE {} SET active_revision = ? \
+                     WHERE namespace = ? AND active_revision = ?",
+                    self.table("authorization_profile_heads")
+                );
+                self.backend.execute(
+                    &sql,
+                    &[
+                        p(revision_key(revision)),
+                        p(namespace.0.clone()),
+                        p(revision_key(expected)),
+                    ],
+                )?
+            }
+        };
+        if affected != 1 {
+            return Err(RepoError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        Ok(previous)
+    }
+
+    fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>> {
+        let Some(revision) = self.active_revision(namespace)? else {
+            return Ok(None);
+        };
+        self.get_profile(namespace, revision)
+    }
+
+    fn active_profiles(&self) -> RepoResult<Vec<AuthorizationProfile>> {
+        let sql = format!(
+            "SELECT p.namespace, p.revision, p.lifecycle, CAST(p.document AS TEXT), \
+                    p.checksum, p.created_at \
+             FROM {profiles} p JOIN {heads} h \
+               ON p.namespace = h.namespace AND p.revision = h.active_revision \
+             ORDER BY p.namespace",
+            profiles = self.table("authorization_profiles"),
+            heads = self.table("authorization_profile_heads")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(|row| {
+                let mut profile = decode_profile(row)?;
+                profile.lifecycle = ProfileLifecycle::Active;
+                Ok(profile)
+            })
+            .collect()
+    }
+}
+
+impl<B: SqlConn> SqlStore<B> {
+    fn active_revision(&self, namespace: &NamespaceId) -> RepoResult<Option<u64>> {
+        let sql = format!(
+            "SELECT active_revision FROM {} WHERE namespace = ?",
+            self.table("authorization_profile_heads")
+        );
+        let rows = self.backend.query(&sql, &[p(namespace.0.clone())])?;
+        rows.first()
+            .map(|row| parse_revision(&req(row, 0, "active profile revision")?))
+            .transpose()
     }
 }
 

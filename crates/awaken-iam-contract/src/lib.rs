@@ -13,6 +13,13 @@ mod trust;
 
 use serde::{Deserialize, Serialize};
 
+mod profile;
+pub use profile::{
+    ActionScopeRule, ActivateAuthorizationProfile, AuthorizationProfile,
+    AuthorizationProfileActivated, AuthorizationProfileDocument, AuthorizationProfileValidation,
+    CreateAuthorizationProfile, ProfileLifecycle, ScopeKind,
+};
+
 pub use admin::{AdminMutationAck, GroupDto, OrgDto, RoleDto};
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

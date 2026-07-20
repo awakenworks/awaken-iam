@@ -28,10 +28,10 @@ use std::collections::HashSet;
 
 use awaken_iam_contract::{
     ActionKey, ApprovalAuthority, ApprovalObligation, AuthorizationDecision, AuthorizationOutcome,
-    AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot,
-    GroupRosterSnapshot, NamespaceId, NamespaceOrgEdge, OrgId, PolicySnapshot, PrincipalRef,
-    ResourceId, ResourceParentEdge, ResourceType, RoleBindingSnapshot, ScopeGraphSnapshot,
-    ScopeRef, WorkspaceId, WorkspaceOrgEdge,
+    AuthorizationProfile, AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef,
+    GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceId, NamespaceOrgEdge, OrgId,
+    PolicySnapshot, PrincipalRef, ResourceId, ResourceParentEdge, ResourceType,
+    RoleBindingSnapshot, ScopeGraphSnapshot, ScopeKind, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::GroupId;
@@ -174,6 +174,9 @@ pub enum DecisionReason {
     /// The request carried no resolvable principal; no principal ever means
     /// allow, so the chain is denied before any grant is consulted.
     PrincipalUnresolved,
+    /// The active authorization profile does not permit this action on the
+    /// submitted structural scope kind.
+    ScopeKindNotAllowed,
 }
 
 impl DecisionReason {
@@ -185,6 +188,7 @@ impl DecisionReason {
             DecisionReason::DeniedByGrant => "denied_by_grant",
             DecisionReason::DefaultDeny => "default_deny",
             DecisionReason::PrincipalUnresolved => "principal_unresolved",
+            DecisionReason::ScopeKindNotAllowed => "scope_kind_not_allowed",
         }
     }
 }
@@ -408,6 +412,8 @@ pub struct PolicySet {
     group_rosters: HashMap<GroupId, Vec<PrincipalRef>>,
     group_role_bindings: Vec<GroupRoleBinding>,
     scope_graph: ScopeGraph,
+    active_profiles: Vec<AuthorizationProfile>,
+    action_scope_rules: HashMap<ActionKey, HashSet<ScopeKind>>,
 }
 
 impl PolicySet {
@@ -630,6 +636,15 @@ impl PolicySet {
         action: &ActionKey,
         scope: &ScopeRef,
     ) -> AuthorizationTrace {
+        if !self.active_profiles.is_empty() && !self.scope_kind_allowed(action, scope) {
+            return AuthorizationTrace {
+                decision: AuthorizationDecision::Deny,
+                reason: DecisionReason::ScopeKindNotAllowed,
+                matched_grants: Vec::new(),
+                matched_roles: Vec::new(),
+                obligation: None,
+            };
+        }
         if chain.is_empty() {
             return AuthorizationTrace {
                 decision: AuthorizationDecision::Deny,
@@ -807,6 +822,7 @@ impl PolicySet {
             group_rosters,
             group_role_bindings,
             scope_graph: self.scope_graph.to_snapshot(),
+            active_profiles: self.active_profiles.clone(),
         }
     }
 
@@ -872,7 +888,93 @@ impl PolicySet {
                 edge.parent.clone(),
             );
         }
+        for profile in &snapshot.active_profiles {
+            policy.install_profile_rules(profile);
+        }
         policy
+    }
+
+    /// Build a complete policy from one immutable profile revision. Activation
+    /// replaces grants, bindings, resource edges, and action/scope rules as one
+    /// unit rather than layering additive mutations onto the previous policy.
+    pub fn from_profile(profile: &AuthorizationProfile) -> Self {
+        Self::from_profiles(std::slice::from_ref(profile))
+    }
+
+    /// Build one evaluator from every consumer namespace's active profile.
+    /// Action keys are shared vocabulary; validation at the PAP prevents an
+    /// individual document from being structurally incomplete.
+    pub fn from_profiles(profiles: &[AuthorizationProfile]) -> Self {
+        let mut snapshot = PolicySnapshot {
+            version: profiles
+                .iter()
+                .map(|profile| profile.revision)
+                .max()
+                .unwrap_or(0),
+            active_profiles: profiles.to_vec(),
+            ..PolicySnapshot::default()
+        };
+        for profile in profiles {
+            let document = &profile.document;
+            snapshot.grants.extend(document.grants.clone());
+            snapshot
+                .role_bindings
+                .extend(document.role_bindings.clone());
+            snapshot
+                .group_rosters
+                .extend(document.group_rosters.clone());
+            snapshot
+                .group_role_bindings
+                .extend(document.group_role_bindings.clone());
+            snapshot
+                .scope_graph
+                .resource_parents
+                .extend(document.resource_model.edges.clone());
+        }
+        let mut policy = Self::from_snapshot(&snapshot);
+        for profile in profiles {
+            let model = crate::ResourceModel::from_registration(&profile.document.resource_model);
+            policy.register_resource_model(&model);
+        }
+        policy
+    }
+
+    fn install_profile_rules(&mut self, profile: &AuthorizationProfile) {
+        self.active_profiles
+            .retain(|active| active.namespace != profile.namespace);
+        self.active_profiles.push(profile.clone());
+        self.action_scope_rules.clear();
+        for active in &self.active_profiles {
+            for rule in &active.document.action_scope_rules {
+                self.action_scope_rules
+                    .entry(rule.action.clone())
+                    .or_default()
+                    .extend(rule.allowed_scope_kinds.iter().cloned());
+            }
+        }
+    }
+
+    fn scope_kind_allowed(&self, action: &ActionKey, scope: &ScopeRef) -> bool {
+        self.action_scope_rules
+            .get(action)
+            .is_some_and(|allowed| allowed.iter().any(|kind| scope_matches_kind(scope, kind)))
+    }
+}
+
+fn scope_matches_kind(scope: &ScopeRef, kind: &ScopeKind) -> bool {
+    match (scope, kind) {
+        (ScopeRef::Global, ScopeKind::Global)
+        | (ScopeRef::Org { .. }, ScopeKind::Org)
+        | (ScopeRef::Namespace { .. }, ScopeKind::Namespace)
+        | (ScopeRef::Workspace { .. }, ScopeKind::Workspace)
+        | (ScopeRef::Project { .. }, ScopeKind::Project) => true,
+        (
+            ScopeRef::Resource { resource_type, .. },
+            ScopeKind::Resource {
+                resource_type: allowed,
+            },
+        ) => resource_type == allowed,
+        _ => false,
     }
 }
 

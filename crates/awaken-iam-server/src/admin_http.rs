@@ -43,14 +43,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
-    AdminMutationAck, AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
-    GrantSubjectRef, GroupDto, OrgDto, OrgId, PolicySnapshot, RoleBindingSnapshot, RoleDto,
-    Timestamp,
+    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
+    NamespaceId, OrgDto, OrgId, PolicySnapshot, RoleBindingSnapshot, RoleDto, Timestamp,
 };
 use awaken_iam_core::{
-    ActionPattern, Effect, Grant, GrantId, GrantSubject, Group, GroupId, Organization, RoleBinding,
-    RoleDef, RoleId,
+    ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
+    Organization, RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -61,7 +61,10 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{AdminCredential, AdminError, InMemoryStore, PolicyAdminApi};
+use crate::{
+    AdminCredential, AdminError, AuthorizationProfileAdmin, InMemoryStore, PolicyAdminApi,
+    ProfileAdminError,
+};
 use awaken_iam_contract::GrantEffect;
 
 /// Who may administer policy over the wire.
@@ -105,6 +108,7 @@ impl AdminAuthPolicy {
 pub struct DaemonState {
     authz: crate::AuthzApi,
     admin: PolicyAdminApi<InMemoryStore>,
+    profiles: AuthorizationProfileAdmin,
     auth: AdminAuthPolicy,
 }
 
@@ -112,9 +116,19 @@ impl DaemonState {
     /// Assemble the daemon state over the daemon's authorization engine, a fresh
     /// policy-administration store, and the admin auth policy.
     pub fn new(authz: crate::AuthzApi, auth: AdminAuthPolicy) -> Self {
+        Self::with_profile_repository(authz, auth, Arc::new(InMemoryStore::new()))
+    }
+
+    /// Assemble the daemon with an explicit durable profile repository.
+    pub fn with_profile_repository(
+        authz: crate::AuthzApi,
+        auth: AdminAuthPolicy,
+        profiles: Arc<dyn AuthorizationProfileRepo>,
+    ) -> Self {
         Self {
             authz,
             admin: PolicyAdminApi::new(InMemoryStore::new()),
+            profiles: AuthorizationProfileAdmin::new(profiles),
             auth,
         }
     }
@@ -149,7 +163,137 @@ pub fn daemon_router(state: SharedDaemonState) -> Router {
             "/v1/admin/memberships",
             post(grant_membership).delete(revoke_membership),
         )
+        .route("/v1/admin/authz/profiles", post(create_profile))
+        .route("/v1/admin/authz/profiles/{namespace}", get(list_profiles))
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/active",
+            get(active_profile),
+        )
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/{revision}",
+            get(get_profile),
+        )
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/{revision}/validate",
+            post(validate_profile),
+        )
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/{revision}/activate",
+            post(activate_profile),
+        )
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/{revision}/rollback",
+            post(rollback_profile),
+        )
         .with_state(state)
+}
+
+async fn create_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAuthorizationProfile>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    profile_result(guard.profiles.create_draft(request))
+}
+
+async fn list_profiles(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    profile_result(guard.profiles.list(&NamespaceId(namespace)))
+}
+
+async fn active_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.profiles.active(&NamespaceId(namespace)) {
+        Ok(Some(profile)) => Json(profile).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => profile_error_response(&error),
+    }
+}
+
+async fn get_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path((namespace, revision)): Path<(String, u64)>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.profiles.get(&NamespaceId(namespace), revision) {
+        Ok(Some(profile)) => Json(profile).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => profile_error_response(&error),
+    }
+}
+
+async fn validate_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path((namespace, revision)): Path<(String, u64)>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    profile_result(guard.profiles.validate(&NamespaceId(namespace), revision))
+}
+
+async fn activate_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path((namespace, revision)): Path<(String, u64)>,
+    Json(request): Json<ActivateAuthorizationProfile>,
+) -> Response {
+    let mut guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    let profiles = guard.profiles.clone();
+    profile_result(profiles.activate(&mut guard.authz, &NamespaceId(namespace), revision, request))
+}
+
+async fn rollback_profile(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    Path((namespace, revision)): Path<(String, u64)>,
+    Json(request): Json<ActivateAuthorizationProfile>,
+) -> Response {
+    let Some(expected) = request.expected_active_revision else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expected_revision_required",
+            "rollback requires expected_active_revision",
+        );
+    };
+    let mut guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    let profiles = guard.profiles.clone();
+    profile_result(profiles.rollback(
+        &mut guard.authz,
+        &NamespaceId(namespace),
+        revision,
+        expected,
+    ))
 }
 
 // -- authorization half of /v1 (shared state, read-only per request) ----------
@@ -424,6 +568,23 @@ fn admin_error_response(error: &AdminError) -> Response {
         AdminError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
         AdminError::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
         AdminError::Backend(_) => (StatusCode::INTERNAL_SERVER_ERROR, "backend_error"),
+    };
+    error_response(status, code, &error.to_string())
+}
+
+fn profile_result<T: serde::Serialize>(result: Result<T, ProfileAdminError>) -> Response {
+    match result {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => profile_error_response(&error),
+    }
+}
+
+fn profile_error_response(error: &ProfileAdminError) -> Response {
+    let (status, code) = match error {
+        ProfileAdminError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        ProfileAdminError::Conflict(_) => (StatusCode::CONFLICT, "profile_conflict"),
+        ProfileAdminError::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "profile_invalid"),
+        ProfileAdminError::Repository(_) => (StatusCode::INTERNAL_SERVER_ERROR, "backend_error"),
     };
     error_response(status, code, &error.to_string())
 }

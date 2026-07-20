@@ -10,15 +10,16 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use awaken_iam_contract::{
-    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
-    ExternalIdentityKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, Session,
-    SessionId, Timestamp,
+    Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
+    ExternalIdentity, ExternalIdentityKey, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId,
+    PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp,
 };
 use awaken_iam_core::{
-    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, ExternalIdentityRepo, Grant, GrantId,
-    GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization,
-    Plan, PlanId, PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge,
-    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
+    ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo,
+    OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, RegisteredClient, RepoError,
+    RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
+    RoleRepo, SessionRepo,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -49,6 +50,8 @@ struct Authz {
     grants: BTreeMap<String, Grant>,
     role_bindings: BTreeMap<String, RoleBinding>,
     resource_edges: BTreeMap<String, ResourceEdge>,
+    profiles: BTreeMap<(String, u64), AuthorizationProfile>,
+    active_profiles: BTreeMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -546,6 +549,133 @@ impl ResourceModelRepo for InMemoryStore {
             .values()
             .cloned()
             .collect())
+    }
+}
+
+impl AuthorizationProfileRepo for InMemoryStore {
+    fn create_profile(&self, profile: AuthorizationProfile) -> RepoResult<()> {
+        let key = (profile.namespace.0.clone(), profile.revision);
+        let mut authz = self.authz.lock().unwrap();
+        if authz.profiles.contains_key(&key) {
+            return Err(RepoError::Conflict(
+                "profile revision already exists".into(),
+            ));
+        }
+        authz.profiles.insert(key, profile);
+        Ok(())
+    }
+
+    fn get_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+    ) -> RepoResult<Option<AuthorizationProfile>> {
+        let authz = self.authz.lock().unwrap();
+        let mut profile = authz
+            .profiles
+            .get(&(namespace.0.clone(), revision))
+            .cloned();
+        if authz.active_profiles.get(&namespace.0) == Some(&revision)
+            && let Some(profile) = &mut profile
+        {
+            profile.lifecycle = ProfileLifecycle::Active;
+        }
+        Ok(profile)
+    }
+
+    fn list_profiles(&self, namespace: &NamespaceId) -> RepoResult<Vec<AuthorizationProfile>> {
+        let authz = self.authz.lock().unwrap();
+        let active = authz.active_profiles.get(&namespace.0).copied();
+        Ok(authz
+            .profiles
+            .iter()
+            .filter(|((owner, _), _)| owner == &namespace.0)
+            .map(|((_, revision), profile)| {
+                let mut profile = profile.clone();
+                if active == Some(*revision) {
+                    profile.lifecycle = ProfileLifecycle::Active;
+                }
+                profile
+            })
+            .collect())
+    }
+
+    fn set_profile_lifecycle(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        lifecycle: ProfileLifecycle,
+    ) -> RepoResult<()> {
+        let mut authz = self.authz.lock().unwrap();
+        let profile = authz
+            .profiles
+            .get_mut(&(namespace.0.clone(), revision))
+            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+        profile.lifecycle = lifecycle;
+        Ok(())
+    }
+
+    fn activate_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+    ) -> RepoResult<Option<u64>> {
+        let mut authz = self.authz.lock().unwrap();
+        let target = authz
+            .profiles
+            .get(&(namespace.0.clone(), revision))
+            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+        if target.lifecycle == ProfileLifecycle::Draft {
+            return Err(RepoError::Conflict(
+                "profile revision is not validated".into(),
+            ));
+        }
+        let previous = authz.active_profiles.get(&namespace.0).copied();
+        if previous != expected_active_revision {
+            return Err(RepoError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        if let Some(previous) = previous
+            && previous != revision
+            && let Some(profile) = authz.profiles.get_mut(&(namespace.0.clone(), previous))
+        {
+            profile.lifecycle = ProfileLifecycle::Retired;
+        }
+        authz.active_profiles.insert(namespace.0.clone(), revision);
+        Ok(previous)
+    }
+
+    fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>> {
+        let authz = self.authz.lock().unwrap();
+        let Some(revision) = authz.active_profiles.get(&namespace.0) else {
+            return Ok(None);
+        };
+        let mut profile = authz
+            .profiles
+            .get(&(namespace.0.clone(), *revision))
+            .cloned()
+            .ok_or_else(|| RepoError::Backend("active profile head is dangling".into()))?;
+        profile.lifecycle = ProfileLifecycle::Active;
+        Ok(Some(profile))
+    }
+
+    fn active_profiles(&self) -> RepoResult<Vec<AuthorizationProfile>> {
+        let authz = self.authz.lock().unwrap();
+        authz
+            .active_profiles
+            .iter()
+            .map(|(namespace, revision)| {
+                let mut profile = authz
+                    .profiles
+                    .get(&(namespace.clone(), *revision))
+                    .cloned()
+                    .ok_or_else(|| RepoError::Backend("active profile head is dangling".into()))?;
+                profile.lifecycle = ProfileLifecycle::Active;
+                Ok(profile)
+            })
+            .collect()
     }
 }
 

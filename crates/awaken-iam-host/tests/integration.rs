@@ -622,7 +622,10 @@ async fn middleware_consults_scope_for_with_request_coordinates() {
         .layer(auth_layer(handle.gate.clone(), actions));
 
     let resp = router
-        .oneshot(bearer_request("/w/wrkspc_acme/threads", &handle.admin_token))
+        .oneshot(bearer_request(
+            "/w/wrkspc_acme/threads",
+            &handle.admin_token,
+        ))
         .await
         .expect("dispatch");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -666,10 +669,7 @@ fn from_local_state_wraps_a_product_owned_embed() {
         )
         .expect("mint into the product-owned state");
 
-    let gate = IamGate::from_local_state(Arc::new(Mutex::new(LocalIamState {
-        authz,
-        directory,
-    })));
+    let gate = IamGate::from_local_state(Arc::new(Mutex::new(LocalIamState { authz, directory })));
 
     assert!(!gate.is_open(), "a product-owned gate is not open mode");
     // authenticate_scoped recovers principal AND the token's workspace binding.

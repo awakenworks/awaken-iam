@@ -23,7 +23,8 @@
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_server::{
-    AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, daemon_router, http,
+    AdminAuthPolicy, AuthorizationProfileAdmin, DaemonState, IamDaemon, RecordingExecutor,
+    SqliteBackend, daemon_router, http, sqlite_migrated_store,
 };
 
 #[tokio::main]
@@ -33,13 +34,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Assemble standalone and migrate before binding the socket, so the process
     // fails fast on a drifted ledger instead of serving a half-migrated schema.
     let daemon = IamDaemon::start(RecordingExecutor::new())?;
-    let authz = daemon.into_assembly().into_authz();
+    let mut authz = daemon.into_assembly().into_authz();
+
+    // Profiles are durable even though the legacy MVP policy-admin aggregates
+    // still use their existing adapters. The active heads are hydrated before
+    // the socket binds, so a restart never serves the pre-profile policy.
+    let database_path =
+        std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
+    let profile_store = Arc::new(sqlite_migrated_store(
+        SqliteBackend::open_path(&database_path)?,
+        "iam",
+    )?);
+    AuthorizationProfileAdmin::new(profile_store.clone()).hydrate_all(&mut authz)?;
 
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
     let admin_auth = admin_auth_from_env();
-    let state = Arc::new(Mutex::new(DaemonState::new(authz, admin_auth)));
+    let state = Arc::new(Mutex::new(DaemonState::with_profile_repository(
+        authz,
+        admin_auth,
+        profile_store,
+    )));
     let router = daemon_router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
