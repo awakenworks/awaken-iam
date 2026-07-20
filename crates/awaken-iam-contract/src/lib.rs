@@ -124,6 +124,15 @@ pub enum ScopeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActionKey(pub String);
 
+impl ActionKey {
+    /// Qualify a consumer-local action under its authorization-policy namespace.
+    /// The delimiter is part of the portable IAM contract and prevents grants
+    /// from one bounded context matching an identically named action in another.
+    pub fn in_namespace(namespace: &NamespaceId, local_action: impl AsRef<str>) -> Self {
+        Self(format!("{}::{}", namespace.0, local_action.as_ref()))
+    }
+}
+
 /// Authorization request.
 ///
 /// A request carries a principal *chain*: [`AuthorizationRequest::principal`] is

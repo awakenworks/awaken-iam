@@ -95,17 +95,17 @@ fn profile_body(scope_kind: &str) -> serde_json::Value {
         "document": {
             "resource_model": {
                 "resource_types": [],
-                "actions": ["memory.read"],
+                "actions": ["awaken.runtime::memory.*"],
                 "edges": []
             },
             "action_scope_rules": [{
-                "action": "memory.read",
+                "action_pattern": "awaken.runtime::memory.*",
                 "allowed_scope_kinds": [scope]
             }],
             "grants": [{
-                "id": "g_memory",
+                "id": "awaken.runtime:g_memory",
                 "subject": {"kind":"principal","principal":{"kind":"service","service_id":"runtime"}},
-                "action_pattern": "memory.*",
+                "action_pattern": "awaken.runtime::memory.*",
                 "scope": {"kind":"global"},
                 "effect": "allow"
             }]
@@ -155,7 +155,7 @@ async fn profile_pap_replaces_scope_rules_and_rolls_back_over_http() {
             "/v1/authorize",
             serde_json::json!({
                 "principal":{"kind":"service","service_id":"runtime"},
-                "action":"memory.read",
+                "action":"awaken.runtime::memory.read",
                 "scope":{"kind":"workspace","workspace_id":"ws"}
             }),
         ))
@@ -169,7 +169,7 @@ async fn profile_pap_replaces_scope_rules_and_rolls_back_over_http() {
             "/v1/authorize",
             serde_json::json!({
                 "principal":{"kind":"service","service_id":"runtime"},
-                "action":"memory.read",
+                "action":"awaken.runtime::memory.read",
                 "scope":{"kind":"project","workspace_id":"ws","project_id":"p"}
             }),
         ))

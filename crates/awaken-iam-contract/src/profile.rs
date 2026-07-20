@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionKey, GrantSnapshot, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceId,
+    GrantSnapshot, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceId,
     ResourceModelRegistration, ResourceType, RoleBindingSnapshot, Timestamp,
 };
 
@@ -22,7 +22,10 @@ pub enum ScopeKind {
 /// One exact action and the target kinds on which it is meaningful.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionScopeRule {
-    pub action: ActionKey,
+    /// IAM action pattern (`memory.read`, `tool.*`); the unconstrained `*`
+    /// pattern is rejected by the PAP so one consumer cannot claim every
+    /// namespace.
+    pub action_pattern: String,
     pub allowed_scope_kinds: Vec<ScopeKind>,
 }
 

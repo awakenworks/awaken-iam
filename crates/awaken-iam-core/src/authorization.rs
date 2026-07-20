@@ -413,7 +413,7 @@ pub struct PolicySet {
     group_role_bindings: Vec<GroupRoleBinding>,
     scope_graph: ScopeGraph,
     active_profiles: Vec<AuthorizationProfile>,
-    action_scope_rules: HashMap<ActionKey, HashSet<ScopeKind>>,
+    action_scope_rules: Vec<(ActionPattern, HashSet<ScopeKind>)>,
 }
 
 impl PolicySet {
@@ -902,8 +902,6 @@ impl PolicySet {
     }
 
     /// Build one evaluator from every consumer namespace's active profile.
-    /// Action keys are shared vocabulary; validation at the PAP prevents an
-    /// individual document from being structurally incomplete.
     pub fn from_profiles(profiles: &[AuthorizationProfile]) -> Self {
         let mut snapshot = PolicySnapshot {
             version: profiles
@@ -946,18 +944,26 @@ impl PolicySet {
         self.action_scope_rules.clear();
         for active in &self.active_profiles {
             for rule in &active.document.action_scope_rules {
-                self.action_scope_rules
-                    .entry(rule.action.clone())
-                    .or_default()
-                    .extend(rule.allowed_scope_kinds.iter().cloned());
+                if let Some((_, allowed)) = self
+                    .action_scope_rules
+                    .iter_mut()
+                    .find(|(pattern, _)| pattern.0 == rule.action_pattern)
+                {
+                    allowed.extend(rule.allowed_scope_kinds.iter().cloned());
+                } else {
+                    self.action_scope_rules.push((
+                        ActionPattern(rule.action_pattern.clone()),
+                        rule.allowed_scope_kinds.iter().cloned().collect(),
+                    ));
+                }
             }
         }
     }
 
     fn scope_kind_allowed(&self, action: &ActionKey, scope: &ScopeRef) -> bool {
-        self.action_scope_rules
-            .get(action)
-            .is_some_and(|allowed| allowed.iter().any(|kind| scope_matches_kind(scope, kind)))
+        self.action_scope_rules.iter().any(|(pattern, allowed)| {
+            pattern.matches(action) && allowed.iter().any(|kind| scope_matches_kind(scope, kind))
+        })
     }
 }
 

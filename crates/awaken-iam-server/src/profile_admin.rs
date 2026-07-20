@@ -96,7 +96,7 @@ impl AuthorizationProfileAdmin {
             .repository
             .get_profile(namespace, revision)?
             .ok_or(ProfileAdminError::NotFound)?;
-        let errors = validate_document(&profile.document);
+        let errors = validate_document(namespace, &profile.document);
         let valid = errors.is_empty();
         if valid {
             self.repository.set_profile_lifecycle(
@@ -214,8 +214,13 @@ fn checksum(document: &AuthorizationProfileDocument) -> Result<String, ProfileAd
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
-fn validate_document(document: &AuthorizationProfileDocument) -> Vec<String> {
+fn validate_document(
+    namespace: &NamespaceId,
+    document: &AuthorizationProfileDocument,
+) -> Vec<String> {
     let mut errors = Vec::new();
+    let action_prefix = format!("{}::", namespace.0);
+    let subject_prefix = format!("{}:", namespace.0);
     let mut resource_types = HashSet::new();
     let mut declared_actions = HashSet::new();
     for resource in &document.resource_model.resource_types {
@@ -250,39 +255,130 @@ fn validate_document(document: &AuthorizationProfileDocument) -> Vec<String> {
 
     let mut ruled_actions = HashSet::new();
     for rule in &document.action_scope_rules {
-        if !ruled_actions.insert(rule.action.clone()) {
-            errors.push(format!("duplicate action scope rule {}", rule.action.0));
+        if rule.action_pattern.is_empty() {
+            errors.push("action scope pattern must not be empty".into());
         }
-        if !declared_actions.contains(&rule.action) {
+        if rule.action_pattern == "*" {
+            errors.push("global action wildcard is not allowed in a profile".into());
+        }
+        if !rule.action_pattern.starts_with(&action_prefix) {
             errors.push(format!(
-                "scope rule references unknown action {}",
-                rule.action.0
+                "action pattern {} is outside namespace {}",
+                rule.action_pattern, namespace.0
+            ));
+        }
+        if !ruled_actions.insert(rule.action_pattern.clone()) {
+            errors.push(format!(
+                "duplicate action scope rule {}",
+                rule.action_pattern
+            ));
+        }
+        if !declared_actions
+            .iter()
+            .any(|action| action.0 == rule.action_pattern)
+        {
+            errors.push(format!(
+                "scope rule references unknown action pattern {}",
+                rule.action_pattern
             ));
         }
         if rule.allowed_scope_kinds.is_empty() {
             errors.push(format!(
-                "action {} has no allowed scope kind",
-                rule.action.0
+                "action pattern {} has no allowed scope kind",
+                rule.action_pattern
             ));
         }
         let mut unique = HashSet::new();
         for kind in &rule.allowed_scope_kinds {
             if !unique.insert(kind.clone()) {
-                errors.push(format!("action {} repeats a scope kind", rule.action.0));
+                errors.push(format!(
+                    "action pattern {} repeats a scope kind",
+                    rule.action_pattern
+                ));
             }
             if let ScopeKind::Resource { resource_type } = kind
                 && !resource_types.contains(resource_type)
             {
                 errors.push(format!(
-                    "action {} references unknown resource type {}",
-                    rule.action.0, resource_type.0
+                    "action pattern {} references unknown resource type {}",
+                    rule.action_pattern, resource_type.0
                 ));
             }
         }
     }
     for action in declared_actions {
-        if !ruled_actions.contains(&action) {
+        if !action.0.starts_with(&action_prefix) {
+            errors.push(format!(
+                "declared action {} is outside namespace {}",
+                action.0, namespace.0
+            ));
+        }
+        if !ruled_actions.contains(&action.0) {
             errors.push(format!("action {} has no scope rule", action.0));
+        }
+    }
+
+    for grant in &document.grants {
+        if !grant.id.starts_with(&subject_prefix) {
+            errors.push(format!(
+                "grant id {} is outside namespace {}",
+                grant.id, namespace.0
+            ));
+        }
+        if !grant.action_pattern.starts_with(&action_prefix) {
+            errors.push(format!(
+                "grant action pattern {} is outside namespace {}",
+                grant.action_pattern, namespace.0
+            ));
+        }
+        match &grant.subject {
+            awaken_iam_contract::GrantSubjectRef::Role { role_id }
+                if !role_id.starts_with(&subject_prefix) =>
+            {
+                errors.push(format!(
+                    "role id {role_id} is outside namespace {}",
+                    namespace.0
+                ));
+            }
+            awaken_iam_contract::GrantSubjectRef::Group { group_id }
+                if !group_id.starts_with(&subject_prefix) =>
+            {
+                errors.push(format!(
+                    "group id {group_id} is outside namespace {}",
+                    namespace.0
+                ));
+            }
+            _ => {}
+        }
+    }
+    for binding in &document.role_bindings {
+        if !binding.role_id.starts_with(&subject_prefix) {
+            errors.push(format!(
+                "role id {} is outside namespace {}",
+                binding.role_id, namespace.0
+            ));
+        }
+    }
+    for roster in &document.group_rosters {
+        if !roster.group_id.starts_with(&subject_prefix) {
+            errors.push(format!(
+                "group id {} is outside namespace {}",
+                roster.group_id, namespace.0
+            ));
+        }
+    }
+    for binding in &document.group_role_bindings {
+        if !binding.group_id.starts_with(&subject_prefix) {
+            errors.push(format!(
+                "group id {} is outside namespace {}",
+                binding.group_id, namespace.0
+            ));
+        }
+        if !binding.role_id.starts_with(&subject_prefix) {
+            errors.push(format!(
+                "role id {} is outside namespace {}",
+                binding.role_id, namespace.0
+            ));
         }
     }
     errors.sort();
@@ -320,21 +416,21 @@ mod tests {
             namespace: NamespaceId("awaken.runtime".into()),
             document: AuthorizationProfileDocument {
                 resource_model: ResourceModelRegistration {
-                    actions: vec![ActionKey("memory.read".into())],
+                    actions: vec![ActionKey("awaken.runtime::memory.*".into())],
                     ..ResourceModelRegistration::default()
                 },
                 action_scope_rules: vec![ActionScopeRule {
-                    action: ActionKey("memory.read".into()),
+                    action_pattern: "awaken.runtime::memory.*".into(),
                     allowed_scope_kinds: vec![scope_kind],
                 }],
                 grants: vec![GrantSnapshot {
-                    id: "grant_memory".into(),
+                    id: "awaken.runtime:grant_memory".into(),
                     subject: GrantSubjectRef::Principal {
                         principal: PrincipalRef::Service {
                             service_id: "runtime".into(),
                         },
                     },
-                    action_pattern: "memory.*".into(),
+                    action_pattern: "awaken.runtime::memory.*".into(),
                     scope,
                     effect: GrantEffect::Allow,
                 }],
@@ -349,7 +445,7 @@ mod tests {
             PrincipalRef::Service {
                 service_id: "runtime".into(),
             },
-            ActionKey("memory.read".into()),
+            ActionKey("awaken.runtime::memory.read".into()),
             scope,
         )
     }
