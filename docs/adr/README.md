@@ -11,3 +11,5 @@
 | [0006](0006-async-signing-seam.md) | The token signing seam is async | Proposed |
 | [0007](0007-release-versioning-contract.md) | The repo is consumed at immutable version tags | Proposed |
 | [0008](0008-org-workspace-member-rbac.md) | One permission model for org/workspace members and API keys | Proposed |
+| [0009](0009-abac-gap-assessment.md) | ABAC gap assessment for consumer authorization | Accepted |
+| [0010](0010-portable-authorization-architecture.md) | Portable authorization control plane and resource-service integration | Proposed |
