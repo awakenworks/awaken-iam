@@ -59,7 +59,7 @@ fn readyz_reports_ready_after_migration() {
     // because its in-process migration executor applied every bundle before
     // the assembly returned.
     let assembly = IamAssembly::embedded(RecordingExecutor::new()).expect("assemble");
-    assert_eq!(assembly.healthz().is_live(), true);
+    assert!(assembly.healthz().is_live());
     assert!(assembly.readyz().is_ready());
 }
 

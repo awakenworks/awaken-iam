@@ -189,8 +189,9 @@ impl IamGate {
     /// Like [`authenticate_scoped`](Self::authenticate_scoped) on success, but on
     /// failure returns an [`AuthReject`] so a product can answer the distinct
     /// 401s its API documents (expired vs revoked vs invalid) rather than one
-    /// opaque "invalid". JWT/introspection failures collapse to
-    /// [`AuthReject::Invalid`] (their sub-reasons are not exposed by the verifier).
+    /// opaque "invalid". A verified JWT keeps its explicit expiry reason;
+    /// introspection failures remain opaque because the remote protocol does not
+    /// disclose whether an API token was invalid, expired, or revoked.
     pub fn authenticate_detailed(
         &self,
         token: &str,
@@ -209,9 +210,7 @@ impl IamGate {
                         Err(_) => Err(AuthReject::Invalid),
                     }
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix)
-                        .map(|p| (p, None))
-                        .ok_or(AuthReject::Invalid)
+                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
                 } else {
                     Err(AuthReject::Invalid)
                 }
@@ -227,9 +226,7 @@ impl IamGate {
                         .map(|r| (r.principal, None))
                         .ok_or(AuthReject::Invalid)
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix)
-                        .map(|p| (p, None))
-                        .ok_or(AuthReject::Invalid)
+                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
                 } else {
                     Err(AuthReject::Invalid)
                 }
@@ -237,23 +234,28 @@ impl IamGate {
         }
     }
 
-    fn verify_jwt(&self, token: &str, jwks: &Jwks, now_unix: i64) -> Option<PrincipalRef> {
-        let claims = verify_access_token(token, jwks).ok()?;
+    fn verify_jwt(
+        &self,
+        token: &str,
+        jwks: &Jwks,
+        now_unix: i64,
+    ) -> Result<PrincipalRef, AuthReject> {
+        let claims = verify_access_token(token, jwks).map_err(|_| AuthReject::Invalid)?;
 
         if claims.exp <= now_unix {
-            return None;
+            return Err(AuthReject::Expired);
         }
         if let Some(ref expected_iss) = self.issuer
             && &claims.iss != expected_iss
         {
-            return None;
+            return Err(AuthReject::Invalid);
         }
         if let Some(ref expected_aud) = self.audience
             && &claims.aud != expected_aud
         {
-            return None;
+            return Err(AuthReject::Invalid);
         }
-        Some(PrincipalRef::Account {
+        Ok(PrincipalRef::Account {
             account_id: AccountId(claims.sub),
         })
     }

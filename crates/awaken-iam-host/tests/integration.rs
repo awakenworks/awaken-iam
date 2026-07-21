@@ -263,12 +263,13 @@ async fn jwt_expired_token_fails_verification_in_gate() {
 
     // But the gate must reject it because exp <= now_unix:
     let ts = now_ts();
-    assert!(
+    assert_eq!(
         handle
             .gate
-            .authenticate_bearer(&token, &ts, NOW_UNIX)
-            .is_none(),
-        "expired JWT must not authenticate via the gate"
+            .authenticate_detailed(&token, &ts, NOW_UNIX)
+            .unwrap_err(),
+        awaken_iam_host::AuthReject::Expired,
+        "expired JWT must retain its explicit rejection reason"
     );
 }
 
