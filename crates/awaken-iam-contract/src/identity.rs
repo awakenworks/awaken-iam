@@ -239,13 +239,13 @@ impl OpenIdProviderMetadata {
     ///
     /// Any trailing `/` on `issuer` is trimmed so the advertised endpoints never
     /// contain a doubled separator. Endpoints mirror the canonical auth tree:
-    /// `/v1/auth/login`, `/v1/oauth/token`, `/v1/oauth/userinfo`, and
+    /// `/v1/oauth/authorize`, `/v1/oauth/token`, `/v1/oauth/userinfo`, and
     /// `/.well-known/jwks.json`.
     pub fn for_issuer(issuer: &str) -> Self {
         let base = issuer.trim_end_matches('/');
         Self {
             issuer: base.to_owned(),
-            authorization_endpoint: format!("{base}/v1/auth/login"),
+            authorization_endpoint: format!("{base}/v1/oauth/authorize"),
             token_endpoint: format!("{base}/v1/oauth/token"),
             userinfo_endpoint: format!("{base}/v1/oauth/userinfo"),
             jwks_uri: format!("{base}/.well-known/jwks.json"),

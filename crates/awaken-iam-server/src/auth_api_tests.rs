@@ -441,7 +441,7 @@ fn openid_configuration_advertises_canonical_endpoints() {
     assert_eq!(metadata.issuer, "https://iam.example");
     assert_eq!(
         metadata.authorization_endpoint,
-        "https://iam.example/v1/auth/login"
+        "https://iam.example/v1/oauth/authorize"
     );
     assert_eq!(
         metadata.token_endpoint,

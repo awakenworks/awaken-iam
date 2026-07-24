@@ -7,11 +7,14 @@ mod anthropic_admin;
 mod approval_discharge;
 mod assembly;
 mod auth_api;
+mod auth_redirect;
 mod authz_api;
 mod capability_token;
+mod clock;
 pub mod http;
 mod license;
 mod oauth_client_admin;
+mod op_http;
 mod op_id_token;
 mod profile_admin;
 mod session;
@@ -40,10 +43,11 @@ pub use approval_discharge::{
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
-    OpCodeRedemption, OpTokenGrant, PrincipalResolutionFailure, ProviderRegistration,
-    ProviderSummary, RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken,
-    RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant, UnlinkIdentity,
+    DEFAULT_LOGIN_COOKIE_NAME, DownstreamAuthorizeOutcome, DownstreamAuthorizeRequest,
+    IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken, OpCodeRedemption, OpTokenGrant,
+    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, RedeemAuthorizationCode,
+    RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint,
+    StartLogin, StartLoginOutcome, TokenGrant, UnlinkIdentity,
 };
 pub use authz_api::{AuthzApi, IntrospectionError};
 pub use capability_token::{
@@ -55,6 +59,7 @@ pub use license::{
     LicenseResolution, LicenseSource, LicenseStatus,
 };
 pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
+pub use op_http::{SharedAuthApi, op_router};
 pub use op_id_token::{
     ID_TOKEN_TYP, IdTokenError, MintIdToken, OidcIdTokenClaims, mint_id_token, verify_id_token,
 };

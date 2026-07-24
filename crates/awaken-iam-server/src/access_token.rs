@@ -18,6 +18,7 @@
 //! [pruned](AccessTokenAuthority::prune), which retires every token it signed.
 
 use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use awaken_iam_contract::{JsonWebKey, Jwks};
@@ -213,8 +214,9 @@ struct JwtHeader {
 /// Rotation keeps predecessors verifiable until pruned, so the active set
 /// published by [`jwks`](Self::jwks) is exactly the keys a verifier may still
 /// trust.
+#[derive(Clone)]
 pub struct AccessTokenAuthority {
-    signers: Vec<Box<dyn Signer>>,
+    signers: Arc<RwLock<Vec<Arc<dyn Signer>>>>,
 }
 
 impl AccessTokenAuthority {
@@ -234,16 +236,19 @@ impl AccessTokenAuthority {
     /// rather than a known concrete type.
     pub fn from_signer(signer: Box<dyn Signer>) -> Self {
         Self {
-            signers: vec![signer],
+            signers: Arc::new(RwLock::new(vec![Arc::from(signer)])),
         }
     }
 
     /// The `kid` of the currently active signer.
-    pub fn active_kid(&self) -> &str {
+    pub fn active_kid(&self) -> String {
         self.signers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .last()
             .expect("authority always retains at least one signer")
             .kid()
+            .to_owned()
     }
 
     /// Rotate in a new active signer, retaining the previous one for verification.
@@ -257,8 +262,12 @@ impl AccessTokenAuthority {
     /// Rotate in an already-boxed signer; the dynamic-dispatch counterpart of
     /// [`rotate`](Self::rotate) for runtime-selected signers.
     pub fn rotate_signer(&mut self, signer: Box<dyn Signer>) {
-        self.signers.retain(|held| held.kid() != signer.kid());
-        self.signers.push(signer);
+        let mut signers = self
+            .signers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signers.retain(|held| held.kid() != signer.kid());
+        signers.push(Arc::from(signer));
     }
 
     /// Drop a retired key by `kid` so tokens it signed no longer verify.
@@ -266,18 +275,31 @@ impl AccessTokenAuthority {
     /// The active key cannot be pruned; pruning it would leave nothing to sign
     /// with. Returns whether a key was removed.
     pub fn prune(&mut self, kid: &str) -> bool {
-        if self.active_kid() == kid {
+        let mut signers = self
+            .signers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if signers
+            .last()
+            .expect("authority always retains at least one signer")
+            .kid()
+            == kid
+        {
             return false;
         }
-        let before = self.signers.len();
-        self.signers.retain(|held| held.kid() != kid);
-        self.signers.len() != before
+        let before = signers.len();
+        signers.retain(|held| held.kid() != kid);
+        signers.len() != before
     }
 
     /// The JWKS document: every retained public key, newest first.
     pub fn jwks(&self) -> Jwks {
+        let signers = self
+            .signers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Jwks {
-            keys: self.signers.iter().rev().map(|s| s.public_jwk()).collect(),
+            keys: signers.iter().rev().map(|s| s.public_jwk()).collect(),
         }
     }
 
@@ -298,7 +320,13 @@ impl AccessTokenAuthority {
         typ: &str,
         claims: &T,
     ) -> Result<String, AccessTokenError> {
-        let active = self.signers.last().ok_or(AccessTokenError::NoSigningKey)?;
+        let active = self
+            .signers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .ok_or(AccessTokenError::NoSigningKey)?;
         let header = JwtHeader {
             alg: ACCESS_TOKEN_ALG.to_owned(),
             typ: typ.to_owned(),
@@ -751,6 +779,20 @@ mod tests {
         assert_eq!(err, AccessTokenError::UnknownKid("key-1".into()));
         // The current token still verifies after the prune.
         verify_access_token(&new_token, &pruned).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloned_authorities_share_rotation_and_pruning() {
+        let mut issuer = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(1)));
+        let verifier_view = issuer.clone();
+
+        issuer.rotate(LocalSeedSigner::new("key-2", seed(2)));
+        assert_eq!(verifier_view.active_kid(), "key-2");
+        assert_eq!(verifier_view.jwks().keys.len(), 2);
+
+        assert!(issuer.prune("key-1"));
+        assert_eq!(verifier_view.jwks().keys.len(), 1);
+        assert_eq!(verifier_view.jwks().keys[0].kid, "key-2");
     }
 
     #[tokio::test]

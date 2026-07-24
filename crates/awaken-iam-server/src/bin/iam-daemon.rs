@@ -22,9 +22,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use awaken_iam_core::RegisteredClient;
 use awaken_iam_server::{
     AdminAuthPolicy, AuthorizationProfileAdmin, DaemonState, IamDaemon, RecordingExecutor,
-    SqliteBackend, daemon_router, http, sqlite_migrated_store,
+    SharedAuthApi, SqliteBackend, daemon_router, http, op_router, sqlite_migrated_store,
 };
 
 #[tokio::main]
@@ -34,7 +35,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Assemble standalone and migrate before binding the socket, so the process
     // fails fast on a drifted ledger instead of serving a half-migrated schema.
     let daemon = IamDaemon::start(RecordingExecutor::new())?;
-    let mut authz = daemon.into_assembly().into_authz();
+    let (mut auth, mut authz) = daemon.into_assembly().into_auth_and_authz();
+    let issuer = std::env::var("IAM_ISSUER").unwrap_or_else(|_| format!("http://{bind_addr}"));
+    auth = auth.with_issuer(issuer.clone());
+    if let (Ok(client_id), Ok(redirect_uris)) = (
+        std::env::var("IAM_DESKTOP_CLIENT_ID"),
+        std::env::var("IAM_DESKTOP_REDIRECT_URIS"),
+    ) {
+        let redirect_uris = redirect_uris
+            .split(',')
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !client_id.trim().is_empty() && !redirect_uris.is_empty() {
+            auth.register_oauth_client(RegisteredClient::public(
+                client_id,
+                redirect_uris,
+                ["openid", "email", "profile"],
+            ));
+        }
+    }
+    let auth: SharedAuthApi = Arc::new(tokio::sync::Mutex::new(auth));
 
     // Profiles are durable even though the legacy MVP policy-admin aggregates
     // still use their existing adapters. The active heads are hydrated before
@@ -56,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_auth,
         profile_store,
     )));
-    let router = daemon_router(state);
+    let router = daemon_router(state).merge(op_router(auth, issuer));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     eprintln!("iam-daemon: serving /v1 (incl. /v1/admin/*) on http://{bind_addr}");

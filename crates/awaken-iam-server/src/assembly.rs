@@ -396,6 +396,13 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         self.authz
     }
 
+    /// Consume the assembly and yield the authentication and authorization
+    /// runtimes together so a standalone host cannot accidentally discard the
+    /// declared OP surface while mounting only the PDP routes.
+    pub fn into_auth_and_authz(self) -> (AuthApi, AuthzApi) {
+        (self.auth, self.authz)
+    }
+
     /// The canonical routes this assembly mounts: the `/v1` surface (auth then
     /// authz), the standalone-only policy-administration seam, then the
     /// operational health probes.

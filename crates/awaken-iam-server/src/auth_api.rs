@@ -75,6 +75,7 @@ use crate::access_token::{
     AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
     LocalSeedSigner,
 };
+use crate::auth_redirect::build_authorize_redirect;
 use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
 use crate::token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
@@ -877,6 +878,12 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self
     }
 
+    /// Use one shared, jointly rotated signing authority for every token family.
+    pub fn with_access_token_authority(mut self, authority: AccessTokenAuthority) -> Self {
+        self.tokens = authority;
+        self
+    }
+
     /// Register (or replace, by issuer id) a trusted external issuer whose
     /// assertions IAM will exchange for IAM tokens via RFC 8693 token exchange.
     pub fn register_trusted_issuer(&mut self, issuer: TrustedIssuer) {
@@ -1211,7 +1218,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     }
 
     /// The `kid` of the active access-token signing key.
-    pub fn active_signing_kid(&self) -> &str {
+    pub fn active_signing_kid(&self) -> String {
         self.tokens.active_kid()
     }
 
@@ -1555,20 +1562,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         })
     }
 
-    /// `POST /v1/oauth/token` (`refresh_token` grant, IAM as OpenID Provider):
-    /// authenticate the requesting client, then rotate the presented refresh
-    /// token and mint a fresh access token.
-    ///
-    /// This is the downstream-OP twin of [`refresh_token_grant`](Self::refresh_token_grant):
-    /// at the OP token endpoint a registered product client drives the grant, so
-    /// the client is authenticated against `provider`'s registry first (RFC 6749
-    /// §2.3 — a confidential client presents its secret, a public client none).
-    /// Only once the client is authenticated does the request fall through to the
-    /// landed rotation-with-reuse-detection machinery, which retires the presented
-    /// token, issues its successor under the same chain, and fails closed by
-    /// revoking the whole chain when an already-retired token is replayed. The new
-    /// access token inherits the chain's stored subject/audience/scope, never
-    /// client-supplied claims.
+    /// Authenticate an OP client, then rotate its refresh-token chain.
     pub async fn op_refresh_token_grant<C: EntropySource>(
         &mut self,
         provider: &OAuthAuthorizationServer<C>,
@@ -1577,6 +1571,28 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         request: RefreshGrant,
     ) -> Result<TokenGrant, AuthApiError> {
         provider.authenticate_client(client_id, client_secret)?;
+        self.refresh_token_grant(request).await
+    }
+
+    /// Authenticate a client from this API's registered OP client registry and
+    /// rotate its refresh-token chain.
+    pub async fn refresh_registered_client(
+        &mut self,
+        client_id: &str,
+        client_secret: Option<&str>,
+        request: RefreshGrant,
+    ) -> Result<TokenGrant, AuthApiError> {
+        self.oauth_provider
+            .authenticate_client(client_id, client_secret)?;
+        let token_matches_client = parse_presented_refresh_token(&request.presented_refresh_token)
+            .map(awaken_iam_core::hash_session_token)
+            .and_then(|hash| self.refresh_tokens.token_by_hash(&hash))
+            .is_some_and(|token| token.audience == client_id);
+        if !token_matches_client {
+            return Err(AuthApiError::OAuthProvider(
+                OAuthProviderError::InvalidGrant,
+            ));
+        }
         self.refresh_token_grant(request).await
     }
 
@@ -1797,6 +1813,22 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         Ok(userinfo)
     }
 
+    /// Resolve OIDC UserInfo from a verified, unrevoked IAM bearer token.
+    pub fn userinfo_for_access_token(&self, token: &str) -> Result<UserInfo, AuthApiError> {
+        let claims = self.verify_access_token(token)?;
+        let account_id = AccountId(claims.sub);
+        let identity = self
+            .directory
+            .identities_for_account(&account_id)
+            .into_iter()
+            .max_by(|left, right| left.last_seen_at.0.cmp(&right.last_seen_at.0));
+        Ok(UserInfo::project(
+            &account_id,
+            identity.map(|value| &value.claims),
+            identity.map(|value| &value.last_seen_at),
+        ))
+    }
+
     /// `DELETE /v1/session`: revoke the presented session and clear its cookie.
     pub fn logout(
         &mut self,
@@ -1955,36 +1987,6 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self.ids.fill_bytes(&mut buf);
         format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(buf))
     }
-}
-
-/// Build the `authorization_code` redirect back to a client's registered
-/// redirect URI, appending the `code` and the echoed `state`.
-///
-/// The separator adapts to whether the registered redirect URI already carries a
-/// query string, and both values are percent-encoded so an opaque `state` can
-/// never break out of the query.
-fn build_authorize_redirect(redirect_uri: &str, code: &str, state: Option<&str>) -> String {
-    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
-    let mut url = format!("{redirect_uri}{separator}code={}", percent_encode(code));
-    if let Some(state) = state {
-        url.push_str(&format!("&state={}", percent_encode(state)));
-    }
-    url
-}
-
-/// Percent-encode a query value, escaping everything outside the unreserved set
-/// (`ALPHA` / `DIGIT` / `-` `.` `_` `~`) per RFC 3986.
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
