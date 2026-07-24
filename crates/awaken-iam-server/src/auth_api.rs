@@ -884,6 +884,11 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self
     }
 
+    /// Replace the shared authority during deployment assembly or key rollout.
+    pub fn set_access_token_authority(&mut self, authority: AccessTokenAuthority) {
+        self.tokens = authority;
+    }
+
     /// Register (or replace, by issuer id) a trusted external issuer whose
     /// assertions IAM will exchange for IAM tokens via RFC 8693 token exchange.
     pub fn register_trusted_issuer(&mut self, issuer: TrustedIssuer) {
