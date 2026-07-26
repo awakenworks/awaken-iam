@@ -19,8 +19,8 @@ use awaken_iam_contract::{
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
     MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResourceModelRegistered,
-    ResourceModelRegistration, RoleBindingSnapshot, SignerSetSnapshot, TokenIntrospectionRequest,
-    TokenIntrospectionResponse, WorkspaceOrgEdge,
+    ResourceModelRegistration, RoleBindingSnapshot, RoleDto, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -104,6 +104,14 @@ pub trait AuthzTransport {
 
     fn create_org(&self, _org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
+    }
+
+    fn create_role(&self, _role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("role PAP is not supported".into()))
+    }
+
+    fn get_role(&self, _role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+        Err(RemoteError("role PAP is not supported".into()))
     }
 
     fn grant_membership(
@@ -270,6 +278,14 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
 
     pub fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_org(org)
+    }
+
+    pub fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.create_role(role)
+    }
+
+    pub fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+        self.transport.get_role(role_id)
     }
 
     pub fn grant_membership(

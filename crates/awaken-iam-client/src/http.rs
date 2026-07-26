@@ -24,7 +24,8 @@ use awaken_iam_contract::{
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
     EntitlementCheckResponse, EntitlementRequest, MembershipQuery, NamespaceId, OrgDto,
     PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, RoleBindingSnapshot,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
+    RoleDto, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -263,6 +264,21 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+        let response =
+            self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
+        Self::decode(response)
+    }
+
+    fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+        let path = format!("/v1/admin/roles/{role_id}");
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+
     fn grant_membership(
         &self,
         binding: &RoleBindingSnapshot,
@@ -482,8 +498,10 @@ mod tests {
         let server = StubServer::start(vec![
             Reply::Ok(r#"{"version":2}"#.into()),
             Reply::Ok(r#"{"version":3}"#.into()),
-            Reply::Ok(binding_json.into()),
+            Reply::Ok(r#"{"id":"tenant-admin","display_name":"Tenant administrator","action_patterns":["awaken.cloud::*"],"created_at":"t","updated_at":"t"}"#.into()),
             Reply::Ok(r#"{"version":4}"#.into()),
+            Reply::Ok(binding_json.into()),
+            Reply::Ok(r#"{"version":5}"#.into()),
         ]);
         let transport = transport(&server);
         let principal = PrincipalRef::Account {
@@ -498,6 +516,19 @@ mod tests {
                 updated_at: awaken_iam_contract::Timestamp("t".into()),
             })
             .unwrap();
+        transport
+            .create_role(&RoleDto {
+                id: "tenant-admin".into(),
+                display_name: Some("Tenant administrator".into()),
+                action_patterns: vec!["awaken.cloud::*".into()],
+                created_at: awaken_iam_contract::Timestamp("t".into()),
+                updated_at: awaken_iam_contract::Timestamp("t".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            transport.get_role("tenant-admin").unwrap().unwrap().id,
+            "tenant-admin"
+        );
         let binding = RoleBindingSnapshot {
             principal: principal.clone(),
             role_id: "tenant-admin".into(),
@@ -521,9 +552,17 @@ mod tests {
 
         let requests = server.requests();
         assert!(requests[0].starts_with("POST /v1/admin/orgs "));
-        assert!(requests[1].starts_with("POST /v1/admin/memberships "));
-        assert!(requests[2].starts_with("POST /v1/admin/memberships/query "));
-        assert!(requests[3].starts_with("POST /v1/admin/scope/workspace-orgs "));
+        assert!(requests[1].starts_with("POST /v1/admin/roles "));
+        assert!(requests[2].starts_with("GET /v1/admin/roles/tenant-admin "));
+        assert!(requests[3].starts_with("POST /v1/admin/memberships "));
+        assert!(requests[4].starts_with("POST /v1/admin/memberships/query "));
+        assert!(requests[5].starts_with("POST /v1/admin/scope/workspace-orgs "));
+    }
+
+    #[test]
+    fn missing_role_is_an_empty_canonical_query() {
+        let server = StubServer::start(vec![Reply::Status(404)]);
+        assert_eq!(transport(&server).get_role("missing").unwrap(), None);
     }
 
     #[test]
