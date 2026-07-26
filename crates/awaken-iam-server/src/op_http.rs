@@ -5,7 +5,7 @@ use std::sync::Arc;
 use awaken_iam_core::{OAuthAuthorizationRequest, OAuthProviderError, TokenRedemption};
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub fn op_router(auth: SharedAuthApi, issuer: impl Into<String>) -> Router {
             get(openid_configuration),
         )
         .route("/v1/oauth/authorize", get(authorize))
+        .route("/v1/oauth/browser/start", get(browser_start))
+        .route("/v1/oauth/browser/callback", get(browser_callback))
         .route("/v1/oauth/token", post(token))
         .route("/v1/oauth/revoke", post(revoke))
         .route("/v1/oauth/userinfo", get(userinfo))
@@ -63,6 +65,13 @@ struct AuthorizeQuery {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BrowserStartQuery {
+    client_id: String,
+    redirect_uri: String,
+    return_to: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +108,86 @@ struct OAuthError {
 async fn openid_configuration(State(state): State<OpHttpState>) -> Response {
     let auth = state.auth.lock().await;
     Json(auth.openid_configuration(&state.issuer)).into_response()
+}
+
+/// Product-neutral browser bootstrap for Authorization Code + PKCE.
+///
+/// Hosted product ingresses proxy this path to IAM, so the page executes under
+/// the product origin and can retain the verifier in that origin's
+/// `sessionStorage`. Authorization still uses the canonical IAM issuer and its
+/// SSO cookie; code redemption returns through the exact registered product
+/// redirect URI. Products do not implement or persist a second OAuth client.
+async fn browser_start(
+    State(state): State<OpHttpState>,
+    Query(query): Query<BrowserStartQuery>,
+) -> Response {
+    if !valid_browser_coordinate(&query) {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let config = serde_json::json!({
+        "issuer": state.issuer.as_ref(),
+        "clientId": query.client_id,
+        "redirectUri": query.redirect_uri,
+        "returnTo": query.return_to,
+    });
+    Html(format!(
+        r#"<!doctype html><meta charset="utf-8"><title>Connecting to Awaken</title>
+<main><h1>Connecting to Awaken</h1><p id="status">Preparing secure sign-in…</p></main>
+<script>
+const config={config};
+const bytes=n=>crypto.getRandomValues(new Uint8Array(n));
+const b64=b=>btoa(String.fromCharCode(...b)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
+const verifier=b64(bytes(48));
+const state=b64(bytes(32));
+const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier));
+sessionStorage.setItem('awaken.oauth.pending',JSON.stringify({{...config,verifier,state}}));
+const authorize=new URL('/v1/oauth/authorize',config.issuer);
+authorize.search=new URLSearchParams({{client_id:config.clientId,redirect_uri:config.redirectUri,response_type:'code',scope:'openid email profile',state,code_challenge:b64(new Uint8Array(digest)),code_challenge_method:'S256'}});
+location.replace(authorize);
+</script>"#
+    ))
+    .into_response()
+}
+
+/// Product-neutral PKCE callback page. It validates browser state before
+/// redeeming through the same-origin ingress proxy and stores only the
+/// short-lived access token. Provider refresh credentials remain in IAM.
+async fn browser_callback() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html><meta charset="utf-8"><title>Completing sign-in</title>
+<main><h1>Completing sign-in</h1><p id="status">Verifying secure sign-in…</p></main>
+<script>
+const status=document.querySelector('#status');
+const fail=message=>{status.textContent=message;throw new Error(message)};
+const params=new URLSearchParams(location.search);
+const pendingRaw=sessionStorage.getItem('awaken.oauth.pending');
+if(!pendingRaw)fail('Sign-in session expired. Return to Awaken Cloud and try again.');
+const pending=JSON.parse(pendingRaw);
+if(!params.get('code')||params.get('state')!==pending.state)fail('Sign-in validation failed. Return to Awaken Cloud and try again.');
+const form=new URLSearchParams({grant_type:'authorization_code',client_id:pending.clientId,code:params.get('code'),redirect_uri:pending.redirectUri,code_verifier:pending.verifier});
+const response=await fetch('/v1/oauth/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:form});
+if(!response.ok)fail('Awaken could not complete sign-in. Return to Awaken Cloud and try again.');
+const grant=await response.json();
+if(typeof grant.access_token!=='string'||!grant.access_token)fail('Awaken returned an invalid sign-in result.');
+sessionStorage.setItem('awaken.product.session-bearer',grant.access_token);
+sessionStorage.removeItem('awaken.oauth.pending');
+location.replace(pending.returnTo);
+</script>"#,
+    )
+}
+
+fn valid_browser_coordinate(query: &BrowserStartQuery) -> bool {
+    let safe_text = |value: &str| {
+        !value.trim().is_empty() && !value.contains(['<', '>', '\n', '\r']) && value.len() <= 2_048
+    };
+    safe_text(&query.client_id)
+        && safe_text(&query.redirect_uri)
+        && (query.redirect_uri.starts_with("https://")
+            || query.redirect_uri.starts_with("http://127.0.0.1:")
+            || query.redirect_uri.starts_with("http://localhost:"))
+        && query.return_to.starts_with('/')
+        && !query.return_to.starts_with("//")
+        && safe_text(&query.return_to)
 }
 
 async fn authorize(
@@ -377,6 +466,70 @@ mod tests {
             .to_owned();
         let shared = Arc::new(Mutex::new(auth));
         (op_router(shared, issuer), session_cookie)
+    }
+
+    /// Causal table for the shared browser bootstrap:
+    ///
+    /// | client/redirect | return path | result |
+    /// |---|---|---|
+    /// | non-empty + HTTPS | same-origin absolute path | one PKCE bootstrap page |
+    /// | any | external/scheme-relative path | reject before browser redirect |
+    /// | markup/control input | any | reject; never reflect executable input |
+    #[tokio::test]
+    async fn browser_bootstrap_accepts_only_bounded_product_coordinates() {
+        let (app, _) = logged_in_router().await;
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/oauth/browser/start?client_id=awaken-flow&redirect_uri=https%3A%2F%2Fflow.example%2Fv1%2Foauth%2Fbrowser%2Fcallback&return_to=%2Fw%2Fws%253Atenant")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(accepted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("crypto.subtle.digest"));
+        assert!(html.contains("awaken.oauth.pending"));
+        assert!(html.contains("https://flow.example/v1/oauth/browser/callback"));
+
+        for uri in [
+            "/v1/oauth/browser/start?client_id=awaken-flow&redirect_uri=https%3A%2F%2Fflow.example%2Fcallback&return_to=https%3A%2F%2Fevil.example",
+            "/v1/oauth/browser/start?client_id=%3Cscript%3E&redirect_uri=https%3A%2F%2Fflow.example%2Fcallback&return_to=%2F",
+        ] {
+            let rejected = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_callback_uses_one_standard_session_bearer_and_state_check() {
+        let (app, _) = logged_in_router().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/oauth/browser/callback?code=opaque&state=opaque")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("params.get('state')!==pending.state"));
+        assert!(html.contains("awaken.product.session-bearer"));
+        assert!(!html.contains("localStorage"));
     }
 
     #[tokio::test]

@@ -91,6 +91,22 @@ The product never calls a provider-specific login URL as its normal entrypoint.
 That keeps GitHub, Google, enterprise SSO, account chooser, and future factors
 inside IAM's bounded context.
 
+Hosted browser products may proxy `/v1/oauth/*` to this same OP and use
+`/v1/oauth/browser/start` plus `/v1/oauth/browser/callback`. These two pages are
+the canonical browser PKCE adapter: the start page creates state/verifier values
+under the product origin, authorization uses the configured IAM issuer and its
+SSO cookie, and the callback validates state before same-origin code redemption.
+It stores only the short-lived access token under
+`awaken.product.session-bearer`; products do not copy this protocol or receive
+an upstream provider credential.
+
+| Registered product coordinate | Return path | Browser state | Result |
+|---|---|---|---|
+| exact HTTPS redirect | same-origin absolute path | matching | redeem once and enter product |
+| unknown redirect/client | any | any | OP rejects; no token |
+| exact | external or scheme-relative | any | bootstrap rejects |
+| exact | exact | absent/mismatched | callback rejects before redemption |
+
 ## Provider login subflow
 
 Provider-specific routes are IAM-internal browser routes used after the unified
