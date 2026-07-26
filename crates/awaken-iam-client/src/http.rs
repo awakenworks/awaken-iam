@@ -22,10 +22,10 @@ use awaken_iam_contract::{
     ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationProfile,
     AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    EntitlementCheckResponse, EntitlementRequest, MembershipQuery, NamespaceId, OrgDto,
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, RoleBindingSnapshot,
-    RoleDto, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
-    WorkspaceOrgEdge,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, MembershipQuery, NamespaceId,
+    OrgDto, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
+    RoleBindingSnapshot, RoleDto, SignerSetSnapshot, TokenIntrospectionRequest,
+    TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -264,6 +264,15 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+        let path = format!("/v1/admin/orgs/{org_id}");
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+
     fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
@@ -272,6 +281,21 @@ impl AuthzTransport for HttpAuthzTransport {
 
     fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
         let path = format!("/v1/admin/roles/{role_id}");
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+
+    fn issue_grant(&self, grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
+        let response =
+            self.send_with_retry(|| self.client.post(self.url("/v1/admin/grants")).json(grant))?;
+        Self::decode(response)
+    }
+
+    fn get_grant(&self, grant_id: &str) -> Result<Option<GrantSnapshot>, RemoteError> {
+        let path = format!("/v1/admin/grants/{grant_id}");
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -563,6 +587,37 @@ mod tests {
     fn missing_role_is_an_empty_canonical_query() {
         let server = StubServer::start(vec![Reply::Status(404)]);
         assert_eq!(transport(&server).get_role("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn missing_org_is_an_empty_canonical_query() {
+        let server = StubServer::start(vec![Reply::Status(404)]);
+        assert_eq!(transport(&server).get_org("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn grant_pap_uses_the_canonical_admin_paths() {
+        let grant_json = r#"{"id":"tenant-admin-console","subject":{"kind":"role","role_id":"tenant-admin"},"action_pattern":"console.tenant.admin.access","scope":{"kind":"global"},"effect":"allow"}"#;
+        let server = StubServer::start(vec![
+            Reply::Ok(r#"{"version":6}"#.into()),
+            Reply::Ok(grant_json.into()),
+        ]);
+        let grant = GrantSnapshot {
+            id: "tenant-admin-console".into(),
+            subject: awaken_iam_contract::GrantSubjectRef::Role {
+                role_id: "tenant-admin".into(),
+            },
+            action_pattern: "console.tenant.admin.access".into(),
+            scope: ScopeRef::Global,
+            effect: awaken_iam_contract::GrantEffect::Allow,
+        };
+        let transport = transport(&server);
+        transport.issue_grant(&grant).unwrap();
+        assert_eq!(transport.get_grant(&grant.id).unwrap(), Some(grant));
+
+        let requests = server.requests();
+        assert!(requests[0].starts_with("POST /v1/admin/grants "));
+        assert!(requests[1].starts_with("GET /v1/admin/grants/tenant-admin-console "));
     }
 
     #[test]

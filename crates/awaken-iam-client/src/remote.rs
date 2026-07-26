@@ -18,7 +18,7 @@ use awaken_iam_contract::{
     AuthorizationProfile, AuthorizationProfileActivated, AuthorizationProfileValidation,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResourceModelRegistered,
+    GrantSnapshot, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResourceModelRegistered,
     ResourceModelRegistration, RoleBindingSnapshot, RoleDto, SignerSetSnapshot,
     TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
@@ -106,12 +106,24 @@ pub trait AuthzTransport {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
+    fn get_org(&self, _org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+        Err(RemoteError("organization PAP is not supported".into()))
+    }
+
     fn create_role(&self, _role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("role PAP is not supported".into()))
     }
 
     fn get_role(&self, _role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
         Err(RemoteError("role PAP is not supported".into()))
+    }
+
+    fn issue_grant(&self, _grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("grant PAP is not supported".into()))
+    }
+
+    fn get_grant(&self, _grant_id: &str) -> Result<Option<GrantSnapshot>, RemoteError> {
+        Err(RemoteError("grant PAP is not supported".into()))
     }
 
     fn grant_membership(
@@ -280,12 +292,24 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.create_org(org)
     }
 
+    pub fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+        self.transport.get_org(org_id)
+    }
+
     pub fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_role(role)
     }
 
     pub fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
         self.transport.get_role(role_id)
+    }
+
+    pub fn issue_grant(&self, grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.issue_grant(grant)
+    }
+
+    pub fn get_grant(&self, grant_id: &str) -> Result<Option<GrantSnapshot>, RemoteError> {
+        self.transport.get_grant(grant_id)
     }
 
     pub fn grant_membership(
