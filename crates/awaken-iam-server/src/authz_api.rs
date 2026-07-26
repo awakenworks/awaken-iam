@@ -162,6 +162,17 @@ impl AuthzApi {
         self.policy_version
     }
 
+    /// Replace the live evaluator with repository-backed policy at `version`.
+    ///
+    /// Administrative handlers call this only after their durable mutation and
+    /// fence commit succeed. The exact returned fence therefore identifies the
+    /// policy the PDP is already able to evaluate; merely bumping a counter
+    /// while leaving the old policy installed is forbidden.
+    pub fn replace_policy_at_version(&mut self, policy: PolicySet, version: u64) {
+        self.core.replace_policy(policy);
+        self.policy_version = version;
+    }
+
     /// `POST /v1/authorize`: evaluate one authorization request into a reasoned
     /// outcome (decision, reason code, matched grant/role ids).
     pub fn authorize(&self, request: &AuthorizationRequest) -> AuthorizationOutcome {

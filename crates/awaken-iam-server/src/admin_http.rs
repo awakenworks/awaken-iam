@@ -50,7 +50,7 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
-    Organization, RoleBinding, RoleDef, RoleId,
+    Organization, PolicySet, RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -63,7 +63,7 @@ use serde::Deserialize;
 
 use crate::{
     AdminCredential, AdminError, AuthorizationProfileAdmin, InMemoryStore, PolicyAdminApi,
-    ProfileAdminError,
+    PolicyStore, ProfileAdminError,
 };
 use awaken_iam_contract::GrantEffect;
 
@@ -104,15 +104,20 @@ impl AdminAuthPolicy {
 
 /// The daemon's shared, mutable `/v1` state: the read engines plus the
 /// policy-administration point over one store, behind a single applier lock.
-#[derive(Debug)]
-pub struct DaemonState {
+pub struct DaemonState<S = InMemoryStore> {
     authz: crate::AuthzApi,
-    admin: PolicyAdminApi<InMemoryStore>,
+    admin: PolicyAdminApi<S>,
     profiles: AuthorizationProfileAdmin,
     auth: AdminAuthPolicy,
 }
 
-impl DaemonState {
+impl<S> std::fmt::Debug for DaemonState<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonState").finish_non_exhaustive()
+    }
+}
+
+impl DaemonState<InMemoryStore> {
     /// Assemble the daemon state over the daemon's authorization engine, a fresh
     /// policy-administration store, and the admin auth policy.
     pub fn new(authz: crate::AuthzApi, auth: AdminAuthPolicy) -> Self {
@@ -125,23 +130,58 @@ impl DaemonState {
         auth: AdminAuthPolicy,
         profiles: Arc<dyn AuthorizationProfileRepo>,
     ) -> Self {
-        Self {
+        Self::with_policy_store(authz, auth, profiles, InMemoryStore::new())
+            .expect("a fresh in-memory IAM policy store must hydrate")
+    }
+}
+
+impl<S: PolicyStore> DaemonState<S> {
+    /// Assemble the daemon over one explicit policy store.
+    ///
+    /// Production passes the same migrated SQL store used for profiles. Tests
+    /// may pass [`InMemoryStore`]. In both cases the PAP, restart hydration, and
+    /// live PDP consume one source of truth.
+    pub fn with_policy_store(
+        mut authz: crate::AuthzApi,
+        auth: AdminAuthPolicy,
+        profiles: Arc<dyn AuthorizationProfileRepo>,
+        store: S,
+    ) -> Result<Self, AdminError> {
+        let admin = PolicyAdminApi::new(store);
+        let version = admin.store_version()?;
+        let base = admin.policy()?;
+        let active_profiles = authz.snapshot().active_profiles;
+        authz.replace_policy_at_version(
+            PolicySet::from_snapshot_and_profiles(&base.snapshot(version), &active_profiles),
+            version,
+        );
+        Ok(Self {
             authz,
-            admin: PolicyAdminApi::new(InMemoryStore::new()),
+            admin,
             profiles: AuthorizationProfileAdmin::new(profiles),
             auth,
-        }
+        })
+    }
+
+    /// Refresh the live PDP from the same repositories the PAP just committed.
+    fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
+        let base = self.admin.policy()?;
+        let base_snapshot = base.snapshot(version);
+        let active_profiles = self.authz.snapshot().active_profiles;
+        let policy = PolicySet::from_snapshot_and_profiles(&base_snapshot, &active_profiles);
+        self.authz.replace_policy_at_version(policy, version);
+        Ok(())
     }
 }
 
 /// Shared handle to the daemon's `/v1` state every request is dispatched to.
-pub type SharedDaemonState = Arc<Mutex<DaemonState>>;
+pub type SharedDaemonState<S = InMemoryStore> = Arc<Mutex<DaemonState<S>>>;
 
 /// Build the [`axum::Router`] the standalone daemon serves: the authorization
 /// half of `/v1`, the operational `GET /healthz` probe, and the guarded
 /// `/v1/admin/*` policy-administration seam — all over one shared
 /// [`DaemonState`].
-pub fn daemon_router(state: SharedDaemonState) -> Router {
+pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/authorize", post(authorize))
@@ -189,7 +229,7 @@ pub fn daemon_router(state: SharedDaemonState) -> Router {
 }
 
 async fn create_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(request): Json<CreateAuthorizationProfile>,
 ) -> Response {
@@ -201,7 +241,7 @@ async fn create_profile(
 }
 
 async fn list_profiles(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Response {
@@ -213,7 +253,7 @@ async fn list_profiles(
 }
 
 async fn active_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Response {
@@ -229,7 +269,7 @@ async fn active_profile(
 }
 
 async fn get_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path((namespace, revision)): Path<(String, u64)>,
 ) -> Response {
@@ -245,7 +285,7 @@ async fn get_profile(
 }
 
 async fn validate_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path((namespace, revision)): Path<(String, u64)>,
 ) -> Response {
@@ -257,7 +297,7 @@ async fn validate_profile(
 }
 
 async fn activate_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path((namespace, revision)): Path<(String, u64)>,
     Json(request): Json<ActivateAuthorizationProfile>,
@@ -271,7 +311,7 @@ async fn activate_profile(
 }
 
 async fn rollback_profile(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path((namespace, revision)): Path<(String, u64)>,
     Json(request): Json<ActivateAuthorizationProfile>,
@@ -303,7 +343,7 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn authorize(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<AuthorizationRequest>,
 ) -> Json<AuthorizationOutcome> {
     let guard = lock(&state);
@@ -311,7 +351,7 @@ async fn authorize(
 }
 
 async fn authorize_batch(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<BatchAuthorizationRequest>,
 ) -> Json<BatchAuthorizationResponse> {
     let guard = lock(&state);
@@ -319,7 +359,7 @@ async fn authorize_batch(
 }
 
 async fn check_entitlement(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<EntitlementRequest>,
 ) -> Json<EntitlementCheckResponse> {
     let guard = lock(&state);
@@ -333,7 +373,7 @@ struct SnapshotQuery {
 }
 
 async fn snapshot(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
     let guard = lock(&state);
@@ -349,7 +389,7 @@ async fn snapshot(
 // -- policy-administration seam (shared state, mutating) ----------------------
 
 async fn create_org(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<OrgDto>,
 ) -> Response {
@@ -359,7 +399,7 @@ async fn create_org(
 }
 
 async fn update_org(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(mut dto): Json<OrgDto>,
@@ -371,7 +411,7 @@ async fn update_org(
 }
 
 async fn delete_org(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -380,7 +420,10 @@ async fn delete_org(
     })
 }
 
-async fn list_orgs(State(state): State<SharedDaemonState>, headers: HeaderMap) -> Response {
+async fn list_orgs(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+) -> Response {
     read(&state, &headers, |admin| {
         admin
             .list_orgs()
@@ -389,7 +432,7 @@ async fn list_orgs(State(state): State<SharedDaemonState>, headers: HeaderMap) -
 }
 
 async fn create_group(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<GroupDto>,
 ) -> Response {
@@ -399,7 +442,7 @@ async fn create_group(
 }
 
 async fn update_group(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(mut dto): Json<GroupDto>,
@@ -411,7 +454,7 @@ async fn update_group(
 }
 
 async fn delete_group(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -421,7 +464,7 @@ async fn delete_group(
 }
 
 async fn define_role(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<RoleDto>,
 ) -> Response {
@@ -431,7 +474,7 @@ async fn define_role(
 }
 
 async fn update_role(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(mut dto): Json<RoleDto>,
@@ -443,7 +486,7 @@ async fn update_role(
 }
 
 async fn delete_role(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -453,7 +496,7 @@ async fn delete_role(
 }
 
 async fn issue_grant(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<GrantSnapshot>,
 ) -> Response {
@@ -463,7 +506,7 @@ async fn issue_grant(
 }
 
 async fn revoke_grant(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -473,7 +516,7 @@ async fn revoke_grant(
 }
 
 async fn grant_membership(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<RoleBindingSnapshot>,
 ) -> Response {
@@ -483,7 +526,7 @@ async fn grant_membership(
 }
 
 async fn revoke_membership(
-    State(state): State<SharedDaemonState>,
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Json(dto): Json<RoleBindingSnapshot>,
 ) -> Response {
@@ -494,7 +537,7 @@ async fn revoke_membership(
 
 // -- shared dispatch helpers --------------------------------------------------
 
-fn lock(state: &SharedDaemonState) -> std::sync::MutexGuard<'_, DaemonState> {
+fn lock<S>(state: &SharedDaemonState<S>) -> std::sync::MutexGuard<'_, DaemonState<S>> {
     // A poisoned lock means a prior handler panicked mid-mutation; recover the
     // guard rather than cascade-panicking every later request.
     state.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -503,28 +546,30 @@ fn lock(state: &SharedDaemonState) -> std::sync::MutexGuard<'_, DaemonState> {
 /// Run one guarded admin mutation: enforce the credential, apply it, then bump
 /// the shared authorization snapshot version so the change fences a consumer's
 /// next poll. The version returned to the caller is that same fence.
-fn apply<F>(state: &SharedDaemonState, headers: &HeaderMap, op: F) -> Response
+fn apply<S, F>(state: &SharedDaemonState<S>, headers: &HeaderMap, op: F) -> Response
 where
-    F: FnOnce(&mut PolicyAdminApi<InMemoryStore>, Timestamp) -> Result<u64, AdminError>,
+    S: PolicyStore,
+    F: FnOnce(&mut PolicyAdminApi<S>, Timestamp) -> Result<u64, AdminError>,
 {
     let mut guard = lock(state);
     if let Some(rejection) = authorize_admin(&guard.auth, headers) {
         return rejection;
     }
     match op(&mut guard.admin, now_timestamp()) {
-        Ok(_) => {
-            let version = guard.authz.bump_policy_version();
-            (StatusCode::OK, Json(AdminMutationAck { version })).into_response()
-        }
+        Ok(version) => match guard.refresh_authorization(version) {
+            Ok(()) => (StatusCode::OK, Json(AdminMutationAck { version })).into_response(),
+            Err(error) => admin_error_response(&error),
+        },
         Err(error) => admin_error_response(&error),
     }
 }
 
 /// Run one guarded admin read.
-fn read<T, F>(state: &SharedDaemonState, headers: &HeaderMap, op: F) -> Response
+fn read<S, T, F>(state: &SharedDaemonState<S>, headers: &HeaderMap, op: F) -> Response
 where
+    S: PolicyStore,
     T: serde::Serialize,
-    F: FnOnce(&PolicyAdminApi<InMemoryStore>) -> Result<T, AdminError>,
+    F: FnOnce(&PolicyAdminApi<S>) -> Result<T, AdminError>,
 {
     let guard = lock(state);
     if let Some(rejection) = authorize_admin(&guard.auth, headers) {

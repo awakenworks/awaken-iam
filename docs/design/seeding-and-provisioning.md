@@ -150,6 +150,36 @@ from a **pre-declared source**:
 In every case the assignment (1) goes through the single write pipeline, (2)
 carries an auditable `GrantSource`, and (3) fails closed if it does not commit.
 
+## Tenant membership decision table
+
+The organization directory, role bindings, policy snapshot, and PDP are one
+causal chain.  A successful administration response is not complete until the
+same committed rows are visible to the evaluator behind the returned snapshot
+version.  A product must never maintain a second organization/member registry.
+
+```text
+admin mutation
+  -> authoritative IAM repository write + audit + version fence
+  -> rebuild/evolve the PDP from that repository state
+  -> return the exact visible version
+  -> product PEP authorizes the trusted tenant scope
+```
+
+| Authenticated | live org binding | requested org | operator list grant | Result |
+|---|---|---|---|---|
+| no | any | any | any | `401`; read and mutation are not attempted |
+| yes | none | any | no | `403`; no product resource is created |
+| yes | org A | org A | no | evaluate the requested action at `Org A` |
+| yes | org A | org B | no | `403`/not-found without revealing whether B exists |
+| yes | any | all orgs | no | `403`; tenant users cannot enumerate organizations |
+| yes | any | all orgs | yes | return the operator view and append an audit event |
+
+The corresponding fault cases are fail-closed: a repository, audit, fence, or
+PDP refresh failure returns an error and must not report a version that the PDP
+cannot evaluate.  Restart hydration reads the same repository; an independent
+in-memory PAP store is forbidden because it makes a successful membership write
+invisible to authorization and loses it on restart.
+
 ## Invariants
 
 - **Default-deny, no superuser.** An empty store denies everyone; seed is the

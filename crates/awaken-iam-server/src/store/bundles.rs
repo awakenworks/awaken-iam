@@ -113,6 +113,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "immutable authorization profiles and atomic active heads",
                     AUTHZ_0004,
                 ),
+                (5, "initialize the singleton freshness fence", AUTHZ_0005),
             ],
         ),
         bundle(
@@ -312,6 +313,10 @@ CREATE TABLE {prefix}_authorization_profiles (\
 CREATE TABLE {prefix}_authorization_profile_heads (\
  namespace TEXT PRIMARY KEY, \
  active_revision TEXT NOT NULL);";
+
+const AUTHZ_0005: &str = "\
+INSERT INTO {prefix}_fence (id, version, epoch, updated_at) \
+VALUES (1, 1, 0, '1970-01-01T00:00:00Z');";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //

@@ -33,6 +33,7 @@ use awaken_iam_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::migration::Dialect;
+use super::{Fence, FenceStore};
 
 /// A bound parameter value. Every IAM column is text or JSON-as-text, so a
 /// nullable string is the only shape a backend has to bind.
@@ -1346,4 +1347,53 @@ impl<B: SqlConn> AuditSink for SqlStore<B> {
             .map(decode_audit)
             .collect()
     }
+}
+
+impl<B: SqlConn> FenceStore for SqlStore<B> {
+    fn fence(&self) -> RepoResult<Fence> {
+        let sql = format!(
+            "SELECT CAST(version AS TEXT), CAST(epoch AS TEXT) FROM {} WHERE id = 1",
+            self.table("fence")
+        );
+        let rows = self.backend.query(&sql, &[])?;
+        let row = rows
+            .first()
+            .ok_or_else(|| RepoError::Backend("IAM freshness fence is missing".to_owned()))?;
+        Ok(Fence {
+            version: parse_fence_value(row.first(), "version")?,
+            epoch: parse_fence_value(row.get(1), "epoch")?,
+        })
+    }
+
+    fn advance_version(&self) -> RepoResult<u64> {
+        self.advance_fence("version")
+    }
+
+    fn advance_epoch(&self) -> RepoResult<u64> {
+        self.advance_fence("epoch")
+    }
+}
+
+impl<B: SqlConn> SqlStore<B> {
+    fn advance_fence(&self, column: &str) -> RepoResult<u64> {
+        debug_assert!(matches!(column, "version" | "epoch"));
+        let sql = format!(
+            "UPDATE {table} SET {column} = {column} + 1 WHERE id = 1 \
+             RETURNING CAST({column} AS TEXT)",
+            table = self.table("fence")
+        );
+        let rows = self.backend.query(&sql, &[])?;
+        let row = rows
+            .first()
+            .ok_or_else(|| RepoError::Backend("IAM freshness fence is missing".to_owned()))?;
+        parse_fence_value(row.first(), column)
+    }
+}
+
+fn parse_fence_value(value: Option<&Option<String>>, name: &str) -> RepoResult<u64> {
+    value
+        .and_then(Option::as_deref)
+        .ok_or_else(|| RepoError::Backend(format!("IAM freshness fence {name} is null")))?
+        .parse()
+        .map_err(|error| RepoError::Backend(format!("invalid IAM fence {name}: {error}")))
 }

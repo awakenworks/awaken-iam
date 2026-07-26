@@ -33,11 +33,39 @@
 use awaken_iam_contract::{OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp};
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, OrgRepo,
-    Organization, RepoError, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo,
-    RoleDef, RoleId, RoleInvariant, RoleRepo,
+    Organization, PolicySet, RepoError, ResourceEdge, ResourceModelRepo, RoleBinding,
+    RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
 };
 
 use crate::FenceStore;
+
+/// Repository capabilities required by the one policy-administration pipeline.
+///
+/// This marker keeps deployment selection generic without wrapping every PAP
+/// operation in a second forwarding interface.
+pub trait PolicyStore:
+    OrgRepo
+    + GroupRepo
+    + RoleRepo
+    + GrantRepo
+    + RoleBindingRepo
+    + ResourceModelRepo
+    + AuditSink
+    + FenceStore
+{
+}
+
+impl<T> PolicyStore for T where
+    T: OrgRepo
+        + GroupRepo
+        + RoleRepo
+        + GrantRepo
+        + RoleBindingRepo
+        + ResourceModelRepo
+        + AuditSink
+        + FenceStore
+{
+}
 
 /// A policy-administration domain event.
 ///
@@ -491,6 +519,33 @@ where
     /// List every persisted resource-model parent edge.
     pub fn list_resource_edges(&self) -> AdminResult<Vec<ResourceEdge>> {
         Ok(ResourceModelRepo::list_edges(&self.store)?)
+    }
+
+    /// Rebuild the evaluator input from the authoritative policy repositories.
+    ///
+    /// This is the single hydration path used both after an administrative
+    /// mutation and at process startup. It deliberately reads the same store the
+    /// PAP writes; maintaining a second in-memory policy makes a successful
+    /// membership response lie about effective authorization.
+    pub fn policy(&self) -> AdminResult<PolicySet> {
+        let mut policy = PolicySet::new();
+        for grant in GrantRepo::list(&self.store)? {
+            policy.add_grant(grant);
+        }
+        for binding in RoleBindingRepo::list(&self.store)? {
+            policy.bind_role(binding);
+        }
+        for group in GroupRepo::list(&self.store)? {
+            policy.set_group_roster(group.id, group.members);
+        }
+        for edge in ResourceModelRepo::list_edges(&self.store)? {
+            policy.scope_graph_mut().assign_resource_parent(
+                edge.resource_type,
+                edge.resource_id,
+                edge.parent,
+            );
+        }
+        Ok(policy)
     }
 }
 

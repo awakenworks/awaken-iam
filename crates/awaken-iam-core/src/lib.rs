@@ -13,6 +13,7 @@ mod google;
 mod linking;
 mod login;
 mod oauth_provider;
+mod policy_composition;
 mod ports;
 mod provider;
 mod provision;

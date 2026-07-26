@@ -67,6 +67,17 @@ fn fence_round_trips_through_the_in_memory_store_with_real_bumps() {
 }
 
 #[test]
+fn fence_round_trips_through_the_migrated_sqlite_store() {
+    let store = awaken_iam_server::sqlite_in_memory_store("iam").expect("migrate sqlite");
+    assert_eq!(store.fence().expect("initial fence").version, 1);
+    assert_eq!(store.advance_version().expect("bump version"), 2);
+    assert_eq!(store.advance_epoch().expect("bump epoch"), 1);
+    let persisted = store.fence().expect("read persisted fence");
+    assert_eq!(persisted.version, 2);
+    assert_eq!(persisted.epoch, 1);
+}
+
+#[test]
 fn policy_admin_api_seed_fence_advances_with_a_real_mutation() {
     // The admin API reads the seed fence from the store; a successful
     // mutation bumps it and a follow-up read sees the new fence.

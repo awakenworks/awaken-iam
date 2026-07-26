@@ -894,49 +894,6 @@ impl PolicySet {
         policy
     }
 
-    /// Build a complete policy from one immutable profile revision. Activation
-    /// replaces grants, bindings, resource edges, and action/scope rules as one
-    /// unit rather than layering additive mutations onto the previous policy.
-    pub fn from_profile(profile: &AuthorizationProfile) -> Self {
-        Self::from_profiles(std::slice::from_ref(profile))
-    }
-
-    /// Build one evaluator from every consumer namespace's active profile.
-    pub fn from_profiles(profiles: &[AuthorizationProfile]) -> Self {
-        let mut snapshot = PolicySnapshot {
-            version: profiles
-                .iter()
-                .map(|profile| profile.revision)
-                .max()
-                .unwrap_or(0),
-            active_profiles: profiles.to_vec(),
-            ..PolicySnapshot::default()
-        };
-        for profile in profiles {
-            let document = &profile.document;
-            snapshot.grants.extend(document.grants.clone());
-            snapshot
-                .role_bindings
-                .extend(document.role_bindings.clone());
-            snapshot
-                .group_rosters
-                .extend(document.group_rosters.clone());
-            snapshot
-                .group_role_bindings
-                .extend(document.group_role_bindings.clone());
-            snapshot
-                .scope_graph
-                .resource_parents
-                .extend(document.resource_model.edges.clone());
-        }
-        let mut policy = Self::from_snapshot(&snapshot);
-        for profile in profiles {
-            let model = crate::ResourceModel::from_registration(&profile.document.resource_model);
-            policy.register_resource_model(&model);
-        }
-        policy
-    }
-
     fn install_profile_rules(&mut self, profile: &AuthorizationProfile) {
         self.active_profiles
             .retain(|active| active.namespace != profile.namespace);

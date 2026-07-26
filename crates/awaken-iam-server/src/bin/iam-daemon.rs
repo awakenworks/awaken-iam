@@ -73,11 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
     let admin_auth = admin_auth_from_env();
-    let state = Arc::new(Mutex::new(DaemonState::with_profile_repository(
+    let state = Arc::new(Mutex::new(DaemonState::with_policy_store(
         authz,
         admin_auth,
-        profile_store,
-    )));
+        profile_store.clone(),
+        (*profile_store).clone(),
+    )?));
     let router = daemon_router(state).merge(op_router(auth, issuer));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

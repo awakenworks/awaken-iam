@@ -14,7 +14,9 @@ use awaken_iam_contract::{
     AdminMutationAck, AuthorizationOutcome, BatchAuthorizationResponse, EntitlementCheckResponse,
     OrgDto, PolicySnapshot,
 };
-use awaken_iam_server::{AdminAuthPolicy, AuthzApi, DaemonState, daemon_router, http};
+use awaken_iam_server::{
+    AdminAuthPolicy, AuthzApi, DaemonState, daemon_router, http, sqlite_in_memory_store,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
@@ -1047,6 +1049,31 @@ async fn admin_grant_issued_over_the_wire_advances_the_snapshot_fence() {
     let ack: AdminMutationAck = serde_json::from_value(body_json(issue).await).expect("ack");
     assert_eq!(ack.version, base + 1);
 
+    // The fence is meaningful only if the PDP already evaluates the committed
+    // repository row. This assertion catches the former parallel-track bug
+    // where the PAP wrote one store and authorize kept an unrelated empty
+    // in-memory policy.
+    let authorize_request = serde_json::json!({
+        "principal": { "kind": "account", "account_id": "ada" },
+        "action": "pack.publish",
+        "scope": { "kind": "global" }
+    });
+    let authorized = router
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/authorize",
+            authorize_request.clone(),
+        ))
+        .await
+        .expect("dispatch");
+    let authorized: AuthorizationOutcome =
+        serde_json::from_value(body_json(authorized).await).expect("outcome");
+    assert_eq!(
+        authorized.decision,
+        awaken_iam_contract::AuthorizationDecision::Allow
+    );
+
     // Revoke the same grant: a second bump.
     let revoke = router
         .clone()
@@ -1057,6 +1084,18 @@ async fn admin_grant_issued_over_the_wire_advances_the_snapshot_fence() {
     let ack: AdminMutationAck = serde_json::from_value(body_json(revoke).await).expect("ack");
     assert_eq!(ack.version, base + 2);
 
+    let denied = router
+        .clone()
+        .oneshot(authed_json("POST", "/v1/authorize", authorize_request))
+        .await
+        .expect("dispatch");
+    let denied: AuthorizationOutcome =
+        serde_json::from_value(body_json(denied).await).expect("outcome");
+    assert_eq!(
+        denied.decision,
+        awaken_iam_contract::AuthorizationDecision::Deny
+    );
+
     // The version fence the snapshot returns reflects the same monotonic bumps.
     let after = router
         .oneshot(authed_get("/v1/authz/snapshot"))
@@ -1064,6 +1103,62 @@ async fn admin_grant_issued_over_the_wire_advances_the_snapshot_fence() {
         .expect("dispatch");
     let after: PolicySnapshot = serde_json::from_value(body_json(after).await).expect("snapshot");
     assert_eq!(after.version, base + 2);
+}
+
+#[tokio::test]
+async fn daemon_restart_hydrates_authorization_from_the_shared_sql_store() {
+    let store = sqlite_in_memory_store("iam").expect("migrate sqlite");
+    let profiles = Arc::new(store.clone());
+    let first = daemon_router(Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            AuthzApi::new(),
+            AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
+            profiles.clone(),
+            store.clone(),
+        )
+        .expect("hydrate first daemon"),
+    )));
+    let grant = serde_json::json!({
+        "id": "g_persisted",
+        "subject": { "kind": "principal", "principal": { "kind": "account", "account_id": "ada" } },
+        "action_pattern": "pack.publish",
+        "scope": { "kind": "global" },
+        "effect": "allow"
+    });
+    let issued = first
+        .oneshot(authed_json("POST", "/v1/admin/grants", grant))
+        .await
+        .expect("issue grant");
+    let issued_status = issued.status();
+    let issued_body = body_json(issued).await;
+    assert_eq!(issued_status, StatusCode::OK, "{issued_body}");
+
+    // A new daemon state represents a process restart. It receives no policy
+    // object from the first state and must hydrate from the durable repository.
+    let restarted = daemon_router(Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            AuthzApi::new(),
+            AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
+            profiles,
+            store,
+        )
+        .expect("hydrate restarted daemon"),
+    )));
+    let request = serde_json::json!({
+        "principal": { "kind": "account", "account_id": "ada" },
+        "action": "pack.publish",
+        "scope": { "kind": "global" }
+    });
+    let response = restarted
+        .oneshot(authed_json("POST", "/v1/authorize", request))
+        .await
+        .expect("authorize after restart");
+    let outcome: AuthorizationOutcome =
+        serde_json::from_value(body_json(response).await).expect("outcome");
+    assert_eq!(
+        outcome.decision,
+        awaken_iam_contract::AuthorizationDecision::Allow
+    );
 }
 
 // -- helpers ------------------------------------------------------------------
