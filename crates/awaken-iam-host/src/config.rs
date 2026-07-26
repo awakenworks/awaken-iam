@@ -62,6 +62,9 @@ pub struct HostConfig {
     /// Used only in `Remote` mode as the `Authorization: Bearer` credential
     /// for calls the host makes to the IAM daemon as a service principal.
     pub service_token: Option<String>,
+    /// Projected file containing the remote service-principal token. Mutually
+    /// exclusive with [`HostConfig::service_token`].
+    pub service_token_file: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -75,6 +78,7 @@ impl HostConfig {
             audience: None,
             issuer: None,
             service_token: None,
+            service_token_file: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl HostConfig {
             audience: None,
             issuer: None,
             service_token: None,
+            service_token_file: None,
         }
     }
 
@@ -101,6 +106,7 @@ impl HostConfig {
             audience: None,
             issuer: None,
             service_token: None,
+            service_token_file: None,
         }
     }
 
@@ -114,6 +120,7 @@ impl HostConfig {
             audience: None,
             issuer: None,
             service_token: None,
+            service_token_file: None,
         }
     }
 

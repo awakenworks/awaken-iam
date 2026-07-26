@@ -52,8 +52,17 @@ pub fn connect_remote(cfg: &HostConfig) -> Result<RemoteHandle, ConnectError> {
             )))?;
 
     let mut transport_cfg = HttpTransportConfig::new(base_url);
+    if cfg.service_token.is_some() && cfg.service_token_file.is_some() {
+        return Err(ConnectError::Config(HostConfigError::InvalidValue(
+            "service_token",
+            "service_token and service_token_file are mutually exclusive".to_owned(),
+        )));
+    }
     if let Some(ref token) = cfg.service_token {
         transport_cfg = transport_cfg.with_service_token(token);
+    }
+    if let Some(ref path) = cfg.service_token_file {
+        transport_cfg = transport_cfg.with_service_token_file(path);
     }
     if let Some(ref aud) = cfg.audience {
         transport_cfg = transport_cfg.with_audience(aud);

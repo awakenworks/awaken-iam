@@ -140,6 +140,31 @@ Each product service authenticates to IAM with a service principal
 *subject* principal travels inside the request body; the *transport* principal is
 the service itself. IAM authorizes the subject, not the carrier.
 
+Long-running workloads may configure that service credential either as one
+explicit in-memory value (tests and local composition) or as one projected file
+(orchestrated deployments). The two sources are mutually exclusive. The HTTP
+transport reads and trims the projected file for every attempt, so an atomic
+file replacement rotates subsequent requests without rebuilding the client or
+its connection pool. A missing, unreadable, or empty file fails closed before
+any request is sent; it never falls back to an ambient user credential.
+
+```text
+configured credential source
+  -> exactly one of static value / projected file
+  -> resolve immediately before an IAM request attempt
+  -> non-empty bearer
+  -> remote IAM decision
+```
+
+| Static value | Projected file | File state | Result |
+|---|---|---|---|
+| present | absent | n/a | send the static bearer |
+| absent | configured | readable and non-empty | send the current file bearer |
+| absent | configured | replaced between requests | next request sends the replacement |
+| absent | configured | missing, unreadable, or empty | fail closed; send no request |
+| present | configured | any | configuration error; send no request |
+| absent | absent | n/a | anonymous transport, only where explicitly permitted |
+
 ## Out of scope
 
 - Login/OAuth endpoints — already served; see

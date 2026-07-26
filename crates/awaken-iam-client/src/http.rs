@@ -16,6 +16,7 @@
 //! site. The client is `Send + Sync` and cheaply cloneable, so one instance is
 //! shared across a service's request handlers.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use awaken_iam_contract::{
@@ -53,6 +54,9 @@ pub struct HttpTransportConfig {
     pub audience: Option<String>,
     /// Service-principal bearer token, sent as `Authorization: Bearer` when set.
     pub service_token: Option<String>,
+    /// File containing the service-principal bearer token. The file is read for
+    /// every request attempt so projected credential rotation needs no restart.
+    pub service_token_file: Option<PathBuf>,
     /// Per-request timeout (connect + read). Failing closed depends on this
     /// firing, so a remote that hangs cannot wedge a caller indefinitely.
     pub timeout: Duration,
@@ -68,6 +72,7 @@ impl HttpTransportConfig {
             base_url: base_url.into(),
             audience: None,
             service_token: None,
+            service_token_file: None,
             timeout: DEFAULT_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
         }
@@ -82,6 +87,12 @@ impl HttpTransportConfig {
     /// Set the service-principal bearer token.
     pub fn with_service_token(mut self, token: impl Into<String>) -> Self {
         self.service_token = Some(token.into());
+        self
+    }
+
+    /// Read the service-principal bearer from `path` for every request attempt.
+    pub fn with_service_token_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.service_token_file = Some(path.into());
         self
     }
 
@@ -109,6 +120,7 @@ pub struct HttpAuthzTransport {
     base_url: String,
     audience: Option<String>,
     service_token: Option<String>,
+    service_token_file: Option<PathBuf>,
     max_retries: u32,
 }
 
@@ -117,6 +129,7 @@ impl HttpAuthzTransport {
     /// the configured timeout. Fails only if the platform cannot initialise the
     /// TLS/HTTP stack.
     pub fn new(config: HttpTransportConfig) -> Result<Self, RemoteError> {
+        Self::validate_credential_source(&config)?;
         let client = Client::builder()
             .timeout(config.timeout)
             .build()
@@ -133,8 +146,18 @@ impl HttpAuthzTransport {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             audience: config.audience,
             service_token: config.service_token,
+            service_token_file: config.service_token_file,
             max_retries: config.max_retries,
         }
+    }
+
+    fn validate_credential_source(config: &HttpTransportConfig) -> Result<(), RemoteError> {
+        if config.service_token.is_some() && config.service_token_file.is_some() {
+            return Err(RemoteError(
+                "service_token and service_token_file are mutually exclusive".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Join the configured base URL with a `/v1`-rooted path.
@@ -143,14 +166,43 @@ impl HttpAuthzTransport {
     }
 
     /// Attach the caller's audience and bearer headers to a request.
-    fn with_headers(&self, mut builder: RequestBuilder) -> RequestBuilder {
+    fn with_headers(&self, mut builder: RequestBuilder) -> Result<RequestBuilder, RemoteError> {
+        if self.service_token.is_some() && self.service_token_file.is_some() {
+            return Err(RemoteError(
+                "service_token and service_token_file are mutually exclusive".to_owned(),
+            ));
+        }
         if let Some(audience) = &self.audience {
             builder = builder.header("X-Iam-Audience", audience);
         }
-        if let Some(token) = &self.service_token {
+        let projected_token = self
+            .service_token_file
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .map_err(|error| {
+                        RemoteError(format!(
+                            "read service token file {}: {error}",
+                            path.display()
+                        ))
+                    })
+                    .and_then(|token| {
+                        let token = token.trim().to_owned();
+                        if token.is_empty() {
+                            Err(RemoteError(format!(
+                                "service token file {} is empty",
+                                path.display()
+                            )))
+                        } else {
+                            Ok(token)
+                        }
+                    })
+            })
+            .transpose()?;
+        if let Some(token) = projected_token.as_ref().or(self.service_token.as_ref()) {
             builder = builder.bearer_auth(token);
         }
-        builder
+        Ok(builder)
     }
 
     /// Run `make_request` up to `1 + max_retries` times, retrying only when the
@@ -163,7 +215,7 @@ impl HttpAuthzTransport {
     {
         let mut attempt = 0;
         loop {
-            let result = self.with_headers(make_request()).send();
+            let result = self.with_headers(make_request())?.send();
             let transient = match &result {
                 // A connection/timeout error has no status; treat as transient.
                 Err(err) => !err.is_decode(),
@@ -725,6 +777,67 @@ mod tests {
         let recorded = server.requests();
         assert!(recorded[0].contains("x-iam-audience: packs-service"));
         assert!(recorded[0].contains("authorization: Bearer svc-token-abc"));
+    }
+
+    #[test]
+    fn projected_service_token_is_reloaded_for_each_request() {
+        let body = r#"{"decision":"allow","reason":"allowed_by_grant","matched_grants":[],"matched_roles":[]}"#;
+        let server = StubServer::start(vec![Reply::Ok(body.into()), Reply::Ok(body.into())]);
+        let path = std::env::temp_dir().join(format!(
+            "awaken-iam-service-token-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "first-token\n").unwrap();
+        let transport = HttpAuthzTransport::new(
+            HttpTransportConfig::new(&server.addr)
+                .with_service_token_file(&path)
+                .with_max_retries(0),
+        )
+        .unwrap();
+
+        transport.authorize(&auth_request("pack.read")).unwrap();
+        std::fs::write(&path, "second-token\n").unwrap();
+        transport.authorize(&auth_request("pack.read")).unwrap();
+
+        drop(transport);
+        let recorded = server.requests();
+        assert!(recorded[0].contains("authorization: Bearer first-token"));
+        assert!(recorded[1].contains("authorization: Bearer second-token"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_projected_service_token_fails_before_network_io() {
+        let missing = std::env::temp_dir().join(format!(
+            "awaken-iam-missing-service-token-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let transport = HttpAuthzTransport::new(
+            HttpTransportConfig::new("http://127.0.0.1:9")
+                .with_service_token_file(&missing)
+                .with_max_retries(0),
+        )
+        .unwrap();
+        let error = transport.authorize(&auth_request("pack.read")).unwrap_err();
+        assert!(error.0.contains("read service token file"));
+
+        std::fs::write(&missing, " \n").unwrap();
+        let error = transport.authorize(&auth_request("pack.read")).unwrap_err();
+        assert!(error.0.contains("is empty"));
+        std::fs::remove_file(missing).unwrap();
+    }
+
+    #[test]
+    fn static_and_projected_service_tokens_are_rejected_as_duplicate_sources() {
+        let error = HttpAuthzTransport::new(
+            HttpTransportConfig::new("http://127.0.0.1:9")
+                .with_service_token("static")
+                .with_service_token_file("/projected/token"),
+        )
+        .unwrap_err();
+        assert!(error.0.contains("mutually exclusive"));
     }
 
     #[test]
