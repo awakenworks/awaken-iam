@@ -30,7 +30,10 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
-use awaken_iam_contract::{OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp};
+use awaken_iam_contract::{
+    OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp, WorkspaceId,
+    WorkspaceOrgEdge,
+};
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, OrgRepo,
     Organization, PolicySet, RepoError, ResourceEdge, ResourceModelRepo, RoleBinding,
@@ -122,6 +125,11 @@ pub enum DomainEvent {
         /// Number of per-instance scope parent edges registered.
         edges: usize,
     },
+    /// A product projected one Workspace → Org ownership edge.
+    WorkspaceOrgAssigned {
+        workspace_id: WorkspaceId,
+        org_id: OrgId,
+    },
 }
 
 impl DomainEvent {
@@ -142,6 +150,7 @@ impl DomainEvent {
             DomainEvent::MembershipGranted { .. } => "membership.grant",
             DomainEvent::MembershipRevoked { .. } => "membership.revoke",
             DomainEvent::ResourceModelRegistered { .. } => "resource_model.register",
+            DomainEvent::WorkspaceOrgAssigned { .. } => "scope.workspace.assign",
         }
     }
 
@@ -174,6 +183,10 @@ impl DomainEvent {
                 resource_types,
                 edges,
             } => format!("resource model: {resource_types} types, {edges} edges"),
+            DomainEvent::WorkspaceOrgAssigned {
+                workspace_id,
+                org_id,
+            } => format!("workspace {} -> org {}", workspace_id.0, org_id.0),
         }
     }
 }
@@ -521,6 +534,40 @@ where
         Ok(ResourceModelRepo::list_edges(&self.store)?)
     }
 
+    /// Persist one product-owned Workspace → IAM Org projection.
+    ///
+    /// Exact redelivery is idempotent. Re-parenting is rejected because a
+    /// caller must never move an existing workspace across tenants implicitly.
+    pub fn assign_workspace_org(
+        &mut self,
+        edge: WorkspaceOrgEdge,
+        at: Timestamp,
+    ) -> AdminResult<u64> {
+        if OrgRepo::get(&self.store, &edge.org_id)?.is_none() {
+            return Err(AdminError::NotFound(format!(
+                "organization {}",
+                edge.org_id.0
+            )));
+        }
+        if let Some(existing) = ResourceModelRepo::workspace_org(&self.store, &edge.workspace_id)? {
+            if existing == edge {
+                return self.store_version();
+            }
+            return Err(AdminError::AlreadyExists(format!(
+                "workspace {} belongs to organization {}",
+                existing.workspace_id.0, existing.org_id.0
+            )));
+        }
+        ResourceModelRepo::put_workspace_org(&self.store, edge.clone())?;
+        self.commit(
+            DomainEvent::WorkspaceOrgAssigned {
+                workspace_id: edge.workspace_id,
+                org_id: edge.org_id,
+            },
+            at,
+        )
+    }
+
     /// Rebuild the evaluator input from the authoritative policy repositories.
     ///
     /// This is the single hydration path used both after an administrative
@@ -544,6 +591,11 @@ where
                 edge.resource_id,
                 edge.parent,
             );
+        }
+        for edge in ResourceModelRepo::list_workspace_orgs(&self.store)? {
+            policy
+                .scope_graph_mut()
+                .assign_workspace(edge.workspace_id, edge.org_id);
         }
         Ok(policy)
     }

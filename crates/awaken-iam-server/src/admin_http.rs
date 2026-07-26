@@ -46,7 +46,8 @@ use awaken_iam_contract::{
     ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
-    NamespaceId, OrgDto, OrgId, PolicySnapshot, RoleBindingSnapshot, RoleDto, Timestamp,
+    MembershipQuery, NamespaceId, OrgDto, OrgId, PolicySnapshot, RoleBindingSnapshot, RoleDto,
+    Timestamp, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
@@ -203,6 +204,8 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
             "/v1/admin/memberships",
             post(grant_membership).delete(revoke_membership),
         )
+        .route("/v1/admin/memberships/query", post(query_memberships))
+        .route("/v1/admin/scope/workspace-orgs", post(assign_workspace_org))
         .route("/v1/admin/authz/profiles", post(create_profile))
         .route("/v1/admin/authz/profiles/{namespace}", get(list_profiles))
         .route(
@@ -535,6 +538,33 @@ async fn revoke_membership(
     })
 }
 
+async fn query_memberships(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(query): Json<MembershipQuery>,
+) -> Response {
+    read(&state, &headers, |admin| {
+        admin
+            .memberships_for_principal(&query.principal)
+            .map(|bindings| {
+                bindings
+                    .into_iter()
+                    .map(role_binding_to_dto)
+                    .collect::<Vec<_>>()
+            })
+    })
+}
+
+async fn assign_workspace_org(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(edge): Json<WorkspaceOrgEdge>,
+) -> Response {
+    apply(&state, &headers, move |admin, at| {
+        admin.assign_workspace_org(edge, at)
+    })
+}
+
 // -- shared dispatch helpers --------------------------------------------------
 
 fn lock<S>(state: &SharedDaemonState<S>) -> std::sync::MutexGuard<'_, DaemonState<S>> {
@@ -708,6 +738,14 @@ fn role_binding_from_dto(dto: RoleBindingSnapshot) -> RoleBinding {
         principal: dto.principal,
         role: RoleId(dto.role_id),
         scope: dto.scope,
+    }
+}
+
+fn role_binding_to_dto(binding: RoleBinding) -> RoleBindingSnapshot {
+    RoleBindingSnapshot {
+        principal: binding.principal,
+        role_id: binding.role.0,
+        scope: binding.scope,
     }
 }
 

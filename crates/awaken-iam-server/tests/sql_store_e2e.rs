@@ -12,7 +12,7 @@ use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,
     IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
-    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
+    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
@@ -365,6 +365,18 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         .unwrap();
     assert_eq!(store.list_edges().unwrap().len(), 1);
 
+    let workspace_edge = WorkspaceOrgEdge {
+        workspace_id: WorkspaceId("ws_flow".into()),
+        org_id: OrgId("acme".into()),
+    };
+    store.put_workspace_org(workspace_edge.clone()).unwrap();
+    store.put_workspace_org(workspace_edge.clone()).unwrap();
+    assert_eq!(
+        store.workspace_org(&WorkspaceId("ws_flow".into())).unwrap(),
+        Some(workspace_edge.clone())
+    );
+    assert_eq!(store.list_workspace_orgs().unwrap(), vec![workspace_edge]);
+
     // --- plans + subscriptions: quota and rate-limit JSON round-trip ---
     let plan = Plan::new(
         PlanId("pro".into()),
@@ -462,6 +474,7 @@ fn postgres_backend_serves_every_port_when_configured() {
         "grants",
         "role_bindings",
         "resource_edges",
+        "workspace_org_edges",
         "plans",
         "subscriptions",
         "audit_events",

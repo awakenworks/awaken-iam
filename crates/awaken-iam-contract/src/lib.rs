@@ -20,7 +20,7 @@ pub use profile::{
     CreateAuthorizationProfile, ProfileLifecycle, ScopeKind,
 };
 
-pub use admin::{AdminMutationAck, GroupDto, OrgDto, RoleDto};
+pub use admin::{AdminMutationAck, GroupDto, MembershipQuery, OrgDto, RoleDto};
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,

@@ -180,6 +180,32 @@ cannot evaluate.  Restart hydration reads the same repository; an independent
 in-memory PAP store is forbidden because it makes a successful membership write
 invisible to authorization and loses it on restart.
 
+### Personal-tenant provisioning
+
+```text
+verified account
+  -> query that principal's live Org bindings
+  -> existing binding: reuse its Org
+  -> no binding: ensure deterministic personal Org
+  -> ensure owner binding at that Org
+  -> product creates its default Workspace
+  -> project Workspace -> Org edge into IAM
+```
+
+| account | existing personal org | owner binding | workspace edge | Action |
+|---|---|---|---|---|
+| absent/unverified | any | any | any | reject before provisioning |
+| verified | no | no | no | create org, binding, then project edge |
+| verified | yes | no | any | repair the missing binding; do not mint tenant scope first |
+| verified | yes | yes | no | reuse org and project the missing edge |
+| verified | yes | yes | same org | idempotent success |
+| verified | yes | yes | different org | conflict; never re-parent silently |
+
+Only the internal/operator PAP may query a named principal or enumerate all
+organizations. A tenant-facing product derives its current tenant from the
+authenticated principal's binding and may not accept an arbitrary organization
+selector as authority.
+
 ## Invariants
 
 - **Default-deny, no superuser.** An empty store denies everyone; seed is the

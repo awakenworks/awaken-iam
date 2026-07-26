@@ -1161,4 +1161,110 @@ async fn daemon_restart_hydrates_authorization_from_the_shared_sql_store() {
     );
 }
 
+#[tokio::test]
+async fn principal_membership_and_workspace_projection_drive_one_live_policy() {
+    let router = daemon();
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("acme")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let binding = serde_json::json!({
+        "principal": { "kind": "account", "account_id": "ada" },
+        "role_id": "tenant-admin",
+        "scope": { "kind": "org", "org_id": "acme" }
+    });
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                "/v1/admin/memberships",
+                binding.clone(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let queried = router
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/memberships/query",
+            serde_json::json!({
+                "principal": { "kind": "account", "account_id": "ada" }
+            }),
+        ))
+        .await
+        .unwrap();
+    let bindings: Vec<awaken_iam_contract::RoleBindingSnapshot> =
+        serde_json::from_value(body_json(queried).await).expect("bindings");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].role_id, "tenant-admin");
+
+    let grant = serde_json::json!({
+        "id": "g_workspace_read",
+        "subject": { "kind": "principal", "principal": { "kind": "account", "account_id": "ada" } },
+        "action_pattern": "workspace.read",
+        "scope": { "kind": "org", "org_id": "acme" },
+        "effect": "allow"
+    });
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/grants", grant))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let edge = serde_json::json!({"workspace_id":"ws_flow","org_id":"acme"});
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                "/v1/admin/scope/workspace-orgs",
+                edge.clone(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // Exact redelivery is idempotent and never creates a second edge.
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/scope/workspace-orgs", edge,))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let authorized = router
+        .oneshot(authed_json(
+            "POST",
+            "/v1/authorize",
+            serde_json::json!({
+                "principal": { "kind": "account", "account_id": "ada" },
+                "action": "workspace.read",
+                "scope": { "kind": "workspace", "workspace_id": "ws_flow" }
+            }),
+        ))
+        .await
+        .unwrap();
+    let outcome: AuthorizationOutcome =
+        serde_json::from_value(body_json(authorized).await).expect("outcome");
+    assert_eq!(
+        outcome.decision,
+        awaken_iam_contract::AuthorizationDecision::Allow
+    );
+}
+
 // -- helpers ------------------------------------------------------------------

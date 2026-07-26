@@ -17,6 +17,7 @@ use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId, OAuthLoginState,
     OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp,
+    WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::{
@@ -217,6 +218,24 @@ pub trait ResourceModelRepo: Send + Sync {
     fn put_edge(&self, edge: ResourceEdge) -> RepoResult<()>;
     /// List every registered parent edge.
     fn list_edges(&self) -> RepoResult<Vec<ResourceEdge>>;
+    /// Persist or replace one well-known Workspace → Org scope edge.
+    fn put_workspace_org(&self, _edge: WorkspaceOrgEdge) -> RepoResult<()> {
+        Err(RepoError::Backend(
+            "Workspace to Org projections are not supported by this adapter".into(),
+        ))
+    }
+    /// Resolve a Workspace → Org scope edge.
+    fn workspace_org(&self, _workspace_id: &WorkspaceId) -> RepoResult<Option<WorkspaceOrgEdge>> {
+        Err(RepoError::Backend(
+            "Workspace to Org projections are not supported by this adapter".into(),
+        ))
+    }
+    /// List every persisted Workspace → Org edge in stable workspace order.
+    fn list_workspace_orgs(&self) -> RepoResult<Vec<WorkspaceOrgEdge>> {
+        Err(RepoError::Backend(
+            "Workspace to Org projections are not supported by this adapter".into(),
+        ))
+    }
 }
 
 /// Persistence for immutable authorization-profile revisions and the atomic

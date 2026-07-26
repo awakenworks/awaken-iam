@@ -114,6 +114,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     AUTHZ_0004,
                 ),
                 (5, "initialize the singleton freshness fence", AUTHZ_0005),
+                (6, "persist Workspace to Org scope projections", AUTHZ_0006),
             ],
         ),
         bundle(
@@ -317,6 +318,13 @@ CREATE TABLE {prefix}_authorization_profile_heads (\
 const AUTHZ_0005: &str = "\
 INSERT INTO {prefix}_fence (id, version, epoch, updated_at) \
 VALUES (1, 1, 0, '1970-01-01T00:00:00Z');";
+
+const AUTHZ_0006: &str = "\
+CREATE TABLE {prefix}_workspace_org_edges (\
+ workspace_id TEXT PRIMARY KEY, \
+ org_id TEXT NOT NULL);\
+CREATE INDEX {prefix}_workspace_org_edges_org_idx \
+ ON {prefix}_workspace_org_edges (org_id);";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //

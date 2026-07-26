@@ -21,7 +21,7 @@ use awaken_iam_contract::{
     AuthorizationProfileDocument, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
     ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, NamespaceId, OAuthLoginState,
     OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ResourceId, ResourceType, Session,
-    SessionId, Timestamp, WorkspaceId,
+    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
@@ -277,6 +277,13 @@ fn decode_resource_edge(row: &SqlRow) -> RepoResult<ResourceEdge> {
         resource_type: ResourceType(req(row, 0, "edge.resource_type")?),
         resource_id: ResourceId(req(row, 1, "edge.resource_id")?),
         parent: json_decode(&req(row, 2, "edge.parent")?, "edge parent")?,
+    })
+}
+
+fn decode_workspace_org(row: &SqlRow) -> RepoResult<WorkspaceOrgEdge> {
+    Ok(WorkspaceOrgEdge {
+        workspace_id: WorkspaceId(req(row, 0, "workspace_org.workspace_id")?),
+        org_id: OrgId(req(row, 1, "workspace_org.org_id")?),
     })
 }
 
@@ -1054,6 +1061,38 @@ impl<B: SqlConn> ResourceModelRepo for SqlStore<B> {
             .query(&sql, &[])?
             .iter()
             .map(decode_resource_edge)
+            .collect()
+    }
+
+    fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepoResult<()> {
+        let sql = format!(
+            "INSERT INTO {t} (workspace_id, org_id) VALUES (?, ?) \
+             ON CONFLICT (workspace_id) DO UPDATE SET org_id = excluded.org_id",
+            t = self.table("workspace_org_edges")
+        );
+        self.backend
+            .execute(&sql, &[p(edge.workspace_id.0), p(edge.org_id.0)])?;
+        Ok(())
+    }
+
+    fn workspace_org(&self, workspace_id: &WorkspaceId) -> RepoResult<Option<WorkspaceOrgEdge>> {
+        let sql = format!(
+            "SELECT workspace_id, org_id FROM {} WHERE workspace_id = ?",
+            self.table("workspace_org_edges")
+        );
+        let rows = self.backend.query(&sql, &[p(workspace_id.0.clone())])?;
+        rows.first().map(decode_workspace_org).transpose()
+    }
+
+    fn list_workspace_orgs(&self) -> RepoResult<Vec<WorkspaceOrgEdge>> {
+        let sql = format!(
+            "SELECT workspace_id, org_id FROM {} ORDER BY workspace_id",
+            self.table("workspace_org_edges")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_workspace_org)
             .collect()
     }
 }

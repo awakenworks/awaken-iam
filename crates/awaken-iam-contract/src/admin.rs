@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{OrgId, PrincipalRef, Timestamp};
 
+/// Internal PAP query for one principal's live role bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipQuery {
+    pub principal: PrincipalRef,
+}
+
 /// Wire shape of an organization administered through `/v1/admin/orgs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgDto {

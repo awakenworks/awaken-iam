@@ -14,12 +14,13 @@
 //! silently widens access to an allow).
 
 use awaken_iam_contract::{
-    ActivateAuthorizationProfile, AuthorizationDecision, AuthorizationOutcome,
+    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationProfile, AuthorizationProfileActivated, AuthorizationProfileValidation,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    NamespaceId, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResourceModelRegistered,
+    ResourceModelRegistration, RoleBindingSnapshot, SignerSetSnapshot, TokenIntrospectionRequest,
+    TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -99,6 +100,31 @@ pub trait AuthzTransport {
         Err(RemoteError(
             "introspect_token is not supported by this transport".into(),
         ))
+    }
+
+    fn create_org(&self, _org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("organization PAP is not supported".into()))
+    }
+
+    fn grant_membership(
+        &self,
+        _binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("membership PAP is not supported".into()))
+    }
+
+    fn memberships_for_principal(
+        &self,
+        _query: &MembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        Err(RemoteError("membership PAP is not supported".into()))
+    }
+
+    fn assign_workspace_org(
+        &self,
+        _edge: &WorkspaceOrgEdge,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("scope projection PAP is not supported".into()))
     }
 
     fn create_profile(
@@ -240,6 +266,31 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         request: &TokenIntrospectionRequest,
     ) -> Result<TokenIntrospectionResponse, RemoteError> {
         self.transport.introspect_token(request)
+    }
+
+    pub fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.create_org(org)
+    }
+
+    pub fn grant_membership(
+        &self,
+        binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.grant_membership(binding)
+    }
+
+    pub fn memberships_for_principal(
+        &self,
+        query: &MembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        self.transport.memberships_for_principal(query)
+    }
+
+    pub fn assign_workspace_org(
+        &self,
+        edge: &WorkspaceOrgEdge,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.assign_workspace_org(edge)
     }
 
     pub fn create_profile(

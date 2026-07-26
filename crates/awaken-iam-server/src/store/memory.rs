@@ -7,12 +7,12 @@
 //! scope-partitioned bundles without ever coupling them by a foreign key.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityKey, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId,
-    PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp,
+    PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
@@ -50,6 +50,7 @@ struct Authz {
     grants: BTreeMap<String, Grant>,
     role_bindings: BTreeMap<String, RoleBinding>,
     resource_edges: BTreeMap<String, ResourceEdge>,
+    workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
 }
@@ -61,13 +62,13 @@ struct Entitlement {
 }
 
 /// In-memory implementation of every IAM repository port.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InMemoryStore {
-    identity: Mutex<Identity>,
-    authz: Mutex<Authz>,
-    entitlement: Mutex<Entitlement>,
-    audit: Mutex<Vec<AuditEvent>>,
-    fence: Mutex<Fence>,
+    identity: Arc<Mutex<Identity>>,
+    authz: Arc<Mutex<Authz>>,
+    entitlement: Arc<Mutex<Entitlement>>,
+    audit: Arc<Mutex<Vec<AuditEvent>>>,
+    fence: Arc<Mutex<Fence>>,
 }
 
 impl std::fmt::Debug for InMemoryStore {
@@ -546,6 +547,36 @@ impl ResourceModelRepo for InMemoryStore {
             .lock()
             .unwrap()
             .resource_edges
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepoResult<()> {
+        self.authz
+            .lock()
+            .unwrap()
+            .workspace_orgs
+            .insert(edge.workspace_id.0.clone(), edge);
+        Ok(())
+    }
+
+    fn workspace_org(&self, workspace_id: &WorkspaceId) -> RepoResult<Option<WorkspaceOrgEdge>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .workspace_orgs
+            .get(&workspace_id.0)
+            .cloned())
+    }
+
+    fn list_workspace_orgs(&self) -> RepoResult<Vec<WorkspaceOrgEdge>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .workspace_orgs
             .values()
             .cloned()
             .collect())
@@ -1285,5 +1316,20 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].detail, "first");
         assert_eq!(events[1].detail, "second");
+    }
+
+    #[test]
+    fn clones_share_one_authoritative_store() {
+        let writer = InMemoryStore::new();
+        let reader = writer.clone();
+        AccountRepo::upsert(&writer, account("shared")).unwrap();
+
+        assert!(
+            AccountRepo::get(&reader, &AccountId("shared".into()))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reader.advance_version().unwrap(), 2);
+        assert_eq!(writer.fence().unwrap().version, 2);
     }
 }

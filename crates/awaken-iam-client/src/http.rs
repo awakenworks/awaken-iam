@@ -19,12 +19,12 @@
 use std::time::Duration;
 
 use awaken_iam_contract::{
-    ActivateAuthorizationProfile, AuthorizationOutcome, AuthorizationProfile,
+    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationProfile,
     AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    EntitlementCheckResponse, EntitlementRequest, NamespaceId, PolicySnapshot,
-    ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse,
+    EntitlementCheckResponse, EntitlementRequest, MembershipQuery, NamespaceId, OrgDto,
+    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, RoleBindingSnapshot,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -257,6 +257,48 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+        let response =
+            self.send_with_retry(|| self.client.post(self.url("/v1/admin/orgs")).json(org))?;
+        Self::decode(response)
+    }
+
+    fn grant_membership(
+        &self,
+        binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/memberships"))
+                .json(binding)
+        })?;
+        Self::decode(response)
+    }
+
+    fn memberships_for_principal(
+        &self,
+        query: &MembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/memberships/query"))
+                .json(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn assign_workspace_org(
+        &self,
+        edge: &WorkspaceOrgEdge,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/scope/workspace-orgs"))
+                .json(edge)
+        })?;
+        Self::decode(response)
+    }
+
     fn create_profile(
         &self,
         request: &CreateAuthorizationProfile,
@@ -432,6 +474,56 @@ mod tests {
         let recorded = server.requests();
         assert!(recorded[0].starts_with("POST /v1/authorize "));
         assert!(recorded[0].contains("pack.read"));
+    }
+
+    #[test]
+    fn directory_pap_uses_the_canonical_admin_paths() {
+        let binding_json = r#"[{"principal":{"kind":"account","account_id":"acct_1"},"role_id":"tenant-admin","scope":{"kind":"org","org_id":"acme"}}]"#;
+        let server = StubServer::start(vec![
+            Reply::Ok(r#"{"version":2}"#.into()),
+            Reply::Ok(r#"{"version":3}"#.into()),
+            Reply::Ok(binding_json.into()),
+            Reply::Ok(r#"{"version":4}"#.into()),
+        ]);
+        let transport = transport(&server);
+        let principal = PrincipalRef::Account {
+            account_id: AccountId("acct_1".into()),
+        };
+        transport
+            .create_org(&OrgDto {
+                id: awaken_iam_contract::OrgId("acme".into()),
+                display_name: None,
+                owner: principal.clone(),
+                created_at: awaken_iam_contract::Timestamp("t".into()),
+                updated_at: awaken_iam_contract::Timestamp("t".into()),
+            })
+            .unwrap();
+        let binding = RoleBindingSnapshot {
+            principal: principal.clone(),
+            role_id: "tenant-admin".into(),
+            scope: ScopeRef::Org {
+                org_id: awaken_iam_contract::OrgId("acme".into()),
+            },
+        };
+        transport.grant_membership(&binding).unwrap();
+        assert_eq!(
+            transport
+                .memberships_for_principal(&MembershipQuery { principal })
+                .unwrap(),
+            vec![binding]
+        );
+        transport
+            .assign_workspace_org(&WorkspaceOrgEdge {
+                workspace_id: awaken_iam_contract::WorkspaceId("ws_flow".into()),
+                org_id: awaken_iam_contract::OrgId("acme".into()),
+            })
+            .unwrap();
+
+        let requests = server.requests();
+        assert!(requests[0].starts_with("POST /v1/admin/orgs "));
+        assert!(requests[1].starts_with("POST /v1/admin/memberships "));
+        assert!(requests[2].starts_with("POST /v1/admin/memberships/query "));
+        assert!(requests[3].starts_with("POST /v1/admin/scope/workspace-orgs "));
     }
 
     #[test]
