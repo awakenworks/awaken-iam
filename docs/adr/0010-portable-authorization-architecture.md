@@ -274,6 +274,19 @@ SQLite and Postgres. At startup the daemon hydrates all active namespace heads
 before binding its socket. `PolicySnapshot.active_profiles` carries the same
 documents to an embedded/local evaluator.
 
+Profile activation and rollback always compose the selected immutable profile
+revisions over the current repository-backed PAP snapshot in one live-PDP
+replacement. They never replace organization grants, role bindings, resource
+ancestry, or other base policy. The same composition applies during restart
+hydration, so a profile mutation cannot make a persisted tenant or operator
+grant disappear until the next PAP write or process restart.
+
+An active profile's scope-kind rules govern only actions in that profile's
+exact `<namespace>::` action namespace. Activating an Awaken Runtime profile,
+for example, cannot make Cloud Console or Flow PAP actions invalid merely
+because those unrelated actions are intentionally absent from the Runtime
+document.
+
 The migration proceeds through four observable phases:
 
 1. **A — shadow:** construct and validate a revision while the prior policy

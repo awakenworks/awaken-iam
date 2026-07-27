@@ -636,7 +636,7 @@ impl PolicySet {
         action: &ActionKey,
         scope: &ScopeRef,
     ) -> AuthorizationTrace {
-        if !self.active_profiles.is_empty() && !self.scope_kind_allowed(action, scope) {
+        if self.profile_governs(action) && !self.scope_kind_allowed(action, scope) {
             return AuthorizationTrace {
                 decision: AuthorizationDecision::Deny,
                 reason: DecisionReason::ScopeKindNotAllowed,
@@ -920,6 +920,15 @@ impl PolicySet {
     fn scope_kind_allowed(&self, action: &ActionKey, scope: &ScopeRef) -> bool {
         self.action_scope_rules.iter().any(|(pattern, allowed)| {
             pattern.matches(action) && allowed.iter().any(|kind| scope_matches_kind(scope, kind))
+        })
+    }
+
+    fn profile_governs(&self, action: &ActionKey) -> bool {
+        self.active_profiles.iter().any(|profile| {
+            action
+                .0
+                .strip_prefix(&profile.namespace.0)
+                .is_some_and(|suffix| suffix.starts_with("::"))
         })
     }
 }

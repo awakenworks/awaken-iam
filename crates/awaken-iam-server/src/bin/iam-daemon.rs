@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_core::RegisteredClient;
 use awaken_iam_server::{
-    AdminAuthPolicy, AuthorizationProfileAdmin, DaemonState, IamDaemon, RecordingExecutor,
-    SharedAuthApi, SqliteBackend, daemon_router, http, op_router, sqlite_migrated_store,
+    AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi, SqliteBackend,
+    daemon_router, http, op_router, sqlite_migrated_store,
 };
 
 #[tokio::main]
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Assemble standalone and migrate before binding the socket, so the process
     // fails fast on a drifted ledger instead of serving a half-migrated schema.
     let daemon = IamDaemon::start(RecordingExecutor::new())?;
-    let (mut auth, mut authz) = daemon.into_assembly().into_auth_and_authz();
+    let (mut auth, authz) = daemon.into_assembly().into_auth_and_authz();
     let issuer = std::env::var("IAM_ISSUER").unwrap_or_else(|_| format!("http://{bind_addr}"));
     auth = auth.with_issuer(issuer.clone());
     if let (Ok(client_id), Ok(redirect_uris)) = (
@@ -67,8 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SqliteBackend::open_path(&database_path)?,
         "iam",
     )?);
-    AuthorizationProfileAdmin::new(profile_store.clone()).hydrate_all(&mut authz)?;
-
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).

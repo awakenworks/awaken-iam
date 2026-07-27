@@ -151,15 +151,15 @@ impl<S: PolicyStore> DaemonState<S> {
         let admin = PolicyAdminApi::new(store);
         let version = admin.store_version()?;
         let base = admin.policy()?;
-        let active_profiles = authz.snapshot().active_profiles;
-        authz.replace_policy_at_version(
-            PolicySet::from_snapshot_and_profiles(&base.snapshot(version), &active_profiles),
-            version,
-        );
+        let base = base.snapshot(version);
+        let profiles = AuthorizationProfileAdmin::new(profiles);
+        profiles
+            .hydrate_all(&mut authz, &base)
+            .map_err(|error| AdminError::Backend(error.to_string()))?;
         Ok(Self {
             authz,
             admin,
-            profiles: AuthorizationProfileAdmin::new(profiles),
+            profiles,
             auth,
         })
     }
@@ -310,7 +310,22 @@ async fn activate_profile(
         return rejection;
     }
     let profiles = guard.profiles.clone();
-    profile_result(profiles.activate(&mut guard.authz, &NamespaceId(namespace), revision, request))
+    let base = match guard.admin.policy().and_then(|policy| {
+        guard
+            .admin
+            .store_version()
+            .map(|version| policy.snapshot(version))
+    }) {
+        Ok(base) => base,
+        Err(error) => return admin_error_response(&error),
+    };
+    profile_result(profiles.activate(
+        &mut guard.authz,
+        &base,
+        &NamespaceId(namespace),
+        revision,
+        request,
+    ))
 }
 
 async fn rollback_profile(
@@ -331,8 +346,18 @@ async fn rollback_profile(
         return rejection;
     }
     let profiles = guard.profiles.clone();
+    let base = match guard.admin.policy().and_then(|policy| {
+        guard
+            .admin
+            .store_version()
+            .map(|version| policy.snapshot(version))
+    }) {
+        Ok(base) => base,
+        Err(error) => return admin_error_response(&error),
+    };
     profile_result(profiles.rollback(
         &mut guard.authz,
+        &base,
         &NamespaceId(namespace),
         revision,
         expected,

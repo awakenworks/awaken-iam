@@ -24,11 +24,11 @@
 
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
-    ApiToken, ApiTokenStatus, AuthorizationDecision, AuthorizationOutcome, AuthorizationProfile,
-    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot,
-    ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot, Timestamp,
-    TokenIntrospectionRequest, TokenIntrospectionResponse,
+    ApiToken, ApiTokenStatus, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
+    EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot, ResourceModelRegistered,
+    ResourceModelRegistration, SignerSetSnapshot, Timestamp, TokenIntrospectionRequest,
+    TokenIntrospectionResponse,
 };
 use awaken_iam_core::{
     ApiTokenDirectory, EntitlementEngine, EntitlementProvider, IamCore, IamError,
@@ -220,30 +220,6 @@ impl AuthzApi {
         ResourceModelRegistered {
             version: self.policy_version,
         }
-    }
-
-    /// Replace the complete authorization policy with one validated, immutable
-    /// profile revision and advance the shared snapshot fence.
-    pub fn activate_profile(&mut self, profile: AuthorizationProfile) -> u64 {
-        let mut profiles = self
-            .core
-            .policy()
-            .snapshot(self.policy_version)
-            .active_profiles;
-        profiles.retain(|active| active.namespace != profile.namespace);
-        profiles.push(profile);
-        self.core
-            .replace_policy(PolicySet::from_profiles(&profiles));
-        self.policy_version += 1;
-        self.policy_version
-    }
-
-    /// Restore all active namespace profiles in one evaluator replacement.
-    pub fn activate_profiles(&mut self, profiles: Vec<AuthorizationProfile>) -> u64 {
-        self.core
-            .replace_policy(PolicySet::from_profiles(&profiles));
-        self.policy_version += 1;
-        self.policy_version
     }
 
     /// `GET /v1/authz/snapshot`: capture the authorization policy as a versioned

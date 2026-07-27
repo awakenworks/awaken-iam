@@ -6,9 +6,9 @@ use std::sync::Arc;
 use awaken_iam_contract::{
     ActivateAuthorizationProfile, AuthorizationProfile, AuthorizationProfileActivated,
     AuthorizationProfileDocument, AuthorizationProfileValidation, CreateAuthorizationProfile,
-    NamespaceId, ProfileLifecycle, ScopeKind,
+    NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
 };
-use awaken_iam_core::{AuthorizationProfileRepo, RepoError};
+use awaken_iam_core::{AuthorizationProfileRepo, PolicySet, RepoError};
 use sha2::{Digest, Sha256};
 
 use crate::AuthzApi;
@@ -117,6 +117,7 @@ impl AuthorizationProfileAdmin {
     pub fn activate(
         &self,
         authz: &mut AuthzApi,
+        base: &PolicySnapshot,
         namespace: &NamespaceId,
         revision: u64,
         request: ActivateAuthorizationProfile,
@@ -135,7 +136,14 @@ impl AuthorizationProfileAdmin {
             revision,
             request.expected_active_revision,
         )?;
-        let policy_version = authz.activate_profile(profile.clone());
+        let mut profiles = authz.snapshot().active_profiles;
+        profiles.retain(|active| active.namespace != profile.namespace);
+        profiles.push(profile.clone());
+        let policy_version = authz.policy_version().max(base.version) + 1;
+        authz.replace_policy_at_version(
+            PolicySet::from_snapshot_and_profiles(base, &profiles),
+            policy_version,
+        );
         Ok(AuthorizationProfileActivated {
             namespace: namespace.clone(),
             active_revision: revision,
@@ -148,12 +156,14 @@ impl AuthorizationProfileAdmin {
     pub fn rollback(
         &self,
         authz: &mut AuthzApi,
+        base: &PolicySnapshot,
         namespace: &NamespaceId,
         target_revision: u64,
         expected_active_revision: u64,
     ) -> Result<AuthorizationProfileActivated, ProfileAdminError> {
         self.activate(
             authz,
+            base,
             namespace,
             target_revision,
             ActivateAuthorizationProfile {
@@ -188,22 +198,36 @@ impl AuthorizationProfileAdmin {
     pub fn hydrate(
         &self,
         authz: &mut AuthzApi,
+        base: &PolicySnapshot,
         namespace: &NamespaceId,
     ) -> Result<Option<u64>, ProfileAdminError> {
         let Some(profile) = self.repository.active_profile(namespace)? else {
             return Ok(None);
         };
-        authz.activate_profile(profile.clone());
+        let mut profiles = authz.snapshot().active_profiles;
+        profiles.retain(|active| active.namespace != profile.namespace);
+        profiles.push(profile.clone());
+        let policy_version = authz.policy_version().max(base.version) + 1;
+        authz.replace_policy_at_version(
+            PolicySet::from_snapshot_and_profiles(base, &profiles),
+            policy_version,
+        );
         Ok(Some(profile.revision))
     }
 
     /// Restore every namespace's durable active revision at process start.
-    pub fn hydrate_all(&self, authz: &mut AuthzApi) -> Result<usize, ProfileAdminError> {
+    pub fn hydrate_all(
+        &self,
+        authz: &mut AuthzApi,
+        base: &PolicySnapshot,
+    ) -> Result<usize, ProfileAdminError> {
         let profiles = self.repository.active_profiles()?;
         let count = profiles.len();
-        if count > 0 {
-            authz.activate_profiles(profiles);
-        }
+        let policy_version = authz.policy_version().max(base.version) + u64::from(count > 0);
+        authz.replace_policy_at_version(
+            PolicySet::from_snapshot_and_profiles(base, &profiles),
+            policy_version,
+        );
         Ok(count)
     }
 }
@@ -450,6 +474,24 @@ mod tests {
         )
     }
 
+    fn base_policy() -> PolicySnapshot {
+        PolicySnapshot {
+            version: 7,
+            grants: vec![GrantSnapshot {
+                id: "cloud:tenant-admin".into(),
+                subject: GrantSubjectRef::Principal {
+                    principal: PrincipalRef::Service {
+                        service_id: "runtime".into(),
+                    },
+                },
+                action_pattern: "console.tenant.admin.access".into(),
+                scope: ScopeRef::Global,
+                effect: GrantEffect::Allow,
+            }],
+            ..PolicySnapshot::default()
+        }
+    }
+
     #[test]
     fn activate_replace_and_rollback_enforce_scope_kind_before_grants() {
         let repository = Arc::new(crate::InMemoryStore::new());
@@ -464,6 +506,7 @@ mod tests {
         );
         pap.activate(
             &mut authz,
+            &PolicySnapshot::default(),
             &first.namespace,
             first.revision,
             ActivateAuthorizationProfile {
@@ -494,6 +537,7 @@ mod tests {
         );
         pap.activate(
             &mut authz,
+            &PolicySnapshot::default(),
             &second.namespace,
             second.revision,
             ActivateAuthorizationProfile {
@@ -513,12 +557,49 @@ mod tests {
 
         pap.rollback(
             &mut authz,
+            &PolicySnapshot::default(),
             &first.namespace,
             first.revision,
             second.revision,
         )
         .unwrap();
         assert_eq!(pap.active(&first.namespace).unwrap().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn profile_activation_preserves_unrelated_base_policy() {
+        let repository = Arc::new(crate::InMemoryStore::new());
+        let pap = AuthorizationProfileAdmin::new(repository);
+        let mut authz = AuthzApi::new();
+        let base = base_policy();
+        let profile = pap.create_draft(request(ScopeKind::Workspace)).unwrap();
+        pap.validate(&profile.namespace, profile.revision).unwrap();
+
+        pap.activate(
+            &mut authz,
+            &base,
+            &profile.namespace,
+            profile.revision,
+            ActivateAuthorizationProfile {
+                expected_active_revision: None,
+            },
+        )
+        .unwrap();
+
+        let base_decision = authz.authorize(&AuthorizationRequest::direct(
+            PrincipalRef::Service {
+                service_id: "runtime".into(),
+            },
+            ActionKey("console.tenant.admin.access".into()),
+            ScopeRef::Org {
+                org_id: awaken_iam_contract::OrgId("personal:ada".into()),
+            },
+        ));
+        assert_eq!(base_decision.decision, AuthorizationDecision::Allow);
+        let active = authz.snapshot().active_profiles;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].namespace, profile.namespace);
+        assert_eq!(active[0].revision, profile.revision);
     }
 
     #[test]
@@ -536,6 +617,7 @@ mod tests {
             pap.validate(&namespace, profile.revision).unwrap();
             pap.activate(
                 &mut authz,
+                &PolicySnapshot::default(),
                 &namespace,
                 profile.revision,
                 ActivateAuthorizationProfile {
@@ -549,7 +631,11 @@ mod tests {
         );
         let pap = AuthorizationProfileAdmin::new(store);
         let mut authz = AuthzApi::new();
-        assert_eq!(pap.hydrate(&mut authz, &namespace).unwrap(), Some(1));
+        assert_eq!(
+            pap.hydrate(&mut authz, &PolicySnapshot::default(), &namespace)
+                .unwrap(),
+            Some(1)
+        );
         assert_eq!(authz.snapshot().active_profiles[0].revision, 1);
         drop(pap);
         std::fs::remove_dir_all(dir).unwrap();
