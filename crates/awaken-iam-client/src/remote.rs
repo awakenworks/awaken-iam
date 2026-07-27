@@ -106,6 +106,10 @@ pub trait AuthzTransport {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
+    fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+        Err(RemoteError("organization PAP is not supported".into()))
+    }
+
     fn get_org(&self, _org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
     }
@@ -290,6 +294,10 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
 
     pub fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_org(org)
+    }
+
+    pub fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+        self.transport.list_orgs()
     }
 
     pub fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {

@@ -316,6 +316,11 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+        let response = self.send_with_retry(|| self.client.get(self.url("/v1/admin/orgs")))?;
+        Self::decode(response)
+    }
+
     fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
         let path = format!("/v1/admin/orgs/{org_id}");
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
@@ -573,6 +578,7 @@ mod tests {
         let binding_json = r#"[{"principal":{"kind":"account","account_id":"acct_1"},"role_id":"tenant-admin","scope":{"kind":"org","org_id":"acme"}}]"#;
         let server = StubServer::start(vec![
             Reply::Ok(r#"{"version":2}"#.into()),
+            Reply::Ok(r#"[{"id":"acme","owner":{"kind":"account","account_id":"acct_1"},"created_at":"t","updated_at":"t"}]"#.into()),
             Reply::Ok(r#"{"version":3}"#.into()),
             Reply::Ok(r#"{"id":"tenant-admin","display_name":"Tenant administrator","action_patterns":["awaken.cloud::*"],"created_at":"t","updated_at":"t"}"#.into()),
             Reply::Ok(r#"{"version":4}"#.into()),
@@ -592,6 +598,16 @@ mod tests {
                 updated_at: awaken_iam_contract::Timestamp("t".into()),
             })
             .unwrap();
+        assert_eq!(
+            transport.list_orgs().unwrap(),
+            vec![OrgDto {
+                id: awaken_iam_contract::OrgId("acme".into()),
+                display_name: None,
+                owner: principal.clone(),
+                created_at: awaken_iam_contract::Timestamp("t".into()),
+                updated_at: awaken_iam_contract::Timestamp("t".into()),
+            }]
+        );
         transport
             .create_role(&RoleDto {
                 id: "tenant-admin".into(),
@@ -628,11 +644,12 @@ mod tests {
 
         let requests = server.requests();
         assert!(requests[0].starts_with("POST /v1/admin/orgs "));
-        assert!(requests[1].starts_with("POST /v1/admin/roles "));
-        assert!(requests[2].starts_with("GET /v1/admin/roles/tenant-admin "));
-        assert!(requests[3].starts_with("POST /v1/admin/memberships "));
-        assert!(requests[4].starts_with("POST /v1/admin/memberships/query "));
-        assert!(requests[5].starts_with("POST /v1/admin/scope/workspace-orgs "));
+        assert!(requests[1].starts_with("GET /v1/admin/orgs "));
+        assert!(requests[2].starts_with("POST /v1/admin/roles "));
+        assert!(requests[3].starts_with("GET /v1/admin/roles/tenant-admin "));
+        assert!(requests[4].starts_with("POST /v1/admin/memberships "));
+        assert!(requests[5].starts_with("POST /v1/admin/memberships/query "));
+        assert!(requests[6].starts_with("POST /v1/admin/scope/workspace-orgs "));
     }
 
     #[test]
