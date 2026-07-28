@@ -28,12 +28,17 @@
 mod config;
 mod gate;
 mod local;
+mod local_browser;
 mod middleware;
 mod remote;
+mod time;
 
 pub use config::{HostConfig, HostConfigError, HostMode};
 pub use gate::{AuthReject, IamGate, LocalIamState};
 pub use local::{EmbedError, LocalHandle, embed_local};
+pub use local_browser::{
+    LocalBrowserAuth, LocalBrowserAuthError, LocalSetupHandoff, local_browser_router,
+};
 pub use middleware::{
     AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenWorkspace, auth_layer,
 };

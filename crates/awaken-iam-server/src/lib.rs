@@ -13,6 +13,7 @@ mod capability_token;
 mod clock;
 pub mod http;
 mod license;
+mod local_setup;
 mod oauth_client_admin;
 mod op_http;
 mod op_id_token;
@@ -57,6 +58,10 @@ pub use capability_token::{
 pub use license::{
     ENV_LICENSE_FILE, ENV_LICENSE_INLINE, LicenseConfig, LicenseLoadError, LicenseRejection,
     LicenseResolution, LicenseSource, LicenseStatus,
+};
+pub use local_setup::{
+    BeginLocalSetup, ExchangeLocalSetup, IssuedLocalSetup, LocalSetupError, LocalSetupGateway,
+    LocalSetupId,
 };
 pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
 pub use op_http::{SharedAuthApi, op_router};

@@ -107,6 +107,25 @@ an upstream provider credential.
 | exact | external or scheme-relative | any | bootstrap rejects |
 | exact | exact | absent/mismatched | callback rejects before redemption |
 
+## Local product bootstrap
+
+Local consoles reuse the same session bounded context without introducing an
+OAuth provider or exposing an automation credential to browser JavaScript:
+
+```text
+1. CLI starts the local host and prints a five-minute, one-time setup token.
+2. Browser POSTs that token to /v1/auth/local/exchange on the same origin.
+3. IAM consumes the hashed challenge and establishes its canonical Session.
+4. Browser receives an HttpOnly, SameSite=Strict local session cookie.
+5. Product middleware resolves that cookie to an Account principal and evaluates
+   the same product action and scope policy used for bearer credentials.
+6. DELETE /v1/session revokes the session and clears the cookie.
+```
+
+The setup token is a bootstrap handoff, not a reusable API credential. It is
+never persisted by the browser. API tokens remain the credential for CLI and
+automation clients.
+
 ## Provider login subflow
 
 Provider-specific routes are IAM-internal browser routes used after the unified
@@ -192,6 +211,7 @@ paths for one job:
 GET    /v1/oauth/authorize              # unified OP authorization endpoint
 GET    /v1/auth/login/{provider}
 GET    /v1/auth/callback/{provider}
+POST   /v1/auth/local/exchange           # one-time local CLI-to-browser bootstrap
 GET    /v1/session                      # current session
 DELETE /v1/session                      # logout
 POST   /v1/tokens                       # mint API token

@@ -7,7 +7,7 @@
 //!
 //! ## Flow (per request)
 //!
-//! 1. Extract `Authorization: Bearer <token>` from the request headers.
+//! 1. Extract `Authorization: Bearer <token>` or the configured browser cookie.
 //! 2. In `Open` mode: skip all auth and call `next`.
 //! 3. When the header is absent: `401 Unauthorized`.
 //! 4. Authenticate via [`IamGate::authenticate_bearer`]:
@@ -34,45 +34,10 @@ use axum::{
 use tower::{Layer, Service};
 
 use awaken_iam_client::IamClient;
-use awaken_iam_contract::{ActionKey, AuthorizationDecision, ScopeRef, Timestamp};
+use awaken_iam_contract::{ActionKey, AuthorizationDecision, ScopeRef};
 
 use crate::gate::IamGate;
-
-/// Return the current wall-clock instant as `(unix_secs_i64, Timestamp)`.
-///
-/// Both values are derived from a single `SystemTime::now()` call so the API-token
-/// expiry check (RFC 3339 string comparison) and the JWT `exp` check (unix integer)
-/// use a consistent instant.
-fn wall_clock_now() -> (i64, Timestamp) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let ts = Timestamp(format_rfc3339(secs));
-    (secs as i64, ts)
-}
-
-fn format_rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let time = secs % 86_400;
-    let (hour, minute, second) = (time / 3600, (time % 3600) / 60, time % 60);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
-}
+use crate::time::wall_clock_now;
 
 /// Map a route's HTTP method and path to an [`ActionKey`].
 ///
@@ -265,17 +230,29 @@ where
                 return inner.call(req).await;
             }
 
-            let token = match state.actions.extract_credential(req.headers()) {
-                Some(t) => t,
-                None => return Ok(state.actions.render_auth_error(&AuthError::MissingToken)),
-            };
-
             let (now_unix, now) = wall_clock_now();
-            let (principal, token_workspace) =
-                match state.gate.authenticate_scoped(&token, &now, now_unix) {
-                    Some(pair) => pair,
-                    None => return Ok(state.actions.render_auth_error(&AuthError::InvalidToken)),
-                };
+            let authenticated = if let Some(token) = state.actions.extract_credential(req.headers())
+            {
+                state
+                    .gate
+                    .authenticate_scoped(&token, &now, now_unix as i64)
+            } else if let Some(cookie) = req
+                .headers()
+                .get(axum::http::header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+            {
+                state
+                    .gate
+                    .authenticate_session_cookie(cookie, now.clone())
+                    .ok()
+                    .map(|principal| (principal, None))
+            } else {
+                return Ok(state.actions.render_auth_error(&AuthError::MissingToken));
+            };
+            let (principal, token_workspace) = match authenticated {
+                Some(pair) => pair,
+                None => return Ok(state.actions.render_auth_error(&AuthError::InvalidToken)),
+            };
 
             // Stash the resolved identity BEFORE scope derivation so `scope_for`
             // (and downstream handlers) can read it: the principal, and — for API

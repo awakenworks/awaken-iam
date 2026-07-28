@@ -13,8 +13,8 @@ use awaken_iam_contract::{
     AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
     EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
 };
-use awaken_iam_core::{ApiTokenDirectory, IamError};
-use awaken_iam_server::{AuthzApi, verify_access_token};
+use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
+use awaken_iam_server::{AuthzApi, SessionGateway, verify_access_token};
 
 /// Combined authentication + authorization gate.
 ///
@@ -30,6 +30,9 @@ pub struct IamGate {
     pub(crate) audience: Option<String>,
     /// Optional issuer claim to validate on JWT tokens.
     pub(crate) issuer: Option<String>,
+    /// Browser sessions are opt-in and share the same authorization path as
+    /// bearer credentials. Local hosts attach the canonical session gateway.
+    pub(crate) browser_sessions: Option<Arc<Mutex<SessionGateway<OsEntropy>>>>,
 }
 
 /// Why a bearer credential failed to authenticate.
@@ -87,6 +90,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Open),
             audience: None,
             issuer: None,
+            browser_sessions: None,
         }
     }
 
@@ -95,6 +99,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Local { state, jwks }),
             audience: None,
             issuer: None,
+            browser_sessions: None,
         }
     }
 
@@ -121,6 +126,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Remote { client, jwks }),
             audience: None,
             issuer: None,
+            browser_sessions: None,
         }
     }
 
@@ -144,6 +150,32 @@ impl IamGate {
     pub(crate) fn with_issuer_opt(mut self, issuer: Option<String>) -> Self {
         self.issuer = issuer;
         self
+    }
+
+    /// Attach the canonical browser-session authority to this gate.
+    pub fn with_browser_sessions(
+        mut self,
+        sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
+    ) -> Self {
+        self.browser_sessions = Some(sessions);
+        self
+    }
+
+    /// Authenticate an HttpOnly browser session cookie.
+    pub fn authenticate_session_cookie(
+        &self,
+        cookie_header: &str,
+        now: Timestamp,
+    ) -> Result<PrincipalRef, AuthReject> {
+        let sessions = self.browser_sessions.as_ref().ok_or(AuthReject::Invalid)?;
+        let view = sessions
+            .lock()
+            .expect("browser session lock")
+            .current_session_from_cookie(cookie_header, now)
+            .map_err(|_| AuthReject::Invalid)?;
+        Ok(PrincipalRef::Account {
+            account_id: view.account_id,
+        })
     }
 
     /// Authenticate a bearer credential, returning the principal on success.
