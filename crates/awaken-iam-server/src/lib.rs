@@ -24,8 +24,9 @@ mod upstream_http;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
-    AccessTokenRevocations, LocalSeedSigner, Signer, SignerError, decode_unverified_claims,
-    ed25519_public_jwk, verify_access_token, verify_active_access_token, verify_signed_claims,
+    AccessTokenRevocations, AccessTokenSubjectKind, LocalSeedSigner, Signer, SignerError,
+    decode_unverified_claims, ed25519_public_jwk, verify_access_token, verify_active_access_token,
+    verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi, PolicyStore};
 pub use admin_http::{AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router};

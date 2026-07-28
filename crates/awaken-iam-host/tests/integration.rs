@@ -2,15 +2,15 @@ use awaken_iam_client::{AuthzTransport, IamClient, RemoteError, RemoteIamClient}
 use awaken_iam_contract::ApiTokenId;
 use awaken_iam_contract::WorkspaceId;
 use awaken_iam_contract::{
-    ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
     EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot, PrincipalRef,
     ResourceModelRegistered, ResourceModelRegistration, ScopeRef, SignerSetSnapshot, Timestamp,
 };
 use awaken_iam_core::{MintApiToken, RoleId};
 use awaken_iam_host::{
-    AccessTokenAuthority, AccessTokenClaims, HostConfig, IamGate, LocalSeedSigner, RouteActions,
-    auth_layer, embed_local, verify_access_token,
+    AccessTokenAuthority, AccessTokenClaims, AccessTokenSubjectKind, HostConfig, IamGate,
+    LocalSeedSigner, RouteActions, auth_layer, embed_local, verify_access_token,
 };
 use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
 use tower::ServiceExt;
@@ -218,6 +218,7 @@ fn make_claims(exp: i64) -> AccessTokenClaims {
     AccessTokenClaims {
         iss: "https://iam.example.com".into(),
         sub: "acct_test_1".into(),
+        subject_kind: AccessTokenSubjectKind::Account,
         aud: "https://api.example.com".into(),
         exp,
         iat: NOW_UNIX - 60,
@@ -344,6 +345,63 @@ async fn jwt_matching_issuer_and_audience_resolves_principal() {
     );
 }
 
+/// Causal graph:
+///
+/// verified JWT -> explicit subject kind -> exact `PrincipalRef` -> policy key
+///
+/// Decision table:
+///
+/// | wire subject kind | resolved principal |
+/// |---|---|
+/// | absent (legacy) | Account |
+/// | `account` | Account |
+/// | `service` | Service |
+#[tokio::test]
+async fn jwt_subject_kind_preserves_account_compatibility_and_service_identity() {
+    let cfg = HostConfig::local_in_memory()
+        .with_seal_key(JWT_SEED)
+        .with_issuer("https://iam.example.com")
+        .with_audience("https://api.example.com");
+    let handle = embed_local(&cfg).expect("embed_local");
+    let authority = handle.jwt_authority.as_ref().expect("jwt authority");
+    let timestamp = now_ts();
+
+    let account_claims = make_claims(NOW_UNIX + 3600);
+    assert!(
+        serde_json::to_value(&account_claims)
+            .unwrap()
+            .get("subject_kind")
+            .is_none(),
+        "Account remains the backward-compatible omitted wire default"
+    );
+    let account = authority.mint(&account_claims).await.expect("mint account");
+    assert_eq!(
+        handle
+            .gate
+            .authenticate_bearer(&account, &timestamp, NOW_UNIX),
+        Some(PrincipalRef::Account {
+            account_id: AccountId("acct_test_1".into()),
+        })
+    );
+
+    let mut service_claims = make_claims(NOW_UNIX + 3600);
+    service_claims.sub = "svc_ci_publisher".into();
+    service_claims.subject_kind = AccessTokenSubjectKind::Service;
+    assert_eq!(
+        serde_json::to_value(&service_claims).unwrap()["subject_kind"],
+        "service"
+    );
+    let service = authority.mint(&service_claims).await.expect("mint service");
+    assert_eq!(
+        handle
+            .gate
+            .authenticate_bearer(&service, &timestamp, NOW_UNIX),
+        Some(PrincipalRef::Service {
+            service_id: "svc_ci_publisher".into(),
+        })
+    );
+}
+
 // ── axum middleware layer: HTTP request-layer tests ───────────────────────────
 
 /// A no-op `RouteActions` that never maps a method+path to an action.
@@ -446,6 +504,7 @@ async fn middleware_expired_jwt_returns_401_with_real_clock() {
     let claims = AccessTokenClaims {
         iss: "https://iam.example.com".into(),
         sub: "acct_expired".into(),
+        subject_kind: AccessTokenSubjectKind::Account,
         aud: "https://api.example.com".into(),
         exp: 1,
         iat: 0,

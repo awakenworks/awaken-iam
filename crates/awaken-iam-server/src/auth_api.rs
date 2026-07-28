@@ -53,6 +53,17 @@
 
 use std::collections::HashMap;
 
+use crate::access_token::{
+    AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
+    LocalSeedSigner,
+};
+use crate::auth_redirect::build_authorize_redirect;
+use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
+use crate::token_exchange::{
+    BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse, TrustedIssuer, TrustedIssuerRegistry,
+};
+use crate::{SessionCookieConfig, SessionGateway};
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ExternalIdentity, ExternalIdentityClaims,
     ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey,
@@ -70,22 +81,8 @@ use awaken_iam_core::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-use crate::access_token::{
-    AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
-    LocalSeedSigner,
-};
-use crate::auth_redirect::build_authorize_redirect;
-use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
-use crate::token_exchange::{
-    BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
-    TokenExchangeResponse, TrustedIssuer, TrustedIssuerRegistry,
-};
-use crate::{SessionCookieConfig, SessionGateway};
-
 /// Default key id minted for the bootstrap access-token signing key.
 const DEFAULT_SIGNING_KID: &str = "iam-access-key-1";
-
 /// Number of random bytes drawn for each generated id (256 bits).
 const ID_BYTES: usize = 32;
 
@@ -1239,6 +1236,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let claims = AccessTokenClaims {
             iss: request.issuer,
             sub: request.subject,
+            subject_kind: crate::AccessTokenSubjectKind::Account,
             aud: request.audience,
             exp: request.expires_at,
             iat: request.issued_at,
@@ -1290,6 +1288,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let claims = AccessTokenClaims {
             iss: self.iam_issuer.clone(),
             sub: service_id.clone(),
+            subject_kind: crate::AccessTokenSubjectKind::Service,
             aud: audience,
             exp: request.now + request.issued_token_lifetime_secs,
             iat: request.now,
@@ -1782,6 +1781,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let claims = AccessTokenClaims {
             iss: issuer,
             sub: subject,
+            subject_kind: crate::AccessTokenSubjectKind::Account,
             aud: audience,
             exp: expires_at,
             iat: issued_at,

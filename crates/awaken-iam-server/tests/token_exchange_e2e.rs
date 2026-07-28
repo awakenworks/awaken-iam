@@ -116,6 +116,10 @@ async fn exchange_mints_an_iam_token_for_the_bound_service_principal() {
     let claims = verify_access_token(&response.access_token, &api.jwks()).unwrap();
     assert_eq!(claims.iss, IAM_ISSUER);
     assert_eq!(claims.sub, "svc_ci_publisher");
+    assert_eq!(
+        claims.subject_kind,
+        awaken_iam_server::AccessTokenSubjectKind::Service
+    );
     assert_eq!(claims.aud, "packs-service");
     assert_eq!(claims.iat, 1_000);
     assert_eq!(claims.exp, 4_600);

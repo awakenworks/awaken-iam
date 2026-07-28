@@ -139,6 +139,24 @@ impl Signer for LocalSeedSigner {
     }
 }
 
+/// Principal category carried beside the JWT `sub`.
+///
+/// Historical access tokens omitted this claim and therefore remain Account
+/// credentials. Workload/service issuers must opt into `Service` explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessTokenSubjectKind {
+    #[default]
+    Account,
+    Service,
+}
+
+impl AccessTokenSubjectKind {
+    fn is_account(&self) -> bool {
+        *self == Self::Account
+    }
+}
+
 /// Claims carried in an access-token JWT payload (a subset of RFC 7519).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct AccessTokenClaims {
@@ -146,6 +164,9 @@ pub struct AccessTokenClaims {
     pub iss: String,
     /// Subject: the IAM account/principal the token authenticates.
     pub sub: String,
+    /// Principal category for `sub`; absent historical tokens are Accounts.
+    #[serde(default, skip_serializing_if = "AccessTokenSubjectKind::is_account")]
+    pub subject_kind: AccessTokenSubjectKind,
     /// Audience: the service the token is presented to.
     pub aud: String,
     /// Expiration time as a Unix timestamp (seconds).
@@ -594,6 +615,7 @@ mod tests {
         AccessTokenClaims {
             iss: "https://iam.example".into(),
             sub: "acct_1".into(),
+            subject_kind: AccessTokenSubjectKind::Account,
             aud: "packs-service".into(),
             exp: 1_900_000_000,
             iat: 1_899_996_400,

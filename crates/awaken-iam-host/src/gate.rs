@@ -14,7 +14,7 @@ use awaken_iam_contract::{
     EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError};
-use awaken_iam_server::{AuthzApi, verify_access_token};
+use awaken_iam_server::{AccessTokenSubjectKind, AuthzApi, verify_access_token};
 
 /// Combined authentication + authorization gate.
 ///
@@ -255,8 +255,13 @@ impl IamGate {
         {
             return Err(AuthReject::Invalid);
         }
-        Ok(PrincipalRef::Account {
-            account_id: AccountId(claims.sub),
+        Ok(match claims.subject_kind {
+            AccessTokenSubjectKind::Account => PrincipalRef::Account {
+                account_id: AccountId(claims.sub),
+            },
+            AccessTokenSubjectKind::Service => PrincipalRef::Service {
+                service_id: claims.sub,
+            },
         })
     }
 
