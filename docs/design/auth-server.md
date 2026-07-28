@@ -282,6 +282,12 @@ identified by `audience`. The human subject travels inside the request/session;
 the transport principal is the product service. IAM authorizes the subject, not
 the carrier — the same separation the [remote protocol](remote-protocol.md) uses.
 
+IAM access-token claims preserve that distinction explicitly. `sub` is the
+opaque principal identifier and `subject_kind` is its category. Account is the
+omitted backward-compatible default; workload exchange and other service-token
+issuers set `subject_kind: service`. A verifier reconstructs the exact
+`PrincipalRef` and never guesses from an identifier prefix.
+
 ## What this plane does not do
 
 - It does not store connector/third-party credentials or secrets for product

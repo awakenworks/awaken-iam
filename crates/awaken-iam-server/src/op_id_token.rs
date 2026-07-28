@@ -203,6 +203,7 @@ mod tests {
             .mint(&AccessTokenClaims {
                 iss: "https://iam.example".into(),
                 sub: "acct_ada".into(),
+                subject_kind: crate::AccessTokenSubjectKind::Account,
                 aud: "packs-service".into(),
                 exp: 1_900_000_000,
                 iat: 1_899_996_400,

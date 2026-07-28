@@ -14,7 +14,7 @@ use awaken_iam_contract::{
     EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
-use awaken_iam_server::{AuthzApi, SessionGateway, verify_access_token};
+use awaken_iam_server::{AccessTokenSubjectKind, AuthzApi, SessionGateway, verify_access_token};
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
 type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
@@ -300,8 +300,13 @@ impl IamGate {
         {
             return Err(AuthReject::Invalid);
         }
-        Ok(PrincipalRef::Account {
-            account_id: AccountId(claims.sub),
+        Ok(match claims.subject_kind {
+            AccessTokenSubjectKind::Account => PrincipalRef::Account {
+                account_id: AccountId(claims.sub),
+            },
+            AccessTokenSubjectKind::Service => PrincipalRef::Service {
+                service_id: claims.sub,
+            },
         })
     }
 

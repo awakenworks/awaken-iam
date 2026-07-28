@@ -50,5 +50,5 @@ pub use awaken_iam_contract::{ActionKey, JsonWebKey, Jwks, PrincipalRef, ScopeRe
 pub use awaken_iam_server::AuthzApi;
 pub use awaken_iam_server::{
     AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
-    LocalSeedSigner, verify_access_token, verify_active_access_token,
+    AccessTokenSubjectKind, LocalSeedSigner, verify_access_token, verify_active_access_token,
 };

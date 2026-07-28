@@ -357,3 +357,27 @@ review, and operational controls.
 - The simple design is one authorization request algebra, one policy model, and
   three interchangeable adapters. DDD boundaries remain intact because identity
   and policy live in IAM while product data and vocabulary live with each product.
+
+## Amendment — 2026-07-28: JWT subjects retain their principal category
+
+The JWT `sub` value alone is not enough to reconstruct a `PrincipalRef`: an
+Account and a Service may use the same opaque identifier. IAM access tokens
+therefore carry `subject_kind = "service"` for workload/service principals.
+Account remains the omitted wire default so every previously issued token keeps
+its exact Account meaning.
+
+```text
+issuer-selected principal -> sub + subject_kind -> signature
+verified claims           -> exact PrincipalRef -> one PDP key
+```
+
+| Verified token | `subject_kind` | Authentication result |
+| --- | --- | --- |
+| historical Account | absent | `PrincipalRef::Account` |
+| current Account | absent or `account` | `PrincipalRef::Account` |
+| workload exchange | `service` | `PrincipalRef::Service` |
+| unknown kind | any | claim decoding fails closed |
+
+Consumers must bind and authorize the resulting typed principal. They must not
+infer Service identity from a subject prefix or persist a workload as a fake
+Account.
