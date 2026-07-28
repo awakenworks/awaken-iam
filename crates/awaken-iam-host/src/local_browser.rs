@@ -88,6 +88,11 @@ impl LocalBrowserAuth {
     pub fn gate(&self, gate: IamGate) -> IamGate {
         gate.with_browser_sessions(Arc::clone(&self.sessions))
     }
+
+    /// Attach this authority to an already-shared product gate.
+    pub fn attach_to(&self, gate: &IamGate) {
+        gate.attach_browser_sessions(Arc::clone(&self.sessions));
+    }
 }
 
 /// Build the common local-auth routes.

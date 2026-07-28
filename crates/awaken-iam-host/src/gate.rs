@@ -16,6 +16,9 @@ use awaken_iam_contract::{
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
 use awaken_iam_server::{AuthzApi, SessionGateway, verify_access_token};
 
+type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
+type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
+
 /// Combined authentication + authorization gate.
 ///
 /// Cloneable via inner [`Arc`], so it is cheap to pass into axum middleware state
@@ -32,7 +35,7 @@ pub struct IamGate {
     pub(crate) issuer: Option<String>,
     /// Browser sessions are opt-in and share the same authorization path as
     /// bearer credentials. Local hosts attach the canonical session gateway.
-    pub(crate) browser_sessions: Option<Arc<Mutex<SessionGateway<OsEntropy>>>>,
+    pub(crate) browser_sessions: BrowserSessionAttachment,
 }
 
 /// Why a bearer credential failed to authenticate.
@@ -90,7 +93,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Open),
             audience: None,
             issuer: None,
-            browser_sessions: None,
+            browser_sessions: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -99,7 +102,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Local { state, jwks }),
             audience: None,
             issuer: None,
-            browser_sessions: None,
+            browser_sessions: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -126,7 +129,7 @@ impl IamGate {
             inner: Arc::new(GateInner::Remote { client, jwks }),
             audience: None,
             issuer: None,
-            browser_sessions: None,
+            browser_sessions: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -153,12 +156,17 @@ impl IamGate {
     }
 
     /// Attach the canonical browser-session authority to this gate.
-    pub fn with_browser_sessions(
-        mut self,
-        sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
-    ) -> Self {
-        self.browser_sessions = Some(sessions);
+    pub fn with_browser_sessions(self, sessions: Arc<Mutex<SessionGateway<OsEntropy>>>) -> Self {
+        self.attach_browser_sessions(sessions);
         self
+    }
+
+    /// Attach browser sessions after a product has shared the gate.
+    pub fn attach_browser_sessions(&self, sessions: Arc<Mutex<SessionGateway<OsEntropy>>>) {
+        *self
+            .browser_sessions
+            .lock()
+            .expect("browser session attachment lock") = Some(sessions);
     }
 
     /// Authenticate an HttpOnly browser session cookie.
@@ -167,7 +175,12 @@ impl IamGate {
         cookie_header: &str,
         now: Timestamp,
     ) -> Result<PrincipalRef, AuthReject> {
-        let sessions = self.browser_sessions.as_ref().ok_or(AuthReject::Invalid)?;
+        let sessions = self
+            .browser_sessions
+            .lock()
+            .expect("browser session attachment lock")
+            .clone()
+            .ok_or(AuthReject::Invalid)?;
         let view = sessions
             .lock()
             .expect("browser session lock")
