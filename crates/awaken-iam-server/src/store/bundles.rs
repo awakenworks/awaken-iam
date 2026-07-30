@@ -409,6 +409,12 @@ mod tests {
 
     #[test]
     fn every_bundle_has_a_unique_dotted_id_and_at_least_one_migration() {
+        // Dependency-revision compatibility design:
+        // C1 = Foundation still accepts every canonical IAM bundle; C2 = bundle
+        // ids remain unique and non-empty. E1 = the upgraded shared planner can
+        // consume the complete IAM schema without a product-local compatibility
+        // path. This test covers R1(C1 && C2 -> E1); planner rejection or duplicate
+        // identity fails the single rule directly.
         // The lint already enforces this; restated here so the invariant is
         // explicit at the API surface too.
         let all = bundles();
