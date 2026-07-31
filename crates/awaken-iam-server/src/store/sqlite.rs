@@ -19,8 +19,8 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, TransactionBehavior, params_from_iter};
 
 use awaken_scoped_migration::{
-    AppliedMigration, LEDGER_VERSION, MigrationBundle, check_ledger_version, plan,
-    render as render_ddl,
+    AppliedMigration, Dialect as MigrationDialect, LedgerBootstrapAction, LedgerSchema,
+    MigrationBundle, MigrationError, check_ledger_version, plan, render as render_ddl,
 };
 
 use awaken_iam_core::{RepoError, RepoResult};
@@ -102,50 +102,50 @@ fn values(params: &[SqlParam]) -> Vec<Value> {
 }
 
 impl SqliteBackend {
-    /// The per-prefix ledger and its companion version-marker table names.
-    fn ledger_tables(prefix: &str) -> (String, String) {
-        (
-            format!("{prefix}_schema_migrations"),
-            format!("{prefix}_schema_migrations_meta"),
-        )
-    }
-
-    /// Create the ledger and the version-marker table, seeding the marker exactly
-    /// once with [`LEDGER_VERSION`]. Mirrors the foundation SQLite shell so an IAM
-    /// ledger is identical in shape to any other consumer's.
-    fn ensure_ledger(conn: &Connection, prefix: &str) -> RepoResult<()> {
-        let (ledger, meta) = Self::ledger_tables(prefix);
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS {ledger} (\
-             bundle_id TEXT NOT NULL, \
-             version INTEGER NOT NULL, \
-             checksum TEXT NOT NULL, \
-             description TEXT NOT NULL, \
-             applied_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             applied_by TEXT NOT NULL, \
-             PRIMARY KEY (bundle_id, version))"
-        ))
-        .map_err(backend_err)?;
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS {meta} (ledger_version INTEGER NOT NULL)"
-        ))
-        .map_err(backend_err)?;
-        conn.execute(
-            &format!(
-                "INSERT INTO {meta} (ledger_version) \
-                 SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM {meta})"
-            ),
-            params_from_iter([Value::Integer(LEDGER_VERSION)]),
-        )
-        .map_err(backend_err)?;
-        let found: i64 = conn
-            .query_row(
-                &format!("SELECT ledger_version FROM {meta} LIMIT 1"),
-                [],
-                |row| row.get(0),
-            )
+    /// Bootstrap or validate the foundation-owned ledger generation under an
+    /// IMMEDIATE transaction. IAM owns only the rusqlite calls; names, DDL, and
+    /// the fail-closed state decision remain authoritative in foundation.
+    fn ensure_ledger(conn: &mut Connection, prefix: &str) -> RepoResult<()> {
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend_err)?;
-        check_ledger_version(&ledger, found).map_err(migration_err)
+        let exists = |table: &str| {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(backend_err)
+        };
+        let action = schema
+            .bootstrap_action(exists(schema.ledger_table())?, exists(schema.meta_table())?)
+            .map_err(migration_err)?;
+        if action == LedgerBootstrapAction::Create {
+            for statement in schema.create_statements(MigrationDialect::Sqlite) {
+                tx.execute_batch(&statement).map_err(backend_err)?;
+            }
+        }
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT ledger_version FROM {}",
+                schema.meta_table()
+            ))
+            .map_err(backend_err)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(backend_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend_err)?;
+        drop(statement);
+        if rows.len() != 1 {
+            return Err(migration_err(MigrationError::LedgerMetadataRowCount {
+                meta_table: schema.meta_table().to_string(),
+                found: rows.len(),
+            }));
+        }
+        check_ledger_version(schema.ledger_table(), rows[0]).map_err(migration_err)?;
+        tx.commit().map_err(backend_err)
     }
 }
 
@@ -194,9 +194,10 @@ impl MigrationExecutor for SqliteBackend {
         bundles: &[MigrationBundle],
     ) -> RepoResult<Vec<AppliedMigration>> {
         let dialect = Dialect::Sqlite;
-        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+        let ledger = schema.ledger_table();
         let mut conn = self.conn.lock().unwrap();
-        Self::ensure_ledger(&conn, prefix)?;
+        Self::ensure_ledger(&mut conn, prefix)?;
 
         let mut applied = Vec::new();
         for bundle in bundles {
@@ -208,7 +209,7 @@ impl MigrationExecutor for SqliteBackend {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(backend_err)?;
 
-            let recorded = read_applied(&tx, &ledger, bundle.bundle_id())?;
+            let recorded = read_applied(&tx, ledger, bundle.bundle_id())?;
             let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
             for migration in pending {
                 let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
@@ -243,9 +244,9 @@ impl MigrationExecutor for SqliteBackend {
     }
 
     fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
-        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let conn = self.conn.lock().unwrap();
-        read_applied(&conn, &ledger, bundle_id)
+        read_applied(&conn, schema.ledger_table(), bundle_id)
     }
 }
 
@@ -274,4 +275,50 @@ fn read_applied(
         applied.insert(version, checksum);
     }
     Ok(applied)
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn ledger_bootstrap_is_deterministic_and_fail_closed() {
+        // Cause/effect decision table:
+        // R1 neither table exists -> create the foundation v1 schema once;
+        // R2 both exist -> validate, leaving one metadata row;
+        // R3/R4 exactly one exists -> Backend(IncompleteLedger), with no repair.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        SqliteBackend::ensure_ledger(&mut fresh, "iam").unwrap();
+        SqliteBackend::ensure_ledger(&mut fresh, "iam").unwrap();
+        let stamps: i64 = fresh
+            .query_row(
+                "SELECT COUNT(*) FROM iam_schema_migrations_meta",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamps, 1);
+
+        for create in [
+            "CREATE TABLE iam_schema_migrations (\
+             bundle_id TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, \
+             description TEXT NOT NULL, applied_at TEXT NOT NULL, applied_by TEXT NOT NULL, \
+             PRIMARY KEY (bundle_id, version))",
+            "CREATE TABLE iam_schema_migrations_meta (ledger_version INTEGER NOT NULL)",
+        ] {
+            let mut partial = Connection::open_in_memory().unwrap();
+            partial.execute_batch(create).unwrap();
+            let error = SqliteBackend::ensure_ledger(&mut partial, "iam").unwrap_err();
+            assert!(error.to_string().contains("incomplete migration ledger"));
+            let tables: i64 = partial
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                     AND name IN ('iam_schema_migrations', 'iam_schema_migrations_meta')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 1, "partial ledger must not be repaired");
+        }
+    }
 }

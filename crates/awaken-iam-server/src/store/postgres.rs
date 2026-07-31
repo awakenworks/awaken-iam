@@ -18,8 +18,8 @@ use postgres::types::ToSql;
 use postgres::{Client, NoTls};
 
 use awaken_scoped_migration::{
-    AppliedMigration, LEDGER_VERSION, MigrationBundle, check_ledger_version, plan,
-    render as render_ddl,
+    AppliedMigration, Dialect as MigrationDialect, LedgerBootstrapAction, LedgerSchema,
+    MigrationBundle, MigrationError, check_ledger_version, plan, render as render_ddl,
 };
 
 use awaken_iam_core::{RepoError, RepoResult};
@@ -116,50 +116,46 @@ fn refs(params: &[SqlParam]) -> Vec<&(dyn ToSql + Sync)> {
 }
 
 impl PostgresBackend {
-    /// The per-prefix ledger and its companion version-marker table names.
-    fn ledger_tables(prefix: &str) -> (String, String) {
-        (
-            format!("{prefix}_schema_migrations"),
-            format!("{prefix}_schema_migrations_meta"),
-        )
-    }
-
-    /// Create the ledger and the version-marker table, seeding the marker exactly
-    /// once with [`LEDGER_VERSION`]. Mirrors the foundation Postgres shell so an
-    /// IAM ledger is byte-identical to any other consumer's.
+    /// Bootstrap or validate the foundation-owned ledger generation while
+    /// holding the namespace lock. IAM owns only the synchronous driver calls;
+    /// names, DDL, and the state decision remain authoritative in foundation.
     fn ensure_ledger(client: &mut Client, prefix: &str) -> RepoResult<()> {
-        let (ledger, meta) = Self::ledger_tables(prefix);
-        client
-            .batch_execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {ledger} (\
-                 bundle_id TEXT NOT NULL, \
-                 version BIGINT NOT NULL, \
-                 checksum TEXT NOT NULL, \
-                 description TEXT NOT NULL, \
-                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                 applied_by TEXT NOT NULL, \
-                 PRIMARY KEY (bundle_id, version))"
-            ))
-            .map_err(backend_err)?;
-        client
-            .batch_execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {meta} (ledger_version BIGINT NOT NULL)"
-            ))
-            .map_err(backend_err)?;
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO {meta} (ledger_version) \
-                     SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM {meta})"
-                ),
-                &[&LEDGER_VERSION],
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+        let mut tx = client.transaction().map_err(backend_err)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            &[&schema.ledger_table(), &"ledger-bootstrap-v1"],
+        )
+        .map_err(backend_err)?;
+        let presence = tx
+            .query_one(
+                "SELECT to_regclass($1) IS NOT NULL, to_regclass($2) IS NOT NULL",
+                &[&schema.ledger_table(), &schema.meta_table()],
             )
             .map_err(backend_err)?;
-        let found: i64 = client
-            .query_one(&format!("SELECT ledger_version FROM {meta} LIMIT 1"), &[])
-            .map_err(backend_err)?
-            .get(0);
-        check_ledger_version(&ledger, found).map_err(migration_err)
+        let action = schema
+            .bootstrap_action(presence.get(0), presence.get(1))
+            .map_err(migration_err)?;
+        if action == LedgerBootstrapAction::Create {
+            for statement in schema.create_statements(MigrationDialect::Postgres) {
+                tx.batch_execute(&statement).map_err(backend_err)?;
+            }
+        }
+        let rows = tx
+            .query(
+                &format!("SELECT ledger_version FROM {}", schema.meta_table()),
+                &[],
+            )
+            .map_err(backend_err)?;
+        if rows.len() != 1 {
+            return Err(migration_err(MigrationError::LedgerMetadataRowCount {
+                meta_table: schema.meta_table().to_string(),
+                found: rows.len(),
+            }));
+        }
+        let found: i64 = rows[0].get(0);
+        check_ledger_version(schema.ledger_table(), found).map_err(migration_err)?;
+        tx.commit().map_err(backend_err)
     }
 }
 
@@ -206,7 +202,8 @@ impl MigrationExecutor for PostgresBackend {
         bundles: &[MigrationBundle],
     ) -> RepoResult<Vec<AppliedMigration>> {
         let dialect = Dialect::Postgres;
-        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+        let ledger = schema.ledger_table();
         let mut client = self.client.lock().unwrap();
         Self::ensure_ledger(&mut client, prefix)?;
 
@@ -224,7 +221,7 @@ impl MigrationExecutor for PostgresBackend {
             )
             .map_err(backend_err)?;
 
-            let recorded = read_applied(&mut tx, &ledger, bundle.bundle_id())?;
+            let recorded = read_applied(&mut tx, ledger, bundle.bundle_id())?;
             let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
             for migration in pending {
                 let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
@@ -259,7 +256,8 @@ impl MigrationExecutor for PostgresBackend {
     }
 
     fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
-        let (ledger, _meta) = Self::ledger_tables(prefix);
+        let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+        let ledger = schema.ledger_table();
         let mut client = self.client.lock().unwrap();
         let rows = client
             .query(

@@ -4,7 +4,9 @@
 //! per subdomain scope. The bundle/checksum/plan **mechanism** is the shared
 //! [`awaken-scoped-migration`](awaken_scoped_migration) foundation crate; this
 //! module is the thin per-backend glue that drives the crate's pure core against
-//! IAM's own database drivers. The bundles themselves — IAM's schema DDL — live
+//! IAM's own database drivers. Ledger names, deterministic bootstrap SQL, and
+//! bootstrap state decisions also come from foundation's `LedgerSchema`; IAM
+//! does not maintain a parallel ledger definition. The bundles themselves — IAM's schema DDL — live
 //! in [`super::bundles`], kept separate so the portable migration best-practice
 //! hook discovers and checks them.
 //!
@@ -41,7 +43,7 @@ use awaken_iam_core::{RepoError, RepoResult};
 pub use awaken_scoped_migration::{
     AppliedMigration, Dialect, Migration, MigrationBundle, MigrationError,
 };
-use awaken_scoped_migration::{plan as plan_bundle, render, sql_identifier};
+use awaken_scoped_migration::{LedgerSchema, plan as plan_bundle, render};
 
 use super::bundles::bundles;
 
@@ -123,6 +125,7 @@ pub trait MigrationExecutor {
 #[derive(Debug, Clone)]
 pub struct IamStore<Pool> {
     prefix: String,
+    ledger: LedgerSchema,
     pool: Pool,
 }
 
@@ -133,8 +136,13 @@ impl<Pool> IamStore<Pool> {
     /// (leading ASCII letter, then `[A-Za-z0-9_]`); it is concatenated into table
     /// names, so anything else is rejected to keep the rendered DDL injection-free.
     pub fn with_prefix(pool: Pool, prefix: impl Into<String>) -> RepoResult<Self> {
-        let prefix = sql_identifier(&prefix.into()).map_err(migration_err)?;
-        Ok(Self { prefix, pool })
+        let prefix = prefix.into();
+        let ledger = LedgerSchema::with_prefix(&prefix).map_err(migration_err)?;
+        Ok(Self {
+            prefix,
+            ledger,
+            pool,
+        })
     }
 
     /// The configured table prefix.
@@ -157,7 +165,7 @@ impl<Pool> IamStore<Pool> {
     /// Each component keeps its own ledger so siblings sharing a database never
     /// contend on a single migration table.
     pub fn ledger_table(&self) -> String {
-        format!("{}_schema_migrations", self.prefix)
+        self.ledger.ledger_table().to_string()
     }
 }
 
@@ -281,9 +289,8 @@ impl MigrationExecutor for RecordingExecutor {
         bundles: &[MigrationBundle],
     ) -> RepoResult<Vec<AppliedMigration>> {
         if !self.ledger_created {
-            self.executed.push(format!(
-                "CREATE TABLE IF NOT EXISTS {prefix}_schema_migrations (...)"
-            ));
+            let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
+            self.executed.extend(schema.create_statements(self.dialect));
             self.ledger_created = true;
         }
         let dialect = self.dialect;
@@ -432,14 +439,15 @@ mod tests {
         assert_eq!(second.applied, 0);
         assert_eq!(second.skipped, store.plan().len());
 
-        // The ledger DDL ran exactly once.
+        // Cause/effect rule: first migrate emits the canonical ledger, meta, and
+        // generation stamp exactly once; a second migrate emits none of them.
         let ledger_runs = store
             .pool()
             .executed
             .iter()
             .filter(|s| s.contains("schema_migrations"))
             .count();
-        assert_eq!(ledger_runs, 1);
+        assert_eq!(ledger_runs, 3);
     }
 
     #[test]

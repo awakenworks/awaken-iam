@@ -69,6 +69,13 @@ IamStore::with_prefix(pool, "iam")
 pool or a SQLite connection — so the prefix and ledger discipline below is
 backend-independent.
 
+Ledger structure is not IAM-local. `awaken-scoped-migration::LedgerSchema` owns
+the two table names, unconditional bootstrap SQL, generation stamp, and the
+presence decision. Each driver acquires a namespace lock, probes both tables,
+creates both only when both are absent, validates when both are present, and
+fails on partial state. IAM therefore has no conditional DDL or second ledger
+definition.
+
 - **embedded** — uses the host's pool (a shared Postgres pool, or a SQLite
   connection for a single-process host); the distinct `iam` prefix and IAM's own
   `iam_schema_migrations` ledger isolate it inside the shared database, next to
@@ -132,7 +139,8 @@ The backend adapters (Postgres and SQLite) and the `awaken-scoped-migration`
 dependency live in the server layer (`awaken-iam-server`, or a small
 `awaken-iam-store` module it owns). Each backend is a thin edge adapter over the
 shared repository ports and a `MigrationExecutor`; they differ only in the
-connection handle, the DDL-token rendering, and the single-applier guard (see
+connection handle and lock/execution calls. Bundle planning, token rendering,
+ledger naming, bootstrap DDL, and bootstrap decisions come from foundation (see
 [ADR-0003](../adr/0003-storage-backends.md)). `contract`, `core`, and `client`
 stay storage-free, preserving the [guardrails](../../AGENTS.md): the core
 declares ports; only the edge knows SQL. An in-memory adapter backs tests and the
