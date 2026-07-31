@@ -162,22 +162,34 @@ async fn browser_callback() -> Html<&'static str> {
     Html(
         r#"<!doctype html><meta charset="utf-8"><title>Completing sign-in</title>
 <main><h1>Completing sign-in</h1><p id="status">Verifying secure sign-in…</p></main>
-<script>
+<script type="module">
 const status=document.querySelector('#status');
 const fail=message=>{status.textContent=message;throw new Error(message)};
-const params=new URLSearchParams(location.search);
-const pendingRaw=sessionStorage.getItem('awaken.oauth.pending');
-if(!pendingRaw)fail('Sign-in session expired. Return to Awaken Cloud and try again.');
-const pending=JSON.parse(pendingRaw);
-if(!params.get('code')||params.get('state')!==pending.state)fail('Sign-in validation failed. Return to Awaken Cloud and try again.');
-const form=new URLSearchParams({grant_type:'authorization_code',client_id:pending.clientId,code:params.get('code'),redirect_uri:pending.redirectUri,code_verifier:pending.verifier});
-const response=await fetch('/v1/oauth/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:form});
-if(!response.ok)fail('Awaken could not complete sign-in. Return to Awaken Cloud and try again.');
-const grant=await response.json();
-if(typeof grant.access_token!=='string'||!grant.access_token)fail('Awaken returned an invalid sign-in result.');
-sessionStorage.setItem('awaken.product.session-bearer',grant.access_token);
-sessionStorage.removeItem('awaken.oauth.pending');
-location.replace(pending.returnTo);
+try {
+  const params=new URLSearchParams(location.search);
+  const pendingRaw=sessionStorage.getItem('awaken.oauth.pending');
+  if(!pendingRaw)fail('Sign-in session expired. Return to Awaken Cloud and try again.');
+  const pending=JSON.parse(pendingRaw);
+  if(!params.get('code')||params.get('state')!==pending.state)fail('Sign-in validation failed. Return to Awaken Cloud and try again.');
+  const form=new URLSearchParams({grant_type:'authorization_code',client_id:pending.clientId,code:params.get('code'),redirect_uri:pending.redirectUri,code_verifier:pending.verifier});
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  let response;
+  try {
+    response=await fetch('/v1/oauth/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:form,signal:controller.signal});
+  } finally {
+    clearTimeout(timeout);
+  }
+  if(!response.ok)fail('Awaken could not complete sign-in. Return to Awaken Cloud and try again.');
+  const grant=await response.json();
+  if(typeof grant.access_token!=='string'||!grant.access_token)fail('Awaken returned an invalid sign-in result.');
+  sessionStorage.setItem('awaken.product.session-bearer',grant.access_token);
+  sessionStorage.removeItem('awaken.oauth.pending');
+  location.replace(pending.returnTo);
+} catch (error) {
+  console.error('Unable to complete secure sign-in',error);
+  if(status.textContent==='Verifying secure sign-in…')status.textContent='Sign-in did not complete. Return to Awaken Cloud and try again.';
+}
 </script>"#,
     )
 }
@@ -519,6 +531,15 @@ mod tests {
         }
     }
 
+    /// Callback cause/effect decision table:
+    ///
+    /// | pending state | callback state/code | token exchange | effect |
+    /// | valid | matching | valid grant | store one session bearer and return |
+    /// | absent | any | not attempted | visible expired-session failure |
+    /// | valid | missing/mismatched | not attempted | visible validation failure |
+    /// | valid | matching | error/invalid/timeout | visible terminal failure within 15s |
+    /// The executable module is required for the awaited exchange; a classic
+    /// script would fail at parse time and leave the loading copy forever.
     #[tokio::test]
     async fn browser_callback_uses_one_standard_session_bearer_and_state_check() {
         let (app, _) = logged_in_router().await;
@@ -536,7 +557,11 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<script type=\"module\">"));
         assert!(html.contains("params.get('state')!==pending.state"));
+        assert!(html.contains("new AbortController()"));
+        assert!(html.contains("15000"));
+        assert!(html.contains("Sign-in did not complete"));
         assert!(html.contains("awaken.product.session-bearer"));
         assert!(!html.contains("localStorage"));
     }
