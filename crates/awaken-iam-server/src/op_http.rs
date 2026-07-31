@@ -133,17 +133,23 @@ async fn browser_start(
     Html(format!(
         r#"<!doctype html><meta charset="utf-8"><title>Connecting to Awaken</title>
 <main><h1>Connecting to Awaken</h1><p id="status">Preparing secure sign-in…</p></main>
-<script>
+<script type="module">
+const status=document.querySelector('#status');
 const config={config};
-const bytes=n=>crypto.getRandomValues(new Uint8Array(n));
-const b64=b=>btoa(String.fromCharCode(...b)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
-const verifier=b64(bytes(48));
-const state=b64(bytes(32));
-const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier));
-sessionStorage.setItem('awaken.oauth.pending',JSON.stringify({{...config,verifier,state}}));
-const authorize=new URL('/v1/oauth/authorize',config.issuer);
-authorize.search=new URLSearchParams({{client_id:config.clientId,redirect_uri:config.redirectUri,response_type:'code',scope:'openid email profile',state,code_challenge:b64(new Uint8Array(digest)),code_challenge_method:'S256'}});
-location.replace(authorize);
+try {{
+  const bytes=n=>crypto.getRandomValues(new Uint8Array(n));
+  const b64=b=>btoa(String.fromCharCode(...b)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
+  const verifier=b64(bytes(48));
+  const state=b64(bytes(32));
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier));
+  sessionStorage.setItem('awaken.oauth.pending',JSON.stringify({{...config,verifier,state}}));
+  const authorize=new URL('/v1/oauth/authorize',config.issuer);
+  authorize.search=new URLSearchParams({{client_id:config.clientId,redirect_uri:config.redirectUri,response_type:'code',scope:'openid email profile',state,code_challenge:b64(new Uint8Array(digest)),code_challenge_method:'S256'}});
+  location.replace(authorize);
+}} catch (error) {{
+  console.error('Unable to prepare secure sign-in',error);
+  status.textContent='Unable to start secure sign-in. Reload this page to try again.';
+}}
 </script>"#
     ))
     .into_response()
@@ -472,8 +478,9 @@ mod tests {
     ///
     /// | client/redirect | return path | result |
     /// |---|---|---|
-    /// | non-empty + HTTPS | same-origin absolute path | one PKCE bootstrap page |
-    /// | any | external/scheme-relative path | reject before browser redirect |
+    /// | valid coordinates | WebCrypto succeeds | executable module stores PKCE state and redirects |
+    /// | valid coordinates | WebCrypto/storage fails | visible retryable terminal error; no infinite loading state |
+    /// | any | external/scheme-relative return path | reject before browser redirect |
     /// | markup/control input | any | reject; never reflect executable input |
     #[tokio::test]
     async fn browser_bootstrap_accepts_only_bounded_product_coordinates() {
@@ -493,9 +500,11 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<script type=\"module\">"));
         assert!(html.contains("crypto.subtle.digest"));
         assert!(html.contains("awaken.oauth.pending"));
         assert!(html.contains("https://flow.example/v1/oauth/browser/callback"));
+        assert!(html.contains("Unable to start secure sign-in"));
 
         for uri in [
             "/v1/oauth/browser/start?client_id=awaken-flow&redirect_uri=https%3A%2F%2Fflow.example%2Fcallback&return_to=https%3A%2F%2Fevil.example",
