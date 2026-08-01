@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_client::{HttpAuthzTransport, IamClient, RemoteIamClient};
 use awaken_iam_contract::{
     AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
-    EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest, WorkspaceId,
+    EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest,
+    TokenIntrospectionResponse, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
 use awaken_iam_server::{AccessTokenSubjectKind, AuthzApi, SessionGateway, verify_access_token};
@@ -268,7 +269,7 @@ impl IamGate {
                     client
                         .introspect_token(&req)
                         .ok()
-                        .map(|r| (r.principal, None))
+                        .map(introspected_identity)
                         .ok_or(AuthReject::Invalid)
                 } else if let Some(jwks) = jwks {
                     self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
@@ -313,6 +314,38 @@ impl IamGate {
     /// Returns `true` when the gate is in open (no-auth) mode.
     pub fn is_open(&self) -> bool {
         matches!(self.inner.as_ref(), GateInner::Open)
+    }
+}
+
+fn introspected_identity(
+    response: TokenIntrospectionResponse,
+) -> (PrincipalRef, Option<WorkspaceId>) {
+    (response.principal, Some(response.workspace))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awaken_iam_contract::ApiTokenStatus;
+
+    #[test]
+    fn remote_api_token_preserves_its_authoritative_workspace() {
+        // Cause/effect graph: C1=IAM introspection succeeded; C2=response has
+        // principal and mandatory workspace. Effect E1=the product receives
+        // both coordinates. Decision rule R1(C1∧C2)->E1. Dropping workspace
+        // would silently widen a one-workspace credential into an unscoped one.
+        let principal = PrincipalRef::ApiToken {
+            token_id: "token-a".into(),
+        };
+        let workspace = WorkspaceId("workspace-a".into());
+        assert_eq!(
+            introspected_identity(TokenIntrospectionResponse {
+                principal: principal.clone(),
+                workspace: workspace.clone(),
+                status: ApiTokenStatus::Active,
+            }),
+            (principal, Some(workspace))
+        );
     }
 }
 
