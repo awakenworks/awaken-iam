@@ -31,7 +31,43 @@ use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore};
 /// backend. Cheap to [`Clone`]: clones share one client.
 #[derive(Clone)]
 pub struct PostgresBackend {
-    client: Arc<Mutex<Client>>,
+    client: Arc<PlainThreadOwner<Mutex<Client>>>,
+}
+
+/// Own a value whose destructor may start its own async runtime.
+///
+/// The synchronous `postgres` client does exactly that. Its final `Arc` may be
+/// released while an async host is unwinding, so the owner moves destruction
+/// to a plain OS thread. This is the one lifecycle boundary for every
+/// `PostgresBackend` clone; callers do not need a second wrapper.
+struct PlainThreadOwner<T: Send + 'static> {
+    value: Option<T>,
+}
+
+impl<T: Send + 'static> PlainThreadOwner<T> {
+    fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+
+    fn get(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("Postgres owner remains live until final drop")
+    }
+}
+
+impl<T: Send + 'static> Drop for PlainThreadOwner<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        std::thread::Builder::new()
+            .name("awaken-iam-postgres-drop".to_owned())
+            .spawn(move || drop(value))
+            .expect("spawn PostgreSQL destructor thread")
+            .join()
+            .expect("PostgreSQL destructor thread panicked");
+    }
 }
 
 impl std::fmt::Debug for PostgresBackend {
@@ -44,8 +80,15 @@ impl PostgresBackend {
     /// Wrap an already-connected client.
     pub fn new(client: Client) -> Self {
         Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(PlainThreadOwner::new(Mutex::new(client))),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Client> {
+        self.client
+            .get()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Connect to Postgres using a libpq-style connection string or URL.
@@ -165,14 +208,14 @@ impl SqlConn for PostgresBackend {
     }
 
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64> {
-        let mut client = self.client.lock().unwrap();
+        let mut client = self.lock();
         client
             .execute(&render(sql), &refs(params))
             .map_err(backend_err)
     }
 
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>> {
-        let mut client = self.client.lock().unwrap();
+        let mut client = self.lock();
         let rows = client
             .query(&render(sql), &refs(params))
             .map_err(backend_err)?;
@@ -204,7 +247,7 @@ impl MigrationExecutor for PostgresBackend {
         let dialect = Dialect::Postgres;
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
-        let mut client = self.client.lock().unwrap();
+        let mut client = self.lock();
         Self::ensure_ledger(&mut client, prefix)?;
 
         let mut applied = Vec::new();
@@ -258,7 +301,7 @@ impl MigrationExecutor for PostgresBackend {
     fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
-        let mut client = self.client.lock().unwrap();
+        let mut client = self.lock();
         let rows = client
             .query(
                 &format!(
@@ -305,7 +348,37 @@ fn read_applied(
 
 #[cfg(test)]
 mod tests {
-    use super::render as render_placeholders;
+    use super::{PlainThreadOwner, render as render_placeholders};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_owning_client_is_destroyed_outside_async_host() {
+        // Cause-effect graph: C1=the final shared backend owner is released,
+        // C2=the caller is inside an entered Tokio runtime, C3=the owned
+        // synchronous client starts its private runtime during Drop. Effects:
+        // E1=Drop runs on a distinct plain thread; E2=no nested-runtime panic.
+        // Decision rule R1(C1+C2+C3)->E1+E2. Non-final Arc releases and a
+        // non-runtime caller cannot create the failure and need no extra path.
+        struct RuntimeOwningValue(std::sync::mpsc::Sender<std::thread::ThreadId>);
+
+        impl Drop for RuntimeOwningValue {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("private client runtime")
+                    .block_on(async {});
+            }
+        }
+
+        let caller = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = std::sync::Arc::new(PlainThreadOwner::new(RuntimeOwningValue(sender)));
+        let clone = std::sync::Arc::clone(&owner);
+        drop(owner);
+        drop(clone);
+
+        assert_ne!(receiver.recv().expect("destructor thread id"), caller);
+    }
 
     #[test]
     fn render_numbers_plain_and_json_placeholders_in_order() {
