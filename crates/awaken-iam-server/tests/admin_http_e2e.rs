@@ -86,6 +86,88 @@ async fn body_json(response: Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("decode json")
 }
 
+#[tokio::test]
+async fn invitation_http_flow_closes_into_queryable_membership() {
+    // Causes/effects over the real router: R1 authenticated create with valid
+    // Org/role intent -> Pending plus one-time token; R2 matching account email
+    // and token -> Accepted plus version fence; R3 scope query after R2 -> exact
+    // materialized membership. This proves transport DTOs do not form a path
+    // parallel to the PAP/store behavior covered by unit tests.
+    let app = daemon();
+    assert_eq!(
+        app.clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("acme")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+    );
+    let role = serde_json::json!({
+        "id": "member",
+        "action_patterns": ["workspace.read"],
+        "created_at": "2026-08-02T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z"
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(authed_json("POST", "/v1/admin/roles", role))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+    );
+    let created = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/invitations",
+            serde_json::json!({
+                "idempotency_key":"http-flow",
+                "org_id":"acme",
+                "email":"member@example.com",
+                "bindings":[{"role_id":"member","scope":{"kind":"org","org_id":"acme"}}],
+                "invited_by":{"kind":"account","account_id":"ada"},
+                "expires_at":"2099-01-01T00:00:00Z"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let issued = body_json(created).await;
+    let invitation_id = issued["invitation"]["id"].as_str().unwrap();
+    let accepted = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/v1/admin/invitations/{invitation_id}/accept"),
+            serde_json::json!({
+                "account_id":"member",
+                "verified_email":"member@example.com",
+                "token":issued["token"]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(accepted).await["invitation"]["status"],
+        "accepted"
+    );
+
+    let memberships = app
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/memberships/query-scope",
+            serde_json::json!({"scope":{"kind":"org","org_id":"acme"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(memberships.status(), StatusCode::OK);
+    let memberships = body_json(memberships).await;
+    assert_eq!(memberships.as_array().unwrap().len(), 1);
+    assert_eq!(memberships[0]["principal"]["account_id"], "member");
+}
+
 fn profile_body(scope_kind: &str) -> serde_json::Value {
     let scope = if scope_kind == "resource" {
         serde_json::json!({"kind":"resource","resource_type":"memory"})

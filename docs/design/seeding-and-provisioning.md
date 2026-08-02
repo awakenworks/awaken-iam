@@ -150,6 +150,22 @@ from a **pre-declared source**:
 In every case the assignment (1) goes through the single write pipeline, (2)
 carries an auditable `GrantSource`, and (3) fails closed if it does not commit.
 
+The concrete invitation lifecycle is:
+
+```text
+create (idempotency key + Org + exact bindings)
+  -> Pending + hashed claim token + audit/version
+  -> Cloud delivers the one-time clear token
+OAuth/UserInfo account + verified email + token
+  -> atomically Accepted + all declared RoleBindings
+  -> audit/version -> PDP refresh
+```
+
+Resend rotates the token and invalidates every older link. Revocation and expiry
+are terminal. A wrong token, wrong verified email, wrong Org/Workspace edge, or
+non-pending state creates no binding. Delivery state and billing-seat
+reservations remain Cloud concerns; neither is copied into IAM membership.
+
 ## Tenant membership decision table
 
 The organization directory, role bindings, policy snapshot, and PDP are one

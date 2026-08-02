@@ -21,8 +21,8 @@ use awaken_iam_contract::{
 };
 
 use crate::{
-    Grant, GrantId, Group, GroupId, Organization, Plan, PlanId, RegisteredClient, ResourceEdge,
-    RoleBinding, RoleDef, RoleId,
+    Grant, GrantId, Group, GroupId, Invitation, Organization, Plan, PlanId, RegisteredClient,
+    ResourceEdge, RoleBinding, RoleDef, RoleId,
 };
 
 /// Error surface shared by every repository port.
@@ -210,6 +210,37 @@ pub trait RoleBindingRepo: Send + Sync {
     fn list(&self) -> RepoResult<Vec<RoleBinding>>;
     /// Remove an exact binding, failing closed when it is absent.
     fn remove(&self, binding: &RoleBinding) -> RepoResult<()>;
+}
+
+/// Persistence and atomic materialization for organization invitations.
+/// Accepting changes the invitation and creates every declared role binding in
+/// one repository transaction so a user is never half-added.
+pub trait InvitationRepo: Send + Sync {
+    fn create_invitation(&self, invitation: Invitation) -> RepoResult<()>;
+    fn get_invitation(
+        &self,
+        id: &awaken_iam_contract::InvitationId,
+    ) -> RepoResult<Option<Invitation>>;
+    fn get_invitation_by_idempotency(
+        &self,
+        org_id: &OrgId,
+        idempotency_key: &str,
+    ) -> RepoResult<Option<Invitation>>;
+    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepoResult<Vec<Invitation>>;
+    /// Replace a pending invitation iff its current token hash matches.
+    fn replace_pending_invitation(
+        &self,
+        invitation: Invitation,
+        expected_token_hash: &str,
+    ) -> RepoResult<bool>;
+    /// Atomically accept and materialize bindings iff pending and token matches.
+    fn accept_pending_invitation(
+        &self,
+        id: &awaken_iam_contract::InvitationId,
+        expected_token_hash: &str,
+        account_id: &AccountId,
+        at: &Timestamp,
+    ) -> RepoResult<Option<Invitation>>;
 }
 
 /// Persistence for the product resource-model registry (parent edges).

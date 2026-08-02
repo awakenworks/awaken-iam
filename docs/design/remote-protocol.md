@@ -123,6 +123,25 @@ above).
 
 ## Failure semantics
 
+### Policy administration: invitations and member queries
+
+The guarded PAP adds the following product-neutral operations. They use the
+same admin credential and version fence as organization and membership writes.
+
+| Method | Path | Result |
+|---|---|---|
+| `POST` | `/v1/admin/memberships/query-scope` | exact RoleBindings anchored at one scope |
+| `POST` | `/v1/admin/invitations` | pending invitation + one-time clear token |
+| `POST` | `/v1/admin/invitations/query` | invitations for one Org |
+| `DELETE` | `/v1/admin/invitations/{id}` | revoke pending invitation |
+| `POST` | `/v1/admin/invitations/{id}/resend` | rotated one-time token |
+| `POST` | `/v1/admin/invitations/{id}/accept` | accepted invitation + visible policy version |
+
+The clear token is never persisted. Accept requires an IAM account id and a
+verified email assertion obtained from IAM UserInfo by the trusted relying
+party; the PAP compares that routing claim to the invitation and atomically
+materializes every declared RoleBinding.
+
 ```text
 transport error / timeout (remote)  -> Deny(reason = iam_unavailable)
 unresolved principal                -> Deny(reason = principal_unresolved)

@@ -27,6 +27,8 @@ serde_json.workspace = true
 async-trait = "0.1"
 base64 = "0.22"
 sha2 = "0.10"
+getrandom = "0.3"
+time.workspace = true
 ed25519-dalek = "2"
 # A *range*, deliberately not a hard `^0.x` pin: rusqlite pulls the native
 # `links = "sqlite3"` crate libsqlite3-sys, of which a graph may contain exactly

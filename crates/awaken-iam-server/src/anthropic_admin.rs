@@ -46,14 +46,10 @@ use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationRequest, OrgId, PrincipalRef, ScopeRef, Timestamp,
     WorkspaceId,
 };
-use awaken_iam_core::{
-    AuditSink, GrantRepo, GroupRepo, OrgRepo, ResourceModelRepo, RoleBinding, RoleBindingRepo,
-    RoleId, RoleRepo,
-};
+use awaken_iam_core::{RoleBinding, RoleId};
 use serde::{Deserialize, Serialize};
 
-use crate::FenceStore;
-use crate::admin_api::{AdminError, PolicyAdminApi};
+use crate::admin_api::{AdminError, PolicyAdminApi, PolicyStore};
 use crate::token_exchange::{TrustedIssuer, WorkloadBinding};
 
 /// Id prefix for a workspace resource, matching the Anthropic `wrkspc_` shape.
@@ -541,14 +537,7 @@ pub struct AnthropicAdminApi<'a, S> {
 
 impl<'a, S> AnthropicAdminApi<'a, S>
 where
-    S: OrgRepo
-        + GroupRepo
-        + RoleRepo
-        + GrantRepo
-        + RoleBindingRepo
-        + ResourceModelRepo
-        + AuditSink
-        + FenceStore,
+    S: PolicyStore,
 {
     /// Bind the surface to `pap`, administering organization `org`.
     pub fn new(pap: &'a mut PolicyAdminApi<S>, org: OrgId) -> Self {

@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    ExternalIdentity, ExternalIdentityKey, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId,
-    PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, Session, SessionId,
+    Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
-    ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, LoginFlowRepo,
-    OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, RegisteredClient, RepoError,
-    RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
-    RoleRepo, SessionRepo,
+    ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
+    InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo,
+    RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
+    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -49,6 +50,7 @@ struct Authz {
     roles: BTreeMap<String, RoleDef>,
     grants: BTreeMap<String, Grant>,
     role_bindings: BTreeMap<String, RoleBinding>,
+    invitations: BTreeMap<String, Invitation>,
     resource_edges: BTreeMap<String, ResourceEdge>,
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
@@ -531,6 +533,118 @@ impl RoleBindingRepo for InMemoryStore {
             .remove(&key)
             .map(|_| ())
             .ok_or_else(|| RepoError::NotFound("role binding not found".to_owned()))
+    }
+}
+
+impl InvitationRepo for InMemoryStore {
+    fn create_invitation(&self, invitation: Invitation) -> RepoResult<()> {
+        let mut guard = self.authz.lock().unwrap();
+        if guard.invitations.contains_key(&invitation.id.0)
+            || guard.invitations.values().any(|existing| {
+                existing.org_id == invitation.org_id
+                    && existing.idempotency_key == invitation.idempotency_key
+            })
+        {
+            return Err(RepoError::Conflict("invitation already exists".into()));
+        }
+        guard
+            .invitations
+            .insert(invitation.id.0.clone(), invitation);
+        Ok(())
+    }
+
+    fn get_invitation(&self, id: &InvitationId) -> RepoResult<Option<Invitation>> {
+        Ok(self.authz.lock().unwrap().invitations.get(&id.0).cloned())
+    }
+
+    fn get_invitation_by_idempotency(
+        &self,
+        org_id: &OrgId,
+        idempotency_key: &str,
+    ) -> RepoResult<Option<Invitation>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .invitations
+            .values()
+            .find(|invite| &invite.org_id == org_id && invite.idempotency_key == idempotency_key)
+            .cloned())
+    }
+
+    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepoResult<Vec<Invitation>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .invitations
+            .values()
+            .filter(|invite| &invite.org_id == org_id)
+            .cloned()
+            .collect())
+    }
+
+    fn replace_pending_invitation(
+        &self,
+        invitation: Invitation,
+        expected_token_hash: &str,
+    ) -> RepoResult<bool> {
+        let mut guard = self.authz.lock().unwrap();
+        let Some(current) = guard.invitations.get(&invitation.id.0) else {
+            return Err(RepoError::NotFound("invitation not found".into()));
+        };
+        if current.status != InvitationStatus::Pending || current.token_hash != expected_token_hash
+        {
+            return Ok(false);
+        }
+        guard
+            .invitations
+            .insert(invitation.id.0.clone(), invitation);
+        Ok(true)
+    }
+
+    fn accept_pending_invitation(
+        &self,
+        id: &InvitationId,
+        expected_token_hash: &str,
+        account_id: &AccountId,
+        at: &Timestamp,
+    ) -> RepoResult<Option<Invitation>> {
+        let mut guard = self.authz.lock().unwrap();
+        let Some(current) = guard.invitations.get(&id.0).cloned() else {
+            return Err(RepoError::NotFound("invitation not found".into()));
+        };
+        if current.status == InvitationStatus::Accepted
+            && current.accepted_by_account_id.as_ref() == Some(account_id)
+            && current.token_hash == expected_token_hash
+        {
+            return Ok(Some(current));
+        }
+        if current.status != InvitationStatus::Pending || current.token_hash != expected_token_hash
+        {
+            return Ok(None);
+        }
+        let principal = PrincipalRef::Account {
+            account_id: account_id.clone(),
+        };
+        for target in &current.bindings {
+            let binding = RoleBinding {
+                principal: principal.clone(),
+                role: RoleId(target.role_id.clone()),
+                scope: target.scope.clone(),
+            };
+            let key = json_key(
+                &(&binding.principal, &binding.role.0, &binding.scope),
+                "role binding",
+            )?;
+            guard.role_bindings.insert(key, binding);
+        }
+        let mut accepted = current;
+        accepted.status = InvitationStatus::Accepted;
+        accepted.accepted_by_account_id = Some(account_id.clone());
+        accepted.updated_at = at.clone();
+        guard.invitations.insert(id.0.clone(), accepted.clone());
+        Ok(Some(accepted))
     }
 }
 

@@ -20,7 +20,11 @@ pub use profile::{
     CreateAuthorizationProfile, ProfileLifecycle, ScopeKind,
 };
 
-pub use admin::{AdminMutationAck, GroupDto, MembershipQuery, OrgDto, RoleDto};
+pub use admin::{
+    AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateInvitation, GroupDto,
+    InvitationBinding, InvitationDto, InvitationId, InvitationQuery, InvitationStatus,
+    IssuedInvitation, MembershipQuery, OrgDto, ResendInvitation, RoleDto, ScopeMembershipQuery,
+};
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,
     ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,

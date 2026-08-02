@@ -17,12 +17,105 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{OrgId, PrincipalRef, Timestamp};
+use crate::{AccountId, OrgId, PrincipalRef, ScopeRef, Timestamp};
+
+/// Stable identifier of an organization invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InvitationId(pub String);
+
+/// Authoritative invitation lifecycle. Delivery is deliberately not a state:
+/// mail can be retried while the invitation remains pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Revoked,
+    Expired,
+}
+
+/// One role IAM will materialize when an invitation is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationBinding {
+    pub role_id: String,
+    pub scope: ScopeRef,
+}
+
+/// Public projection of IAM's invitation aggregate. The token hash is never
+/// exposed; a clear token appears only in create/resend responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationDto {
+    pub id: InvitationId,
+    pub org_id: OrgId,
+    pub email: String,
+    pub bindings: Vec<InvitationBinding>,
+    pub invited_by: PrincipalRef,
+    pub status: InvitationStatus,
+    pub expires_at: Timestamp,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_by_account_id: Option<AccountId>,
+}
+
+/// Idempotent invitation creation command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateInvitation {
+    pub idempotency_key: String,
+    pub org_id: OrgId,
+    pub email: String,
+    pub bindings: Vec<InvitationBinding>,
+    pub invited_by: PrincipalRef,
+    pub expires_at: Timestamp,
+}
+
+/// Invitation plus the one-time token a delivery adapter must send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedInvitation {
+    pub invitation: InvitationDto,
+    pub token: String,
+    pub version: u64,
+}
+
+/// Organization-scoped invitation list query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationQuery {
+    pub org_id: OrgId,
+}
+
+/// Rotate a pending invitation token and set its new expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResendInvitation {
+    pub expires_at: Timestamp,
+}
+
+/// Authenticated acceptance command from a trusted relying party. The party
+/// must obtain `verified_email` from IAM's signed-token UserInfo endpoint; it
+/// must never accept a caller-entered email as this assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptInvitation {
+    pub account_id: AccountId,
+    pub verified_email: String,
+    pub token: String,
+}
+
+/// Successful acceptance response and the PDP visibility fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedInvitation {
+    pub invitation: InvitationDto,
+    pub version: u64,
+}
 
 /// Internal PAP query for one principal's live role bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipQuery {
     pub principal: PrincipalRef,
+}
+
+/// Internal PAP query for exact role bindings at one scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeMembershipQuery {
+    pub scope: ScopeRef,
 }
 
 /// Wire shape of an organization administered through `/v1/admin/orgs`.

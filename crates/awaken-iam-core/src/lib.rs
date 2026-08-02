@@ -10,6 +10,7 @@ mod fake_provider;
 mod generic_oauth;
 mod github;
 mod google;
+mod invitation;
 mod linking;
 mod login;
 mod oauth_provider;
@@ -58,6 +59,7 @@ pub use google::{
     GOOGLE_TOKEN_ENDPOINT, GoogleOidcProvider, GoogleProviderSecrets, HttpRequest, HttpTransport,
     IdTokenVerification, Jwk, JwkSet, JwsVerifier, SystemClock, verify_id_token,
 };
+pub use invitation::{Invitation, normalize_invitation_email};
 pub use linking::{AccountLinker, LoginResolution, ResolveLogin};
 pub use login::{
     BeginLogin, EntropySource, IssuedLogin, LoginAttempt, LoginSecrets, OAuthChallengeService,
@@ -70,9 +72,9 @@ pub use oauth_provider::{
 };
 pub use ports::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
-    ExternalIdentityRepo, GrantRepo, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo,
-    RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo,
-    external_identity_id_hint, seed_roles,
+    ExternalIdentityRepo, GrantRepo, GroupRepo, InvitationRepo, LoginFlowRepo, OAuthClientRepo,
+    OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo,
+    SessionRepo, external_identity_id_hint, seed_roles,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,

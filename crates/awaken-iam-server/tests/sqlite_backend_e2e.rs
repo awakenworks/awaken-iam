@@ -11,9 +11,14 @@
 
 use std::collections::BTreeMap;
 
-use awaken_iam_core::RepoError;
+use awaken_iam_contract::{
+    AcceptInvitation, AccountId, CreateInvitation, InvitationBinding, InvitationStatus, OrgId,
+    PrincipalRef, ScopeRef, Timestamp,
+};
+use awaken_iam_core::{ActionPattern, Organization, RepoError, RoleDef, RoleId};
 use awaken_iam_server::{
-    Dialect, MigrationExecutor, SqlConn, SqliteBackend, bundles, sqlite_migrated_store,
+    Dialect, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
+    sqlite_migrated_store,
 };
 
 #[test]
@@ -146,4 +151,84 @@ fn sqlite_backend_with_prefix_validates_the_identifier_in_sqlite_migrated_store(
     assert!(matches!(bad, Err(RepoError::Backend(_))));
     let good = sqlite_migrated_store(backend, "iam");
     assert!(good.is_ok());
+}
+
+#[test]
+fn sqlite_invitation_acceptance_is_atomic_and_restart_visible() {
+    // Cause/effect decision table: R1 pending+matching token+matching verified
+    // email -> one transaction changes invitation to Accepted and inserts all
+    // role bindings; R2 a new PAP over the same database -> both invitation and
+    // binding remain visible. An implementation that commits either half alone
+    // fails one of the paired restart assertions.
+    let backend = SqliteBackend::open_in_memory().expect("open");
+    let store = sqlite_migrated_store(backend, "iam").expect("migrate");
+    let now = Timestamp("2026-08-02T00:00:00Z".into());
+    let principal = PrincipalRef::Account {
+        account_id: AccountId("owner".into()),
+    };
+    let mut pap = PolicyAdminApi::new(store.clone());
+    pap.create_org(
+        Organization {
+            id: OrgId("acme".into()),
+            display_name: None,
+            owner: principal.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        now.clone(),
+    )
+    .unwrap();
+    pap.define_role(
+        RoleDef {
+            id: RoleId("member".into()),
+            display_name: None,
+            action_patterns: vec![ActionPattern("workspace.read".into())],
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        now.clone(),
+    )
+    .unwrap();
+    let issued = pap
+        .create_invitation(
+            CreateInvitation {
+                idempotency_key: "sqlite-restart".into(),
+                org_id: OrgId("acme".into()),
+                email: "member@example.com".into(),
+                bindings: vec![InvitationBinding {
+                    role_id: "member".into(),
+                    scope: ScopeRef::Org {
+                        org_id: OrgId("acme".into()),
+                    },
+                }],
+                invited_by: principal,
+                expires_at: Timestamp("2026-08-03T00:00:00Z".into()),
+            },
+            now.clone(),
+        )
+        .unwrap();
+    pap.accept_invitation(
+        &issued.invitation.id,
+        AcceptInvitation {
+            account_id: AccountId("member".into()),
+            verified_email: "member@example.com".into(),
+            token: issued.token,
+        },
+        now,
+    )
+    .unwrap();
+    drop(pap);
+
+    let restarted = PolicyAdminApi::new(store);
+    let invitations = restarted.list_invitations(&OrgId("acme".into())).unwrap();
+    assert_eq!(invitations[0].status, InvitationStatus::Accepted);
+    assert_eq!(
+        restarted
+            .memberships_for_principal(&PrincipalRef::Account {
+                account_id: AccountId("member".into()),
+            })
+            .unwrap()
+            .len(),
+        1,
+    );
 }

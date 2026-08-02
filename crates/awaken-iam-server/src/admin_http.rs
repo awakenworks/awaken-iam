@@ -43,10 +43,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
-    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationRequest,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
+    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
-    MembershipQuery, NamespaceId, OrgDto, OrgId, PolicySnapshot, RoleBindingSnapshot, RoleDto,
+    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, OrgId,
+    PolicySnapshot, ResendInvitation, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
     Timestamp, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
@@ -205,6 +207,15 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
             post(grant_membership).delete(revoke_membership),
         )
         .route("/v1/admin/memberships/query", post(query_memberships))
+        .route(
+            "/v1/admin/memberships/query-scope",
+            post(query_scope_memberships),
+        )
+        .route("/v1/admin/invitations", post(create_invitation))
+        .route("/v1/admin/invitations/query", post(list_invitations))
+        .route("/v1/admin/invitations/{id}", delete(revoke_invitation))
+        .route("/v1/admin/invitations/{id}/resend", post(resend_invitation))
+        .route("/v1/admin/invitations/{id}/accept", post(accept_invitation))
         .route("/v1/admin/scope/workspace-orgs", post(assign_workspace_org))
         .route("/v1/admin/authz/profiles", post(create_profile))
         .route("/v1/admin/authz/profiles/{namespace}", get(list_profiles))
@@ -580,6 +591,82 @@ async fn query_memberships(
     })
 }
 
+async fn query_scope_memberships(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(query): Json<ScopeMembershipQuery>,
+) -> Response {
+    read(&state, &headers, |admin| {
+        admin.memberships_for_scope(&query.scope).map(|bindings| {
+            bindings
+                .into_iter()
+                .map(role_binding_to_dto)
+                .collect::<Vec<_>>()
+        })
+    })
+}
+
+async fn create_invitation(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitation>,
+) -> Response {
+    apply_value(
+        &state,
+        &headers,
+        move |admin, at| admin.create_invitation(request, at),
+        |value| value.version,
+    )
+}
+
+async fn list_invitations(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(query): Json<InvitationQuery>,
+) -> Response {
+    read(&state, &headers, |admin| {
+        admin.list_invitations(&query.org_id)
+    })
+}
+
+async fn revoke_invitation(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    apply(&state, &headers, move |admin, at| {
+        admin.revoke_invitation(&InvitationId(id), at)
+    })
+}
+
+async fn resend_invitation(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ResendInvitation>,
+) -> Response {
+    apply_value(
+        &state,
+        &headers,
+        move |admin, at| admin.resend_invitation(&InvitationId(id), request.expires_at, at),
+        |value: &IssuedInvitation| value.version,
+    )
+}
+
+async fn accept_invitation(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AcceptInvitation>,
+) -> Response {
+    apply_value(
+        &state,
+        &headers,
+        move |admin, at| admin.accept_invitation(&InvitationId(id), request, at),
+        |value: &AcceptedInvitation| value.version,
+    )
+}
+
 async fn assign_workspace_org(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
@@ -613,6 +700,31 @@ where
     match op(&mut guard.admin, now_timestamp()) {
         Ok(version) => match guard.refresh_authorization(version) {
             Ok(()) => (StatusCode::OK, Json(AdminMutationAck { version })).into_response(),
+            Err(error) => admin_error_response(&error),
+        },
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+fn apply_value<S, T, F, V>(
+    state: &SharedDaemonState<S>,
+    headers: &HeaderMap,
+    op: F,
+    version: V,
+) -> Response
+where
+    S: PolicyStore,
+    T: serde::Serialize,
+    F: FnOnce(&mut PolicyAdminApi<S>, Timestamp) -> Result<T, AdminError>,
+    V: FnOnce(&T) -> u64,
+{
+    let mut guard = lock(state);
+    if let Some(rejection) = authorize_admin(&guard.auth, headers) {
+        return rejection;
+    }
+    match op(&mut guard.admin, now_timestamp()) {
+        Ok(value) => match guard.refresh_authorization(version(&value)) {
+            Ok(()) => (StatusCode::OK, Json(value)).into_response(),
             Err(error) => admin_error_response(&error),
         },
         Err(error) => admin_error_response(&error),

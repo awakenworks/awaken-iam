@@ -26,7 +26,7 @@ use awaken_scoped_migration::{
 use awaken_iam_core::{RepoError, RepoResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
-use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore};
+use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
 
 /// A SQLite connection usable as both a migration executor and a repository
 /// backend. Cheap to [`Clone`]: clones share one connection.
@@ -180,6 +180,22 @@ impl SqlConn for SqliteBackend {
             collected.push(row.map_err(backend_err)?);
         }
         Ok(collected)
+    }
+
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend_err)?;
+        let mut affected = Vec::with_capacity(writes.len());
+        for write in writes {
+            affected.push(
+                tx.execute(&render(&write.sql), params_from_iter(values(&write.params)))
+                    .map_err(backend_err)? as u64,
+            );
+        }
+        tx.commit().map_err(backend_err)?;
+        Ok(affected)
     }
 }
 

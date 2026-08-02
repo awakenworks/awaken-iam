@@ -125,6 +125,16 @@ reintroduce the parallel model this ADR exists to avoid.
    for `agent.*` and `RequireApproval` for some `oversight.*` actions under the
    same evaluation, with no extra wiring.
 
+9. **Invitations are IAM-owned authorization intent, not product membership.**
+   A pending invitation records one normalized routing email, one Org, and the
+   exact Org/Workspace role bindings IAM will materialize on acceptance. IAM
+   stores only a claim-token hash and owns `pending → accepted | revoked |
+   expired`; Cloud owns delivery and billing-seat coordination. Acceptance is
+   atomic with RoleBinding materialization. A trusted relying party obtains the
+   account id and verified email from IAM OAuth/UserInfo and submits that
+   assertion through the guarded PAP; caller-entered email is never accepted as
+   identity. Products therefore do not store invitations or member rosters.
+
 ## Consequences
 
 - `ApiToken` loses `scope: Vec<ActionKey>` and gains `workspace: WorkspaceId` — a
@@ -144,6 +154,9 @@ reintroduce the parallel model this ADR exists to avoid.
   federation-rule → workspace-role mapping; a per-consumer action-namespace
   convention (`agent.*`, `oversight.*`); and — sequenced separately — an
   `sk-ant-`-style API-key credential rendering.
+- Invitation creation, resend/revoke/accept, exact-scope member queries, and
+  atomic role materialization are additive operations on the same PAP and
+  snapshot fence; they do not introduce a second membership engine.
 
 ## Supersession note — credential rendering (decision 6)
 

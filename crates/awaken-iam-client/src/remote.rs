@@ -14,13 +14,16 @@
 //! silently widens access to an allow).
 
 use awaken_iam_contract::{
-    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationDecision, AuthorizationOutcome,
-    AuthorizationProfile, AuthorizationProfileActivated, AuthorizationProfileValidation,
-    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    CreateAuthorizationProfile, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    GrantSnapshot, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResourceModelRegistered,
-    ResourceModelRegistration, RoleBindingSnapshot, RoleDto, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
+    AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
+    AuthorizationDecision, AuthorizationOutcome, AuthorizationProfile,
+    AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    CreateInvitation, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    GrantSnapshot, InvitationDto, InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery,
+    NamespaceId, OrgDto, PolicySnapshot, ResendInvitation, ResourceModelRegistered,
+    ResourceModelRegistration, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
+    WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -137,11 +140,64 @@ pub trait AuthzTransport {
         Err(RemoteError("membership PAP is not supported".into()))
     }
 
+    fn revoke_membership(
+        &self,
+        _binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("membership PAP is not supported".into()))
+    }
+
     fn memberships_for_principal(
         &self,
         _query: &MembershipQuery,
     ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
         Err(RemoteError("membership PAP is not supported".into()))
+    }
+
+    fn memberships_for_scope(
+        &self,
+        _query: &ScopeMembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        Err(RemoteError("membership PAP is not supported".into()))
+    }
+
+    fn create_invitation(
+        &self,
+        _request: &CreateInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        Err(RemoteError("invitation PAP is not supported".into()))
+    }
+
+    fn list_invitations(
+        &self,
+        _query: &InvitationQuery,
+    ) -> Result<Vec<InvitationDto>, RemoteError> {
+        Err(RemoteError("invitation PAP is not supported".into()))
+    }
+
+    fn revoke_invitation(&self, _id: &InvitationId) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("invitation PAP is not supported".into()))
+    }
+
+    fn resend_invitation(
+        &self,
+        _id: &InvitationId,
+        _request: &ResendInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        Err(RemoteError("invitation PAP is not supported".into()))
+    }
+
+    fn accept_invitation(
+        &self,
+        _id: &InvitationId,
+        _request: &AcceptInvitation,
+    ) -> Result<AcceptedInvitation, RemoteError> {
+        Err(RemoteError("invitation PAP is not supported".into()))
+    }
+
+    /// Resolve verified OIDC claims from an end-user access token.
+    fn userinfo(&self, _access_token: &str) -> Result<UserInfo, RemoteError> {
+        Err(RemoteError("userinfo is not supported".into()))
     }
 
     fn assign_workspace_org(
@@ -327,11 +383,63 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.grant_membership(binding)
     }
 
+    pub fn revoke_membership(
+        &self,
+        binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.revoke_membership(binding)
+    }
+
     pub fn memberships_for_principal(
         &self,
         query: &MembershipQuery,
     ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
         self.transport.memberships_for_principal(query)
+    }
+
+    pub fn memberships_for_scope(
+        &self,
+        query: &ScopeMembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        self.transport.memberships_for_scope(query)
+    }
+
+    pub fn create_invitation(
+        &self,
+        request: &CreateInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        self.transport.create_invitation(request)
+    }
+
+    pub fn list_invitations(
+        &self,
+        query: &InvitationQuery,
+    ) -> Result<Vec<InvitationDto>, RemoteError> {
+        self.transport.list_invitations(query)
+    }
+
+    pub fn revoke_invitation(&self, id: &InvitationId) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.revoke_invitation(id)
+    }
+
+    pub fn resend_invitation(
+        &self,
+        id: &InvitationId,
+        request: &ResendInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        self.transport.resend_invitation(id, request)
+    }
+
+    pub fn accept_invitation(
+        &self,
+        id: &InvitationId,
+        request: &AcceptInvitation,
+    ) -> Result<AcceptedInvitation, RemoteError> {
+        self.transport.accept_invitation(id, request)
+    }
+
+    pub fn userinfo(&self, access_token: &str) -> Result<UserInfo, RemoteError> {
+        self.transport.userinfo(access_token)
     }
 
     pub fn assign_workspace_org(

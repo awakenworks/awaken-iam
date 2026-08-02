@@ -115,6 +115,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 ),
                 (5, "initialize the singleton freshness fence", AUTHZ_0005),
                 (6, "persist Workspace to Org scope projections", AUTHZ_0006),
+                (7, "organization invitation lifecycle", AUTHZ_0007),
             ],
         ),
         bundle(
@@ -325,6 +326,26 @@ CREATE TABLE {prefix}_workspace_org_edges (\
  org_id TEXT NOT NULL);\
 CREATE INDEX {prefix}_workspace_org_edges_org_idx \
  ON {prefix}_workspace_org_edges (org_id);";
+
+// Invitation is IAM authorization intent, stored beside role bindings. Only a
+// SHA-256 claim-token hash is persisted; delivery remains a Cloud adapter.
+const AUTHZ_0007: &str = "\
+CREATE TABLE {prefix}_invitations (\
+ id TEXT PRIMARY KEY, \
+ idempotency_key TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ email TEXT NOT NULL, \
+ bindings {json} NOT NULL, \
+ invited_by {json} NOT NULL, \
+ token_hash TEXT NOT NULL, \
+ status TEXT NOT NULL, \
+ expires_at TEXT NOT NULL, \
+ created_at TEXT NOT NULL, \
+ updated_at TEXT NOT NULL, \
+ accepted_by_account_id TEXT, \
+ UNIQUE (org_id, idempotency_key));\n\
+CREATE INDEX {prefix}_invitations_org_idx \
+ ON {prefix}_invitations (org_id, created_at);";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //

@@ -31,14 +31,19 @@
 //! here propagates to in-process evaluators on their next poll.
 
 use awaken_iam_contract::{
-    OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp, WorkspaceId,
-    WorkspaceOrgEdge,
+    AcceptInvitation, AcceptedInvitation, CreateInvitation, InvitationId, InvitationStatus,
+    IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp,
+    WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, OrgRepo,
-    Organization, PolicySet, RepoError, ResourceEdge, ResourceModelRepo, RoleBinding,
-    RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
+    AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
+    InvitationRepo, OrgRepo, Organization, PolicySet, RepoError, ResourceEdge, ResourceModelRepo,
+    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
+    normalize_invitation_email,
 };
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::FenceStore;
 
@@ -52,6 +57,7 @@ pub trait PolicyStore:
     + RoleRepo
     + GrantRepo
     + RoleBindingRepo
+    + InvitationRepo
     + ResourceModelRepo
     + AuditSink
     + FenceStore
@@ -64,6 +70,7 @@ impl<T> PolicyStore for T where
         + RoleRepo
         + GrantRepo
         + RoleBindingRepo
+        + InvitationRepo
         + ResourceModelRepo
         + AuditSink
         + FenceStore
@@ -118,6 +125,11 @@ pub enum DomainEvent {
         /// Scope at which the binding applied.
         scope: ScopeRef,
     },
+    InvitationCreated(InvitationId),
+    InvitationResent(InvitationId),
+    InvitationRevoked(InvitationId),
+    InvitationAccepted(InvitationId),
+    InvitationExpired(InvitationId),
     /// A consumer registered (or extended) its resource model.
     ResourceModelRegistered {
         /// Number of resource types declared in the registration.
@@ -149,6 +161,11 @@ impl DomainEvent {
             DomainEvent::GrantRevoked(_) => "grant.revoke",
             DomainEvent::MembershipGranted { .. } => "membership.grant",
             DomainEvent::MembershipRevoked { .. } => "membership.revoke",
+            DomainEvent::InvitationCreated(_) => "invitation.create",
+            DomainEvent::InvitationResent(_) => "invitation.resend",
+            DomainEvent::InvitationRevoked(_) => "invitation.revoke",
+            DomainEvent::InvitationAccepted(_) => "invitation.accept",
+            DomainEvent::InvitationExpired(_) => "invitation.expire",
             DomainEvent::ResourceModelRegistered { .. } => "resource_model.register",
             DomainEvent::WorkspaceOrgAssigned { .. } => "scope.workspace.assign",
         }
@@ -179,6 +196,11 @@ impl DomainEvent {
                 role,
                 scope,
             } => format!("role {} for {principal:?} at {scope:?}", role.0),
+            DomainEvent::InvitationCreated(id)
+            | DomainEvent::InvitationResent(id)
+            | DomainEvent::InvitationRevoked(id)
+            | DomainEvent::InvitationAccepted(id)
+            | DomainEvent::InvitationExpired(id) => format!("invitation {}", id.0),
             DomainEvent::ResourceModelRegistered {
                 resource_types,
                 edges,
@@ -227,6 +249,41 @@ impl From<RoleInvariant> for AdminError {
 /// Result alias for policy-administration operations.
 pub type AdminResult<T> = Result<T, AdminError>;
 
+fn hash_claim_token(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn new_claim_token() -> AdminResult<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| AdminError::Backend(format!("invitation entropy unavailable: {error}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn invitation_id(org_id: &OrgId, idempotency_key: &str) -> InvitationId {
+    let digest = Sha256::digest(format!("{}\0{idempotency_key}", org_id.0).as_bytes());
+    InvitationId(format!(
+        "invite_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..18])
+    ))
+}
+
+fn validate_timestamp_order(now: &Timestamp, expires_at: &Timestamp) -> AdminResult<()> {
+    if timestamp_is_expired(now, expires_at)? {
+        return Err(AdminError::Invalid("invitation is expired".into()));
+    }
+    Ok(())
+}
+
+fn timestamp_is_expired(now: &Timestamp, expires_at: &Timestamp) -> AdminResult<bool> {
+    Ok(parse_timestamp(expires_at)? <= parse_timestamp(now)?)
+}
+
+fn parse_timestamp(value: &Timestamp) -> AdminResult<OffsetDateTime> {
+    OffsetDateTime::parse(&value.0, &Rfc3339)
+        .map_err(|_| AdminError::Invalid("timestamps must be RFC 3339".into()))
+}
+
 /// Policy Administration Point over a set of repository ports.
 ///
 /// `S` is any store implementing the policy repository ports, the audit sink,
@@ -250,8 +307,7 @@ pub struct PolicyAdminApi<S> {
 
 impl<S> PolicyAdminApi<S>
 where
-    S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + ResourceModelRepo + AuditSink,
-    S: OrgRepo + GroupRepo + RoleRepo + GrantRepo + RoleBindingRepo + AuditSink + FenceStore,
+    S: PolicyStore,
 {
     /// Build a PAP over `store`, seeding the cached snapshot version from the
     /// store's fence (a fresh store starts at version 1).
@@ -499,6 +555,255 @@ where
         Ok(RoleBindingRepo::list_for_principal(&self.store, principal)?)
     }
 
+    /// List exact bindings anchored at `scope`; inherited effective membership
+    /// remains a read projection above this primitive.
+    pub fn memberships_for_scope(&self, scope: &ScopeRef) -> AdminResult<Vec<RoleBinding>> {
+        Ok(RoleBindingRepo::list(&self.store)?
+            .into_iter()
+            .filter(|binding| &binding.scope == scope)
+            .collect())
+    }
+
+    /// Create an invitation or idempotently rotate its delivery token when the
+    /// same command is retried while still pending.
+    pub fn create_invitation(
+        &mut self,
+        request: CreateInvitation,
+        at: Timestamp,
+    ) -> AdminResult<IssuedInvitation> {
+        validate_timestamp_order(&at, &request.expires_at)?;
+        let email = normalize_invitation_email(&request.email)
+            .ok_or_else(|| AdminError::Invalid("invalid invitation email".into()))?;
+        self.validate_invitation_targets(&request.org_id, &request.bindings)?;
+        if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 200 {
+            return Err(AdminError::Invalid("invalid idempotency key".into()));
+        }
+        let token = new_claim_token()?;
+        let token_hash = hash_claim_token(&token);
+        if let Some(mut existing) = self
+            .store
+            .get_invitation_by_idempotency(&request.org_id, &request.idempotency_key)?
+        {
+            if existing.email != email
+                || existing.bindings != request.bindings
+                || existing.invited_by != request.invited_by
+                || existing.status != InvitationStatus::Pending
+            {
+                return Err(AdminError::AlreadyExists(
+                    "idempotency key belongs to another invitation command".into(),
+                ));
+            }
+            let expected = existing.token_hash.clone();
+            existing.token_hash = token_hash;
+            existing.expires_at = request.expires_at;
+            existing.updated_at = at.clone();
+            if !self
+                .store
+                .replace_pending_invitation(existing.clone(), &expected)?
+            {
+                return Err(AdminError::AlreadyExists(
+                    "invitation changed concurrently".into(),
+                ));
+            }
+            let version = self.commit(DomainEvent::InvitationResent(existing.id.clone()), at)?;
+            return Ok(IssuedInvitation {
+                invitation: existing.to_dto(),
+                token,
+                version,
+            });
+        }
+        let id = invitation_id(&request.org_id, &request.idempotency_key);
+        let invitation = Invitation {
+            id: id.clone(),
+            idempotency_key: request.idempotency_key,
+            org_id: request.org_id,
+            email,
+            bindings: request.bindings,
+            invited_by: request.invited_by,
+            token_hash,
+            status: InvitationStatus::Pending,
+            expires_at: request.expires_at,
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            accepted_by_account_id: None,
+        };
+        self.store.create_invitation(invitation.clone())?;
+        let version = self.commit(DomainEvent::InvitationCreated(id), at)?;
+        Ok(IssuedInvitation {
+            invitation: invitation.to_dto(),
+            token,
+            version,
+        })
+    }
+
+    pub fn list_invitations(
+        &self,
+        org_id: &OrgId,
+    ) -> AdminResult<Vec<awaken_iam_contract::InvitationDto>> {
+        Ok(self
+            .store
+            .list_invitations_for_org(org_id)?
+            .into_iter()
+            .map(|value| value.to_dto())
+            .collect())
+    }
+
+    pub fn resend_invitation(
+        &mut self,
+        id: &InvitationId,
+        expires_at: Timestamp,
+        at: Timestamp,
+    ) -> AdminResult<IssuedInvitation> {
+        validate_timestamp_order(&at, &expires_at)?;
+        let mut invitation = self
+            .store
+            .get_invitation(id)?
+            .ok_or_else(|| AdminError::NotFound("invitation".into()))?;
+        if invitation.status != InvitationStatus::Pending {
+            return Err(AdminError::Invalid(
+                "only pending invitations can be resent".into(),
+            ));
+        }
+        let token = new_claim_token()?;
+        let expected = invitation.token_hash.clone();
+        invitation.token_hash = hash_claim_token(&token);
+        invitation.expires_at = expires_at;
+        invitation.updated_at = at.clone();
+        if !self
+            .store
+            .replace_pending_invitation(invitation.clone(), &expected)?
+        {
+            return Err(AdminError::AlreadyExists(
+                "invitation changed concurrently".into(),
+            ));
+        }
+        let version = self.commit(DomainEvent::InvitationResent(id.clone()), at)?;
+        Ok(IssuedInvitation {
+            invitation: invitation.to_dto(),
+            token,
+            version,
+        })
+    }
+
+    pub fn revoke_invitation(&mut self, id: &InvitationId, at: Timestamp) -> AdminResult<u64> {
+        let mut invitation = self
+            .store
+            .get_invitation(id)?
+            .ok_or_else(|| AdminError::NotFound("invitation".into()))?;
+        if invitation.status == InvitationStatus::Revoked {
+            return self.store_version();
+        }
+        if invitation.status != InvitationStatus::Pending {
+            return Err(AdminError::Invalid(
+                "accepted invitation cannot be revoked".into(),
+            ));
+        }
+        let expected = invitation.token_hash.clone();
+        invitation.status = InvitationStatus::Revoked;
+        invitation.updated_at = at.clone();
+        if !self
+            .store
+            .replace_pending_invitation(invitation, &expected)?
+        {
+            return Err(AdminError::AlreadyExists(
+                "invitation changed concurrently".into(),
+            ));
+        }
+        self.commit(DomainEvent::InvitationRevoked(id.clone()), at)
+    }
+
+    pub fn accept_invitation(
+        &mut self,
+        id: &InvitationId,
+        request: AcceptInvitation,
+        at: Timestamp,
+    ) -> AdminResult<AcceptedInvitation> {
+        let invitation = self
+            .store
+            .get_invitation(id)?
+            .ok_or_else(|| AdminError::NotFound("invitation".into()))?;
+        let expected = hash_claim_token(&request.token);
+        if invitation.token_hash != expected {
+            return Err(AdminError::NotFound("invitation".into()));
+        }
+        if invitation.status == InvitationStatus::Accepted
+            && invitation.accepted_by_account_id.as_ref() == Some(&request.account_id)
+        {
+            return Ok(AcceptedInvitation {
+                invitation: invitation.to_dto(),
+                version: self.store_version()?,
+            });
+        }
+        if invitation.status != InvitationStatus::Pending {
+            return Err(AdminError::NotFound("invitation".into()));
+        }
+        if timestamp_is_expired(&at, &invitation.expires_at)? {
+            let mut expired = invitation;
+            expired.status = InvitationStatus::Expired;
+            expired.updated_at = at.clone();
+            if self.store.replace_pending_invitation(expired, &expected)? {
+                self.commit(DomainEvent::InvitationExpired(id.clone()), at)?;
+            }
+            return Err(AdminError::Invalid("invitation is expired".into()));
+        }
+        if normalize_invitation_email(&request.verified_email).as_deref()
+            != Some(invitation.email.as_str())
+        {
+            return Err(AdminError::NotFound("invitation".into()));
+        }
+        let accepted = self
+            .store
+            .accept_pending_invitation(id, &expected, &request.account_id, &at)?
+            .ok_or_else(|| AdminError::AlreadyExists("invitation changed concurrently".into()))?;
+        let version = self.commit(DomainEvent::InvitationAccepted(id.clone()), at)?;
+        Ok(AcceptedInvitation {
+            invitation: accepted.to_dto(),
+            version,
+        })
+    }
+
+    fn validate_invitation_targets(
+        &self,
+        org_id: &OrgId,
+        targets: &[awaken_iam_contract::InvitationBinding],
+    ) -> AdminResult<()> {
+        if OrgRepo::get(&self.store, org_id)?.is_none() {
+            return Err(AdminError::NotFound(format!("organization {}", org_id.0)));
+        }
+        if targets.is_empty() || !targets.iter().any(|target| matches!(&target.scope, ScopeRef::Org { org_id: target_org } if target_org == org_id)) {
+            return Err(AdminError::Invalid("an invitation requires an exact organization binding".into()));
+        }
+        let mut unique = std::collections::HashSet::new();
+        for target in targets {
+            if RoleRepo::get(&self.store, &RoleId(target.role_id.clone()))?.is_none() {
+                return Err(AdminError::NotFound(format!("role {}", target.role_id)));
+            }
+            let key = serde_json::to_string(target)
+                .map_err(|error| AdminError::Backend(error.to_string()))?;
+            if !unique.insert(key) {
+                return Err(AdminError::Invalid("duplicate invitation binding".into()));
+            }
+            match &target.scope {
+                ScopeRef::Org { org_id: target_org } if target_org == org_id => {}
+                ScopeRef::Workspace { workspace_id } => {
+                    let edge = self.store.workspace_org(workspace_id)?;
+                    if edge.as_ref().map(|edge| &edge.org_id) != Some(org_id) {
+                        return Err(AdminError::Invalid(
+                            "workspace is not owned by invitation organization".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(AdminError::Invalid(
+                        "invitation bindings may target only its organization or owned workspaces"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // -- resource model -----------------------------------------------------
 
     /// Register a consumer's resource model, persisting its per-instance scope
@@ -640,6 +945,209 @@ mod tests {
 
     fn pap() -> PolicyAdminApi<InMemoryStore> {
         PolicyAdminApi::new(InMemoryStore::new())
+    }
+
+    fn invitation_request(key: &str) -> CreateInvitation {
+        CreateInvitation {
+            idempotency_key: key.into(),
+            org_id: OrgId("acme".into()),
+            email: " Bob@Example.COM ".into(),
+            bindings: vec![awaken_iam_contract::InvitationBinding {
+                role_id: "member".into(),
+                scope: ScopeRef::Org {
+                    org_id: OrgId("acme".into()),
+                },
+            }],
+            invited_by: account("ada"),
+            expires_at: Timestamp("2026-06-22T00:00:00Z".into()),
+        }
+    }
+
+    fn invitation_pap() -> PolicyAdminApi<InMemoryStore> {
+        let mut pap = pap();
+        pap.create_org(org("acme"), at()).unwrap();
+        pap.define_role(role("member"), at()).unwrap();
+        pap
+    }
+
+    #[test]
+    fn invitation_acceptance_materializes_exact_bindings_once() {
+        // Cause/effect graph: C1=pending, C2=live token, C3=matching verified
+        // email, C4=unexpired, C5=same account retry. R1(C1+C2+C3+C4)->Accepted
+        // plus exact RoleBinding and version bump; R2(R1+C5)->same Accepted
+        // projection with no duplicate binding/version bump.
+        let mut pap = invitation_pap();
+        let issued = pap
+            .create_invitation(invitation_request("request-1"), at())
+            .unwrap();
+        assert_eq!(issued.invitation.email, "bob@example.com");
+        let before_accept = pap.version();
+        let request = AcceptInvitation {
+            account_id: AccountId("bob".into()),
+            verified_email: "BOB@example.com".into(),
+            token: issued.token,
+        };
+        let accepted = pap
+            .accept_invitation(&issued.invitation.id, request.clone(), at())
+            .unwrap();
+        assert_eq!(accepted.invitation.status, InvitationStatus::Accepted);
+        assert_eq!(
+            pap.memberships_for_principal(&account("bob"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(accepted.version, before_accept + 1);
+
+        let retried = pap
+            .accept_invitation(&issued.invitation.id, request, at())
+            .unwrap();
+        assert_eq!(retried.version, accepted.version);
+        assert_eq!(
+            pap.memberships_for_principal(&account("bob"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn invitation_claim_failures_leave_membership_unchanged() {
+        // Decision table causes: token T, verified-email E, expiry X, pending P.
+        // R1 !T+P -> NotFound; R2 T+!E+P -> NotFound; R3 T+E+X+P -> Invalid;
+        // R4 T+E+!X+!P(revoked) -> NotFound. Every rule has no role binding;
+        // only R3 records the terminal Expired transition and its version bump.
+        for case in ["token", "email", "expired", "revoked"] {
+            let mut pap = invitation_pap();
+            let mut create = invitation_request(&format!("request-{case}"));
+            if case == "expired" {
+                create.expires_at = Timestamp("2026-06-21T00:00:01Z".into());
+            }
+            let issued = pap.create_invitation(create, at()).unwrap();
+            if case == "revoked" {
+                pap.revoke_invitation(&issued.invitation.id, at()).unwrap();
+            }
+            let version = pap.version();
+            let result = pap.accept_invitation(
+                &issued.invitation.id,
+                AcceptInvitation {
+                    account_id: AccountId("bob".into()),
+                    verified_email: if case == "email" {
+                        "mallory@example.com"
+                    } else {
+                        "bob@example.com"
+                    }
+                    .into(),
+                    token: if case == "token" {
+                        "wrong".into()
+                    } else {
+                        issued.token
+                    },
+                },
+                if case == "expired" {
+                    Timestamp("2026-06-21T00:00:02Z".into())
+                } else {
+                    at()
+                },
+            );
+            assert!(result.is_err(), "{case}");
+            assert!(
+                pap.memberships_for_principal(&account("bob"))
+                    .unwrap()
+                    .is_empty(),
+                "{case}"
+            );
+            if case == "expired" {
+                assert_eq!(pap.version(), version + 1, "{case}");
+                assert_eq!(
+                    pap.list_invitations(&OrgId("acme".into())).unwrap()[0].status,
+                    InvitationStatus::Expired,
+                );
+            } else {
+                assert_eq!(pap.version(), version, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn invitation_idempotency_and_resend_rotate_tokens() {
+        // Causes: same org+idempotency key S, same command fingerprint F,
+        // pending P. R1(S+F+P)->same invitation id/new token; old token denies
+        // and new token accepts. R2(S+!F)->Conflict and original intent stays.
+        let mut pap = invitation_pap();
+        let first = pap
+            .create_invitation(invitation_request("same"), at())
+            .unwrap();
+        let second = pap
+            .create_invitation(invitation_request("same"), at())
+            .unwrap();
+        assert_eq!(first.invitation.id, second.invitation.id);
+        assert_ne!(first.token, second.token);
+        assert!(
+            pap.accept_invitation(
+                &first.invitation.id,
+                AcceptInvitation {
+                    account_id: AccountId("bob".into()),
+                    verified_email: "bob@example.com".into(),
+                    token: first.token
+                },
+                at(),
+            )
+            .is_err()
+        );
+
+        let mut conflict = invitation_request("same");
+        conflict.email = "other@example.com".into();
+        assert!(matches!(
+            pap.create_invitation(conflict, at()),
+            Err(AdminError::AlreadyExists(_))
+        ));
+        pap.accept_invitation(
+            &second.invitation.id,
+            AcceptInvitation {
+                account_id: AccountId("bob".into()),
+                verified_email: "bob@example.com".into(),
+                token: second.token,
+            },
+            at(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn invitation_rejects_cross_org_workspace_binding() {
+        // C1=mandatory exact Org binding, C2=Workspace projected to the same
+        // Org. R1(C1+!C2)->Invalid and no invitation/audit/version mutation.
+        let mut pap = invitation_pap();
+        pap.create_org(org("other"), at()).unwrap();
+        pap.assign_workspace_org(
+            WorkspaceOrgEdge {
+                workspace_id: WorkspaceId("ws-other".into()),
+                org_id: OrgId("other".into()),
+            },
+            at(),
+        )
+        .unwrap();
+        let mut request = invitation_request("cross-org");
+        request
+            .bindings
+            .push(awaken_iam_contract::InvitationBinding {
+                role_id: "member".into(),
+                scope: ScopeRef::Workspace {
+                    workspace_id: WorkspaceId("ws-other".into()),
+                },
+            });
+        let version = pap.version();
+        assert!(matches!(
+            pap.create_invitation(request, at()),
+            Err(AdminError::Invalid(_))
+        ));
+        assert_eq!(pap.version(), version);
+        assert!(
+            pap.list_invitations(&OrgId("acme".into()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

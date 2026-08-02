@@ -25,7 +25,7 @@ use awaken_scoped_migration::{
 use awaken_iam_core::{RepoError, RepoResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
-use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore};
+use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
 
 /// A Postgres connection usable as both a migration executor and a repository
 /// backend. Cheap to [`Clone`]: clones share one client.
@@ -231,6 +231,20 @@ impl SqlConn for PostgresBackend {
             out.push(cells);
         }
         Ok(out)
+    }
+
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>> {
+        let mut client = self.lock();
+        let mut tx = client.transaction().map_err(backend_err)?;
+        let mut affected = Vec::with_capacity(writes.len());
+        for write in writes {
+            affected.push(
+                tx.execute(&render(&write.sql), &refs(&write.params))
+                    .map_err(backend_err)?,
+            );
+        }
+        tx.commit().map_err(backend_err)?;
+        Ok(affected)
     }
 }
 

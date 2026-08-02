@@ -20,13 +20,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use awaken_iam_contract::{
-    ActivateAuthorizationProfile, AdminMutationAck, AuthorizationOutcome, AuthorizationProfile,
-    AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, MembershipQuery, NamespaceId,
-    OrgDto, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    RoleBindingSnapshot, RoleDto, SignerSetSnapshot, TokenIntrospectionRequest,
-    TokenIntrospectionResponse, WorkspaceOrgEdge,
+    AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
+    AuthorizationOutcome, AuthorizationProfile, AuthorizationProfileActivated,
+    AuthorizationProfileValidation, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId,
+    InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot,
+    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration, RoleBindingSnapshot,
+    RoleDto, ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest,
+    TokenIntrospectionResponse, UserInfo, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -372,6 +374,18 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn revoke_membership(
+        &self,
+        binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .delete(self.url("/v1/admin/memberships"))
+                .json(binding)
+        })?;
+        Self::decode(response)
+    }
+
     fn memberships_for_principal(
         &self,
         query: &MembershipQuery,
@@ -381,6 +395,75 @@ impl AuthzTransport for HttpAuthzTransport {
                 .post(self.url("/v1/admin/memberships/query"))
                 .json(query)
         })?;
+        Self::decode(response)
+    }
+
+    fn memberships_for_scope(
+        &self,
+        query: &ScopeMembershipQuery,
+    ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/memberships/query-scope"))
+                .json(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn create_invitation(
+        &self,
+        request: &CreateInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/invitations"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
+    fn list_invitations(&self, query: &InvitationQuery) -> Result<Vec<InvitationDto>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/invitations/query"))
+                .json(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn revoke_invitation(&self, id: &InvitationId) -> Result<AdminMutationAck, RemoteError> {
+        let path = format!("/v1/admin/invitations/{}", id.0);
+        let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn resend_invitation(
+        &self,
+        id: &InvitationId,
+        request: &ResendInvitation,
+    ) -> Result<IssuedInvitation, RemoteError> {
+        let path = format!("/v1/admin/invitations/{}/resend", id.0);
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn accept_invitation(
+        &self,
+        id: &InvitationId,
+        request: &AcceptInvitation,
+    ) -> Result<AcceptedInvitation, RemoteError> {
+        let path = format!("/v1/admin/invitations/{}/accept", id.0);
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn userinfo(&self, access_token: &str) -> Result<UserInfo, RemoteError> {
+        let response = self
+            .client
+            .get(self.url("/v1/oauth/userinfo"))
+            .bearer_auth(access_token)
+            .send()
+            .map_err(|error| RemoteError(format!("request failed: {error}")))?;
         Self::decode(response)
     }
 

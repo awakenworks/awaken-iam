@@ -19,16 +19,17 @@
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     AuthorizationProfileDocument, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
-    ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, NamespaceId, OAuthLoginState,
-    OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ResourceId, ResourceType, Session,
-    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, InvitationBinding, InvitationId,
+    InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
+    ProfileLifecycle, ResourceId, ResourceType, Session, SessionId, Timestamp, WorkspaceId,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
     Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId,
-    GroupRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota,
-    RateLimit, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
-    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId,
+    PlanRepo, PlanTier, Quota, RateLimit, RepoError, RepoResult, ResourceEdge, ResourceModelRepo,
+    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,6 +44,13 @@ pub type SqlParam = Option<String>;
 /// order. JSON columns arrive already rendered to text by the backend.
 pub type SqlRow = Vec<Option<String>>;
 
+/// One parameterized write in a backend-owned atomic transaction.
+#[derive(Debug, Clone)]
+pub struct SqlWrite {
+    pub sql: String,
+    pub params: Vec<SqlParam>,
+}
+
 /// The driver seam each backend implements: render the portable placeholder
 /// dialect, bind parameters, and run a statement against its connection.
 ///
@@ -56,6 +64,8 @@ pub trait SqlConn: Send + Sync {
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64>;
     /// Execute a read, returning every matching row.
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>>;
+    /// Execute every write atomically and return each affected-row count.
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>>;
 }
 
 /// A storage adapter that serves every IAM repository port from a real database.
@@ -285,6 +295,46 @@ fn decode_workspace_org(row: &SqlRow) -> RepoResult<WorkspaceOrgEdge> {
         workspace_id: WorkspaceId(req(row, 0, "workspace_org.workspace_id")?),
         org_id: OrgId(req(row, 1, "workspace_org.org_id")?),
     })
+}
+
+fn decode_invitation(row: &SqlRow) -> RepoResult<Invitation> {
+    let status = match req(row, 7, "invitation.status")?.as_str() {
+        "pending" => InvitationStatus::Pending,
+        "accepted" => InvitationStatus::Accepted,
+        "revoked" => InvitationStatus::Revoked,
+        "expired" => InvitationStatus::Expired,
+        other => {
+            return Err(RepoError::Backend(format!(
+                "invalid invitation status {other}"
+            )));
+        }
+    };
+    Ok(Invitation {
+        id: InvitationId(req(row, 0, "invitation.id")?),
+        idempotency_key: req(row, 1, "invitation.idempotency_key")?,
+        org_id: OrgId(req(row, 2, "invitation.org_id")?),
+        email: req(row, 3, "invitation.email")?,
+        bindings: json_decode::<Vec<InvitationBinding>>(
+            &req(row, 4, "invitation.bindings")?,
+            "invitation bindings",
+        )?,
+        invited_by: json_decode::<PrincipalRef>(
+            &req(row, 5, "invitation.invited_by")?,
+            "invitation inviter",
+        )?,
+        token_hash: req(row, 6, "invitation.token_hash")?,
+        status,
+        expires_at: Timestamp(req(row, 8, "invitation.expires_at")?),
+        created_at: Timestamp(req(row, 9, "invitation.created_at")?),
+        updated_at: Timestamp(req(row, 10, "invitation.updated_at")?),
+        accepted_by_account_id: opt(row, 11).map(AccountId),
+    })
+}
+
+fn invitation_columns() -> &'static str {
+    "id, idempotency_key, org_id, email, CAST(bindings AS TEXT), \
+     CAST(invited_by AS TEXT), token_hash, status, expires_at, created_at, \
+     updated_at, accepted_by_account_id"
 }
 
 fn revision_key(revision: u64) -> String {
@@ -1033,6 +1083,170 @@ impl<B: SqlConn> RoleBindingRepo for SqlStore<B> {
             return Err(RepoError::NotFound("role binding not found".to_owned()));
         }
         Ok(())
+    }
+}
+
+impl<B: SqlConn> InvitationRepo for SqlStore<B> {
+    fn create_invitation(&self, invitation: Invitation) -> RepoResult<()> {
+        let bindings = json_encode(&invitation.bindings, "invitation bindings")?;
+        let invited_by = json_encode(&invitation.invited_by, "invitation inviter")?;
+        let sql = format!(
+            "INSERT INTO {} (id,idempotency_key,org_id,email,bindings,invited_by,token_hash,status,expires_at,created_at,updated_at,accepted_by_account_id) \
+             VALUES (?,?,?,?,?j,?j,?,?,?,?,?,?)",
+            self.table("invitations")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(invitation.id.0),
+                p(invitation.idempotency_key),
+                p(invitation.org_id.0),
+                p(invitation.email),
+                p(bindings),
+                p(invited_by),
+                p(invitation.token_hash),
+                p(encode_invitation_status(invitation.status)),
+                p(invitation.expires_at.0),
+                p(invitation.created_at.0),
+                p(invitation.updated_at.0),
+                invitation.accepted_by_account_id.map(|id| id.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_invitation(&self, id: &InvitationId) -> RepoResult<Option<Invitation>> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE id = ?",
+            invitation_columns(),
+            self.table("invitations")
+        );
+        self.backend
+            .query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_invitation)
+            .transpose()
+    }
+
+    fn get_invitation_by_idempotency(
+        &self,
+        org_id: &OrgId,
+        key: &str,
+    ) -> RepoResult<Option<Invitation>> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE org_id = ? AND idempotency_key = ?",
+            invitation_columns(),
+            self.table("invitations")
+        );
+        self.backend
+            .query(&sql, &[p(org_id.0.clone()), p(key.to_owned())])?
+            .first()
+            .map(decode_invitation)
+            .transpose()
+    }
+
+    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepoResult<Vec<Invitation>> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE org_id = ? ORDER BY created_at, id",
+            invitation_columns(),
+            self.table("invitations")
+        );
+        self.backend
+            .query(&sql, &[p(org_id.0.clone())])?
+            .iter()
+            .map(decode_invitation)
+            .collect()
+    }
+
+    fn replace_pending_invitation(
+        &self,
+        invitation: Invitation,
+        expected: &str,
+    ) -> RepoResult<bool> {
+        let bindings = json_encode(&invitation.bindings, "invitation bindings")?;
+        let invited_by = json_encode(&invitation.invited_by, "invitation inviter")?;
+        let sql = format!(
+            "UPDATE {} SET email=?,bindings=?j,invited_by=?j,token_hash=?,status=?,expires_at=?,updated_at=?,accepted_by_account_id=? \
+             WHERE id=? AND status='pending' AND token_hash=?",
+            self.table("invitations")
+        );
+        Ok(self.backend.execute(
+            &sql,
+            &[
+                p(invitation.email),
+                p(bindings),
+                p(invited_by),
+                p(invitation.token_hash),
+                p(encode_invitation_status(invitation.status)),
+                p(invitation.expires_at.0),
+                p(invitation.updated_at.0),
+                invitation.accepted_by_account_id.map(|id| id.0),
+                p(invitation.id.0),
+                p(expected.to_owned()),
+            ],
+        )? == 1)
+    }
+
+    fn accept_pending_invitation(
+        &self,
+        id: &InvitationId,
+        expected: &str,
+        account_id: &AccountId,
+        at: &Timestamp,
+    ) -> RepoResult<Option<Invitation>> {
+        let current = self
+            .get_invitation(id)?
+            .ok_or_else(|| RepoError::NotFound("invitation not found".into()))?;
+        if current.status == InvitationStatus::Accepted
+            && current.accepted_by_account_id.as_ref() == Some(account_id)
+            && current.token_hash == expected
+        {
+            return Ok(Some(current));
+        }
+        let mut writes = vec![SqlWrite {
+            sql: format!(
+                "UPDATE {} SET status='accepted',accepted_by_account_id=?,updated_at=? WHERE id=? AND status='pending' AND token_hash=?",
+                self.table("invitations")
+            ),
+            params: vec![
+                p(account_id.0.clone()),
+                p(at.0.clone()),
+                p(id.0.clone()),
+                p(expected.to_owned()),
+            ],
+        }];
+        let principal = json_encode(
+            &PrincipalRef::Account {
+                account_id: account_id.clone(),
+            },
+            "principal",
+        )?;
+        for target in &current.bindings {
+            let scope = json_encode(&target.scope, "binding scope")?;
+            writes.push(SqlWrite {
+                sql: format!(
+                    "INSERT INTO {bindings} (principal,role,scope) \
+                     SELECT ?j,?,?j WHERE EXISTS (SELECT 1 FROM {invites} WHERE id=? AND status='accepted' AND accepted_by_account_id=? AND token_hash=?) \
+                     ON CONFLICT (principal,role,scope) DO NOTHING",
+                    bindings = self.table("role_bindings"), invites = self.table("invitations")
+                ),
+                params: vec![p(principal.clone()), p(target.role_id.clone()), p(scope), p(id.0.clone()), p(account_id.0.clone()), p(expected.to_owned())],
+            });
+        }
+        let affected = self.backend.execute_transaction(&writes)?;
+        if affected.first().copied() != Some(1) {
+            return Ok(None);
+        }
+        self.get_invitation(id)
+    }
+}
+
+fn encode_invitation_status(status: InvitationStatus) -> &'static str {
+    match status {
+        InvitationStatus::Pending => "pending",
+        InvitationStatus::Accepted => "accepted",
+        InvitationStatus::Revoked => "revoked",
+        InvitationStatus::Expired => "expired",
     }
 }
 
