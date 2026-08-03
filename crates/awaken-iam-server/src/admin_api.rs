@@ -775,9 +775,6 @@ where
         }
         let mut unique = std::collections::HashSet::new();
         for target in targets {
-            if RoleRepo::get(&self.store, &RoleId(target.role_id.clone()))?.is_none() {
-                return Err(AdminError::NotFound(format!("role {}", target.role_id)));
-            }
             let key = serde_json::to_string(target)
                 .map_err(|error| AdminError::Backend(error.to_string()))?;
             if !unique.insert(key) {
@@ -1009,6 +1006,58 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn invitation_accepts_profile_owned_workspace_role() {
+        // Cause/effect decision table:
+        // C1 exact Org binding | C2 workspace belongs to Org | C3 role has a
+        // base RoleDef | result
+        // yes | yes | no  -> invitation accepted and both exact bindings persist
+        // yes | no  | any -> rejected by the workspace ownership rule (covered below)
+        // Constraint: product authorization profiles own their role grants;
+        // an ungranted role id is inert and therefore fails closed in the PDP.
+        let mut pap = invitation_pap();
+        let workspace = WorkspaceId("flow-acme".into());
+        pap.assign_workspace_org(
+            WorkspaceOrgEdge {
+                workspace_id: workspace.clone(),
+                org_id: OrgId("acme".into()),
+            },
+            at(),
+        )
+        .unwrap();
+        let mut request = invitation_request("profile-role");
+        request
+            .bindings
+            .push(awaken_iam_contract::InvitationBinding {
+                role_id: "awaken.flow:workspace_user".into(),
+                scope: ScopeRef::Workspace {
+                    workspace_id: workspace.clone(),
+                },
+            });
+
+        let issued = pap.create_invitation(request, at()).unwrap();
+        pap.accept_invitation(
+            &issued.invitation.id,
+            AcceptInvitation {
+                account_id: AccountId("bob".into()),
+                verified_email: "bob@example.com".into(),
+                token: issued.token,
+            },
+            at(),
+        )
+        .unwrap();
+
+        let bindings = pap.memberships_for_principal(&account("bob")).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().any(|binding| {
+            binding.role == RoleId("awaken.flow:workspace_user".into())
+                && binding.scope
+                    == ScopeRef::Workspace {
+                        workspace_id: workspace.clone(),
+                    }
+        }));
     }
 
     #[test]
