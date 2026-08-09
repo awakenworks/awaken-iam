@@ -33,7 +33,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "awaken-iam"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-client"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-contract",
  "awaken-iam-core",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-contract"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-core"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "argon2",
  "awaken-iam-contract",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-guard"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-host"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-client",
  "awaken-iam-contract",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-preset"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-contract",
  "awaken-iam-core",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "awaken-iam-server"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "async-trait",
  "awaken-iam-client",
@@ -2293,7 +2293,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "serde_json",
 ]
