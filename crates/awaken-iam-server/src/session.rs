@@ -309,6 +309,26 @@ mod tests {
     use super::*;
     use awaken_iam_contract::{AccountId, ExternalIdentityId};
 
+    struct UnavailableSessionRepo;
+
+    impl SessionRepo for UnavailableSessionRepo {
+        fn get(&self, _: &SessionId) -> awaken_iam_core::RepoResult<Option<Session>> {
+            Err(RepoError::Backend("unavailable".into()))
+        }
+
+        fn get_by_token_hash(&self, _: &str) -> awaken_iam_core::RepoResult<Option<Session>> {
+            Err(RepoError::Backend("unavailable".into()))
+        }
+
+        fn create(&self, _: Session) -> awaken_iam_core::RepoResult<()> {
+            Err(RepoError::Backend("unavailable".into()))
+        }
+
+        fn update(&self, _: Session) -> awaken_iam_core::RepoResult<()> {
+            Err(RepoError::Backend("unavailable".into()))
+        }
+    }
+
     /// Deterministic entropy so minted tokens are distinct and reproducible.
     #[derive(Default)]
     struct SequentialEntropy {
@@ -451,6 +471,37 @@ mod tests {
             IamError::SessionRevoked {
                 id: SessionId("sess_1".into()),
             }
+        );
+    }
+
+    /// Repository-failure decision rows: create/read/revoke backend failures all
+    /// collapse to one opaque storage-unavailable error; no cookie or principal
+    /// is accepted and no backend detail crosses the session boundary.
+    #[test]
+    fn repository_failure_fails_every_session_transition_closed() {
+        let repository: Arc<dyn SessionRepo> = Arc::new(UnavailableSessionRepo);
+        let mut gateway = SessionGateway::with_repository(
+            SequentialEntropy::default(),
+            SessionCookieConfig::default(),
+            repository,
+        );
+        assert_eq!(
+            gateway
+                .establish_session(establish_request("sess_1", "2026-06-20T00:00:00Z"), None)
+                .unwrap_err(),
+            IamError::SessionStorageUnavailable
+        );
+        assert_eq!(
+            gateway
+                .current_session("opaque", Timestamp("2026-06-19T06:00:00Z".into()))
+                .unwrap_err(),
+            IamError::SessionStorageUnavailable
+        );
+        assert_eq!(
+            gateway
+                .logout("opaque", Timestamp("2026-06-19T07:00:00Z".into()))
+                .unwrap_err(),
+            IamError::SessionStorageUnavailable
         );
     }
 
