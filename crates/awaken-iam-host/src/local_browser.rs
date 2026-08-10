@@ -5,12 +5,11 @@
 //! while the resulting HttpOnly cookie authenticates through the same PDP as
 //! API tokens and access tokens.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{AccountId, SessionId, SessionView, Timestamp};
-use awaken_iam_core::OsEntropy;
-use awaken_iam_core::SessionRepo;
+use awaken_iam_core::{EntropySource, OsEntropy, SessionRepo};
 use awaken_iam_server::{
     BeginLocalSetup, ExchangeLocalSetup, LocalSetupError, LocalSetupGateway, LocalSetupId,
     SameSite, SessionCookieConfig, SessionGateway,
@@ -43,7 +42,7 @@ pub struct LocalBrowserAuth {
     setup_id: LocalSetupId,
     setup: Arc<Mutex<LocalSetupGateway<OsEntropy>>>,
     sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
-    session_sequence: Arc<AtomicU64>,
+    session_ids: Arc<Mutex<OsEntropy>>,
 }
 
 impl LocalBrowserAuth {
@@ -91,7 +90,7 @@ impl LocalBrowserAuth {
                 setup_id,
                 setup: Arc::new(Mutex::new(setup)),
                 sessions: Arc::new(Mutex::new(sessions)),
-                session_sequence: Arc::new(AtomicU64::new(1)),
+                session_ids: Arc::new(Mutex::new(OsEntropy)),
             },
             LocalSetupHandoff {
                 setup_token: issued.setup_token,
@@ -145,7 +144,7 @@ async fn exchange(
 ) -> Result<Response, LocalBrowserAuthError> {
     require_same_origin(&headers)?;
     let (now_secs, now) = wall_clock_now();
-    let sequence = auth.session_sequence.fetch_add(1, Ordering::Relaxed);
+    let session_id = random_session_id(&mut *auth.session_ids.lock().expect("session id lock"));
     let established = auth
         .setup
         .lock()
@@ -154,7 +153,7 @@ async fn exchange(
             ExchangeLocalSetup {
                 id: auth.setup_id.clone(),
                 setup_token: request.setup_token,
-                session_id: SessionId(format!("local-session-{now_secs}-{sequence}")),
+                session_id,
                 now,
                 session_expires_at: timestamp_after(now_secs, SESSION_LIFETIME_SECS),
                 cookie_max_age_secs: Some(SESSION_LIFETIME_SECS),
@@ -172,6 +171,17 @@ async fn exchange(
             .map_err(|_| LocalBrowserAuthError::Unavailable)?,
     );
     Ok(response)
+}
+
+fn random_session_id(entropy: &mut impl EntropySource) -> SessionId {
+    let mut bytes = [0_u8; 32];
+    entropy.fill_bytes(&mut bytes);
+    let mut value = String::with_capacity("local-session-".len() + bytes.len() * 2);
+    value.push_str("local-session-");
+    for byte in bytes {
+        write!(value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    SessionId(value)
 }
 
 async fn current_session(
@@ -299,6 +309,18 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[derive(Default)]
+    struct SequentialEntropy(u8);
+
+    impl EntropySource for SequentialEntropy {
+        fn fill_bytes(&mut self, bytes: &mut [u8]) {
+            for byte in bytes {
+                *byte = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+    }
+
     fn exchange_request(token: &str, origin: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -310,6 +332,19 @@ mod tests {
                 serde_json::json!({ "setup_token": token }).to_string(),
             ))
             .unwrap()
+    }
+
+    /// Persisted-id cause/effect: process-local counters may restart at the same
+    /// wall-clock second, while consecutive entropy draws must still produce
+    /// distinct opaque ids that disclose neither account nor storage location.
+    #[test]
+    fn local_session_ids_are_entropy_owned_and_distinct() {
+        let mut entropy = SequentialEntropy::default();
+        let first = random_session_id(&mut entropy);
+        let second = random_session_id(&mut entropy);
+        assert_ne!(first, second);
+        assert!(first.0.starts_with("local-session-"));
+        assert_eq!(first.0.len(), "local-session-".len() + 64);
     }
 
     // Cause/effect decision table:
