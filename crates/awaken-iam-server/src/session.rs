@@ -13,11 +13,15 @@
 //! browser copy. Expiry and revocation are enforced by the directory: a revoked
 //! or expired session no longer authenticates.
 
-use awaken_iam_contract::{SessionId, SessionView, Timestamp};
+use std::sync::Arc;
+
+use awaken_iam_contract::{Session, SessionId, SessionView, Timestamp};
 use awaken_iam_core::{
-    EntropySource, EstablishSession, IamError, OsEntropy, SessionDirectory, SessionMinter,
+    EntropySource, EstablishSession, IamError, OsEntropy, RepoError, SessionMinter, SessionRepo,
     hash_session_token,
 };
+
+use crate::store::InMemoryStore;
 
 /// Default session cookie name.
 ///
@@ -132,25 +136,48 @@ pub struct EstablishedSession {
 }
 
 /// Server-side session manager backing the session cookie and `/v1/session`.
-#[derive(Debug, Default)]
 pub struct SessionGateway<E: EntropySource = OsEntropy> {
-    directory: SessionDirectory,
+    repository: Arc<dyn SessionRepo>,
     minter: SessionMinter<E>,
     cookie: SessionCookieConfig,
+}
+
+impl<E: EntropySource> std::fmt::Debug for SessionGateway<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionGateway")
+            .field("repository", &"SessionRepo")
+            .field("cookie", &self.cookie)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionGateway<OsEntropy> {
     /// Build a gateway over the OS entropy source and default cookie attributes.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_entropy(OsEntropy, SessionCookieConfig::default())
+    }
+}
+
+impl Default for SessionGateway<OsEntropy> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl<E: EntropySource> SessionGateway<E> {
     /// Build a gateway over a custom entropy source and cookie configuration.
     pub fn with_entropy(entropy: E, cookie: SessionCookieConfig) -> Self {
+        Self::with_repository(entropy, cookie, Arc::new(InMemoryStore::new()))
+    }
+
+    /// Build a gateway over one caller-selected authoritative session repository.
+    pub fn with_repository(
+        entropy: E,
+        cookie: SessionCookieConfig,
+        repository: Arc<dyn SessionRepo>,
+    ) -> Self {
         Self {
-            directory: SessionDirectory::new(),
+            repository,
             minter: SessionMinter::new(entropy),
             cookie,
         }
@@ -161,11 +188,6 @@ impl<E: EntropySource> SessionGateway<E> {
         &self.cookie
     }
 
-    /// Borrow the underlying session directory.
-    pub fn directory(&self) -> &SessionDirectory {
-        &self.directory
-    }
-
     /// Establish a session after a successful login and build its session
     /// cookie. `cookie_max_age_secs` optionally bounds the browser cookie; the
     /// server-side session expiry is carried by `request.expires_at`.
@@ -174,7 +196,11 @@ impl<E: EntropySource> SessionGateway<E> {
         request: EstablishSession,
         cookie_max_age_secs: Option<u64>,
     ) -> Result<EstablishedSession, IamError> {
-        let issued = self.minter.establish(&mut self.directory, request)?;
+        let session_id = request.id.clone();
+        let issued = self.minter.issue(request)?;
+        self.repository
+            .create(issued.session.clone())
+            .map_err(|error| repository_error(error, session_id))?;
         let set_cookie = self
             .cookie
             .render_set_cookie(&issued.token, cookie_max_age_secs);
@@ -194,10 +220,17 @@ impl<E: EntropySource> SessionGateway<E> {
         now: Timestamp,
     ) -> Result<SessionView, IamError> {
         let token_hash = hash_session_token(token);
-        let session = self
-            .directory
-            .authenticate_by_token_hash(&token_hash, now)?;
-        Ok(SessionView::from(session))
+        let mut session = self
+            .repository
+            .get_by_token_hash(&token_hash)
+            .map_err(|_| IamError::SessionStorageUnavailable)?
+            .ok_or_else(unknown_session)?;
+        authenticate(&session, &now)?;
+        session.last_seen_at = now;
+        self.repository
+            .update(session.clone())
+            .map_err(|_| IamError::SessionStorageUnavailable)?;
+        Ok(SessionView::from(&session))
     }
 
     /// Resolve the current session directly from a request `Cookie` header.
@@ -223,15 +256,51 @@ impl<E: EntropySource> SessionGateway<E> {
     /// Revocation is idempotent; an unknown token fails closed.
     pub fn logout(&mut self, token: &str, now: Timestamp) -> Result<String, IamError> {
         let token_hash = hash_session_token(token);
-        let id = self
-            .directory
-            .session_id_for_token_hash(&token_hash)
-            .cloned()
-            .ok_or_else(|| IamError::SessionNotFound {
-                id: SessionId(String::new()),
-            })?;
-        self.directory.revoke_session(&id, now)?;
+        let mut session = self
+            .repository
+            .get_by_token_hash(&token_hash)
+            .map_err(|_| IamError::SessionStorageUnavailable)?
+            .ok_or_else(unknown_session)?;
+        session.revoked_at.get_or_insert(now);
+        self.repository
+            .update(session)
+            .map_err(|_| IamError::SessionStorageUnavailable)?;
         Ok(self.cookie.render_clear_cookie())
+    }
+
+    /// Resolve the server-side id for audit without exposing repository access.
+    pub fn session_id_for_token(&self, token: &str) -> Result<Option<SessionId>, IamError> {
+        self.repository
+            .get_by_token_hash(&hash_session_token(token))
+            .map(|session| session.map(|value| value.id))
+            .map_err(|_| IamError::SessionStorageUnavailable)
+    }
+}
+
+fn authenticate(session: &Session, now: &Timestamp) -> Result<(), IamError> {
+    if session.revoked_at.is_some() {
+        return Err(IamError::SessionRevoked {
+            id: session.id.clone(),
+        });
+    }
+    if now.0 >= session.expires_at.0 {
+        return Err(IamError::SessionExpired {
+            id: session.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn unknown_session() -> IamError {
+    IamError::SessionNotFound {
+        id: SessionId(String::new()),
+    }
+}
+
+fn repository_error(error: RepoError, id: SessionId) -> IamError {
+    match error {
+        RepoError::Conflict(_) => IamError::DuplicateSession { id },
+        RepoError::NotFound(_) | RepoError::Backend(_) => IamError::SessionStorageUnavailable,
     }
 }
 
@@ -327,6 +396,58 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
+            IamError::SessionRevoked {
+                id: SessionId("sess_1".into()),
+            }
+        );
+    }
+
+    /// Repository-backed session cause/effect design:
+    /// C1=session is live, C2=Gateway is reconstructed over the same repository,
+    /// C3=logout is persisted. R1(C1,C2,!C3) authenticates and refreshes activity;
+    /// R2(C1,C2,C3) rejects after another reconstruction. This is the restart
+    /// durability and non-resurrection rule without a second hydration cache.
+    #[test]
+    fn repository_backed_session_survives_reconstruction_and_logout_does_not() {
+        let repository = Arc::new(InMemoryStore::new());
+        let mut first = SessionGateway::with_repository(
+            SequentialEntropy::default(),
+            SessionCookieConfig::default(),
+            repository.clone(),
+        );
+        let established = first
+            .establish_session(establish_request("sess_1", "2026-06-20T00:00:00Z"), None)
+            .unwrap();
+        let token = first
+            .cookie_config()
+            .extract_token(&established.set_cookie)
+            .unwrap();
+        drop(first);
+
+        let mut restarted = SessionGateway::with_repository(
+            SequentialEntropy::default(),
+            SessionCookieConfig::default(),
+            repository.clone(),
+        );
+        let live = restarted
+            .current_session(&token, Timestamp("2026-06-19T06:00:00Z".into()))
+            .unwrap();
+        assert_eq!(live.session_id, SessionId("sess_1".into()));
+        assert_eq!(live.last_seen_at, Timestamp("2026-06-19T06:00:00Z".into()));
+        restarted
+            .logout(&token, Timestamp("2026-06-19T07:00:00Z".into()))
+            .unwrap();
+        drop(restarted);
+
+        let mut after_logout = SessionGateway::with_repository(
+            SequentialEntropy::default(),
+            SessionCookieConfig::default(),
+            repository,
+        );
+        assert_eq!(
+            after_logout
+                .current_session(&token, Timestamp("2026-06-19T08:00:00Z".into()))
+                .unwrap_err(),
             IamError::SessionRevoked {
                 id: SessionId("sess_1".into()),
             }

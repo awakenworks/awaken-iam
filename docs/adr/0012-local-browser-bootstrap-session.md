@@ -45,3 +45,31 @@ session table, cookie parser, or setup-token implementation.
   `SessionGateway`, not create another authentication path.
 - Products must mount the IAM router before their protected routes and use the
   returned, session-enabled `IamGate`.
+
+## Amendment — 2026-08-10: durable local browser sessions
+
+The initial in-memory consequence is superseded for persistent local
+deployments. `SessionGateway` now uses the existing
+`awaken_iam_core::SessionRepo` port as its only session backing. Its default
+adapter remains the existing `InMemoryStore` for tests and explicitly
+ephemeral composition, while local products inject the same migrated
+`SqlStore<SqliteBackend>` that already owns `iam.identity` under their typed
+data directory.
+
+Static ownership remains unchanged:
+
+| Owner | Responsibility |
+|---|---|
+| `SessionGateway` | mint, cookie parsing, liveness, activity refresh, logout |
+| `SessionRepo` | create, token-hash lookup, activity/revocation persistence |
+| local product composition | select its existing `iam.sqlite` adapter |
+| browser | retain only the opaque HttpOnly cookie |
+
+On every authentication, the Gateway resolves the token hash from the
+repository, rejects unknown, expired, or revoked rows, and writes the refreshed
+`last_seen_at` through the same repository. Logout persists `revoked_at`
+before clearing the cookie. Repository failures fail closed. After a process
+restart, the unchanged cookie therefore resolves through the reopened
+`iam.sqlite`; the newly issued setup challenge is needed only by a browser
+without a live session. Setup challenges remain deliberately transient,
+five-minute, and single-use.

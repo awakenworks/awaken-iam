@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{AccountId, SessionId, SessionView, Timestamp};
 use awaken_iam_core::OsEntropy;
+use awaken_iam_core::SessionRepo;
 use awaken_iam_server::{
     BeginLocalSetup, ExchangeLocalSetup, LocalSetupError, LocalSetupGateway, LocalSetupId,
     SameSite, SessionCookieConfig, SessionGateway,
@@ -50,6 +51,30 @@ impl LocalBrowserAuth {
     pub fn begin(
         account_id: AccountId,
     ) -> Result<(Self, LocalSetupHandoff), LocalBrowserAuthError> {
+        Self::begin_with_gateway(
+            account_id,
+            SessionGateway::with_entropy(OsEntropy, local_cookie_config()),
+        )
+    }
+
+    /// Start a setup window whose resulting sessions use an existing repository.
+    ///
+    /// Persistent local products pass the same migrated IAM identity store they
+    /// already own; no product-local session cache or hydration path is created.
+    pub fn begin_with_session_repository(
+        account_id: AccountId,
+        repository: Arc<dyn SessionRepo>,
+    ) -> Result<(Self, LocalSetupHandoff), LocalBrowserAuthError> {
+        Self::begin_with_gateway(
+            account_id,
+            SessionGateway::with_repository(OsEntropy, local_cookie_config(), repository),
+        )
+    }
+
+    fn begin_with_gateway(
+        account_id: AccountId,
+        sessions: SessionGateway<OsEntropy>,
+    ) -> Result<(Self, LocalSetupHandoff), LocalBrowserAuthError> {
         let (now_secs, now) = wall_clock_now();
         let setup_id = LocalSetupId(format!("local-setup-{now_secs}"));
         let mut setup = LocalSetupGateway::new(OsEntropy);
@@ -61,15 +86,6 @@ impl LocalBrowserAuth {
                 expires_at: timestamp_after(now_secs, SETUP_LIFETIME_SECS),
             })
             .map_err(|_| LocalBrowserAuthError::Unavailable)?;
-        let sessions = SessionGateway::with_entropy(
-            OsEntropy,
-            SessionCookieConfig {
-                name: LOCAL_COOKIE_NAME.to_owned(),
-                secure: false,
-                same_site: SameSite::Strict,
-                ..SessionCookieConfig::default()
-            },
-        );
         Ok((
             Self {
                 setup_id,
@@ -92,6 +108,15 @@ impl LocalBrowserAuth {
     /// Attach this authority to an already-shared product gate.
     pub fn attach_to(&self, gate: &IamGate) {
         gate.attach_browser_sessions(Arc::clone(&self.sessions));
+    }
+}
+
+fn local_cookie_config() -> SessionCookieConfig {
+    SessionCookieConfig {
+        name: LOCAL_COOKIE_NAME.to_owned(),
+        secure: false,
+        same_site: SameSite::Strict,
+        ..SessionCookieConfig::default()
     }
 }
 
@@ -160,24 +185,41 @@ async fn current_session(
         .lock()
         .expect("browser session lock")
         .current_session_from_cookie(cookie, now)
-        .map_err(|_| LocalBrowserAuthError::Unauthenticated)?;
+        .map_err(|error| match error {
+            awaken_iam_core::IamError::SessionStorageUnavailable => {
+                LocalBrowserAuthError::Unavailable
+            }
+            _ => LocalBrowserAuthError::Unauthenticated,
+        })?;
     Ok(Json(SessionResponse { session }))
 }
 
-async fn logout(State(auth): State<LocalBrowserAuth>, headers: HeaderMap) -> Response {
+async fn logout(
+    State(auth): State<LocalBrowserAuth>,
+    headers: HeaderMap,
+) -> Result<Response, LocalBrowserAuthError> {
     let (_, now) = wall_clock_now();
     let mut sessions = auth.sessions.lock().expect("browser session lock");
-    let clear = headers
+    let token = headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|header| sessions.cookie_config().extract_token(header))
-        .and_then(|token| sessions.logout(&token, now).ok())
-        .unwrap_or_else(|| sessions.cookie_config().render_clear_cookie());
+        .and_then(|header| sessions.cookie_config().extract_token(header));
+    let clear = if let Some(token) = token {
+        match sessions.logout(&token, now) {
+            Ok(clear) => clear,
+            Err(awaken_iam_core::IamError::SessionStorageUnavailable) => {
+                return Err(LocalBrowserAuthError::Unavailable);
+            }
+            Err(_) => sessions.cookie_config().render_clear_cookie(),
+        }
+    } else {
+        sessions.cookie_config().render_clear_cookie()
+    };
     let mut response = StatusCode::NO_CONTENT.into_response();
     if let Ok(value) = HeaderValue::from_str(&clear) {
         response.headers_mut().insert(SET_COOKIE, value);
     }
-    response
+    Ok(response)
 }
 
 fn cookie_header(headers: &HeaderMap) -> Result<&str, LocalBrowserAuthError> {
@@ -220,8 +262,13 @@ pub enum LocalBrowserAuthError {
 }
 
 impl From<LocalSetupError> for LocalBrowserAuthError {
-    fn from(_: LocalSetupError) -> Self {
-        Self::Unauthenticated
+    fn from(error: LocalSetupError) -> Self {
+        match error {
+            LocalSetupError::SessionUnavailable => Self::Unavailable,
+            LocalSetupError::InvalidChallenge
+            | LocalSetupError::InvalidWindow
+            | LocalSetupError::Session => Self::Unauthenticated,
+        }
     }
 }
 
@@ -247,6 +294,7 @@ impl IntoResponse for LocalBrowserAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use awaken_iam_server::InMemoryStore;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -323,5 +371,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Local-browser restart decision table:
+    /// C1=one exchanged cookie, C2=same SessionRepo after authority rebuild,
+    /// C3=persisted logout. R1(C1,C2,!C3) GETs the current session without the
+    /// new setup token; R2(C1,C2,C3) rejects after another rebuild.
+    #[tokio::test]
+    async fn repository_backed_browser_cookie_survives_authority_restart() {
+        let repository: Arc<dyn SessionRepo> = Arc::new(InMemoryStore::new());
+        let (first, handoff) = LocalBrowserAuth::begin_with_session_repository(
+            AccountId("local-admin".into()),
+            repository.clone(),
+        )
+        .unwrap();
+        let exchange = local_browser_router(first)
+            .oneshot(exchange_request(
+                &handoff.setup_token,
+                "http://127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        let cookie = exchange.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let (restarted, _) = LocalBrowserAuth::begin_with_session_repository(
+            AccountId("local-admin".into()),
+            repository.clone(),
+        )
+        .unwrap();
+        let restarted_app = local_browser_router(restarted);
+        let current = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/v1/session")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+
+        let logout = restarted_app
+            .oneshot(
+                Request::delete("/v1/session")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+        let (after_logout, _) = LocalBrowserAuth::begin_with_session_repository(
+            AccountId("local-admin".into()),
+            repository,
+        )
+        .unwrap();
+        let rejected = local_browser_router(after_logout)
+            .oneshot(
+                Request::get("/v1/session")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     }
 }

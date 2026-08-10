@@ -68,6 +68,8 @@ pub enum LocalSetupError {
     InvalidWindow,
     #[error("local setup session could not be established")]
     Session,
+    #[error("local setup session storage is unavailable")]
+    SessionUnavailable,
 }
 
 /// Issues and atomically consumes local setup challenges.
@@ -142,7 +144,12 @@ impl<E: EntropySource> LocalSetupGateway<E> {
                 },
                 request.cookie_max_age_secs,
             )
-            .map_err(|_| LocalSetupError::Session)
+            .map_err(|error| match error {
+                awaken_iam_core::IamError::SessionStorageUnavailable => {
+                    LocalSetupError::SessionUnavailable
+                }
+                _ => LocalSetupError::Session,
+            })
     }
 }
 

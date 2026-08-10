@@ -83,6 +83,17 @@ impl<E: EntropySource> SessionMinter<E> {
         directory: &mut SessionDirectory,
         request: EstablishSession,
     ) -> Result<IssuedSession, IamError> {
+        let issued = self.issue(request)?;
+        directory.create_session(issued.session.clone())?;
+        Ok(issued)
+    }
+
+    /// Mint one session without selecting a persistence adapter.
+    ///
+    /// Server composition uses this seam with the canonical [`SessionRepo`](crate::SessionRepo),
+    /// while the legacy in-memory directory helper above remains available to
+    /// core-only consumers. The cleartext token is still returned exactly once.
+    pub fn issue(&mut self, request: EstablishSession) -> Result<IssuedSession, IamError> {
         if request.expires_at.0 <= request.created_at.0 {
             return Err(IamError::InvalidSessionWindow {
                 id: request.id.clone(),
@@ -102,8 +113,6 @@ impl<E: EntropySource> SessionMinter<E> {
             expires_at: request.expires_at,
             revoked_at: None,
         };
-
-        directory.create_session(session.clone())?;
 
         Ok(IssuedSession { session, token })
     }

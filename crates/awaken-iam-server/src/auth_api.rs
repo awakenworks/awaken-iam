@@ -1847,11 +1847,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             .ok_or(AuthApiError::Login(IamError::SessionNotFound {
                 id: SessionId(String::new()),
             }))?;
-        let session_id = self
-            .sessions
-            .directory()
-            .session_id_for_token_hash(&awaken_iam_core::hash_session_token(&token))
-            .cloned();
+        let session_id = self.sessions.session_id_for_token(&token)?;
         let clear_session_cookie = self.sessions.logout(&token, now.clone())?;
         if let Some(session_id) = session_id {
             self.audit.push(AuthAuditEvent::LoggedOut {

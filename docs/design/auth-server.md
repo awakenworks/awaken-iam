@@ -120,11 +120,16 @@ OAuth provider or exposing an automation credential to browser JavaScript:
 5. Product middleware resolves that cookie to an Account principal and evaluates
    the same product action and scope policy used for bearer credentials.
 6. DELETE /v1/session revokes the session and clears the cookie.
+7. Persistent local compositions reopen the same `SessionRepo` after restart,
+   so an unexpired, unrevoked cookie continues without another setup exchange.
 ```
 
 The setup token is a bootstrap handoff, not a reusable API credential. It is
 never persisted by the browser. API tokens remain the credential for CLI and
-automation clients.
+automation clients. The canonical `SessionRepo` stores only the opaque
+cookie's hash plus session metadata; authentication refresh and logout update
+that same row. Setup challenges remain in memory and are never a recovery
+credential.
 
 ## Provider login subflow
 

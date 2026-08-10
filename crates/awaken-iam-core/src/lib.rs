@@ -237,6 +237,12 @@ pub enum IamError {
         /// Expired session id.
         id: SessionId,
     },
+    /// The authoritative session repository could not complete a read or write.
+    ///
+    /// The backend detail stays opaque at the domain boundary; callers fail
+    /// closed and may report an unavailable authentication service.
+    #[error("session storage is unavailable")]
+    SessionStorageUnavailable,
     /// The requested API-token expiry was not strictly after creation.
     #[error("api token window is invalid")]
     InvalidApiTokenWindow {
