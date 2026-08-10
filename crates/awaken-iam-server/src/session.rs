@@ -188,6 +188,12 @@ impl<E: EntropySource> SessionGateway<E> {
         &self.cookie
     }
 
+    /// Clone the authoritative repository handle for composition builders that
+    /// replace cookie policy without changing storage ownership.
+    pub(crate) fn repository(&self) -> Arc<dyn SessionRepo> {
+        Arc::clone(&self.repository)
+    }
+
     /// Establish a session after a successful login and build its session
     /// cookie. `cookie_max_age_secs` optionally bounds the browser cookie; the
     /// server-side session expiry is carried by `request.expires_at`.

@@ -28,6 +28,12 @@ assembly — N stateless nodes against one HA store. That topology requires
 Postgres; SQLite is single-writer and serves the single-node embedded/local band
 only. See [high availability](high-availability.md).
 
+The same rule applies specifically to browser authorization: durable server
+composition injects the shared SQL adapter through IAM's canonical
+`SessionRepo`; it does not retain a process-local session cache or introduce a
+separate browser-session database. Repository failure rejects the request, so
+an unhealthy replica cannot silently mint or accept an unshared session.
+
 > "Migration" here means **schema** migration (owning IAM's tables). It is
 > unrelated to the capability [migration plan](migration-strategy.md) (moving IAM
 > capability in from other services). Two different migrations.

@@ -52,6 +52,7 @@
 //! [`AuthAuditEvent`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::access_token::{
     AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
@@ -76,11 +77,14 @@ use awaken_iam_core::{
     EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt,
     MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
     OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory,
-    RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, TokenRedemption,
-    parse_presented_refresh_token,
+    RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, SessionRepo,
+    TokenRedemption, parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+mod builder;
+
 /// Default key id minted for the bootstrap access-token signing key.
 const DEFAULT_SIGNING_KID: &str = "iam-access-key-1";
 /// Number of random bytes drawn for each generated id (256 bits).
@@ -800,92 +804,7 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     ids: E,
 }
 
-impl AuthApi<OsEntropy> {
-    /// Build an auth API over OS entropy and hardened default cookies.
-    pub fn new() -> Self {
-        Self::with_entropy(OsEntropy)
-    }
-}
-
-impl Default for AuthApi<OsEntropy> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<E: EntropySource + Clone> AuthApi<E> {
-    /// Build an auth API over a custom entropy source and default policies.
-    pub fn with_entropy(entropy: E) -> Self {
-        let login_cookie = SessionCookieConfig {
-            name: DEFAULT_LOGIN_COOKIE_NAME.to_owned(),
-            ..SessionCookieConfig::default()
-        };
-        // Draw the bootstrap signing seed from a clone so the live `ids` stream
-        // (and therefore minted ids) is unaffected by key generation.
-        let mut bootstrap = entropy.clone();
-        let mut seed = [0u8; 32];
-        bootstrap.fill_bytes(&mut seed);
-        let tokens = AccessTokenAuthority::new(LocalSeedSigner::new(DEFAULT_SIGNING_KID, seed));
-        Self {
-            providers: Vec::new(),
-            challenge: OAuthChallengeService::new(entropy.clone()),
-            login_directory: SessionDirectory::new(),
-            sessions: SessionGateway::with_entropy(entropy.clone(), SessionCookieConfig::default()),
-            directory: IdentityDirectory::new(),
-            pending: HashMap::new(),
-            return_to: ReturnToPolicy::default(),
-            login_cookie,
-            tokens,
-            refresh_tokens: RefreshTokenDirectory::new(),
-            refresh_minter: RefreshTokenMinter::new(entropy.clone()),
-            access_revocations: AccessTokenRevocations::new(),
-            trusted_issuers: TrustedIssuerRegistry::new(),
-            iam_issuer: String::new(),
-            oauth_provider: OAuthAuthorizationServer::new(
-                OAuthClientRegistry::new(),
-                entropy.clone(),
-            ),
-            audit: Vec::new(),
-            ids: entropy,
-        }
-    }
-
-    /// Replace the `return_to` allowlist policy.
-    pub fn with_return_to_policy(mut self, policy: ReturnToPolicy) -> Self {
-        self.return_to = policy;
-        self
-    }
-
-    /// Replace the session cookie configuration.
-    pub fn with_session_cookie(mut self, cookie: SessionCookieConfig) -> Self {
-        self.sessions = SessionGateway::with_entropy(self.ids.clone(), cookie);
-        self
-    }
-
-    /// Replace the login correlation cookie configuration.
-    pub fn with_login_cookie(mut self, cookie: SessionCookieConfig) -> Self {
-        self.login_cookie = cookie;
-        self
-    }
-
-    /// Set the IAM issuer (`iss`) stamped into tokens minted by federated token
-    /// exchange. A deployment configures this to its own canonical base URL.
-    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
-        self.iam_issuer = issuer.into();
-        self
-    }
-
-    /// Use one shared, jointly rotated signing authority for every token family.
-    pub fn with_access_token_authority(mut self, authority: AccessTokenAuthority) -> Self {
-        self.tokens = authority;
-        self
-    }
-
-    /// Replace the shared authority during deployment assembly or key rollout.
-    pub fn set_access_token_authority(&mut self, authority: AccessTokenAuthority) {
-        self.tokens = authority;
-    }
-
     /// Register (or replace, by issuer id) a trusted external issuer whose
     /// assertions IAM will exchange for IAM tokens via RFC 8693 token exchange.
     pub fn register_trusted_issuer(&mut self, issuer: TrustedIssuer) {

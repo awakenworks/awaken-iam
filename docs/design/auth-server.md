@@ -131,6 +131,14 @@ cookie's hash plus session metadata; authentication refresh and logout update
 that same row. Setup challenges remain in memory and are never a recovery
 credential.
 
+Hosted and standalone server compositions use the identical session port with a
+different adapter: every replica receives the same Postgres-backed
+`SqlStore<PostgresBackend>` as its `SessionRepo`. A cookie established by one
+replica is therefore resolvable by another replica and survives process
+replacement. PostgreSQL unavailability fails session creation, resolution, and
+logout closed; the server never falls back to an in-memory session directory.
+SQLite remains the single-process local adapter and is not an HA server store.
+
 ## Provider login subflow
 
 Provider-specific routes are IAM-internal browser routes used after the unified

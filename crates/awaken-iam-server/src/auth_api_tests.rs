@@ -1,5 +1,5 @@
 use super::*;
-use crate::DEFAULT_SESSION_COOKIE_NAME;
+use crate::{DEFAULT_SESSION_COOKIE_NAME, InMemoryStore};
 use awaken_iam_contract::IdentityProviderConfigId;
 
 /// Deterministic entropy so minted ids and secrets are reproducible.
@@ -231,6 +231,45 @@ fn full_login_loop_provisions_account_and_establishes_session() {
         .filter(|event| matches!(event, AuthAuditEvent::LoginSucceeded { .. }))
         .count();
     assert_eq!(succeeded, 2);
+}
+
+/// Durable server-session cause/effect decision table:
+/// C1=two AuthApi instances share one SessionRepo, C2=session is live,
+/// C3=logout is persisted, C4=cookie/repository builders are applied in either
+/// order. R1(C1,C2,!C3,C4) lets the second instance authenticate a session
+/// minted by the first; R2(C1,C2,C3,C4) makes a third instance reject it. This
+/// covers restart and multi-replica continuity without a hydration cache.
+#[test]
+fn shared_session_repository_survives_auth_api_reconstruction_and_logout() {
+    let repository = Arc::new(InMemoryStore::new());
+    let mut first = api()
+        .with_session_repository(repository.clone())
+        .with_session_cookie(SessionCookieConfig::default());
+    let login = start(&mut first, Some("/dashboard"));
+    let established = callback(&mut first, &login, "subject-1:user@example.com").unwrap();
+    let token = SessionCookieConfig::default()
+        .extract_token(&established.set_session_cookie)
+        .unwrap();
+    let cookie = format!("{DEFAULT_SESSION_COOKIE_NAME}={token}");
+    drop(first);
+
+    let mut restarted = api()
+        .with_session_cookie(SessionCookieConfig::default())
+        .with_session_repository(repository.clone());
+    let current = restarted
+        .current_session(&cookie, Timestamp("2026-06-19T02:00:00Z".into()))
+        .unwrap();
+    assert_eq!(current.session_id, established.session.session_id);
+    restarted
+        .logout(&cookie, Timestamp("2026-06-19T03:00:00Z".into()))
+        .unwrap();
+    drop(restarted);
+
+    let mut after_logout = api().with_session_repository(repository);
+    assert!(matches!(
+        after_logout.current_session(&cookie, Timestamp("2026-06-19T04:00:00Z".into())),
+        Err(AuthApiError::Login(IamError::SessionRevoked { .. }))
+    ));
 }
 
 #[test]
