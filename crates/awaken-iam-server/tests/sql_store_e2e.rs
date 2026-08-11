@@ -454,8 +454,18 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
     assert_eq!(AccountRepo::list(&other).unwrap().len(), 0);
 }
 
-#[test]
-fn postgres_backend_serves_every_port_when_configured() {
+#[tokio::test]
+async fn postgres_backend_serves_every_port_when_configured() {
+    // Cause/effect graph: C1=the complete Postgres port suite runs inside an
+    // entered Tokio host, C2=connect/query/transaction/migration use the
+    // synchronous driver. E1=every call crosses the adapter-owned plain-thread
+    // boundary; E2=all repository effects match the shared backend contract;
+    // E3=no nested-runtime panic occurs.
+    //
+    // Decision table: configured+C1+C2 -> E1+E2+E3; unconfigured -> explicit
+    // skip; configured+plain caller is covered by the same shared port harness
+    // through production migration callers and does not select this regression
+    // branch. Backend errors remain fail-closed through the existing assertions.
     let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
         eprintln!("skipping: set IAM_TEST_POSTGRES_URL to run the Postgres backend e2e");
         return;

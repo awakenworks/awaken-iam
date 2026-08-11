@@ -121,3 +121,31 @@ guard**, and the **prose in the docs**.
   replication or failover story and is fail-closed single-node; Postgres keeps
   the HA story in [high availability](../design/high-availability.md). Neither
   backend changes the engine's default-deny, fail-closed posture.
+
+## Amendment: synchronous Postgres runtime ownership (2026-08-12)
+
+The Postgres adapter owns the complete synchronous-driver boundary, not only
+the final `Client` destructor. The `postgres` client enters its private Tokio
+runtime during ordinary queries and transactions as well as shutdown. When an
+embedded or standalone Axum handler calls a synchronous repository port from
+an already-entered Tokio runtime, `PostgresBackend` executes that driver call
+on a scoped plain OS thread and synchronously returns its result. Callers that
+already run outside Tokio retain the direct path.
+
+This remains one storage adapter and one source of SQL/transaction truth. HTTP
+routers, `AuthApi`, and embedding products must not grow parallel database
+executors or Postgres-specific session repositories.
+
+```text
+Axum/AuthApi -> repository port -> PostgresBackend
+                                -> direct call (plain caller)
+                                -> scoped plain thread (Tokio caller)
+                                -> one shared Client/transaction
+```
+
+| Caller context | Driver operation | Adapter boundary | Outcome |
+|---|---|---|---|
+| no entered Tokio runtime | query/transaction | direct | original result |
+| entered Tokio runtime | query/transaction | scoped plain thread | original result |
+| entered Tokio runtime | direct driver call | forbidden | nested-runtime panic |
+| either | backend error | same selected boundary | unchanged fail-closed error |

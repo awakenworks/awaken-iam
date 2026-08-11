@@ -27,6 +27,29 @@ use awaken_iam_core::{RepoError, RepoResult};
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
 use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
 
+/// Execute a synchronous-driver operation without an entered Tokio runtime.
+///
+/// The `postgres` client owns a private runtime. Repository ports remain
+/// synchronous, so an Axum host cannot safely call the driver on its Tokio
+/// worker. A scoped thread preserves the synchronous port and borrowed inputs
+/// while keeping runtime ownership inside this adapter. Existing plain-thread
+/// callers retain the allocation-free direct path.
+fn run_outside_tokio<T: Send>(component: &'static str, operation: impl FnOnce() -> T + Send) -> T {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return operation();
+    }
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name(format!("awaken-iam-postgres-{component}"))
+            .spawn_scoped(scope, operation)
+            .expect("spawn PostgreSQL operation thread");
+        match handle.join() {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
 /// A Postgres connection usable as both a migration executor and a repository
 /// backend. Cheap to [`Clone`]: clones share one client.
 #[derive(Clone)]
@@ -91,9 +114,21 @@ impl PostgresBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn with_client<T: Send>(
+        &self,
+        component: &'static str,
+        operation: impl FnOnce(&mut Client) -> T + Send,
+    ) -> T {
+        run_outside_tokio(component, || {
+            let mut client = self.lock();
+            operation(&mut client)
+        })
+    }
+
     /// Connect to Postgres using a libpq-style connection string or URL.
     pub fn connect(params: &str) -> RepoResult<Self> {
-        let client = Client::connect(params, NoTls).map_err(backend_err)?;
+        let client =
+            run_outside_tokio("connect", || Client::connect(params, NoTls)).map_err(backend_err)?;
         Ok(Self::new(client))
     }
 }
@@ -208,43 +243,46 @@ impl SqlConn for PostgresBackend {
     }
 
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64> {
-        let mut client = self.lock();
-        client
-            .execute(&render(sql), &refs(params))
-            .map_err(backend_err)
+        self.with_client("execute", |client| {
+            client
+                .execute(&render(sql), &refs(params))
+                .map_err(backend_err)
+        })
     }
 
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>> {
-        let mut client = self.lock();
-        let rows = client
-            .query(&render(sql), &refs(params))
-            .map_err(backend_err)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut cells: SqlRow = Vec::with_capacity(row.len());
-            for idx in 0..row.len() {
-                cells.push(
-                    row.try_get::<usize, Option<String>>(idx)
-                        .map_err(backend_err)?,
-                );
+        self.with_client("query", |client| {
+            let rows = client
+                .query(&render(sql), &refs(params))
+                .map_err(backend_err)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut cells: SqlRow = Vec::with_capacity(row.len());
+                for idx in 0..row.len() {
+                    cells.push(
+                        row.try_get::<usize, Option<String>>(idx)
+                            .map_err(backend_err)?,
+                    );
+                }
+                out.push(cells);
             }
-            out.push(cells);
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>> {
-        let mut client = self.lock();
-        let mut tx = client.transaction().map_err(backend_err)?;
-        let mut affected = Vec::with_capacity(writes.len());
-        for write in writes {
-            affected.push(
-                tx.execute(&render(&write.sql), &refs(&write.params))
-                    .map_err(backend_err)?,
-            );
-        }
-        tx.commit().map_err(backend_err)?;
-        Ok(affected)
+        self.with_client("transaction", |client| {
+            let mut tx = client.transaction().map_err(backend_err)?;
+            let mut affected = Vec::with_capacity(writes.len());
+            for write in writes {
+                affected.push(
+                    tx.execute(&render(&write.sql), &refs(&write.params))
+                        .map_err(backend_err)?,
+                );
+            }
+            tx.commit().map_err(backend_err)?;
+            Ok(affected)
+        })
     }
 }
 
@@ -261,77 +299,79 @@ impl MigrationExecutor for PostgresBackend {
         let dialect = Dialect::Postgres;
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
-        let mut client = self.lock();
-        Self::ensure_ledger(&mut client, prefix)?;
+        self.with_client("migrate", |client| {
+            Self::ensure_ledger(client, prefix)?;
 
-        let mut applied = Vec::new();
-        for bundle in bundles {
-            let mut tx = client.transaction().map_err(backend_err)?;
-            // Transaction-scoped advisory lock keyed on the ledger and bundle id —
-            // the single-applier guard (ADR-0003), released automatically at
-            // commit/rollback. Held across the ledger read and the apply, it makes
-            // exactly one node apply a pending bundle while the others wait, then
-            // verify; a failed run never strands it.
-            tx.execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-                &[&ledger, &bundle.bundle_id()],
-            )
-            .map_err(backend_err)?;
-
-            let recorded = read_applied(&mut tx, ledger, bundle.bundle_id())?;
-            let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
-            for migration in pending {
-                let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
-                tx.batch_execute(&sql).map_err(backend_err)?;
-                let checksum = migration.checksum_for(dialect);
-                let description = migration.ledger_description();
+            let mut applied = Vec::new();
+            for bundle in bundles {
+                let mut tx = client.transaction().map_err(backend_err)?;
+                // Transaction-scoped advisory lock keyed on the ledger and bundle id —
+                // the single-applier guard (ADR-0003), released automatically at
+                // commit/rollback. Held across the ledger read and the apply, it makes
+                // exactly one node apply a pending bundle while the others wait, then
+                // verify; a failed run never strands it.
                 tx.execute(
-                    &format!(
-                        "INSERT INTO {ledger} \
-                         (bundle_id, version, checksum, description, applied_by) \
-                         VALUES ($1, $2, $3, $4, $5)"
-                    ),
-                    &[
-                        &bundle.bundle_id(),
-                        &migration.version(),
-                        &checksum,
-                        &description,
-                        &"awaken-iam",
-                    ],
+                    "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+                    &[&ledger, &bundle.bundle_id()],
                 )
                 .map_err(backend_err)?;
-                applied.push(AppliedMigration {
-                    bundle_id: bundle.bundle_id().to_owned(),
-                    version: migration.version(),
-                    checksum,
-                    description,
-                });
+
+                let recorded = read_applied(&mut tx, ledger, bundle.bundle_id())?;
+                let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+                for migration in pending {
+                    let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
+                    tx.batch_execute(&sql).map_err(backend_err)?;
+                    let checksum = migration.checksum_for(dialect);
+                    let description = migration.ledger_description();
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO {ledger} \
+                         (bundle_id, version, checksum, description, applied_by) \
+                         VALUES ($1, $2, $3, $4, $5)"
+                        ),
+                        &[
+                            &bundle.bundle_id(),
+                            &migration.version(),
+                            &checksum,
+                            &description,
+                            &"awaken-iam",
+                        ],
+                    )
+                    .map_err(backend_err)?;
+                    applied.push(AppliedMigration {
+                        bundle_id: bundle.bundle_id().to_owned(),
+                        version: migration.version(),
+                        checksum,
+                        description,
+                    });
+                }
+                tx.commit().map_err(backend_err)?;
             }
-            tx.commit().map_err(backend_err)?;
-        }
-        Ok(applied)
+            Ok(applied)
+        })
     }
 
     fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
-        let mut client = self.lock();
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT version, checksum FROM {ledger} \
-                     WHERE bundle_id = $1 ORDER BY version"
-                ),
-                &[&bundle_id],
-            )
-            .map_err(backend_err)?;
-        let mut applied = BTreeMap::new();
-        for row in &rows {
-            let version: i64 = row.try_get(0).map_err(backend_err)?;
-            let checksum: String = row.try_get(1).map_err(backend_err)?;
-            applied.insert(version, checksum);
-        }
-        Ok(applied)
+        self.with_client("migration-read", |client| {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT version, checksum FROM {ledger} \
+                         WHERE bundle_id = $1 ORDER BY version"
+                    ),
+                    &[&bundle_id],
+                )
+                .map_err(backend_err)?;
+            let mut applied = BTreeMap::new();
+            for row in &rows {
+                let version: i64 = row.try_get(0).map_err(backend_err)?;
+                let checksum: String = row.try_get(1).map_err(backend_err)?;
+                applied.insert(version, checksum);
+            }
+            Ok(applied)
+        })
     }
 }
 
@@ -362,7 +402,33 @@ fn read_applied(
 
 #[cfg(test)]
 mod tests {
-    use super::{PlainThreadOwner, render as render_placeholders};
+    use super::{PlainThreadOwner, render as render_placeholders, run_outside_tokio};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_driver_operation_runs_outside_async_host() {
+        // Cause/effect graph: C1=an entered Tokio runtime, C2=a synchronous
+        // driver operation enters its own private runtime. E1=the adapter uses
+        // a distinct scoped thread; E2=the nested runtime completes; E3=the
+        // exact result returns to the caller.
+        //
+        // Decision table: C1+C2 -> E1+E2+E3; !C1+C2 -> direct completion;
+        // C1+C2 with a direct call -> forbidden nested-runtime panic. Backend
+        // errors use the same chosen boundary and are covered by repository
+        // contract tests.
+        let caller = std::thread::current().id();
+        let (operation, value) = run_outside_tokio("test", || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("private client runtime");
+            (
+                std::thread::current().id(),
+                runtime.block_on(async { 42_u8 }),
+            )
+        });
+
+        assert_ne!(operation, caller);
+        assert_eq!(value, 42);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_owning_client_is_destroyed_outside_async_host() {
