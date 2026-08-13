@@ -433,8 +433,10 @@ fn forged_state_is_rejected_and_burns_the_challenge() {
         }
     )));
 
-    // Replaying the now-burned challenge, even with the correct state, no longer
-    // correlates: the transient secrets were dropped.
+    // Replaying the now-burned challenge, even with the correct state, is
+    // classified from the retained consumed row. The durable repository owns
+    // this one replay fence; deleting correlation state here would create a
+    // second, less precise replay path.
     let replay = api
         .complete_callback(CallbackRequest {
             provider_key: key(),
@@ -446,7 +448,10 @@ fn forged_state_is_rejected_and_burns_the_challenge() {
             session_cookie_max_age_secs: None,
         })
         .expect_err("replay must fail");
-    assert!(matches!(replay, AuthApiError::MissingCorrelation));
+    assert!(matches!(
+        replay,
+        AuthApiError::Login(awaken_iam_core::IamError::LoginStateAlreadyConsumed { .. })
+    ));
 }
 
 #[test]

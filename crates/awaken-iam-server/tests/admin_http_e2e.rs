@@ -87,6 +87,82 @@ async fn body_json(response: Response<Body>) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn capability_http_uses_one_admin_issuer_and_public_fail_closed_verifier() {
+    // Capability HTTP cause/effect decision table:
+    // C1=admin credential, C2=forward window + non-empty coordinates/scopes,
+    // C3=matching audience, C4=unexpired token. Effects: E1=mint exactly one
+    // cap+jwt from the daemon authority, E2=return its verified claims, E3=deny
+    // without claims. Rules R1 C1+C2 -> E1; R2 !C1|!C2 -> E3;
+    // R3 E1+C3+C4 -> E2; R4 E1+(!C3|!C4) -> E3.
+    let app = daemon();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let body = serde_json::json!({
+        "issuer":"https://iam.example",
+        "subject":"public-link-1",
+        "audience":"awaken-pilot-public",
+        "token_id":"cap-public-1",
+        "issued_at":now,
+        "expires_at":now + 600,
+        "scopes":["pilot.mission.read"]
+    });
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/capabilities")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED, "R2");
+
+    let issued = app
+        .clone()
+        .oneshot(authed_json("POST", "/v1/admin/capabilities", body))
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED, "R1");
+    let token = body_json(issued).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let introspect = |audience: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/capabilities/introspect")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"token":token,"audience":audience}).to_string(),
+            ))
+            .unwrap()
+    };
+    let verified = app
+        .clone()
+        .oneshot(introspect("awaken-pilot-public"))
+        .await
+        .unwrap();
+    assert_eq!(verified.status(), StatusCode::OK, "R3");
+    let claims = body_json(verified).await;
+    assert_eq!(claims["sub"], "public-link-1", "E2");
+    assert_eq!(
+        claims["scope"],
+        serde_json::json!(["pilot.mission.read"]),
+        "E2"
+    );
+
+    let wrong_audience = app.oneshot(introspect("other-product")).await.unwrap();
+    assert_eq!(wrong_audience.status(), StatusCode::UNAUTHORIZED, "R4");
+}
+
+#[tokio::test]
 async fn invitation_http_flow_closes_into_queryable_membership() {
     // Causes/effects over the real router: R1 authenticated create with valid
     // Org/role intent -> Pending plus one-time token; R2 matching account email
@@ -1197,6 +1273,7 @@ async fn daemon_restart_hydrates_authorization_from_the_shared_sql_store() {
             AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
             profiles.clone(),
             store.clone(),
+            awaken_iam_server::AuthApi::new().token_authority(),
         )
         .expect("hydrate first daemon"),
     )));
@@ -1223,6 +1300,7 @@ async fn daemon_restart_hydrates_authorization_from_the_shared_sql_store() {
             AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
             profiles,
             store,
+            awaken_iam_server::AuthApi::new().token_authority(),
         )
         .expect("hydrate restarted daemon"),
     )));

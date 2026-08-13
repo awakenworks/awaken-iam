@@ -66,6 +66,8 @@ GET  /v1/namespaces/{namespace_id}/signers
 GET  /v1/authz/snapshot?since={version}
 GET  /v1/session
 POST /v1/tokens/introspect
+POST /v1/capabilities/introspect
+POST /v1/admin/capabilities
 ```
 
 ### POST /v1/authorize
@@ -110,6 +112,23 @@ no-information-leak rule. The `status` field is always `active` in a 200 respons
 it is present for forward-compatibility with any future offline/cached introspection
 path. Exposed on `AuthzTransport` as `introspect_token` (see the method table
 above).
+
+### Capability issuance and introspection
+
+`POST /v1/admin/capabilities` is the single guarded HTTP adapter over IAM's
+existing `mint_capability` mechanism. It accepts issuer, subject, audience,
+token id, Unix-second issue/expiry coordinates, and non-empty scopes, and
+returns the one-time `cap+jwt`. The daemon uses the same injected asymmetric
+authority and JWKS as its access-token surface; it never constructs a second
+signer.
+
+`POST /v1/capabilities/introspect` verifies the presented token's signature,
+family `typ`, audience, public-link epoch, and expiry and returns its claims.
+The token remains only authentication evidence. A consumer must separately call
+the ordinary `/v1/authorize` PDP for the returned subject, requested action, and
+exact product resource. Revocation and rotation therefore reuse the canonical
+Grant: remove it to revoke, or replace its deterministic id with a fresh subject
+to invalidate every older link. IAM stores no second share registry.
 
 ## Caching and freshness
 

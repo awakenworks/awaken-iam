@@ -1172,6 +1172,13 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self.tokens.active_kid()
     }
 
+    /// Clone the single signing authority shared by access, ID, and capability
+    /// token families. Deployment composition uses this to mount capability
+    /// issuance without constructing a second key or JWKS authority.
+    pub fn token_authority(&self) -> AccessTokenAuthority {
+        self.tokens.clone()
+    }
+
     /// `POST /v1/tokens`: mint a signed asymmetric bearer access token.
     ///
     /// The token is a compact JWT signed with the active key (EdDSA/Ed25519),

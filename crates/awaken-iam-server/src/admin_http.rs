@@ -65,8 +65,9 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    AdminCredential, AdminError, AuthorizationProfileAdmin, InMemoryStore, PolicyAdminApi,
-    PolicyStore, ProfileAdminError,
+    AccessTokenAuthority, AdminCredential, AdminError, AuthorizationProfileAdmin, CapabilityCheck,
+    InMemoryStore, LeaseEpoch, MintCapability, PolicyAdminApi, PolicyStore, ProfileAdminError,
+    mint_capability, verify_capability,
 };
 use awaken_iam_contract::GrantEffect;
 
@@ -111,6 +112,7 @@ pub struct DaemonState<S = InMemoryStore> {
     authz: crate::AuthzApi,
     admin: PolicyAdminApi<S>,
     profiles: AuthorizationProfileAdmin,
+    capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
 }
 
@@ -124,7 +126,8 @@ impl DaemonState<InMemoryStore> {
     /// Assemble the daemon state over the daemon's authorization engine, a fresh
     /// policy-administration store, and the admin auth policy.
     pub fn new(authz: crate::AuthzApi, auth: AdminAuthPolicy) -> Self {
-        Self::with_profile_repository(authz, auth, Arc::new(InMemoryStore::new()))
+        let authority = crate::AuthApi::new().token_authority();
+        Self::with_profile_repository(authz, auth, Arc::new(InMemoryStore::new()), authority)
     }
 
     /// Assemble the daemon with an explicit durable profile repository.
@@ -132,8 +135,9 @@ impl DaemonState<InMemoryStore> {
         authz: crate::AuthzApi,
         auth: AdminAuthPolicy,
         profiles: Arc<dyn AuthorizationProfileRepo>,
+        authority: AccessTokenAuthority,
     ) -> Self {
-        Self::with_policy_store(authz, auth, profiles, InMemoryStore::new())
+        Self::with_policy_store(authz, auth, profiles, InMemoryStore::new(), authority)
             .expect("a fresh in-memory IAM policy store must hydrate")
     }
 }
@@ -149,6 +153,7 @@ impl<S: PolicyStore> DaemonState<S> {
         auth: AdminAuthPolicy,
         profiles: Arc<dyn AuthorizationProfileRepo>,
         store: S,
+        capability_tokens: AccessTokenAuthority,
     ) -> Result<Self, AdminError> {
         let admin = PolicyAdminApi::new(store);
         let version = admin.store_version()?;
@@ -162,6 +167,7 @@ impl<S: PolicyStore> DaemonState<S> {
             authz,
             admin,
             profiles,
+            capability_tokens,
             auth,
         })
     }
@@ -191,6 +197,7 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
         .route("/v1/authorize/batch", post(authorize_batch))
         .route("/v1/entitlements/check", post(check_entitlement))
         .route("/v1/authz/snapshot", get(snapshot))
+        .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
         .route("/v1/admin/orgs/{id}", put(update_org).delete(delete_org))
         .route("/v1/admin/groups", post(create_group))
@@ -202,6 +209,7 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
         .route("/v1/admin/roles/{id}", put(update_role).delete(delete_role))
         .route("/v1/admin/grants", post(issue_grant))
         .route("/v1/admin/grants/{id}", delete(revoke_grant))
+        .route("/v1/admin/capabilities", post(issue_capability))
         .route(
             "/v1/admin/memberships",
             post(grant_membership).delete(revoke_membership),
@@ -240,6 +248,108 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
             post(rollback_profile),
         )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityMintBody {
+    issuer: String,
+    subject: String,
+    audience: String,
+    token_id: String,
+    issued_at: i64,
+    expires_at: i64,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityIntrospectionBody {
+    token: String,
+    audience: String,
+}
+
+/// Mint one root capability under the daemon's existing signing authority.
+/// The admin guard is the issuance authority; product-specific grants remain
+/// ordinary PAP records and are deliberately not duplicated in this token.
+async fn issue_capability(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(request): Json<CapabilityMintBody>,
+) -> Response {
+    let authority = {
+        let guard = lock(&state);
+        if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+            return rejection;
+        }
+        guard.capability_tokens.clone()
+    };
+    if [
+        &request.issuer,
+        &request.subject,
+        &request.audience,
+        &request.token_id,
+    ]
+    .into_iter()
+    .any(|value| value.trim().is_empty())
+        || request.scopes.is_empty()
+        || request.scopes.iter().any(|scope| scope.trim().is_empty())
+    {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_capability",
+            "issuer, subject, audience, token_id, and non-empty scopes are required",
+        );
+    }
+    let mint = MintCapability {
+        iss: request.issuer,
+        sub: request.subject,
+        aud: request.audience,
+        jti: request.token_id,
+        iat: request.issued_at,
+        exp: request.expires_at,
+        epoch: LeaseEpoch::initial(),
+        scope: request.scopes,
+        obligation: None,
+    };
+    match mint_capability(&authority, mint).await {
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "token": token })),
+        )
+            .into_response(),
+        Err(error) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_capability",
+            &error.to_string(),
+        ),
+    }
+}
+
+/// Verify the bearer itself against the shared JWKS, fixed public-link epoch,
+/// audience, and current time. Authorization remains a separate `/v1/authorize`
+/// decision over the returned subject, action, and exact product resource.
+async fn introspect_capability(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    Json(request): Json<CapabilityIntrospectionBody>,
+) -> Response {
+    let jwks = lock(&state).capability_tokens.jwks();
+    match verify_capability(
+        &request.token,
+        &jwks,
+        CapabilityCheck {
+            audience: &request.audience,
+            epoch: LeaseEpoch::initial(),
+            now: unix_seconds(),
+        },
+    ) {
+        Ok(claims) => Json(claims).into_response(),
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 async fn create_profile(

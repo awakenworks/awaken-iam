@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
         }
     }
+    let capability_tokens = auth.token_authority();
     let auth: SharedAuthApi = Arc::new(tokio::sync::Mutex::new(auth));
 
     // Profiles are durable even though the legacy MVP policy-admin aggregates
@@ -82,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_auth,
         profile_store.clone(),
         (*profile_store).clone(),
+        capability_tokens,
     )?));
     let router = daemon_router(state).merge(op_router(auth, issuer));
 

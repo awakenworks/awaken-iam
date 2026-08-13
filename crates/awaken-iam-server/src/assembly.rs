@@ -156,6 +156,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::post("/v1/authz/resource-model"),
     RouteSpec::get("/v1/authz/snapshot"),
+    RouteSpec::post("/v1/capabilities/introspect"),
 ];
 
 /// The policy-administration routes ([`PolicyAdminApi`](crate::PolicyAdminApi)).
@@ -180,6 +181,7 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::delete("/v1/admin/roles/{id}"),
     RouteSpec::post("/v1/admin/grants"),
     RouteSpec::delete("/v1/admin/grants/{id}"),
+    RouteSpec::post("/v1/admin/capabilities"),
     RouteSpec::post("/v1/admin/memberships"),
     RouteSpec::delete("/v1/admin/memberships"),
     RouteSpec::post("/v1/admin/memberships/query"),
