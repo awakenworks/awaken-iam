@@ -15,11 +15,11 @@ use awaken_iam_contract::{
     ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, Effect, ExternalIdentityRepo,
-    Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo, LoginFlowRepo, OrgRepo,
-    Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RepoError,
-    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo,
-    SessionRepo,
+    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, Effect,
+    ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo,
+    LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota,
+    RateLimit, RateWindow, RegisteredClient, RepoError, ResourceEdge, ResourceModelRepo,
+    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 use awaken_iam_server::{
     PostgresBackend, SqlConn, SqlStore, postgres_migrated_store, sqlite_in_memory_store,
@@ -201,6 +201,59 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         ),
         Err(RepoError::NotFound(_))
     ));
+
+    // --- downstream OAuth: shared clients + atomic live code consumption ---
+    // Cause/effect rules: R1(upsert client)->read/list round-trip; R2(live,
+    // unconsumed code)->one successful CAS; R3(consumed or expired)->false and
+    // no second state transition. The same harness runs on SQLite and optional
+    // Postgres, proving one backend-neutral repository contract.
+    let client = RegisteredClient::public(
+        "awaken-runtime",
+        vec!["https://awaken.example/callback".into()],
+        ["openid", "email"],
+    );
+    OAuthClientRepo::upsert(store, client.clone()).unwrap();
+    assert_eq!(
+        OAuthClientRepo::get(store, "awaken-runtime").unwrap(),
+        Some(client)
+    );
+    assert_eq!(OAuthClientRepo::list(store).unwrap().len(), 1);
+    let code = StoredAuthorizationCode {
+        code_hash: "code-hash-live".into(),
+        client_id: "awaken-runtime".into(),
+        redirect_uri: "https://awaken.example/callback".into(),
+        account_id: AccountId("a".into()),
+        scopes: vec!["openid".into()],
+        code_challenge: Some("challenge".into()),
+        nonce: Some("nonce".into()),
+        expires_at: ts("2026-06-19T00:10:00Z"),
+        consumed_at: None,
+    };
+    AuthCodeRepo::create(store, code.clone()).unwrap();
+    assert_eq!(
+        AuthCodeRepo::get(store, "code-hash-live").unwrap(),
+        Some(code)
+    );
+    assert!(
+        AuthCodeRepo::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:05:00Z"))
+            .unwrap()
+    );
+    assert!(
+        !AuthCodeRepo::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:06:00Z"))
+            .unwrap()
+    );
+    let expired = StoredAuthorizationCode {
+        code_hash: "code-hash-expired".into(),
+        expires_at: ts("2026-06-19T00:04:00Z"),
+        consumed_at: None,
+        ..AuthCodeRepo::get(store, "code-hash-live").unwrap().unwrap()
+    };
+    AuthCodeRepo::create(store, expired).unwrap();
+    assert!(
+        !AuthCodeRepo::consume_if_live(store, "code-hash-expired", &ts("2026-06-19T00:05:00Z"))
+            .unwrap()
+    );
+    OAuthClientRepo::remove(store, "awaken-runtime").unwrap();
 
     // --- api tokens: unique id + prefix, prefix lookup, in-place revoke ---
     let token = ApiToken {

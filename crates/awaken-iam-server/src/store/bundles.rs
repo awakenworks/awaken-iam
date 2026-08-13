@@ -92,6 +92,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "bind API tokens to a workspace; drop per-token scope",
                     IDENTITY_0004,
                 ),
+                (
+                    5,
+                    "single-use downstream OAuth authorization codes",
+                    IDENTITY_0005,
+                ),
             ],
         ),
         bundle(
@@ -236,6 +241,23 @@ CREATE TABLE {prefix}_oauth_clients (\
 const IDENTITY_0004: &str = "\
 ALTER TABLE {prefix}_api_tokens DROP COLUMN scope;\n\
 ALTER TABLE {prefix}_api_tokens ADD COLUMN workspace TEXT NOT NULL DEFAULT '';";
+
+// Hashed downstream authorization codes. The conditional update over
+// `consumed_at IS NULL AND expires_at > now` is the shared multi-replica replay
+// fence; no cleartext browser code is persisted.
+const IDENTITY_0005: &str = "\
+CREATE TABLE {prefix}_oauth_authorization_codes (\
+ code_hash TEXT PRIMARY KEY, \
+ client_id TEXT NOT NULL, \
+ redirect_uri TEXT NOT NULL, \
+ account_id TEXT NOT NULL, \
+ scopes {json} NOT NULL, \
+ code_challenge TEXT, \
+ nonce TEXT, \
+ expires_at TEXT NOT NULL, \
+ consumed_at TEXT);\n\
+CREATE INDEX {prefix}_oauth_authorization_codes_expiry_idx \
+ ON {prefix}_oauth_authorization_codes (expires_at);";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //

@@ -73,12 +73,12 @@ use awaken_iam_contract::{
     UserInfo,
 };
 use awaken_iam_core::{
-    AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange, EntropySource,
-    EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter, LoginAttempt,
-    MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
-    OAuthClientRegistry, OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory,
-    RefreshTokenMinter, RegisteredClient, RotateRefreshToken, SessionDirectory, SessionRepo,
-    TokenRedemption, parse_presented_refresh_token,
+    AuthCodeRepo, AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange,
+    EntropySource, EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter,
+    LoginAttempt, MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer,
+    OAuthChallengeService, OAuthClientRegistry, OAuthClientRepo, OAuthProviderError, OsEntropy,
+    ProviderError, RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient, RotateRefreshToken,
+    SessionDirectory, SessionRepo, TokenRedemption, parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -825,13 +825,11 @@ impl<E: EntropySource + Clone> AuthApi<E> {
 
     /// Register a downstream product client that integrates against IAM as an
     /// OpenID Provider (the `/v1/oauth/authorize` + `/v1/oauth/token` flow).
-    pub fn register_oauth_client(&mut self, client: RegisteredClient) {
-        self.oauth_provider.register_client(client);
-    }
-
-    /// Borrow the downstream OAuth provider's client registry.
-    pub fn oauth_client_registry(&self) -> &OAuthClientRegistry {
-        self.oauth_provider.registry()
+    pub fn register_oauth_client(
+        &mut self,
+        client: RegisteredClient,
+    ) -> Result<(), OAuthProviderError> {
+        self.oauth_provider.register_client(client)
     }
 
     /// Borrow the identity directory backing account/identity reads.

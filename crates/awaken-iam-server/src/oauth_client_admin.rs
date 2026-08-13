@@ -5,9 +5,9 @@
 //! integrate against IAM as an OAuth authorization server (the provider posture
 //! in [auth server](../../../docs/design/auth-server.md)). It persists each
 //! [`RegisteredClient`] through the [`OAuthClientRepo`] port so the registry the
-//! authorization server enforces is durable rather than an in-memory seed — the
-//! server rebuilds its [`OAuthClientRegistry`] from the store via
-//! [`OAuthClientAdminApi::registry`].
+//! authorization server enforces is durable rather than an in-memory seed. The
+//! authorization server reads the same repository on every request, so an admin
+//! mutation is immediately visible to every replica without snapshot hydration.
 //!
 //! Like the other admin seams it speaks in logical request/response values and
 //! is framework-agnostic; a deployment maps these methods onto its router:
@@ -24,9 +24,7 @@
 //! version, matching the discipline of the policy PAP.
 
 use awaken_iam_contract::Timestamp;
-use awaken_iam_core::{
-    AuditEvent, AuditSink, EntropySource, OAuthClientRegistry, OAuthClientRepo, RegisteredClient,
-};
+use awaken_iam_core::{AuditEvent, AuditSink, EntropySource, OAuthClientRepo, RegisteredClient};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -212,15 +210,6 @@ where
     pub fn list_clients(&self) -> AdminResult<Vec<RegisteredClient>> {
         Ok(OAuthClientRepo::list(&self.store)?)
     }
-
-    /// Hydrate an [`OAuthClientRegistry`] from the persisted clients.
-    ///
-    /// This is the seam the authorization server uses to enforce the durable
-    /// registry: an administrative change made here is reflected the next time
-    /// the server rebuilds its registry.
-    pub fn registry(&self) -> AdminResult<OAuthClientRegistry> {
-        Ok(OAuthClientRegistry::load(&self.store)?)
-    }
 }
 
 /// Mint a fresh URL-safe base64 client secret from `entropy`.
@@ -238,6 +227,7 @@ mod tests {
     use awaken_iam_core::{
         OAuthAuthorizationRequest, OAuthAuthorizationServer, TokenRedemption, hash_session_token,
     };
+    use std::sync::Arc;
 
     /// Deterministic entropy: each draw is a fixed, distinct byte pattern.
     struct SeqEntropy {
@@ -356,18 +346,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_hydrates_and_backs_a_live_authorization_server() {
-        let mut api = api();
+    fn shared_repository_changes_are_visible_without_registry_hydration() {
+        // Cause/effect rule: C1=PAP and authorization server share one client
+        // repository, C2=server already exists, C3=PAP registers then rotates.
+        // R1(C1,C2,C3) makes the live server accept only the rotated secret;
+        // no rebuild/snapshot synchronization is an allowed precondition.
+        let store = InMemoryStore::new();
+        let shared = Arc::new(store.clone());
+        let mut server = OAuthAuthorizationServer::with_repositories(
+            shared.clone(),
+            shared,
+            SeqEntropy { next: 100 },
+        );
+        let mut api = OAuthClientAdminApi::new(store);
         api.register(confidential(), at()).unwrap();
         let issued = api
             .rotate_secret("product-web", &mut SeqEntropy { next: 3 }, at())
             .unwrap();
 
-        // The registry rebuilt from the store carries the rotated client, and a
-        // server over it authenticates a full authorization-code redemption with
-        // the freshly rotated secret.
-        let registry = api.registry().unwrap();
-        let mut server = OAuthAuthorizationServer::new(registry, SeqEntropy { next: 100 });
         let request = OAuthAuthorizationRequest {
             client_id: "product-web".into(),
             redirect_uri: "https://product.example/cb".into(),

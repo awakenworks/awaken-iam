@@ -24,6 +24,11 @@ Postgres.
    and token `epoch` that fence them (rule 3) belong there too. Losing a node then
    drops zero authoritative state.
 
+   The rule includes downstream OAuth clients and authorization codes. Client
+   lookup reads the shared repository, and redemption atomically consumes a
+   live code there; neither relies on a hydrated per-node registry, sticky
+   routing, or a best-effort cache synchronization loop.
+
 2. **Every node is identical and stateless.** Same assembly, same migration
    bundles, same `/v1` surface (see [assembly](deployment.md#assembly)). A load
    balancer may route any request to any node; there is no affinity and no sticky

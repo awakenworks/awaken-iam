@@ -787,7 +787,7 @@ fn refresh_grant(presented: &str, now: &str) -> RefreshGrant {
 
 /// A downstream OP registry with one confidential and one public product client.
 fn op_provider() -> OAuthAuthorizationServer<SequentialEntropy> {
-    let mut registry = awaken_iam_core::OAuthClientRegistry::new();
+    let registry = awaken_iam_core::OAuthClientRegistry::new();
     registry.register(awaken_iam_core::RegisteredClient::confidential(
         "packs-web",
         "client-secret",
@@ -1122,7 +1122,8 @@ fn register_downstream_client(api: &mut AuthApi<SequentialEntropy>) {
         "client-secret",
         vec!["https://product.example/callback".into()],
         ["openid", "email"],
-    ));
+    ))
+    .unwrap();
 }
 
 fn downstream_authorize(cookie: &str) -> DownstreamAuthorizeRequest {
@@ -1178,7 +1179,7 @@ fn op_provider_with_issued_code(
     awaken_iam_core::OAuthAuthorizationServer<SequentialEntropy>,
     awaken_iam_core::IssuedAuthorizationCode,
 ) {
-    let mut registry = awaken_iam_core::OAuthClientRegistry::new();
+    let registry = awaken_iam_core::OAuthClientRegistry::new();
     registry.register(awaken_iam_core::RegisteredClient::confidential(
         "product-web",
         "top-secret",

@@ -18,6 +18,7 @@
 //! and JWKS publication are a separate, additive layer.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
 use awaken_iam_contract::{AccountId, Timestamp};
 use base64::Engine;
@@ -26,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::EntropySource;
 use crate::hash_session_token;
-use crate::ports::{OAuthClientRepo, RepoResult};
+use crate::ports::{AuthCodeRepo, OAuthClientRepo, RepoError, RepoResult};
 
 /// Bytes of entropy in a freshly minted authorization code.
 const CODE_BYTES: usize = 32;
@@ -61,6 +62,9 @@ pub enum OAuthProviderError {
     /// The PKCE verifier was missing or did not match the stored challenge.
     #[error("pkce verification failed")]
     PkceVerificationFailed,
+    /// The authoritative OAuth repository could not serve the operation.
+    #[error("oauth authorization storage is unavailable")]
+    StorageUnavailable,
 }
 
 /// A product client registered to integrate against IAM as an OAuth provider.
@@ -133,7 +137,7 @@ impl RegisteredClient {
 /// Registry of clients that may integrate against IAM as an OAuth provider.
 #[derive(Debug, Default, Clone)]
 pub struct OAuthClientRegistry {
-    clients: HashMap<String, RegisteredClient>,
+    clients: Arc<RwLock<HashMap<String, RegisteredClient>>>,
 }
 
 impl OAuthClientRegistry {
@@ -142,35 +146,58 @@ impl OAuthClientRegistry {
         Self::default()
     }
 
-    /// Build a registry hydrated from every client persisted in `repo`.
-    ///
-    /// This is how a deployment backs the registry with durable storage: the
-    /// admin API writes registered clients through an [`OAuthClientRepo`], and
-    /// the authorization server loads them here rather than holding an in-memory
-    /// seed. The order clients are inserted in does not matter; lookup is by id.
-    pub fn load(repo: &impl OAuthClientRepo) -> RepoResult<Self> {
-        let mut registry = Self::new();
-        for client in repo.list()? {
-            registry.register(client);
-        }
-        Ok(registry)
-    }
-
     /// Register or replace a client.
-    pub fn register(&mut self, client: RegisteredClient) {
-        self.clients.insert(client.client_id.clone(), client);
+    pub fn register(&self, client: RegisteredClient) {
+        self.clients
+            .write()
+            .expect("oauth client registry lock poisoned")
+            .insert(client.client_id.clone(), client);
     }
 
     /// Look up a registered client by id.
-    pub fn get(&self, client_id: &str) -> Option<&RegisteredClient> {
-        self.clients.get(client_id)
+    pub fn get(&self, client_id: &str) -> Option<RegisteredClient> {
+        self.clients
+            .read()
+            .expect("oauth client registry lock poisoned")
+            .get(client_id)
+            .cloned()
     }
 
     /// List the registered clients ordered by id for stable iteration.
-    pub fn clients(&self) -> Vec<&RegisteredClient> {
-        let mut clients: Vec<&RegisteredClient> = self.clients.values().collect();
+    pub fn clients(&self) -> Vec<RegisteredClient> {
+        let mut clients: Vec<RegisteredClient> = self
+            .clients
+            .read()
+            .expect("oauth client registry lock poisoned")
+            .values()
+            .cloned()
+            .collect();
         clients.sort_by(|left, right| left.client_id.cmp(&right.client_id));
         clients
+    }
+}
+
+impl OAuthClientRepo for OAuthClientRegistry {
+    fn upsert(&self, client: RegisteredClient) -> RepoResult<()> {
+        self.register(client);
+        Ok(())
+    }
+
+    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>> {
+        Ok(OAuthClientRegistry::get(self, client_id))
+    }
+
+    fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+        Ok(self.clients())
+    }
+
+    fn remove(&self, client_id: &str) -> RepoResult<()> {
+        self.clients
+            .write()
+            .expect("oauth client registry lock poisoned")
+            .remove(client_id)
+            .map(|_| ())
+            .ok_or_else(|| RepoError::NotFound(format!("oauth client {client_id} not found")))
     }
 }
 
@@ -235,40 +262,105 @@ pub struct AuthorizedGrant {
 }
 
 /// Internal record of an issued, not-yet-redeemed authorization code.
-#[derive(Debug, Clone)]
-struct StoredAuthCode {
-    code_hash: String,
-    client_id: String,
-    redirect_uri: String,
-    account_id: AccountId,
-    scopes: Vec<String>,
-    code_challenge: Option<String>,
-    nonce: Option<String>,
-    expires_at: Timestamp,
-    consumed: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAuthorizationCode {
+    /// SHA-256 hash of the cleartext browser code.
+    pub code_hash: String,
+    /// Client the code was issued to.
+    pub client_id: String,
+    /// Exact redirect URI bound at issuance.
+    pub redirect_uri: String,
+    /// Authenticated account the grant represents.
+    pub account_id: AccountId,
+    /// Down-scoped grant scopes.
+    pub scopes: Vec<String>,
+    /// Optional PKCE S256 challenge.
+    pub code_challenge: Option<String>,
+    /// Optional OIDC nonce.
+    pub nonce: Option<String>,
+    /// Exclusive expiry boundary.
+    pub expires_at: Timestamp,
+    /// Consumption timestamp; `None` until the atomic replay fence succeeds.
+    pub consumed_at: Option<Timestamp>,
+}
+
+/// Process-local authorization-code repository for tests and single-process
+/// compositions. Durable compositions inject their shared SQL store instead.
+#[derive(Debug, Default)]
+struct InMemoryAuthCodeRepo {
+    codes: RwLock<HashMap<String, StoredAuthorizationCode>>,
+}
+
+impl AuthCodeRepo for InMemoryAuthCodeRepo {
+    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()> {
+        let mut codes = self.codes.write().expect("oauth code lock poisoned");
+        if codes.contains_key(&code.code_hash) {
+            return Err(RepoError::Conflict("duplicate authorization code".into()));
+        }
+        codes.insert(code.code_hash.clone(), code);
+        Ok(())
+    }
+
+    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+        Ok(self
+            .codes
+            .read()
+            .expect("oauth code lock poisoned")
+            .get(code_hash)
+            .cloned())
+    }
+
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool> {
+        let mut codes = self.codes.write().expect("oauth code lock poisoned");
+        let Some(code) = codes.get_mut(code_hash) else {
+            return Ok(false);
+        };
+        if code.consumed_at.is_some() || code.expires_at.0 <= now.0 {
+            return Ok(false);
+        }
+        code.consumed_at = Some(now.clone());
+        Ok(true)
+    }
 }
 
 /// IAM's downstream OAuth 2.0 authorization server.
-#[derive(Debug)]
 pub struct OAuthAuthorizationServer<E: EntropySource> {
-    registry: OAuthClientRegistry,
-    codes: Vec<StoredAuthCode>,
+    clients: Arc<dyn OAuthClientRepo>,
+    codes: Arc<dyn AuthCodeRepo>,
     entropy: E,
+}
+
+impl<E: EntropySource> std::fmt::Debug for OAuthAuthorizationServer<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthAuthorizationServer")
+            .field("clients", &"oauth-client-repository")
+            .field("codes", &"authorization-code-repository")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<E: EntropySource> OAuthAuthorizationServer<E> {
     /// Build a server over a client registry and an entropy source.
     pub fn new(registry: OAuthClientRegistry, entropy: E) -> Self {
         Self {
-            registry,
-            codes: Vec::new(),
+            clients: Arc::new(registry),
+            codes: Arc::new(InMemoryAuthCodeRepo::default()),
             entropy,
         }
     }
 
-    /// Borrow the client registry.
-    pub fn registry(&self) -> &OAuthClientRegistry {
-        &self.registry
+    /// Build over caller-selected authoritative repositories.
+    pub fn with_repositories(
+        clients: Arc<dyn OAuthClientRepo>,
+        codes: Arc<dyn AuthCodeRepo>,
+        entropy: E,
+    ) -> Self {
+        Self {
+            clients,
+            codes,
+            entropy,
+        }
     }
 
     /// Register or replace a client in the underlying registry.
@@ -276,8 +368,10 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
     /// Lets a caller that built the server over an empty registry add clients
     /// later (e.g. as a deployment provisions its product integrations) without
     /// reconstructing the server and discarding issued codes.
-    pub fn register_client(&mut self, client: RegisteredClient) {
-        self.registry.register(client);
+    pub fn register_client(&self, client: RegisteredClient) -> Result<(), OAuthProviderError> {
+        self.clients
+            .upsert(client)
+            .map_err(|_| OAuthProviderError::StorageUnavailable)
     }
 
     /// Authenticate a client at the token endpoint (RFC 6749 §2.3) for a grant
@@ -295,10 +389,11 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         &self,
         client_id: &str,
         client_secret: Option<&str>,
-    ) -> Result<&RegisteredClient, OAuthProviderError> {
+    ) -> Result<RegisteredClient, OAuthProviderError> {
         let client = self
-            .registry
+            .clients
             .get(client_id)
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?
             .ok_or(OAuthProviderError::UnknownClient)?;
         if let Some(expected) = &client.secret_hash {
             let presented = client_secret.ok_or(OAuthProviderError::InvalidClientSecret)?;
@@ -322,8 +417,9 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         expires_at: Timestamp,
     ) -> Result<IssuedAuthorizationCode, OAuthProviderError> {
         let client = self
-            .registry
+            .clients
             .get(&request.client_id)
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?
             .ok_or(OAuthProviderError::UnknownClient)?;
         if !client.allows_redirect(&request.redirect_uri) {
             return Err(OAuthProviderError::UnregisteredRedirectUri);
@@ -351,17 +447,19 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         self.entropy.fill_bytes(&mut buf);
         let code = URL_SAFE_NO_PAD.encode(buf);
 
-        self.codes.push(StoredAuthCode {
-            code_hash: hash_session_token(&code),
-            client_id: client.client_id.clone(),
-            redirect_uri: request.redirect_uri.clone(),
-            account_id,
-            scopes: request.scopes.clone(),
-            code_challenge: request.code_challenge.clone(),
-            nonce: request.nonce.clone(),
-            expires_at,
-            consumed: false,
-        });
+        self.codes
+            .create(StoredAuthorizationCode {
+                code_hash: hash_session_token(&code),
+                client_id: client.client_id.clone(),
+                redirect_uri: request.redirect_uri.clone(),
+                account_id,
+                scopes: request.scopes.clone(),
+                code_challenge: request.code_challenge.clone(),
+                nonce: request.nonce.clone(),
+                expires_at,
+                consumed_at: None,
+            })
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?;
 
         Ok(IssuedAuthorizationCode {
             code,
@@ -377,9 +475,9 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         now: Timestamp,
     ) -> Result<AuthorizedGrant, OAuthProviderError> {
         let client = self
-            .registry
+            .clients
             .get(&redemption.client_id)
-            .cloned()
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?
             .ok_or(OAuthProviderError::UnknownClient)?;
 
         // Confidential clients authenticate; public clients present no secret.
@@ -396,12 +494,12 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         let code_hash = hash_session_token(&redemption.code);
         let stored = self
             .codes
-            .iter_mut()
-            .find(|c| c.code_hash == code_hash)
+            .get(&code_hash)
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?
             .ok_or(OAuthProviderError::InvalidGrant)?;
 
         // Single-use and expiry, evaluated independently of the rest.
-        if stored.consumed || now.0 >= stored.expires_at.0 {
+        if stored.consumed_at.is_some() || now.0 >= stored.expires_at.0 {
             return Err(OAuthProviderError::InvalidGrant);
         }
         // The code is bound to the client it was issued to.
@@ -423,7 +521,13 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
         }
 
         // Consume the code so it can never be replayed.
-        stored.consumed = true;
+        if !self
+            .codes
+            .consume_if_live(&code_hash, &now)
+            .map_err(|_| OAuthProviderError::StorageUnavailable)?
+        {
+            return Err(OAuthProviderError::InvalidGrant);
+        }
         Ok(AuthorizedGrant {
             account_id: stored.account_id.clone(),
             scopes: stored.scopes.clone(),
@@ -441,6 +545,7 @@ fn pkce_s256_challenge(verifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     /// Deterministic entropy: each draw is a fixed, distinct byte pattern so two
     /// issued codes differ.
@@ -470,7 +575,7 @@ mod tests {
     }
 
     fn public_registry() -> OAuthClientRegistry {
-        let mut registry = OAuthClientRegistry::new();
+        let registry = OAuthClientRegistry::new();
         registry.register(RegisteredClient::public(
             "product-web",
             vec!["https://product.example/cb".into()],
@@ -633,7 +738,7 @@ mod tests {
 
     #[test]
     fn confidential_client_authenticates_with_its_secret() {
-        let mut registry = OAuthClientRegistry::new();
+        let registry = OAuthClientRegistry::new();
         registry.register(RegisteredClient::confidential(
             "service-client",
             "top-secret",
@@ -676,7 +781,7 @@ mod tests {
 
     #[test]
     fn a_code_is_bound_to_its_redirect_uri() {
-        let mut registry = OAuthClientRegistry::new();
+        let registry = OAuthClientRegistry::new();
         registry.register(RegisteredClient::confidential(
             "svc",
             "s3cr3t",
@@ -717,7 +822,7 @@ mod tests {
 
     #[test]
     fn confidential_client_authenticates_at_the_token_endpoint() {
-        let mut registry = OAuthClientRegistry::new();
+        let registry = OAuthClientRegistry::new();
         registry.register(RegisteredClient::confidential(
             "service-client",
             "top-secret",
@@ -758,6 +863,287 @@ mod tests {
         assert_eq!(
             server.authenticate_client("ghost", Some("anything")),
             Err(OAuthProviderError::UnknownClient)
+        );
+    }
+
+    /// Durable downstream OAuth cause/effect decision table:
+    /// C1=two server instances share client/code repositories, C2=client was
+    /// registered through A, C3=A issued a live PKCE-bound code. Effects:
+    /// E1=B observes the client without registry hydration; E2=B redeems A's
+    /// code exactly once. R1(C1,C2,!C3)->B authenticates client; R2(C1,C2,C3)
+    /// ->B returns the grant. This covers replica replacement and cross-Pod
+    /// authorize/token routing through one authoritative store.
+    #[test]
+    fn shared_repositories_make_clients_and_codes_visible_across_instances() {
+        let clients = Arc::new(OAuthClientRegistry::new());
+        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let mut first = OAuthAuthorizationServer::with_repositories(
+            clients.clone(),
+            codes.clone(),
+            SeqEntropy { next: 20 },
+        );
+        let mut second =
+            OAuthAuthorizationServer::with_repositories(clients, codes, SeqEntropy { next: 40 });
+        first
+            .register_client(RegisteredClient::public(
+                "product-web",
+                vec!["https://product.example/cb".into()],
+                ["openid", "email"],
+            ))
+            .unwrap();
+        assert_eq!(
+            second
+                .authenticate_client("product-web", None)
+                .unwrap()
+                .client_id,
+            "product-web"
+        );
+
+        let (verifier, challenge) = pkce_pair();
+        let issued = first
+            .issue_code(account(), &authz_request(Some(challenge)), now(), soon())
+            .unwrap();
+        let grant = second
+            .redeem_code(
+                &TokenRedemption {
+                    client_id: "product-web".into(),
+                    client_secret: None,
+                    code: issued.code,
+                    redirect_uri: "https://product.example/cb".into(),
+                    code_verifier: Some(verifier),
+                },
+                now(),
+            )
+            .unwrap();
+        assert_eq!(grant.account_id, account());
+    }
+
+    /// Atomic-consume cause/effect decision table:
+    /// C1=one live code, C2=two replicas pass identical client/redirect/PKCE
+    /// validation concurrently. The only permitted effect is E1=one grant and
+    /// one InvalidGrant. R1(C1,C2)->CAS winner succeeds; CAS loser fails. Zero
+    /// or two successes would violate availability or replay safety.
+    #[test]
+    fn concurrent_redemption_has_exactly_one_winner() {
+        let clients = Arc::new(OAuthClientRegistry::new());
+        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let mut issuer = OAuthAuthorizationServer::with_repositories(
+            clients.clone(),
+            codes.clone(),
+            SeqEntropy { next: 60 },
+        );
+        issuer
+            .register_client(RegisteredClient::public(
+                "product-web",
+                vec!["https://product.example/cb".into()],
+                ["openid", "email"],
+            ))
+            .unwrap();
+        let (verifier, challenge) = pkce_pair();
+        let issued = issuer
+            .issue_code(account(), &authz_request(Some(challenge)), now(), soon())
+            .unwrap();
+        let redemption = TokenRedemption {
+            client_id: "product-web".into(),
+            client_secret: None,
+            code: issued.code,
+            redirect_uri: "https://product.example/cb".into(),
+            code_verifier: Some(verifier),
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [80, 100].map(|next| {
+            let clients = clients.clone();
+            let codes = codes.clone();
+            let redemption = redemption.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut replica = OAuthAuthorizationServer::with_repositories(
+                    clients,
+                    codes,
+                    SeqEntropy { next },
+                );
+                barrier.wait();
+                replica.redeem_code(&redemption, now())
+            })
+        });
+        let results = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(OAuthProviderError::InvalidGrant))
+                .count(),
+            1
+        );
+    }
+
+    /// Validation/non-consumption decision table:
+    /// C1=client binding matches, C2=redirect matches, C3=PKCE matches,
+    /// C4=code is live. E1=consume+grant only for R1(C1,C2,C3,C4); R2(!C1),
+    /// R3(!C2), and R4(!C3) reject without consuming so a later R1 succeeds;
+    /// R5(!C4) rejects and leaves consumed_at absent for expiry audit/cleanup.
+    #[test]
+    fn invalid_bindings_and_expiry_never_consume_a_code() {
+        let clients = Arc::new(OAuthClientRegistry::new());
+        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let mut server = OAuthAuthorizationServer::with_repositories(
+            clients,
+            codes.clone(),
+            SeqEntropy { next: 120 },
+        );
+        for client_id in ["product-web", "other-product"] {
+            server
+                .register_client(RegisteredClient::public(
+                    client_id,
+                    vec!["https://product.example/cb".into()],
+                    ["openid", "email"],
+                ))
+                .unwrap();
+        }
+        let (verifier, challenge) = pkce_pair();
+        let issued = server
+            .issue_code(account(), &authz_request(Some(challenge)), now(), soon())
+            .unwrap();
+        let valid = TokenRedemption {
+            client_id: "product-web".into(),
+            client_secret: None,
+            code: issued.code.clone(),
+            redirect_uri: "https://product.example/cb".into(),
+            code_verifier: Some(verifier),
+        };
+        let mut wrong_client = valid.clone();
+        wrong_client.client_id = "other-product".into();
+        assert_eq!(
+            server.redeem_code(&wrong_client, now()),
+            Err(OAuthProviderError::InvalidGrant)
+        );
+        let mut wrong_redirect = valid.clone();
+        wrong_redirect.redirect_uri = "https://product.example/other".into();
+        assert_eq!(
+            server.redeem_code(&wrong_redirect, now()),
+            Err(OAuthProviderError::RedirectUriMismatch)
+        );
+        let mut wrong_pkce = valid.clone();
+        wrong_pkce.code_verifier = Some("wrong-verifier".into());
+        assert_eq!(
+            server.redeem_code(&wrong_pkce, now()),
+            Err(OAuthProviderError::PkceVerificationFailed)
+        );
+        assert!(server.redeem_code(&valid, now()).is_ok());
+
+        let (_, challenge) = pkce_pair();
+        let expired = server
+            .issue_code(account(), &authz_request(Some(challenge)), now(), soon())
+            .unwrap();
+        let mut expired_redemption = valid;
+        expired_redemption.code = expired.code.clone();
+        assert_eq!(
+            server.redeem_code(&expired_redemption, soon()),
+            Err(OAuthProviderError::InvalidGrant)
+        );
+        assert!(
+            codes
+                .get(&hash_session_token(&expired.code))
+                .unwrap()
+                .unwrap()
+                .consumed_at
+                .is_none()
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingCodeRepo;
+
+    impl AuthCodeRepo for FailingCodeRepo {
+        fn create(&self, _: StoredAuthorizationCode) -> RepoResult<()> {
+            Err(RepoError::Backend("offline".into()))
+        }
+
+        fn get(&self, _: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+            Err(RepoError::Backend("offline".into()))
+        }
+
+        fn consume_if_live(&self, _: &str, _: &Timestamp) -> RepoResult<bool> {
+            Err(RepoError::Backend("offline".into()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingClientRepo;
+
+    impl OAuthClientRepo for FailingClientRepo {
+        fn upsert(&self, _: RegisteredClient) -> RepoResult<()> {
+            Err(RepoError::Backend("offline".into()))
+        }
+
+        fn get(&self, _: &str) -> RepoResult<Option<RegisteredClient>> {
+            Err(RepoError::Backend("offline".into()))
+        }
+
+        fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+            Err(RepoError::Backend("offline".into()))
+        }
+
+        fn remove(&self, _: &str) -> RepoResult<()> {
+            Err(RepoError::Backend("offline".into()))
+        }
+    }
+
+    /// Repository-failure decision rules: C1=client exists, C2=code store is
+    /// unavailable, C3=client store is unavailable. R1(C1,C2,issue)
+    /// ->StorageUnavailable and no cleartext code; R2(C1,C2,redeem)
+    /// ->StorageUnavailable and no grant; R3(C3,authenticate/issue) returns the
+    /// same fail-closed class. No in-memory fallback is permitted because it
+    /// would create replica-local authority.
+    #[test]
+    fn authorization_code_storage_failure_fails_closed() {
+        let clients = Arc::new(OAuthClientRegistry::new());
+        clients.register(RegisteredClient::public(
+            "product-web",
+            vec!["https://product.example/cb".into()],
+            ["openid", "email"],
+        ));
+        let mut server = OAuthAuthorizationServer::with_repositories(
+            clients,
+            Arc::new(FailingCodeRepo),
+            SeqEntropy { next: 140 },
+        );
+        let (verifier, challenge) = pkce_pair();
+        assert_eq!(
+            server.issue_code(account(), &authz_request(Some(challenge)), now(), soon()),
+            Err(OAuthProviderError::StorageUnavailable)
+        );
+        assert_eq!(
+            server.redeem_code(
+                &TokenRedemption {
+                    client_id: "product-web".into(),
+                    client_secret: None,
+                    code: "unknown".into(),
+                    redirect_uri: "https://product.example/cb".into(),
+                    code_verifier: Some(verifier),
+                },
+                now(),
+            ),
+            Err(OAuthProviderError::StorageUnavailable)
+        );
+
+        let mut client_store_offline = OAuthAuthorizationServer::with_repositories(
+            Arc::new(FailingClientRepo),
+            Arc::new(InMemoryAuthCodeRepo::default()),
+            SeqEntropy { next: 160 },
+        );
+        assert_eq!(
+            client_store_offline.authenticate_client("product-web", None),
+            Err(OAuthProviderError::StorageUnavailable)
+        );
+        assert_eq!(
+            client_store_offline.issue_code(
+                account(),
+                &authz_request(Some(pkce_pair().1)),
+                now(),
+                soon()
+            ),
+            Err(OAuthProviderError::StorageUnavailable)
         );
     }
 }

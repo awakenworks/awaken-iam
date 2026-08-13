@@ -25,11 +25,12 @@ use awaken_iam_contract::{
     WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
-    Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId,
-    GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OrgRepo, Organization, Plan, PlanId,
-    PlanRepo, PlanTier, Quota, RateLimit, RepoError, RepoResult, ResourceEdge, ResourceModelRepo,
-    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
+    AuthorizationProfileRepo, Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo,
+    GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
+    OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit,
+    RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
+    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -247,6 +248,35 @@ fn decode_login_flow(row: &SqlRow) -> RepoResult<OAuthLoginState> {
         return_to: opt(row, 5),
         created_at: Timestamp(req(row, 6, "login_flow.created_at")?),
         expires_at: Timestamp(req(row, 7, "login_flow.expires_at")?),
+        consumed_at: opt(row, 8).map(Timestamp),
+    })
+}
+
+fn decode_oauth_client(row: &SqlRow) -> RepoResult<RegisteredClient> {
+    Ok(RegisteredClient {
+        client_id: req(row, 0, "oauth_client.client_id")?,
+        redirect_uris: json_decode(
+            &req(row, 1, "oauth_client.redirect_uris")?,
+            "oauth redirect URIs",
+        )?,
+        allowed_scopes: json_decode(
+            &req(row, 2, "oauth_client.allowed_scopes")?,
+            "oauth allowed scopes",
+        )?,
+        secret_hash: opt(row, 3),
+    })
+}
+
+fn decode_auth_code(row: &SqlRow) -> RepoResult<StoredAuthorizationCode> {
+    Ok(StoredAuthorizationCode {
+        code_hash: req(row, 0, "oauth_code.code_hash")?,
+        client_id: req(row, 1, "oauth_code.client_id")?,
+        redirect_uri: req(row, 2, "oauth_code.redirect_uri")?,
+        account_id: AccountId(req(row, 3, "oauth_code.account_id")?),
+        scopes: json_decode(&req(row, 4, "oauth_code.scopes")?, "oauth code scopes")?,
+        code_challenge: opt(row, 5),
+        nonce: opt(row, 6),
+        expires_at: Timestamp(req(row, 7, "oauth_code.expires_at")?),
         consumed_at: opt(row, 8).map(Timestamp),
     })
 }
@@ -704,6 +734,115 @@ impl<B: SqlConn> LoginFlowRepo for SqlStore<B> {
             )));
         }
         Ok(())
+    }
+}
+
+impl<B: SqlConn> OAuthClientRepo for SqlStore<B> {
+    fn upsert(&self, client: RegisteredClient) -> RepoResult<()> {
+        let redirect_uris = json_encode(&client.redirect_uris, "oauth redirect URIs")?;
+        let allowed_scopes = json_encode(&client.allowed_scopes, "oauth allowed scopes")?;
+        let sql = format!(
+            "INSERT INTO {t} (client_id, redirect_uris, allowed_scopes, secret_hash) \
+             VALUES (?, ?j, ?j, ?) ON CONFLICT (client_id) DO UPDATE SET \
+             redirect_uris = excluded.redirect_uris, \
+             allowed_scopes = excluded.allowed_scopes, secret_hash = excluded.secret_hash",
+            t = self.table("oauth_clients")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(client.client_id),
+                p(redirect_uris),
+                p(allowed_scopes),
+                client.secret_hash,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>> {
+        let sql = format!(
+            "SELECT client_id, CAST(redirect_uris AS TEXT), \
+             CAST(allowed_scopes AS TEXT), secret_hash FROM {} WHERE client_id = ?",
+            self.table("oauth_clients")
+        );
+        let rows = self.backend.query(&sql, &[p(client_id)])?;
+        rows.first().map(decode_oauth_client).transpose()
+    }
+
+    fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+        let sql = format!(
+            "SELECT client_id, CAST(redirect_uris AS TEXT), \
+             CAST(allowed_scopes AS TEXT), secret_hash FROM {} ORDER BY client_id",
+            self.table("oauth_clients")
+        );
+        self.backend
+            .query(&sql, &[])?
+            .iter()
+            .map(decode_oauth_client)
+            .collect()
+    }
+
+    fn remove(&self, client_id: &str) -> RepoResult<()> {
+        let sql = format!(
+            "DELETE FROM {} WHERE client_id = ?",
+            self.table("oauth_clients")
+        );
+        if self.backend.execute(&sql, &[p(client_id)])? == 0 {
+            return Err(RepoError::NotFound(format!(
+                "oauth client {client_id} not found"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<B: SqlConn> AuthCodeRepo for SqlStore<B> {
+    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()> {
+        let scopes = json_encode(&code.scopes, "oauth code scopes")?;
+        let sql = format!(
+            "INSERT INTO {t} (code_hash, client_id, redirect_uri, account_id, scopes, \
+             code_challenge, nonce, expires_at, consumed_at) \
+             VALUES (?, ?, ?, ?, ?j, ?, ?, ?, ?)",
+            t = self.table("oauth_authorization_codes")
+        );
+        self.backend.execute(
+            &sql,
+            &[
+                p(code.code_hash),
+                p(code.client_id),
+                p(code.redirect_uri),
+                p(code.account_id.0),
+                p(scopes),
+                code.code_challenge,
+                code.nonce,
+                p(code.expires_at.0),
+                code.consumed_at.map(|timestamp| timestamp.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+        let sql = format!(
+            "SELECT code_hash, client_id, redirect_uri, account_id, CAST(scopes AS TEXT), \
+             code_challenge, nonce, expires_at, consumed_at FROM {} WHERE code_hash = ?",
+            self.table("oauth_authorization_codes")
+        );
+        let rows = self.backend.query(&sql, &[p(code_hash)])?;
+        rows.first().map(decode_auth_code).transpose()
+    }
+
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool> {
+        let sql = format!(
+            "UPDATE {t} SET consumed_at = ? WHERE code_hash = ? \
+             AND consumed_at IS NULL AND expires_at > ?",
+            t = self.table("oauth_authorization_codes")
+        );
+        Ok(self
+            .backend
+            .execute(&sql, &[p(now.0.clone()), p(code_hash), p(now.0.clone())])?
+            == 1)
     }
 }
 

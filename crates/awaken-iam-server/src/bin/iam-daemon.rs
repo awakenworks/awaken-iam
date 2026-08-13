@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_core::RegisteredClient;
+use awaken_iam_core::{AuthCodeRepo, OAuthClientRepo, RegisteredClient, SessionRepo};
 use awaken_iam_server::{
     AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi, SqliteBackend,
     daemon_router, http, op_router, sqlite_migrated_store,
@@ -38,6 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut auth, authz) = daemon.into_assembly().into_auth_and_authz();
     let issuer = std::env::var("IAM_ISSUER").unwrap_or_else(|_| format!("http://{bind_addr}"));
     auth = auth.with_issuer(issuer.clone());
+    let database_path =
+        std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
+    let profile_store = Arc::new(sqlite_migrated_store(
+        SqliteBackend::open_path(&database_path)?,
+        "iam",
+    )?);
+    let sessions: Arc<dyn SessionRepo> = profile_store.clone();
+    let oauth_clients: Arc<dyn OAuthClientRepo> = profile_store.clone();
+    let oauth_codes: Arc<dyn AuthCodeRepo> = profile_store.clone();
+    auth = auth
+        .with_session_repository(sessions)
+        .with_oauth_repositories(oauth_clients, oauth_codes);
     if let (Ok(client_id), Ok(redirect_uris)) = (
         std::env::var("IAM_DESKTOP_CLIENT_ID"),
         std::env::var("IAM_DESKTOP_REDIRECT_URIS"),
@@ -53,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client_id,
                 redirect_uris,
                 ["openid", "email", "profile"],
-            ));
+            ))?;
         }
     }
     let auth: SharedAuthApi = Arc::new(tokio::sync::Mutex::new(auth));
@@ -61,12 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Profiles are durable even though the legacy MVP policy-admin aggregates
     // still use their existing adapters. The active heads are hydrated before
     // the socket binds, so a restart never serves the pre-profile policy.
-    let database_path =
-        std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
-    let profile_store = Arc::new(sqlite_migrated_store(
-        SqliteBackend::open_path(&database_path)?,
-        "iam",
-    )?);
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).

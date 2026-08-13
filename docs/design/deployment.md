@@ -34,6 +34,13 @@ composition injects the shared SQL adapter through IAM's canonical
 separate browser-session database. Repository failure rejects the request, so
 an unhealthy replica cannot silently mint or accept an unshared session.
 
+Downstream product OAuth uses that same adapter through `OAuthClientRepo` and
+`AuthCodeRepo`. Registered product clients and the single-use authorization
+code transition are therefore shared across replicas and process replacement;
+no deployment affinity is required for `/v1/oauth/authorize` followed by
+`/v1/oauth/token`. The code repository stores a hash, never the browser bearer,
+and its conditional live-to-consumed update is the atomic replay fence.
+
 > "Migration" here means **schema** migration (owning IAM's tables). It is
 > unrelated to the capability [migration plan](migration-strategy.md) (moving IAM
 > capability in from other services). Two different migrations.

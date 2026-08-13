@@ -139,6 +139,26 @@ replacement. PostgreSQL unavailability fails session creation, resolution, and
 logout closed; the server never falls back to an in-memory session directory.
 SQLite remains the single-process local adapter and is not an HA server store.
 
+The downstream authorization server follows the same one-store rule. Its
+`OAuthClientRepo` is the authoritative registered-client directory and its
+`AuthCodeRepo` holds only hashed, short-lived authorization-code records. A
+durable composition injects the same `SqlStore` behind both ports; it never
+hydrates a process-local client snapshot or keeps issued codes in a replica.
+Code redemption first validates the stored client, redirect URI, expiry, and
+PKCE binding, then performs one conditional consume (`unconsumed && live`) in
+the repository. That compare-and-set is the replay boundary: two replicas may
+race to redeem one valid code, but exactly one succeeds. Validation failure does
+not consume the code, while repository failure rejects issuance or redemption
+as temporarily unavailable rather than falling back to memory.
+
+```text
+authorize on replica A -> OAuthClientRepo.get -> AuthCodeRepo.create(hash only)
+token on replica B     -> OAuthClientRepo.get -> AuthCodeRepo.get
+                                            -> validate all bindings
+                                            -> consume_if_live (atomic CAS)
+                                            -> mint tokens
+```
+
 ## Provider login subflow
 
 Provider-specific routes are IAM-internal browser routes used after the unified

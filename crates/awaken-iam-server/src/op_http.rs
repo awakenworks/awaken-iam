@@ -360,6 +360,9 @@ fn oauth_provider_error(error: OAuthProviderError) -> Response {
         OAuthProviderError::ScopeNotAllowed => {
             oauth_error(StatusCode::BAD_REQUEST, "invalid_scope")
         }
+        OAuthProviderError::StorageUnavailable => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        }
         OAuthProviderError::PkceRequired
         | OAuthProviderError::UnsupportedCodeChallengeMethod
         | OAuthProviderError::UnregisteredRedirectUri
@@ -434,7 +437,8 @@ mod tests {
             "desktop",
             vec!["http://127.0.0.1:9234/callback".into()],
             ["openid", "email", "profile"],
-        ));
+        ))
+        .unwrap();
         auth.register_provider(crate::ProviderRegistration {
             config: IdentityProviderConfig {
                 id: IdentityProviderConfigId("fake-config".into()),
@@ -646,4 +650,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+}
+/// OAuth storage failure cause/effect rule: C1=the authoritative client or
+/// code repository is unavailable. R1(C1) returns HTTP 503 with the OAuth
+/// temporarily_unavailable class; it must not collapse to invalid_grant or
+/// fall back to replica memory.
+#[test]
+fn oauth_storage_failure_is_temporarily_unavailable() {
+    let response = oauth_provider_error(OAuthProviderError::StorageUnavailable);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

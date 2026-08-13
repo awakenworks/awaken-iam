@@ -80,6 +80,22 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self
     }
 
+    /// Replace downstream OAuth client and authorization-code repositories.
+    ///
+    /// Durable compositions pass two trait-object views of the same shared SQL
+    /// store. This runs during assembly before clients or codes are issued;
+    /// every later lookup and single-use transition goes directly through the
+    /// repositories, with no hydrated per-process registry.
+    pub fn with_oauth_repositories(
+        mut self,
+        clients: Arc<dyn OAuthClientRepo>,
+        codes: Arc<dyn AuthCodeRepo>,
+    ) -> Self {
+        self.oauth_provider =
+            OAuthAuthorizationServer::with_repositories(clients, codes, self.ids.clone());
+        self
+    }
+
     /// Replace the login correlation cookie configuration.
     pub fn with_login_cookie(mut self, cookie: SessionCookieConfig) -> Self {
         self.login_cookie = cookie;

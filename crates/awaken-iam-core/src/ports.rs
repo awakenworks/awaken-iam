@@ -20,6 +20,7 @@ use awaken_iam_contract::{
     WorkspaceId, WorkspaceOrgEdge,
 };
 
+use crate::oauth_provider::StoredAuthorizationCode;
 use crate::{
     Grant, GrantId, Group, GroupId, Invitation, Organization, Plan, PlanId, RegisteredClient,
     ResourceEdge, RoleBinding, RoleDef, RoleId,
@@ -119,9 +120,9 @@ pub trait LoginFlowRepo: Send + Sync {
 ///
 /// These are the product clients allowed to integrate against IAM as an OAuth
 /// authorization server. The natural key is the public `client_id`; only the
-/// confidential `secret_hash` is stored, never the cleartext secret. The
-/// authorization server hydrates its [`OAuthClientRegistry`](crate::OAuthClientRegistry)
-/// from this port rather than from an in-memory seed.
+/// confidential `secret_hash` is stored, never the cleartext secret. Durable
+/// authorization servers read this port directly on every operation rather
+/// than hydrating a per-process registry snapshot.
 pub trait OAuthClientRepo: Send + Sync {
     /// Insert or replace a registered client by its `client_id`.
     fn upsert(&self, client: RegisteredClient) -> RepoResult<()>;
@@ -131,6 +132,21 @@ pub trait OAuthClientRepo: Send + Sync {
     fn list(&self) -> RepoResult<Vec<RegisteredClient>>;
     /// Remove a registered client, failing closed when it is absent.
     fn remove(&self, client_id: &str) -> RepoResult<()>;
+}
+
+/// Persistence for short-lived downstream OAuth authorization codes.
+///
+/// Only the cleartext code's hash is stored. Redemption validates the returned
+/// record in the domain, then calls [`AuthCodeRepo::consume_if_live`] as the
+/// atomic replay fence shared by every replica.
+pub trait AuthCodeRepo: Send + Sync {
+    /// Persist a freshly issued, unconsumed code record.
+    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()>;
+    /// Resolve a record from the presented code hash.
+    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>>;
+    /// Atomically consume the code only when it is unconsumed and expires after
+    /// `now`; returns `false` for absent, consumed, or expired records.
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool>;
 }
 
 // ---------------------------------------------------------------------------

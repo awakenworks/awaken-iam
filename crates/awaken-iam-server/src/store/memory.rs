@@ -16,11 +16,11 @@ use awaken_iam_contract::{
     Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthorizationProfileRepo,
+    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, AuthorizationProfileRepo,
     ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
     InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo,
     RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
-    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -41,6 +41,7 @@ struct Identity {
     api_tokens: BTreeMap<String, ApiToken>,
     api_tokens_by_prefix: BTreeMap<String, String>,
     oauth_clients: BTreeMap<String, RegisteredClient>,
+    oauth_codes: BTreeMap<String, StoredAuthorizationCode>,
 }
 
 #[derive(Default)]
@@ -351,6 +352,39 @@ impl OAuthClientRepo for InMemoryStore {
             .remove(client_id)
             .map(|_| ())
             .ok_or_else(|| RepoError::NotFound(format!("oauth client {client_id} not found")))
+    }
+}
+
+impl AuthCodeRepo for InMemoryStore {
+    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()> {
+        let mut identity = self.identity.lock().unwrap();
+        if identity.oauth_codes.contains_key(&code.code_hash) {
+            return Err(RepoError::Conflict("duplicate authorization code".into()));
+        }
+        identity.oauth_codes.insert(code.code_hash.clone(), code);
+        Ok(())
+    }
+
+    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+        Ok(self
+            .identity
+            .lock()
+            .unwrap()
+            .oauth_codes
+            .get(code_hash)
+            .cloned())
+    }
+
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool> {
+        let mut identity = self.identity.lock().unwrap();
+        let Some(code) = identity.oauth_codes.get_mut(code_hash) else {
+            return Ok(false);
+        };
+        if code.consumed_at.is_some() || code.expires_at.0 <= now.0 {
+            return Ok(false);
+        }
+        code.consumed_at = Some(now.clone());
+        Ok(true)
     }
 }
 
