@@ -45,11 +45,12 @@ pub use approval_discharge::{
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, DownstreamAuthorizeOutcome, DownstreamAuthorizeRequest,
-    IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken, OpCodeRedemption, OpTokenGrant,
-    PrincipalResolutionFailure, ProviderRegistration, ProviderSummary, RedeemAuthorizationCode,
-    RefreshGrant, ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint,
-    StartLogin, StartLoginOutcome, TokenGrant, UnlinkIdentity,
+    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_LOGIN_PROOF_COOKIE_NAME, DownstreamAuthorizeOutcome,
+    DownstreamAuthorizeRequest, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
+    OpCodeRedemption, OpTokenGrant, PrincipalResolutionFailure, ProviderRegistration,
+    ProviderSummary, RedeemAuthorizationCode, RefreshGrant, ReturnToDecision, ReturnToPolicy,
+    RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant,
+    UnlinkIdentity,
 };
 pub use authz_api::{AuthzApi, IntrospectionError};
 pub use capability_token::{

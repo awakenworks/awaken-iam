@@ -36,8 +36,9 @@ use awaken_iam_core::{
 };
 use awaken_iam_server::{
     AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME, IamServer, ProviderRegistration,
-    ReturnToPolicy, SessionCookieConfig, StartLogin, StartLoginOutcome,
+    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_LOGIN_PROOF_COOKIE_NAME, DEFAULT_SESSION_COOKIE_NAME,
+    IamServer, ProviderRegistration, ReturnToPolicy, SessionCookieConfig, StartLogin,
+    StartLoginOutcome,
 };
 
 const ISSUER: &str = "https://idp.test";
@@ -217,14 +218,11 @@ fn begin(api: &mut AuthApi<CountingEntropy>, return_to: Option<&str>) -> StartLo
 
 /// Replay the correlation cookie the start step set, as the browser would.
 fn login_cookie_header(outcome: &StartLoginOutcome) -> String {
-    let cfg = SessionCookieConfig {
-        name: DEFAULT_LOGIN_COOKIE_NAME.to_owned(),
-        ..SessionCookieConfig::default()
-    };
-    let id = cfg
-        .extract_token(&outcome.set_cookie)
-        .expect("login correlation cookie");
-    format!("{DEFAULT_LOGIN_COOKIE_NAME}={id}")
+    format!(
+        "{}; {}",
+        outcome.set_cookie.split(';').next().unwrap(),
+        outcome.set_proof_cookie.split(';').next().unwrap()
+    )
 }
 
 /// Replay the session cookie the callback established, as the browser would.
@@ -332,6 +330,11 @@ fn fake_provider_login_loop_closes_session_and_authorize_path() {
     //    provider authorization redirect.
     let start = begin(&mut api, Some("/dashboard"));
     assert!(start.set_cookie.contains(DEFAULT_LOGIN_COOKIE_NAME));
+    assert!(
+        start
+            .set_proof_cookie
+            .contains(DEFAULT_LOGIN_PROOF_COOKIE_NAME)
+    );
     assert!(start.set_cookie.contains("; HttpOnly"));
     assert!(start.set_cookie.contains("; Secure"));
     assert!(
@@ -369,6 +372,7 @@ fn fake_provider_login_loop_closes_session_and_authorize_path() {
             .contains(DEFAULT_SESSION_COOKIE_NAME)
     );
     assert!(outcome.clear_login_cookie.contains("; Max-Age=0"));
+    assert!(outcome.clear_login_proof_cookie.contains("; Max-Age=0"));
     assert!(outcome.session.external_identity_id.is_some());
 
     // 4. /v1/session resolves the live session from the session cookie.

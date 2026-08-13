@@ -41,6 +41,12 @@ no deployment affinity is required for `/v1/oauth/authorize` followed by
 `/v1/oauth/token`. The code repository stores a hash, never the browser bearer,
 and its conditional live-to-consumed update is the atomic replay fence.
 
+Upstream provider login uses the existing `LoginFlowRepo` on that same adapter.
+The shared row contains only state/nonce/PKCE hashes and the single-use fence;
+the browser returns the cleartext nonce and verifier in a short-lived,
+HttpOnly correlation-proof cookie. Any replica can therefore consume the row
+and verify the proof without a process-local pending map or sticky routing.
+
 > "Migration" here means **schema** migration (owning IAM's tables). It is
 > unrelated to the capability [migration plan](migration-strategy.md) (moving IAM
 > capability in from other services). Two different migrations.
@@ -51,7 +57,8 @@ IAM declares its DDL as append-only, checksum-verified **migration bundles**, on
 per subdomain scope:
 
 ```text
-iam.identity     accounts, external identities, sessions, api tokens
+iam.identity     accounts, external identities, login flows, sessions, api tokens,
+                 OAuth clients and authorization codes
 iam.authz        roles, grants, memberships, resource-model registry
 iam.entitlement  plans, subscriptions
 iam.namespace    namespace ownership, signers        (only if split out)

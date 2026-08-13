@@ -468,11 +468,17 @@ mod tests {
             })
             .unwrap();
         let login_cookie = started.set_cookie.split(';').next().unwrap().to_owned();
+        let login_proof_cookie = started
+            .set_proof_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
         let state = started.redirect_url.split("state=").nth(1).unwrap();
         let completed = auth
             .complete_callback(crate::CallbackRequest {
                 provider_key: IdentityProviderKey("fake".into()),
-                cookie_header: login_cookie,
+                cookie_header: format!("{login_cookie}; {login_proof_cookie}"),
                 code: "accepted".into(),
                 state: state.into(),
                 now: crate::clock::timestamp(now + 1),

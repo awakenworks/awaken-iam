@@ -25,6 +25,10 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             name: DEFAULT_LOGIN_COOKIE_NAME.to_owned(),
             ..SessionCookieConfig::default()
         };
+        let login_proof_cookie = SessionCookieConfig {
+            name: DEFAULT_LOGIN_PROOF_COOKIE_NAME.to_owned(),
+            ..SessionCookieConfig::default()
+        };
         // Draw the bootstrap signing seed from a clone so the live `ids` stream
         // (and therefore minted ids) is unaffected by key generation.
         let mut bootstrap = entropy.clone();
@@ -34,12 +38,12 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         Self {
             providers: Vec::new(),
             challenge: OAuthChallengeService::new(entropy.clone()),
-            login_directory: SessionDirectory::new(),
+            login_flows: Arc::new(crate::store::InMemoryStore::new()),
             sessions: SessionGateway::with_entropy(entropy.clone(), SessionCookieConfig::default()),
             directory: IdentityDirectory::new(),
-            pending: HashMap::new(),
             return_to: ReturnToPolicy::default(),
             login_cookie,
+            login_proof_cookie,
             tokens,
             refresh_tokens: RefreshTokenDirectory::new(),
             refresh_minter: RefreshTokenMinter::new(entropy.clone()),
@@ -96,9 +100,24 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self
     }
 
+    /// Replace the single authoritative upstream login-flow repository.
+    ///
+    /// Durable compositions inject the same shared SQL store used by sessions
+    /// and downstream OAuth state. No process-local compatibility path remains.
+    pub fn with_login_repository(mut self, repository: Arc<dyn LoginFlowRepo>) -> Self {
+        self.login_flows = repository;
+        self
+    }
+
     /// Replace the login correlation cookie configuration.
     pub fn with_login_cookie(mut self, cookie: SessionCookieConfig) -> Self {
         self.login_cookie = cookie;
+        self
+    }
+
+    /// Replace the one-time callback-proof cookie configuration.
+    pub fn with_login_proof_cookie(mut self, cookie: SessionCookieConfig) -> Self {
+        self.login_proof_cookie = cookie;
         self
     }
 

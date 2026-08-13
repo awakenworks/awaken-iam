@@ -106,12 +106,11 @@ fn start(api: &mut AuthApi<SequentialEntropy>, return_to: Option<&str>) -> Start
 }
 
 fn login_cookie_header(outcome: &StartLoginOutcome) -> String {
-    let cfg = SessionCookieConfig {
-        name: DEFAULT_LOGIN_COOKIE_NAME.to_owned(),
-        ..SessionCookieConfig::default()
-    };
-    let id = cfg.extract_token(&outcome.set_cookie).unwrap();
-    format!("{DEFAULT_LOGIN_COOKIE_NAME}={id}")
+    format!(
+        "{}; {}",
+        outcome.set_cookie.split(';').next().unwrap(),
+        outcome.set_proof_cookie.split(';').next().unwrap()
+    )
 }
 
 fn state_from_redirect(outcome: &StartLoginOutcome) -> String {
@@ -184,11 +183,22 @@ fn start_login_unknown_provider_fails_closed() {
 
 #[test]
 fn full_login_loop_provisions_account_and_establishes_session() {
+    // Cause/effect graph: C1=shared login row, C2=matching browser proof,
+    // C3=valid provider callback. E1=single-use row consumed, E2=session
+    // established, E3=both correlation cookies cleared. Decision-table rule:
+    // C1+C2+C3 -> E1+E2+E3; missing/mismatched C2 -> fail closed (covered by
+    // the correlation and mismatch cases below); replay !C1 -> reject.
     let mut api = api();
     let outcome = start(&mut api, Some("/dashboard"));
     assert!(outcome.set_cookie.contains(DEFAULT_LOGIN_COOKIE_NAME));
     assert!(outcome.set_cookie.contains("; HttpOnly"));
     assert!(outcome.set_cookie.contains("; Secure"));
+    assert!(
+        outcome
+            .set_proof_cookie
+            .contains(DEFAULT_LOGIN_PROOF_COOKIE_NAME)
+    );
+    assert!(outcome.set_proof_cookie.contains("; HttpOnly"));
     assert_eq!(
         outcome.return_to,
         ReturnToDecision::Allowed("/dashboard".into())
@@ -203,6 +213,7 @@ fn full_login_loop_provisions_account_and_establishes_session() {
             .contains(DEFAULT_SESSION_COOKIE_NAME)
     );
     assert!(result.clear_login_cookie.contains("; Max-Age=0"));
+    assert!(result.clear_login_proof_cookie.contains("; Max-Age=0"));
 
     // The new session resolves from its cookie.
     let session_cookie = {
@@ -270,6 +281,31 @@ fn shared_session_repository_survives_auth_api_reconstruction_and_logout() {
         after_logout.current_session(&cookie, Timestamp("2026-06-19T04:00:00Z".into())),
         Err(AuthApiError::Login(IamError::SessionRevoked { .. }))
     ));
+}
+
+/// Upstream-login HA cause/effect decision table:
+/// C1=start and callback hit different AuthApi replicas, C2=both share one
+/// LoginFlowRepo, C3=the browser returns both hardened cookies, C4=bindings
+/// match. R1(C1+C2+C3+C4) consumes the shared row and establishes the session;
+/// R2(C1+!C2) rejects unknown state; R3(C1+C2+!C3) rejects missing correlation;
+/// R4(C1+C2+C3+!C4) burns the row and rejects. R2-R4 are covered by the
+/// existing missing/replay/mismatch cases; this case selects the HA success row.
+#[test]
+fn shared_login_repository_completes_callback_on_another_replica() {
+    let repository = Arc::new(InMemoryStore::new());
+    let mut starter = api().with_login_repository(repository.clone());
+    let started = start(&mut starter, Some("/dashboard"));
+
+    let mut callback_replica = api().with_login_repository(repository);
+    let completed = callback(
+        &mut callback_replica,
+        &started,
+        "subject-1:user@example.com",
+    )
+    .unwrap();
+
+    assert_eq!(completed.redirect_to, "/dashboard");
+    assert!(completed.registered);
 }
 
 #[test]
@@ -358,7 +394,10 @@ fn forged_state_fails_closed_and_burns_challenge() {
 
     // The burned challenge cannot be replayed even with the correct state.
     let replay = callback(&mut api, &outcome, "subject-1:user@example.com").unwrap_err();
-    assert!(matches!(replay, AuthApiError::MissingCorrelation));
+    assert!(matches!(
+        replay,
+        AuthApiError::Login(IamError::LoginStateAlreadyConsumed { .. })
+    ));
 }
 
 #[test]

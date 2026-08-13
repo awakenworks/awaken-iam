@@ -42,16 +42,14 @@
 //! its own.
 //!
 //! The front half of the login loop mints a challenge whose hashes are persisted
-//! in the [`SessionDirectory`](awaken_iam_core::SessionDirectory); the one-time
-//! cleartext secrets needed to finish the exchange (the PKCE verifier and OIDC
-//! nonce) are held in a transient in-memory pending map keyed by the login-state
-//! id and dropped the instant the callback consumes them. The browser only
-//! carries the login-state id in a hardened correlation cookie, never the
-//! secrets. `return_to` is constrained by an allowlist so a crafted link cannot
+//! through the authoritative [`LoginFlowRepo`]. The one-time cleartext PKCE
+//! verifier and OIDC nonce are returned only in a second hardened, HttpOnly
+//! correlation cookie; their hashes bind them to the shared challenge row, so
+//! callback processing is stateless and any replica can complete it without
+//! persisting the cleartext values. `return_to` is constrained by an allowlist so a crafted link cannot
 //! turn login into an open redirect, and every transition emits an
 //! [`AuthAuditEvent`].
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::access_token::{
@@ -75,13 +73,15 @@ use awaken_iam_contract::{
 use awaken_iam_core::{
     AuthCodeRepo, AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange,
     EntropySource, EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter,
-    LoginAttempt, MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer,
-    OAuthChallengeService, OAuthClientRegistry, OAuthClientRepo, OAuthProviderError, OsEntropy,
-    ProviderError, RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient, RotateRefreshToken,
-    SessionDirectory, SessionRepo, TokenRedemption, parse_presented_refresh_token,
+    LoginAttempt, LoginFlowRepo, MintRefreshToken, OAuthAuthorizationRequest,
+    OAuthAuthorizationServer, OAuthChallengeService, OAuthClientRegistry, OAuthClientRepo,
+    OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory, RefreshTokenMinter,
+    RegisteredClient, RotateRefreshToken, SessionRepo, TokenRedemption,
+    parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 
 mod builder;
 
@@ -95,6 +95,8 @@ const ID_BYTES: usize = 32;
 /// The `__Host-` prefix binds it to `Secure`, `Path=/`, and no `Domain`, which
 /// the default [`SessionCookieConfig`] satisfies.
 pub const DEFAULT_LOGIN_COOKIE_NAME: &str = "__Host-awaken_login";
+/// Default name for the callback proof paired with the login-id cookie.
+pub const DEFAULT_LOGIN_PROOF_COOKIE_NAME: &str = "__Host-awaken_login_proof";
 
 /// Allowlist policy constraining post-login `return_to` destinations.
 ///
@@ -425,10 +427,28 @@ struct RegisteredProvider {
     include_pkce: bool,
 }
 
-/// Transient cleartext secrets retained between start and callback.
-struct PendingLogin {
+/// Browser-held, one-time callback proof. The shared login row stores only the
+/// hashes of these values, so cookie tampering fails closed during consumption.
+#[derive(Debug, Serialize, Deserialize)]
+struct LoginCorrelationProof {
+    login_state_id: OAuthLoginStateId,
     nonce: Option<String>,
     pkce_verifier: Option<String>,
+}
+
+impl LoginCorrelationProof {
+    fn encode(&self) -> Result<String, AuthApiError> {
+        serde_json::to_vec(self)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| AuthApiError::MissingCorrelation)
+    }
+
+    fn decode(value: &str) -> Result<Self, AuthApiError> {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| AuthApiError::MissingCorrelation)?;
+        serde_json::from_slice(&bytes).map_err(|_| AuthApiError::MissingCorrelation)
+    }
 }
 
 /// Request to begin a login (`GET /v1/auth/login/{provider}`).
@@ -453,6 +473,8 @@ pub struct StartLoginOutcome {
     pub redirect_url: String,
     /// `Set-Cookie` header value carrying the login correlation cookie.
     pub set_cookie: String,
+    /// `Set-Cookie` header carrying the one-time nonce/PKCE callback proof.
+    pub set_proof_cookie: String,
     /// Resolved `return_to` destination after allowlist enforcement.
     pub return_to: ReturnToDecision,
 }
@@ -485,6 +507,8 @@ pub struct CallbackOutcome {
     pub set_session_cookie: String,
     /// `Set-Cookie` header value clearing the login correlation cookie.
     pub clear_login_cookie: String,
+    /// `Set-Cookie` header value clearing the callback-proof cookie.
+    pub clear_login_proof_cookie: String,
     /// Public, token-free view of the new session.
     pub session: SessionView,
     /// Whether a new account was provisioned on this login.
@@ -787,12 +811,12 @@ pub enum AuthApiError {
 pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     providers: Vec<RegisteredProvider>,
     challenge: OAuthChallengeService<E>,
-    login_directory: SessionDirectory,
+    login_flows: Arc<dyn LoginFlowRepo>,
     sessions: SessionGateway<E>,
     directory: IdentityDirectory,
-    pending: HashMap<OAuthLoginStateId, PendingLogin>,
     return_to: ReturnToPolicy,
     login_cookie: SessionCookieConfig,
+    login_proof_cookie: SessionCookieConfig,
     tokens: AccessTokenAuthority,
     refresh_tokens: RefreshTokenDirectory,
     refresh_minter: RefreshTokenMinter<E>,
@@ -881,7 +905,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         };
 
         let issued = self.challenge.begin_login(
-            &mut self.login_directory,
+            self.login_flows.as_ref(),
             BeginLogin {
                 id: login_state_id.clone(),
                 provider_key: request.provider_key.clone(),
@@ -905,17 +929,17 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             .adapter
             .authorization_url(&provider.config, &url_request)?;
 
-        self.pending.insert(
-            login_state_id.clone(),
-            PendingLogin {
-                nonce: issued.secrets.nonce.clone(),
-                pkce_verifier: issued.secrets.pkce_verifier.clone(),
-            },
-        );
-
         let set_cookie = self
             .login_cookie
             .render_set_cookie(&login_state_id.0, request.cookie_max_age_secs);
+        let proof = LoginCorrelationProof {
+            login_state_id: login_state_id.clone(),
+            nonce: issued.secrets.nonce.clone(),
+            pkce_verifier: issued.secrets.pkce_verifier.clone(),
+        };
+        let set_proof_cookie = self
+            .login_proof_cookie
+            .render_set_cookie(&proof.encode()?, request.cookie_max_age_secs);
 
         self.audit.push(AuthAuditEvent::LoginStarted {
             provider_key: request.provider_key,
@@ -926,6 +950,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         Ok(StartLoginOutcome {
             redirect_url: redirect.url,
             set_cookie,
+            set_proof_cookie,
             return_to,
         })
     }
@@ -951,9 +976,14 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             }
         };
 
-        let pending = match self.pending.remove(&login_state_id) {
-            Some(pending) => pending,
-            None => {
+        let proof = match self
+            .login_proof_cookie
+            .extract_token(&request.cookie_header)
+            .ok_or(AuthApiError::MissingCorrelation)
+            .and_then(|value| LoginCorrelationProof::decode(&value))
+        {
+            Ok(proof) if proof.login_state_id == login_state_id => proof,
+            Ok(_) | Err(_) => {
                 self.record_failure(
                     &request.provider_key,
                     AuthFailureReason::MissingCorrelation,
@@ -966,11 +996,11 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let attempt = LoginAttempt {
             id: login_state_id.clone(),
             state: request.state.clone(),
-            nonce: pending.nonce.clone(),
-            pkce_verifier: pending.pkce_verifier.clone(),
+            nonce: proof.nonce.clone(),
+            pkce_verifier: proof.pkce_verifier.clone(),
         };
         let consumed = match self.challenge.complete_login(
-            &mut self.login_directory,
+            self.login_flows.as_ref(),
             &attempt,
             request.now.clone(),
         ) {
@@ -1003,7 +1033,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             let exchange = CallbackExchange {
                 redirect_uri: provider.redirect_uri.clone(),
                 code: request.code.clone(),
-                pkce_verifier: pending.pkce_verifier.clone(),
+                pkce_verifier: proof.pkce_verifier.clone(),
             };
             match provider
                 .adapter
@@ -1049,6 +1079,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             redirect_to: return_to,
             set_session_cookie: established.set_cookie,
             clear_login_cookie: self.login_cookie.render_clear_cookie(),
+            clear_login_proof_cookie: self.login_proof_cookie.render_clear_cookie(),
             session: established.view,
             registered,
         })

@@ -93,8 +93,8 @@ pub use trust::{NamespaceGrant, NamespaceTrustDirectory, TrustError};
 use awaken_iam_contract::{
     Account, AccountId, ApiTokenId, ApiTokenPrefix, AuthorizationDecision, AuthorizationRequest,
     ExternalIdentity, ExternalIdentityClaims, ExternalIdentityKey, ExternalSubject,
-    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, RefreshTokenChainId, RefreshTokenId,
-    Session, SessionId, Timestamp,
+    IdentityProviderKey, OAuthLoginStateId, RefreshTokenChainId, RefreshTokenId, Session,
+    SessionId, Timestamp,
 };
 
 /// Identifies which bound login value failed verification on callback.
@@ -174,6 +174,13 @@ pub enum IamError {
         /// Consumed login-state id.
         id: OAuthLoginStateId,
     },
+    /// The authoritative login-flow repository could not complete an operation.
+    ///
+    /// Backend detail stays behind the repository port. HTTP hosts may expose
+    /// this as temporary unavailability, but must never fall back to a
+    /// process-local challenge directory.
+    #[error("login flow storage is unavailable")]
+    LoginFlowStorageUnavailable,
     /// The OIDC provider returned a validation error.
     #[error("provider validation error")]
     ProviderValidationError {
@@ -541,18 +548,16 @@ impl IdentityDirectory {
     }
 }
 
-/// In-memory directory enforcing login-state and session invariants.
+/// In-memory directory enforcing legacy local session invariants.
 ///
-/// This closes the login loop on top of [`IdentityDirectory`]: an OAuth
-/// login-state challenge is started once and consumed at most once, and the
-/// resulting session can authenticate only while it is unrevoked and unexpired.
+/// OAuth login challenges use the single authoritative [`LoginFlowRepo`] port;
+/// this directory owns only process-local sessions retained by the core API.
 ///
 /// Timestamps are compared as canonical RFC 3339 UTC strings (`...Z`), which is
 /// the form produced across the contract. Lexical ordering of that canonical
 /// form matches chronological ordering.
 #[derive(Debug, Default)]
 pub struct SessionDirectory {
-    login_states: HashMap<OAuthLoginStateId, OAuthLoginState>,
     sessions: HashMap<SessionId, Session>,
     /// Secondary index from session `token_hash` to session id, so a presented
     /// bearer token (the cookie value, hashed) resolves to its session without
@@ -564,50 +569,6 @@ impl SessionDirectory {
     /// Create an empty session directory.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Record a freshly issued OAuth login-state challenge.
-    ///
-    /// Each login-state id may be started only once.
-    pub fn start_login(&mut self, state: OAuthLoginState) -> Result<(), IamError> {
-        match self.login_states.entry(state.id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(state);
-                Ok(())
-            }
-            Entry::Occupied(entry) => Err(IamError::DuplicateLoginState {
-                id: entry.key().clone(),
-            }),
-        }
-    }
-
-    /// Resolve a login-state challenge by id without consuming it.
-    pub fn login_state(&self, id: &OAuthLoginStateId) -> Option<&OAuthLoginState> {
-        self.login_states.get(id)
-    }
-
-    /// Consume a login-state challenge exactly once.
-    ///
-    /// The challenge must exist, be unexpired at `now`, and not have been
-    /// consumed already. On success it is marked consumed and returned so the
-    /// caller can validate the bound `state`/`nonce`/PKCE hashes.
-    pub fn consume_login_state(
-        &mut self,
-        id: &OAuthLoginStateId,
-        now: Timestamp,
-    ) -> Result<&OAuthLoginState, IamError> {
-        let state = self
-            .login_states
-            .get_mut(id)
-            .ok_or_else(|| IamError::LoginStateNotFound { id: id.clone() })?;
-        if state.consumed_at.is_some() {
-            return Err(IamError::LoginStateAlreadyConsumed { id: id.clone() });
-        }
-        if now.0 >= state.expires_at.0 {
-            return Err(IamError::LoginStateExpired { id: id.clone() });
-        }
-        state.consumed_at = Some(now);
-        Ok(state)
     }
 
     /// Persist a newly established session.

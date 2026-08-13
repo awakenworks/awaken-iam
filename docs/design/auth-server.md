@@ -159,6 +159,20 @@ token on replica B     -> OAuthClientRepo.get -> AuthCodeRepo.get
                                             -> mint tokens
 ```
 
+Upstream provider correlation follows the same one-store rule. `LoginFlowRepo`
+stores only state, nonce, and PKCE hashes plus expiry/consumption metadata. The
+start response sets two short-lived, hardened cookies: an opaque login-row id
+and an HttpOnly proof containing the one-time nonce/PKCE verifier. On callback,
+any replica loads and atomically consumes the shared row, then verifies the
+browser proof against its hashes before exchanging the provider code. The proof
+is cleared with the login-id cookie. There is no process-local pending map and
+load-balancer affinity is not a correctness requirement.
+
+```text
+start on replica A    -> LoginFlowRepo.start(hashes) -> browser id+proof cookies
+callback on replica B -> LoginFlowRepo.get/consume -> verify proof -> provider exchange
+```
+
 ## Provider login subflow
 
 Provider-specific routes are IAM-internal browser routes used after the unified

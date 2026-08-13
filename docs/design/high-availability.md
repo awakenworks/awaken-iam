@@ -29,6 +29,12 @@ Postgres.
    live code there; neither relies on a hydrated per-node registry, sticky
    routing, or a best-effort cache synchronization loop.
 
+   It also includes upstream provider login flows. The shared repository stores
+   only hashed bindings and the atomic consumption fence; a short-lived,
+   HttpOnly browser proof carries the one-time nonce/PKCE verifier. A callback
+   may therefore land on a different node than the login start without affinity
+   or a process-local pending map.
+
 2. **Every node is identical and stateless.** Same assembly, same migration
    bundles, same `/v1` surface (see [assembly](deployment.md#assembly)). A load
    balancer may route any request to any node; there is no affinity and no sticky
