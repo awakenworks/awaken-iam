@@ -70,6 +70,15 @@ pub trait Signer: Send + Sync {
     /// publication never reaches across the (possibly remote) signer boundary.
     fn public_jwk(&self) -> JsonWebKey;
 
+    /// Whether the active signing dependency is currently able to serve.
+    ///
+    /// In-process signers are always ready. Remote KMS adapters override this
+    /// with their last observed signing result, allowing hosts to remove an
+    /// unhealthy token issuer from service without issuing probe tokens.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Produce the detached `EdDSA` (Ed25519) signature over `message` — the
     /// JWT's `header.payload` signing input. Returns the raw 64-byte signature.
     /// Async so a KMS/HSM-backed signer can do a remote round-trip without
@@ -270,6 +279,18 @@ impl AccessTokenAuthority {
             .expect("authority always retains at least one signer")
             .kid()
             .to_owned()
+    }
+
+    /// Whether the active signer is currently able to issue tokens.
+    ///
+    /// This is an observation of the signer's existing health signal, never a
+    /// signing operation, so readiness polling adds no KMS traffic or tokens.
+    pub fn is_ready(&self) -> bool {
+        self.signers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .is_some_and(|signer| signer.is_ready())
     }
 
     /// Rotate in a new active signer, retaining the previous one for verification.
@@ -699,6 +720,20 @@ mod tests {
             err,
             AccessTokenError::SigningFailed("kms unreachable".into())
         );
+    }
+
+    #[test]
+    fn authority_readiness_delegates_only_to_the_active_signer() {
+        // Cause/effect decision table: active ready -> authority ready; active
+        // unavailable -> authority unavailable; a retired unavailable signer
+        // with a ready active successor -> authority ready. Readiness is a pure
+        // observation and must not invoke sign(). The default local/external
+        // implementation selects the ready rows; the closed KMS adapter covers
+        // its failure/success transition.
+        let mut authority = AccessTokenAuthority::new(LocalSeedSigner::new("ready", seed(1)));
+        assert!(authority.is_ready());
+        authority.rotate(ExternalSigner::new("successor", 2));
+        assert!(authority.is_ready());
     }
 
     #[tokio::test]
