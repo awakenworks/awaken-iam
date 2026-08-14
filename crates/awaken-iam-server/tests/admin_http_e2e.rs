@@ -244,6 +244,82 @@ async fn invitation_http_flow_closes_into_queryable_membership() {
     assert_eq!(memberships[0]["principal"]["account_id"], "member");
 }
 
+#[tokio::test]
+async fn scoped_role_change_reaches_the_live_pdp_as_one_http_command() {
+    // Cause/effect decision table over the real transport: R1 authenticated
+    // subset replacement -> 200 + one version fence + exact new binding;
+    // R2 replacement outside the managed family -> 400 and old binding stays;
+    // R3 unrelated role at the same scope -> preserved. The query proves the
+    // mutation reached the authoritative PAP rather than a response-only DTO.
+    let app = daemon();
+    let principal = serde_json::json!({"kind":"account","account_id":"member"});
+    let scope = serde_json::json!({"kind":"workspace","workspace_id":"workspace-a"});
+    for role in ["product:member", "custom:auditor"] {
+        let response = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                "/v1/admin/memberships",
+                serde_json::json!({
+                    "principal":principal.clone(),
+                    "role_id":role,
+                    "scope":scope.clone(),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let replaced = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            "/v1/admin/memberships/scoped",
+            serde_json::json!({
+                "principal":principal.clone(),
+                "scope":scope.clone(),
+                "managed_role_ids":["product:member","product:admin"],
+                "replacement_role_ids":["product:admin"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK, "R1");
+
+    let invalid = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            "/v1/admin/memberships/scoped",
+            serde_json::json!({
+                "principal":principal.clone(),
+                "scope":scope,
+                "managed_role_ids":["product:member"],
+                "replacement_role_ids":["product:admin"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY, "R2");
+
+    let queried = app
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/memberships/query",
+            serde_json::json!({"principal":principal}),
+        ))
+        .await
+        .unwrap();
+    let bindings = body_json(queried).await;
+    let roles = bindings
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|binding| binding["role_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(roles, ["custom:auditor", "product:admin"].into(), "R2/R3");
+}
+
 fn profile_body(scope_kind: &str) -> serde_json::Value {
     let scope = if scope_kind == "resource" {
         serde_json::json!({"kind":"resource","resource_type":"memory"})

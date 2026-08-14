@@ -1223,6 +1223,38 @@ impl<B: SqlConn> RoleBindingRepo for SqlStore<B> {
         }
         Ok(())
     }
+
+    fn replace_scoped(
+        &self,
+        principal: &PrincipalRef,
+        scope: &awaken_iam_contract::ScopeRef,
+        managed_roles: &[RoleId],
+        replacement_roles: &[RoleId],
+    ) -> RepoResult<()> {
+        let principal = json_encode(principal, "principal")?;
+        let scope = json_encode(scope, "binding scope")?;
+        let table = self.table("role_bindings");
+        let mut writes = Vec::with_capacity(managed_roles.len() + replacement_roles.len());
+        for role in managed_roles {
+            writes.push(SqlWrite {
+                sql: format!(
+                    "DELETE FROM {table} WHERE principal = ?j AND role = ? AND scope = ?j"
+                ),
+                params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
+            });
+        }
+        for role in replacement_roles {
+            writes.push(SqlWrite {
+                sql: format!(
+                    "INSERT INTO {table} (principal, role, scope) VALUES (?j, ?, ?j) \
+                     ON CONFLICT (principal, role, scope) DO NOTHING"
+                ),
+                params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
+            });
+        }
+        self.backend.execute_transaction(&writes)?;
+        Ok(())
+    }
 }
 
 impl<B: SqlConn> InvitationRepo for SqlStore<B> {

@@ -6,14 +6,14 @@
 //! lives behind a single [`Mutex`] keyed by subdomain, mirroring the
 //! scope-partitioned bundles without ever coupling them by a foreign key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, Session, SessionId,
-    Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ScopeRef, Session,
+    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, AuthorizationProfileRepo,
@@ -567,6 +567,35 @@ impl RoleBindingRepo for InMemoryStore {
             .remove(&key)
             .map(|_| ())
             .ok_or_else(|| RepoError::NotFound("role binding not found".to_owned()))
+    }
+
+    fn replace_scoped(
+        &self,
+        principal: &PrincipalRef,
+        scope: &ScopeRef,
+        managed_roles: &[RoleId],
+        replacement_roles: &[RoleId],
+    ) -> RepoResult<()> {
+        let managed: BTreeSet<&str> = managed_roles.iter().map(|role| role.0.as_str()).collect();
+        let mut guard = self.authz.lock().unwrap();
+        guard.role_bindings.retain(|_, binding| {
+            &binding.principal != principal
+                || &binding.scope != scope
+                || !managed.contains(binding.role.0.as_str())
+        });
+        for role in replacement_roles {
+            let binding = RoleBinding {
+                principal: principal.clone(),
+                role: role.clone(),
+                scope: scope.clone(),
+            };
+            let key = json_key(
+                &(&binding.principal, &binding.role.0, &binding.scope),
+                "role binding",
+            )?;
+            guard.role_bindings.insert(key, binding);
+        }
+        Ok(())
     }
 }
 

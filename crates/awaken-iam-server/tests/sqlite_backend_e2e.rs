@@ -15,7 +15,7 @@ use awaken_iam_contract::{
     AcceptInvitation, AccountId, CreateInvitation, InvitationBinding, InvitationStatus, OrgId,
     PrincipalRef, ScopeRef, Timestamp,
 };
-use awaken_iam_core::{ActionPattern, Organization, RepoError, RoleDef, RoleId};
+use awaken_iam_core::{ActionPattern, Organization, RepoError, RoleBinding, RoleDef, RoleId};
 use awaken_iam_server::{
     Dialect, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
     sqlite_migrated_store,
@@ -231,4 +231,64 @@ fn sqlite_invitation_acceptance_is_atomic_and_restart_visible() {
             .len(),
         1,
     );
+}
+
+#[test]
+fn sqlite_scoped_role_change_is_atomic_and_restart_visible() {
+    // Causes/effects: two incumbent managed bindings at the exact scope plus
+    // one unrelated binding -> one replacement transaction; after restart the
+    // replacement is the only managed binding and the unrelated binding
+    // remains. This covers the SQL adapter's delete+insert transaction, not a
+    // sequential PAP fallback.
+    let backend = SqliteBackend::open_in_memory().expect("open");
+    let store = sqlite_migrated_store(backend, "iam").expect("migrate");
+    let now = Timestamp("2026-08-15T00:00:00Z".into());
+    let principal = PrincipalRef::Account {
+        account_id: AccountId("member".into()),
+    };
+    let scope = ScopeRef::Workspace {
+        workspace_id: awaken_iam_contract::WorkspaceId("workspace-a".into()),
+    };
+    let mut pap = PolicyAdminApi::new(store.clone());
+    for role in ["product:member", "product:admin", "custom:auditor"] {
+        pap.grant_membership(
+            RoleBinding {
+                principal: principal.clone(),
+                role: RoleId(role.into()),
+                scope: scope.clone(),
+            },
+            now.clone(),
+        )
+        .unwrap();
+    }
+    pap.replace_scoped_memberships(
+        principal.clone(),
+        scope.clone(),
+        vec![
+            RoleId("product:member".into()),
+            RoleId("product:admin".into()),
+        ],
+        vec![RoleId("product:member".into())],
+        now,
+    )
+    .unwrap();
+    drop(pap);
+
+    let bindings = PolicyAdminApi::new(store)
+        .memberships_for_principal(&principal)
+        .unwrap();
+    assert_eq!(
+        bindings
+            .iter()
+            .filter(|binding| {
+                binding.scope == scope
+                    && ["product:member", "product:admin"].contains(&binding.role.0.as_str())
+            })
+            .map(|binding| binding.role.0.as_str())
+            .collect::<Vec<_>>(),
+        ["product:member"]
+    );
+    assert!(bindings.iter().any(|binding| {
+        binding.scope == scope && binding.role == RoleId("custom:auditor".into())
+    }));
 }

@@ -26,10 +26,10 @@ use awaken_iam_contract::{
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
     CreateInvitation, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationDto,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto,
-    PolicySnapshot, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
-    WorkspaceOrgEdge,
+    PolicySnapshot, ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered,
+    ResourceModelRegistration, RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto,
+    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    UserInfo, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -383,6 +383,18 @@ impl AuthzTransport for HttpAuthzTransport {
             self.client
                 .delete(self.url("/v1/admin/memberships"))
                 .json(binding)
+        })?;
+        Self::decode(response)
+    }
+
+    fn replace_scoped_memberships(
+        &self,
+        request: &ReplaceScopedMemberships,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .put(self.url("/v1/admin/memberships/scoped"))
+                .json(request)
         })?;
         Self::decode(response)
     }
@@ -750,6 +762,35 @@ mod tests {
     fn missing_role_is_an_empty_canonical_query() {
         let server = StubServer::start(vec![Reply::Status(404)]);
         assert_eq!(transport(&server).get_role("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn scoped_membership_replacement_uses_the_atomic_admin_path() {
+        // Transport rule: one typed replacement command must produce one PUT
+        // to the atomic PAP route. No client-side DELETE+POST compatibility
+        // sequence is permitted because it would expose a denial window.
+        let server = StubServer::start(vec![Reply::Ok(r#"{"version":8}"#.into())]);
+        let request = ReplaceScopedMemberships {
+            principal: PrincipalRef::Account {
+                account_id: AccountId("acct_1".into()),
+            },
+            scope: ScopeRef::Workspace {
+                workspace_id: awaken_iam_contract::WorkspaceId("workspace-a".into()),
+            },
+            managed_role_ids: vec!["product:member".into(), "product:admin".into()],
+            replacement_role_ids: vec!["product:admin".into()],
+        };
+        assert_eq!(
+            transport(&server)
+                .replace_scoped_memberships(&request)
+                .unwrap()
+                .version,
+            8
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("PUT /v1/admin/memberships/scoped "));
+        assert!(requests[0].contains("product:admin"));
     }
 
     #[test]

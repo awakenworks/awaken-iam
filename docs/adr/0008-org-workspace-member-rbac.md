@@ -158,6 +158,31 @@ reintroduce the parallel model this ADR exists to avoid.
   atomic role materialization are additive operations on the same PAP and
   snapshot fence; they do not introduce a second membership engine.
 
+## Amendment: exact-scope role changes are one atomic PAP command (2026-08-15)
+
+An administrator changing an existing member's role must not simulate the
+change with `revoke_membership` followed by `grant_membership`. That sequence
+creates a temporary denial window, can stop after either half, and makes the
+caller a second owner of membership consistency. IAM therefore owns
+`ReplaceScopedMemberships`: the request names one principal, one exact
+`ScopeRef`, the finite role family the caller manages, and the desired subset.
+The repository removes matching incumbents and inserts replacements in one
+transaction. Roles outside the declared family and bindings at every other
+scope remain untouched.
+
+```text
+principal + exact scope + managed role family + desired subset
+  -> IAM validates desired subset and non-empty managed family
+  -> one repository transaction: remove managed incumbents; add desired
+  -> one audit event + one policy-version fence
+  -> PDP rebuild from the authoritative repository
+```
+
+This is still the existing `RoleBinding` aggregate and PAP. It adds no member
+entity, role mirror, ACL, inheritance algorithm, or product-specific engine.
+Products may expose a deliberately small role choice while using the same
+generic atomic command.
+
 ## Supersession note — credential rendering (decision 6)
 
 **Decision 6** recorded that the API-key credential rendering was a

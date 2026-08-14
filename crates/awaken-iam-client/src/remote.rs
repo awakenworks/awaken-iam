@@ -20,10 +20,11 @@ use awaken_iam_contract::{
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, CreateInvitation, EntitlementCheckResponse, EntitlementDecision,
     EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId, InvitationQuery,
-    IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResendInvitation,
-    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
-    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo, WorkspaceOrgEdge,
+    IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot,
+    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
+    WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -143,6 +144,13 @@ pub trait AuthzTransport {
     fn revoke_membership(
         &self,
         _binding: &RoleBindingSnapshot,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("membership PAP is not supported".into()))
+    }
+
+    fn replace_scoped_memberships(
+        &self,
+        _request: &ReplaceScopedMemberships,
     ) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("membership PAP is not supported".into()))
     }
@@ -398,6 +406,13 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         binding: &RoleBindingSnapshot,
     ) -> Result<AdminMutationAck, RemoteError> {
         self.transport.revoke_membership(binding)
+    }
+
+    pub fn replace_scoped_memberships(
+        &self,
+        request: &ReplaceScopedMemberships,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.replace_scoped_memberships(request)
     }
 
     pub fn memberships_for_principal(

@@ -118,6 +118,23 @@ pub struct ScopeMembershipQuery {
     pub scope: ScopeRef,
 }
 
+/// Atomically replace one caller-owned family of exact-scope role bindings.
+///
+/// `managed_role_ids` declares the finite role family the caller is authorized
+/// to manage. IAM removes only matching roles for `principal` at the exact
+/// `scope`, then materializes `replacement_role_ids` in the same repository
+/// transaction. Replacement roles must be a subset of the managed family.
+/// Unrelated roles and bindings at parent, child, or sibling scopes are never
+/// touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceScopedMemberships {
+    pub principal: PrincipalRef,
+    pub scope: ScopeRef,
+    pub managed_role_ids: Vec<String>,
+    #[serde(default)]
+    pub replacement_role_ids: Vec<String>,
+}
+
 /// Wire shape of an organization administered through `/v1/admin/orgs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgDto {

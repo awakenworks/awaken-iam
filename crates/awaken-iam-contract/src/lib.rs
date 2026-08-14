@@ -24,7 +24,8 @@ pub use profile::{
 pub use admin::{
     AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateInvitation, GroupDto,
     InvitationBinding, InvitationDto, InvitationId, InvitationQuery, InvitationStatus,
-    IssuedInvitation, MembershipQuery, OrgDto, ResendInvitation, RoleDto, ScopeMembershipQuery,
+    IssuedInvitation, MembershipQuery, OrgDto, ReplaceScopedMemberships, ResendInvitation, RoleDto,
+    ScopeMembershipQuery,
 };
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

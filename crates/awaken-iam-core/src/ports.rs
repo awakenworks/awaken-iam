@@ -226,6 +226,15 @@ pub trait RoleBindingRepo: Send + Sync {
     fn list(&self) -> RepoResult<Vec<RoleBinding>>;
     /// Remove an exact binding, failing closed when it is absent.
     fn remove(&self, binding: &RoleBinding) -> RepoResult<()>;
+    /// Atomically replace the managed role family held by one principal at one
+    /// exact scope. Roles outside `managed_roles` remain untouched.
+    fn replace_scoped(
+        &self,
+        principal: &PrincipalRef,
+        scope: &awaken_iam_contract::ScopeRef,
+        managed_roles: &[RoleId],
+        replacement_roles: &[RoleId],
+    ) -> RepoResult<()>;
 }
 
 /// Persistence and atomic materialization for organization invitations.

@@ -32,6 +32,7 @@
 //! | `DELETE /v1/admin/grants/{id}` | [`PolicyAdminApi::revoke_grant`] |
 //! | `POST /v1/admin/memberships` | [`PolicyAdminApi::grant_membership`] |
 //! | `DELETE /v1/admin/memberships` | [`PolicyAdminApi::revoke_membership`] |
+//! | `PUT /v1/admin/memberships/scoped` | [`PolicyAdminApi::replace_scoped_memberships`] |
 //!
 //! Every admin route is guarded: a caller must present a recognised admin
 //! credential ([`AdminCredential`]) the daemon's [`AdminAuthPolicy`] accepts, or
@@ -48,8 +49,8 @@ use awaken_iam_contract::{
     BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, OrgId,
-    PolicySnapshot, ResendInvitation, RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto,
-    ScopeMembershipQuery, Timestamp, WorkspaceOrgEdge,
+    PolicySnapshot, ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
+    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, Timestamp, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
@@ -213,6 +214,10 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
         .route(
             "/v1/admin/memberships",
             post(grant_membership).delete(revoke_membership),
+        )
+        .route(
+            "/v1/admin/memberships/scoped",
+            put(replace_scoped_memberships),
         )
         .route("/v1/admin/memberships/query", post(query_memberships))
         .route(
@@ -713,6 +718,26 @@ async fn revoke_membership(
 ) -> Response {
     apply(&state, &headers, move |admin, at| {
         admin.revoke_membership(&role_binding_from_dto(dto), at)
+    })
+}
+
+async fn replace_scoped_memberships(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(request): Json<ReplaceScopedMemberships>,
+) -> Response {
+    apply(&state, &headers, move |admin, at| {
+        admin.replace_scoped_memberships(
+            request.principal,
+            request.scope,
+            request.managed_role_ids.into_iter().map(RoleId).collect(),
+            request
+                .replacement_role_ids
+                .into_iter()
+                .map(RoleId)
+                .collect(),
+            at,
+        )
     })
 }
 

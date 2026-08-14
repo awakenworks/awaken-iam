@@ -23,6 +23,7 @@
 //! | `DELETE /v1/admin/grants/{id}` | [`PolicyAdminApi::revoke_grant`] |
 //! | `POST /v1/admin/memberships` | [`PolicyAdminApi::grant_membership`] |
 //! | `DELETE /v1/admin/memberships` | [`PolicyAdminApi::revoke_membership`] |
+//! | `PUT /v1/admin/memberships/scoped` | [`PolicyAdminApi::replace_scoped_memberships`] |
 //!
 //! Every mutation emits a [`DomainEvent`] that is appended to the audit trail and
 //! **bumps the snapshot version**. A local-mode consumer that synchronises the
@@ -43,6 +44,7 @@ use awaken_iam_core::{
 };
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::FenceStore;
@@ -125,6 +127,13 @@ pub enum DomainEvent {
         /// Scope at which the binding applied.
         scope: ScopeRef,
     },
+    /// One caller-owned role family was atomically replaced at an exact scope.
+    ScopedMembershipsReplaced {
+        principal: PrincipalRef,
+        scope: ScopeRef,
+        managed_roles: Vec<RoleId>,
+        replacement_roles: Vec<RoleId>,
+    },
     InvitationCreated(InvitationId),
     InvitationResent(InvitationId),
     InvitationRevoked(InvitationId),
@@ -161,6 +170,7 @@ impl DomainEvent {
             DomainEvent::GrantRevoked(_) => "grant.revoke",
             DomainEvent::MembershipGranted { .. } => "membership.grant",
             DomainEvent::MembershipRevoked { .. } => "membership.revoke",
+            DomainEvent::ScopedMembershipsReplaced { .. } => "membership.replace_scoped",
             DomainEvent::InvitationCreated(_) => "invitation.create",
             DomainEvent::InvitationResent(_) => "invitation.resend",
             DomainEvent::InvitationRevoked(_) => "invitation.revoke",
@@ -196,6 +206,22 @@ impl DomainEvent {
                 role,
                 scope,
             } => format!("role {} for {principal:?} at {scope:?}", role.0),
+            DomainEvent::ScopedMembershipsReplaced {
+                principal,
+                scope,
+                managed_roles,
+                replacement_roles,
+            } => format!(
+                "roles {:?} -> {:?} for {principal:?} at {scope:?}",
+                managed_roles
+                    .iter()
+                    .map(|role| role.0.as_str())
+                    .collect::<Vec<_>>(),
+                replacement_roles
+                    .iter()
+                    .map(|role| role.0.as_str())
+                    .collect::<Vec<_>>()
+            ),
             DomainEvent::InvitationCreated(id)
             | DomainEvent::InvitationResent(id)
             | DomainEvent::InvitationRevoked(id)
@@ -273,6 +299,20 @@ fn validate_timestamp_order(now: &Timestamp, expires_at: &Timestamp) -> AdminRes
         return Err(AdminError::Invalid("invitation is expired".into()));
     }
     Ok(())
+}
+
+fn normalized_role_family(roles: Vec<RoleId>, label: &str) -> AdminResult<Vec<RoleId>> {
+    let mut normalized = BTreeSet::new();
+    for role in roles {
+        let role = role.0.trim();
+        if role.is_empty() {
+            return Err(AdminError::Invalid(format!(
+                "{label} role ids must not be empty"
+            )));
+        }
+        normalized.insert(role.to_owned());
+    }
+    Ok(normalized.into_iter().map(RoleId).collect())
 }
 
 fn timestamp_is_expired(now: &Timestamp, expires_at: &Timestamp) -> AdminResult<bool> {
@@ -537,6 +577,49 @@ where
                 principal: binding.principal.clone(),
                 role: binding.role.clone(),
                 scope: binding.scope.clone(),
+            },
+            at,
+        )
+    }
+
+    /// Atomically replace a finite, caller-owned role family for one principal
+    /// at one exact scope. Unrelated roles and other scopes remain untouched.
+    pub fn replace_scoped_memberships(
+        &mut self,
+        principal: PrincipalRef,
+        scope: ScopeRef,
+        managed_roles: Vec<RoleId>,
+        replacement_roles: Vec<RoleId>,
+        at: Timestamp,
+    ) -> AdminResult<u64> {
+        let managed_roles = normalized_role_family(managed_roles, "managed")?;
+        let replacement_roles = normalized_role_family(replacement_roles, "replacement")?;
+        if managed_roles.is_empty() {
+            return Err(AdminError::Invalid(
+                "managed role family must not be empty".into(),
+            ));
+        }
+        if replacement_roles
+            .iter()
+            .any(|role| !managed_roles.contains(role))
+        {
+            return Err(AdminError::Invalid(
+                "replacement roles must be contained in the managed role family".into(),
+            ));
+        }
+        RoleBindingRepo::replace_scoped(
+            &self.store,
+            &principal,
+            &scope,
+            &managed_roles,
+            &replacement_roles,
+        )?;
+        self.commit(
+            DomainEvent::ScopedMembershipsReplaced {
+                principal,
+                scope,
+                managed_roles,
+                replacement_roles,
             },
             at,
         )
@@ -958,6 +1041,94 @@ mod tests {
             invited_by: account("ada"),
             expires_at: Timestamp("2026-06-22T00:00:00Z".into()),
         }
+    }
+
+    #[test]
+    fn scoped_membership_replacement_is_exact_and_validated_before_mutation() {
+        // Cause/effect graph: C1 replacement is a subset of the non-empty
+        // managed family, C2 principal+scope match, C3 binding role is managed.
+        // Effects: E1 replace the matching family atomically, E2 preserve
+        // unrelated roles/scopes, E3 reject without version/state change.
+        // Decision table: R1 C1+C2+C3 -> E1; R2 C1+(!C2|!C3) -> E2;
+        // R3 !C1 -> E3. Replay of R1 is idempotent data with a new audit fence.
+        let mut pap = pap();
+        let principal = account("member");
+        let scope = ScopeRef::Workspace {
+            workspace_id: WorkspaceId("workspace-a".into()),
+        };
+        let foreign = ScopeRef::Workspace {
+            workspace_id: WorkspaceId("workspace-b".into()),
+        };
+        for binding in [
+            RoleBinding {
+                principal: principal.clone(),
+                role: RoleId("product:member".into()),
+                scope: scope.clone(),
+            },
+            RoleBinding {
+                principal: principal.clone(),
+                role: RoleId("custom:auditor".into()),
+                scope: scope.clone(),
+            },
+            RoleBinding {
+                principal: principal.clone(),
+                role: RoleId("product:member".into()),
+                scope: foreign.clone(),
+            },
+        ] {
+            pap.grant_membership(binding, at()).unwrap();
+        }
+
+        pap.replace_scoped_memberships(
+            principal.clone(),
+            scope.clone(),
+            vec![
+                RoleId("product:admin".into()),
+                RoleId("product:member".into()),
+            ],
+            vec![RoleId("product:admin".into())],
+            at(),
+        )
+        .unwrap();
+        let bindings = pap.memberships_for_principal(&principal).unwrap();
+        assert!(bindings.contains(&RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("product:admin".into()),
+            scope: scope.clone(),
+        }));
+        assert!(bindings.contains(&RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("custom:auditor".into()),
+            scope: scope.clone(),
+        }));
+        assert!(bindings.contains(&RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("product:member".into()),
+            scope: foreign,
+        }));
+        assert!(!bindings.contains(&RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("product:member".into()),
+            scope: scope.clone(),
+        }));
+
+        let before_version = pap.version();
+        let before_bindings = pap.memberships_for_principal(&principal).unwrap();
+        assert!(matches!(
+            pap.replace_scoped_memberships(
+                principal.clone(),
+                scope,
+                vec![RoleId("product:member".into())],
+                vec![RoleId("product:admin".into())],
+                at(),
+            ),
+            Err(AdminError::Invalid(_))
+        ));
+        assert_eq!(pap.version(), before_version);
+        assert_eq!(
+            pap.memberships_for_principal(&principal).unwrap(),
+            before_bindings
+        );
     }
 
     fn invitation_pap() -> PolicyAdminApi<InMemoryStore> {

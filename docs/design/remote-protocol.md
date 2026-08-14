@@ -150,6 +150,7 @@ same admin credential and version fence as organization and membership writes.
 | Method | Path | Result |
 |---|---|---|
 | `POST` | `/v1/admin/memberships/query-scope` | exact RoleBindings anchored at one scope |
+| `PUT` | `/v1/admin/memberships/scoped` | atomically replace one managed role family for a principal at an exact scope |
 | `POST` | `/v1/admin/invitations` | pending invitation + one-time clear token |
 | `POST` | `/v1/admin/invitations/query` | invitations for one Org |
 | `DELETE` | `/v1/admin/invitations/{id}` | revoke pending invitation |
