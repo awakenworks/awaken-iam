@@ -136,6 +136,12 @@ login uses the same model: the fake provider emits a deterministic provider key
 and subject, then IAM resolves that provider+subject to the linked account and
 creates a session.
 
+`Account` is platform-global and durable. Every hosted IAM replica reads the
+same Account and ExternalIdentity repositories; Account plus first identity are
+provisioned atomically. Organizations, Workspaces, Projects, products, and
+physical Cells reference that AccountId through roles or projections and do not
+own a separate user lifecycle.
+
 Hosted AwakenWorks identity uses `https://accounts.awakenworks.com` as the stable
 OIDC issuer. Product applications discover and start login through that issuer's
 `/v1/oauth/authorize` endpoint; provider-specific routes such as

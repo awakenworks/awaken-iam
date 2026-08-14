@@ -25,9 +25,9 @@ use awaken_iam_contract::{
     WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo,
-    GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
+    AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
+    AuthCodeRepo, AuthorizationProfileRepo, Effect, ExternalIdentityRepo, Grant, GrantId,
+    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
     OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit,
     RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
     RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
@@ -600,6 +600,89 @@ impl<B: SqlConn> ExternalIdentityRepo for SqlStore<B> {
             .iter()
             .map(decode_external)
             .collect()
+    }
+}
+
+impl<B: SqlConn> AccountIdentityRepo for SqlStore<B> {
+    fn provision(&self, account: Account, identity: ExternalIdentity) -> RepoResult<()> {
+        let status = json_encode(&account.status, "account status")?
+            .trim_matches('"')
+            .to_owned();
+        let key = identity.key();
+        let claims = json_encode(&identity.claims, "claims")?;
+        self.backend.execute_transaction(&[
+            SqlWrite {
+                sql: format!(
+                    "INSERT INTO {} (id, status, display_name, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    self.table("accounts")
+                ),
+                params: vec![
+                    p(account.id.0),
+                    p(status),
+                    account.display_name,
+                    p(account.created_at.0),
+                    p(account.updated_at.0),
+                ],
+            },
+            SqlWrite {
+                sql: format!(
+                    "INSERT INTO {} \
+                     (id, account_id, provider_key, subject, claims, first_seen_at, last_seen_at) \
+                     VALUES (?, ?, ?, ?, ?j, ?, ?)",
+                    self.table("external_identities")
+                ),
+                params: vec![
+                    p(identity.id.0),
+                    p(identity.account_id.0),
+                    p(key.provider_key.0),
+                    p(key.subject.0),
+                    p(claims),
+                    p(identity.first_seen_at.0),
+                    p(identity.last_seen_at.0),
+                ],
+            },
+        ])?;
+        Ok(())
+    }
+
+    fn unlink(
+        &self,
+        key: &ExternalIdentityKey,
+        account_id: &AccountId,
+    ) -> RepoResult<ExternalIdentity> {
+        let existing = ExternalIdentityRepo::get_by_key(self, key)?.ok_or_else(|| {
+            RepoError::NotFound(format!(
+                "external identity {}:{}",
+                key.provider_key.0, key.subject.0
+            ))
+        })?;
+        if &existing.account_id != account_id {
+            return Err(RepoError::Conflict(format!(
+                "external identity {}:{} belongs to another account",
+                key.provider_key.0, key.subject.0
+            )));
+        }
+        let table = self.table("external_identities");
+        let affected = self.backend.execute(
+            &format!(
+                "DELETE FROM {table} WHERE provider_key = ? AND subject = ? AND account_id = ? \
+                 AND (SELECT COUNT(*) FROM {table} WHERE account_id = ?) > 1"
+            ),
+            &[
+                p(key.provider_key.0.clone()),
+                p(key.subject.0.clone()),
+                p(account_id.0.clone()),
+                p(account_id.0.clone()),
+            ],
+        )?;
+        if affected == 0 {
+            return Err(RepoError::Conflict(format!(
+                "account {} must retain one external identity",
+                account_id.0
+            )));
+        }
+        Ok(existing)
     }
 }
 

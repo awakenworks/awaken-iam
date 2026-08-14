@@ -212,6 +212,14 @@ duplicate-subject protection (b) refuses to re-point an already-owned subject at
 a different account. The single-use challenge and the unexpired/unrevoked session
 are the two login invariants the core already enforces.
 
+Hosted deployments persist Account and ExternalIdentity through the same shared
+IAM repository used by every replica. First-account creation and its initial
+identity link are one atomic command; a concurrent first login either commits
+both rows or observes the winning `(provider, subject)` link. Repository failure
+fails closed and never falls back to a process-local directory. Product services
+and physical Cells retain only the resulting AccountId as a principal reference;
+they never create or copy a user record.
+
 **Unlink.** Detaching an external identity requires that the link exist and
 belong to the account being unlinked, and it may not remove an account's *last*
 sign-in method — unlinking the last identity would orphan the account, so it

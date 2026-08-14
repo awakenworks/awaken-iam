@@ -35,12 +35,15 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let mut seed = [0u8; 32];
         bootstrap.fill_bytes(&mut seed);
         let tokens = AccessTokenAuthority::new(LocalSeedSigner::new(DEFAULT_SIGNING_KID, seed));
+        let identity_store = crate::store::InMemoryStore::new();
         Self {
             providers: Vec::new(),
             challenge: OAuthChallengeService::new(entropy.clone()),
             login_flows: Arc::new(crate::store::InMemoryStore::new()),
             sessions: SessionGateway::with_entropy(entropy.clone(), SessionCookieConfig::default()),
-            directory: IdentityDirectory::new(),
+            accounts: Arc::new(identity_store.clone()),
+            external_identities: Arc::new(identity_store.clone()),
+            identity_commands: Arc::new(identity_store),
             return_to: ReturnToPolicy::default(),
             login_cookie,
             login_proof_cookie,
@@ -81,6 +84,20 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     pub fn with_session_repository(mut self, repository: Arc<dyn SessionRepo>) -> Self {
         let cookie = self.sessions.cookie_config().clone();
         self.sessions = SessionGateway::with_repository(self.ids.clone(), cookie, repository);
+        self
+    }
+
+    /// Replace the platform-global Account query repositories and the single
+    /// atomic Account+ExternalIdentity command owner selected by deployment.
+    pub fn with_identity_repositories(
+        mut self,
+        accounts: Arc<dyn AccountRepo>,
+        external_identities: Arc<dyn ExternalIdentityRepo>,
+        identity_commands: Arc<dyn AccountIdentityRepo>,
+    ) -> Self {
+        self.accounts = accounts;
+        self.external_identities = external_identities;
+        self.identity_commands = identity_commands;
         self
     }
 

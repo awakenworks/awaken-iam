@@ -71,13 +71,13 @@ use awaken_iam_contract::{
     UserInfo,
 };
 use awaken_iam_core::{
-    AuthCodeRepo, AuthorizationUrlRequest, AuthorizedGrant, BeginLogin, CallbackExchange,
-    EntropySource, EstablishSession, IamError, IdentityDirectory, IdentityProviderAdapter,
-    LoginAttempt, LoginFlowRepo, MintRefreshToken, OAuthAuthorizationRequest,
-    OAuthAuthorizationServer, OAuthChallengeService, OAuthClientRegistry, OAuthClientRepo,
-    OAuthProviderError, OsEntropy, ProviderError, RefreshTokenDirectory, RefreshTokenMinter,
-    RegisteredClient, RotateRefreshToken, SessionRepo, TokenRedemption,
-    parse_presented_refresh_token,
+    AccountIdentityRepo, AccountRepo, AuthCodeRepo, AuthorizationUrlRequest, AuthorizedGrant,
+    BeginLogin, CallbackExchange, EntropySource, EstablishSession, ExternalIdentityRepo, IamError,
+    IdentityProviderAdapter, LoginAttempt, LoginFlowRepo, MintRefreshToken,
+    OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
+    OAuthClientRegistry, OAuthClientRepo, OAuthProviderError, OsEntropy, ProviderError,
+    RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient, RepoError, RotateRefreshToken,
+    SessionRepo, TokenRedemption, parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -792,6 +792,10 @@ pub enum AuthApiError {
     /// The session resolved to an account that is disabled or no longer exists.
     #[error("session principal account is disabled")]
     AccountDisabled,
+    /// The authoritative global identity repository was unavailable or rejected
+    /// an invalid persistence transition.
+    #[error(transparent)]
+    Repository(#[from] RepoError),
     /// Minting an asymmetric access token failed.
     #[error(transparent)]
     AccessToken(#[from] AccessTokenError),
@@ -813,7 +817,9 @@ pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     challenge: OAuthChallengeService<E>,
     login_flows: Arc<dyn LoginFlowRepo>,
     sessions: SessionGateway<E>,
-    directory: IdentityDirectory,
+    accounts: Arc<dyn AccountRepo>,
+    external_identities: Arc<dyn ExternalIdentityRepo>,
+    identity_commands: Arc<dyn AccountIdentityRepo>,
     return_to: ReturnToPolicy,
     login_cookie: SessionCookieConfig,
     login_proof_cookie: SessionCookieConfig,
@@ -856,9 +862,15 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         self.oauth_provider.register_client(client)
     }
 
-    /// Borrow the identity directory backing account/identity reads.
-    pub fn directory(&self) -> &IdentityDirectory {
-        &self.directory
+    /// Read one platform-global account from the authoritative repository.
+    pub fn account(&self, account_id: &AccountId) -> Result<Option<Account>, AuthApiError> {
+        Ok(self.accounts.get(account_id)?)
+    }
+
+    /// Persist account profile/status metadata through the same global owner
+    /// used by login and principal resolution.
+    pub fn upsert_account(&self, account: Account) -> Result<(), AuthApiError> {
+        Ok(self.accounts.upsert(account)?)
     }
 
     /// The accumulated audit trail for this API instance.
@@ -1130,7 +1142,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             }
         };
 
-        match self.directory.account(&account_id) {
+        match self.accounts.get(&account_id)? {
             Some(account) if account.status == AccountStatus::Active => {
                 let principal = PrincipalRef::Account { account_id };
                 self.audit.push(AuthAuditEvent::PrincipalResolved {
@@ -1759,10 +1771,12 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         now: Timestamp,
     ) -> Result<UserInfo, AuthApiError> {
         let view = self.current_session(cookie_header, now)?;
+        let identities = self
+            .external_identities
+            .list_for_account(&view.account_id)?;
         let identity = view.external_identity_id.as_ref().and_then(|external_id| {
-            self.directory
-                .identities_for_account(&view.account_id)
-                .into_iter()
+            identities
+                .iter()
                 .find(|identity| &identity.id == external_id)
         });
         let userinfo = UserInfo::project(
@@ -1778,14 +1792,14 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let claims = self.verify_access_token(token)?;
         let account_id = AccountId(claims.sub);
         let identity = self
-            .directory
-            .identities_for_account(&account_id)
+            .external_identities
+            .list_for_account(&account_id)?
             .into_iter()
             .max_by(|left, right| left.last_seen_at.0.cmp(&right.last_seen_at.0));
         Ok(UserInfo::project(
             &account_id,
-            identity.map(|value| &value.claims),
-            identity.map(|value| &value.last_seen_at),
+            identity.as_ref().map(|value| &value.claims),
+            identity.as_ref().map(|value| &value.last_seen_at),
         ))
     }
 
@@ -1816,12 +1830,11 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     }
 
     /// `GET /v1/account/identities`: list the identities linked to an account.
-    pub fn list_identities(&self, account_id: &AccountId) -> Vec<ExternalIdentity> {
-        self.directory
-            .identities_for_account(account_id)
-            .into_iter()
-            .cloned()
-            .collect()
+    pub fn list_identities(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<ExternalIdentity>, AuthApiError> {
+        Ok(self.external_identities.list_for_account(account_id)?)
     }
 
     /// `POST /v1/account/identities`: link a verified external identity to an
@@ -1839,7 +1852,20 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             first_seen_at: request.now.clone(),
             last_seen_at: request.now.clone(),
         };
-        self.directory.link_external_identity(identity.clone())?;
+        if self.accounts.get(&request.account_id)?.is_none() {
+            return Err(AuthApiError::Repository(RepoError::NotFound(format!(
+                "account {}",
+                request.account_id.0
+            ))));
+        }
+        if let Some(existing) = self.external_identities.get_by_key(&identity.key())? {
+            return Err(AuthApiError::Login(IamError::DuplicateExternalIdentity {
+                provider_key: existing.provider_key,
+                subject: existing.claims.subject,
+                existing_account_id: existing.account_id,
+            }));
+        }
+        self.external_identities.link(identity.clone())?;
         self.audit.push(AuthAuditEvent::IdentityLinked {
             account_id: request.account_id,
             external_identity_id,
@@ -1852,9 +1878,13 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// `DELETE /v1/account/identities/{provider}/{subject}`: detach an identity
     /// owned by the account.
     pub fn unlink_identity(&mut self, request: UnlinkIdentity) -> Result<(), AuthApiError> {
+        let key = awaken_iam_contract::ExternalIdentityKey {
+            provider_key: request.provider_key.clone(),
+            subject: request.subject.clone(),
+        };
         let owned = self
-            .directory
-            .external_identity(&request.provider_key, &request.subject)
+            .external_identities
+            .get_by_key(&key)?
             .map(|identity| identity.account_id == request.account_id);
         match owned {
             None => Err(AuthApiError::Login(IamError::ExternalIdentityNotFound {
@@ -1863,8 +1893,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             })),
             Some(false) => Err(AuthApiError::IdentityAccountMismatch),
             Some(true) => {
-                self.directory
-                    .remove_external_identity(&request.provider_key, &request.subject)?;
+                self.identity_commands.unlink(&key, &request.account_id)?;
                 self.audit.push(AuthAuditEvent::IdentityUnlinked {
                     account_id: request.account_id,
                     provider_key: request.provider_key,
@@ -1884,38 +1913,51 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         claims: ExternalIdentityClaims,
         now: &Timestamp,
     ) -> Result<(AccountId, ExternalIdentityId, bool), AuthApiError> {
-        if let Some(existing) = self
-            .directory
-            .external_identity(provider_key, &claims.subject)
-        {
+        let key = awaken_iam_contract::ExternalIdentityKey {
+            provider_key: provider_key.clone(),
+            subject: claims.subject.clone(),
+        };
+        if let Some(mut existing) = self.external_identities.get_by_key(&key)? {
             let account_id = existing.account_id.clone();
             let external_identity_id = existing.id.clone();
-            self.directory.update_external_identity_claims(
-                provider_key.clone(),
-                claims,
-                now.clone(),
-            )?;
+            existing.claims = claims;
+            existing.last_seen_at = now.clone();
+            self.external_identities.update_claims(existing)?;
             return Ok((account_id, external_identity_id, false));
         }
 
         let account_id = AccountId(self.mint_id("acct"));
-        self.directory.upsert_account(Account {
+        let account = Account {
             id: account_id.clone(),
             status: AccountStatus::Active,
             display_name: claims.display_name.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
-        });
+        };
         let external_identity_id = ExternalIdentityId(self.mint_id("ext"));
-        self.directory.link_external_identity(ExternalIdentity {
+        let identity = ExternalIdentity {
             id: external_identity_id.clone(),
             account_id: account_id.clone(),
             provider_key: provider_key.clone(),
-            claims,
+            claims: claims.clone(),
             first_seen_at: now.clone(),
             last_seen_at: now.clone(),
-        })?;
-        Ok((account_id, external_identity_id, true))
+        };
+        match self.identity_commands.provision(account, identity) {
+            Ok(()) => Ok((account_id, external_identity_id, true)),
+            Err(RepoError::Conflict(_)) => {
+                let mut winner = self.external_identities.get_by_key(&key)?.ok_or_else(|| {
+                    RepoError::Backend(
+                        "identity provisioning conflicted without a durable winner".into(),
+                    )
+                })?;
+                winner.claims = claims;
+                winner.last_seen_at = now.clone();
+                self.external_identities.update_claims(winner.clone())?;
+                Ok((winner.account_id, winner.id, false))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn provider_index(&self, provider_key: &IdentityProviderKey) -> Result<usize, AuthApiError> {

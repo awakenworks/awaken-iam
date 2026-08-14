@@ -94,6 +94,28 @@ fn api() -> AuthApi<SequentialEntropy> {
     api
 }
 
+fn api_with_identity_store(store: InMemoryStore) -> AuthApi<SequentialEntropy> {
+    let mut api = AuthApi::with_entropy(SequentialEntropy::default())
+        .with_return_to_policy(ReturnToPolicy::new(
+            "/home",
+            ["/dashboard".to_owned(), "/home".to_owned()],
+        ))
+        .with_identity_repositories(
+            Arc::new(store.clone()),
+            Arc::new(store.clone()),
+            Arc::new(store),
+        );
+    api.register_provider(ProviderRegistration {
+        config: config(true),
+        adapter: Box::new(FakeAdapter),
+        redirect_uri: "https://app.example/v1/auth/callback/fake".into(),
+        scopes: vec!["openid".into(), "email".into()],
+        include_nonce: true,
+        include_pkce: true,
+    });
+    api
+}
+
 fn start(api: &mut AuthApi<SequentialEntropy>, return_to: Option<&str>) -> StartLoginOutcome {
     api.start_login(StartLogin {
         provider_key: IdentityProviderKey("fake".into()),
@@ -456,7 +478,7 @@ fn link_list_and_unlink_external_identities() {
         .unwrap();
     assert_eq!(linked.account_id, account_id);
 
-    let identities = api.list_identities(&account_id);
+    let identities = api.list_identities(&account_id).unwrap();
     assert_eq!(identities.len(), 2);
 
     // Unlinking an identity owned by a different account fails closed.
@@ -478,7 +500,7 @@ fn link_list_and_unlink_external_identities() {
         now: Timestamp("2026-06-19T05:00:00Z".into()),
     })
     .unwrap();
-    assert_eq!(api.list_identities(&account_id).len(), 1);
+    assert_eq!(api.list_identities(&account_id).unwrap().len(), 1);
     assert!(
         api.audit_log()
             .iter()
@@ -487,8 +509,58 @@ fn link_list_and_unlink_external_identities() {
 }
 
 #[test]
+fn replicas_resolve_one_provider_subject_to_one_global_account() {
+    // Cause/effect decision table:
+    // R1 shared repository + same provider/subject across replicas -> reuse the
+    //    exact AccountId and refresh claims; the second login is not registered.
+    // R2 shared repository + different subject -> provision a distinct Account.
+    // The verified email is deliberately equal in R2: email is presentation
+    // metadata and must never silently merge platform-global identities.
+    let store = InMemoryStore::new();
+    let mut replica_a = api_with_identity_store(store.clone());
+    let mut replica_b = api_with_identity_store(store);
+
+    let first_start = start(&mut replica_a, Some("/dashboard"));
+    let first = callback(
+        &mut replica_a,
+        &first_start,
+        "google-subject:user@example.com",
+    )
+    .unwrap();
+    assert!(first.registered);
+
+    let replay_start = start(&mut replica_b, Some("/dashboard"));
+    let replay = callback(
+        &mut replica_b,
+        &replay_start,
+        "google-subject:user@example.com",
+    )
+    .unwrap();
+    assert!(!replay.registered);
+    assert_eq!(replay.session.account_id, first.session.account_id);
+
+    let other_start = start(&mut replica_b, Some("/dashboard"));
+    let other = callback(
+        &mut replica_b,
+        &other_start,
+        "different-google-subject:user@example.com",
+    )
+    .unwrap();
+    assert!(other.registered);
+    assert_ne!(other.session.account_id, first.session.account_id);
+}
+
+#[test]
 fn linking_a_subject_twice_is_rejected() {
     let mut api = api();
+    api.upsert_account(Account {
+        id: AccountId("acct_1".into()),
+        status: AccountStatus::Active,
+        display_name: None,
+        created_at: Timestamp("2026-06-19T03:00:00Z".into()),
+        updated_at: Timestamp("2026-06-19T03:00:00Z".into()),
+    })
+    .unwrap();
     let link = || LinkIdentity {
         account_id: AccountId("acct_1".into()),
         provider_key: IdentityProviderKey("github".into()),
@@ -721,10 +793,10 @@ fn resolve_principal_for_disabled_account_fails_closed() {
     let account_id = result.session.account_id.clone();
 
     // Disable the account behind the otherwise-live session.
-    let mut account = api.directory().account(&account_id).unwrap().clone();
+    let mut account = api.account(&account_id).unwrap().unwrap();
     account.status = AccountStatus::Disabled;
     account.updated_at = Timestamp("2026-06-19T02:00:00Z".into());
-    api.directory.upsert_account(account);
+    api.upsert_account(account).unwrap();
 
     let err = api
         .resolve_principal(&cookie, Timestamp("2026-06-19T03:00:00Z".into()))

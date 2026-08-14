@@ -335,6 +335,9 @@ async fn userinfo(State(state): State<OpHttpState>, headers: HeaderMap) -> Respo
     }
     match auth.userinfo_for_access_token(token) {
         Ok(info) => Json(info).into_response(),
+        Err(AuthApiError::Repository(_)) => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        }
         Err(_) => oauth_error(StatusCode::UNAUTHORIZED, "invalid_token"),
     }
 }

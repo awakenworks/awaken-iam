@@ -71,10 +71,10 @@ pub use oauth_provider::{
     StoredAuthorizationCode, TokenRedemption,
 };
 pub use ports::{
-    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, AuthorizationProfileRepo,
-    ExternalIdentityRepo, GrantRepo, GroupRepo, InvitationRepo, LoginFlowRepo, OAuthClientRepo,
-    OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo,
-    SessionRepo, external_identity_id_hint, seed_roles,
+    AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
+    AuthorizationProfileRepo, ExternalIdentityRepo, GrantRepo, GroupRepo, InvitationRepo,
+    LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo,
+    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint, seed_roles,
 };
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,

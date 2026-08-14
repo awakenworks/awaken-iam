@@ -76,6 +76,24 @@ pub trait ExternalIdentityRepo: Send + Sync {
     fn list_for_account(&self, account_id: &AccountId) -> RepoResult<Vec<ExternalIdentity>>;
 }
 
+/// Atomic commands spanning the platform Account aggregate and its external
+/// identity links.
+///
+/// Query ownership remains with [`AccountRepo`] and [`ExternalIdentityRepo`].
+/// This narrow port exists only for effects that must commit together so a
+/// concurrent first login can never leave a half-created global account.
+pub trait AccountIdentityRepo: Send + Sync {
+    /// Create a new account and its first external identity in one transaction.
+    fn provision(&self, account: Account, identity: ExternalIdentity) -> RepoResult<()>;
+
+    /// Remove an exact identity owned by `account_id`, refusing the last link.
+    fn unlink(
+        &self,
+        key: &ExternalIdentityKey,
+        account_id: &AccountId,
+    ) -> RepoResult<ExternalIdentity>;
+}
+
 /// Persistence for login [`Session`] rows.
 pub trait SessionRepo: Send + Sync {
     /// Resolve a session by id.

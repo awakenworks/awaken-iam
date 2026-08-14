@@ -16,11 +16,12 @@ use awaken_iam_contract::{
     SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, AuthorizationProfileRepo,
-    ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
-    InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo,
-    RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
-    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
+    AuthorizationProfileRepo, ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId,
+    GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization,
+    Plan, PlanId, PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge,
+    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -162,6 +163,54 @@ impl ExternalIdentityRepo for InMemoryStore {
             .collect();
         found.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         Ok(found)
+    }
+}
+
+impl AccountIdentityRepo for InMemoryStore {
+    fn provision(&self, account: Account, identity: ExternalIdentity) -> RepoResult<()> {
+        let key = external_key(&identity.key());
+        let mut guard = self.identity.lock().unwrap();
+        if guard.accounts.contains_key(&account.id.0) || guard.external.contains_key(&key) {
+            return Err(RepoError::Conflict(format!(
+                "account {} or external identity {key} already exists",
+                account.id.0
+            )));
+        }
+        guard.accounts.insert(account.id.0.clone(), account);
+        guard.external.insert(key, identity);
+        Ok(())
+    }
+
+    fn unlink(
+        &self,
+        key: &ExternalIdentityKey,
+        account_id: &AccountId,
+    ) -> RepoResult<ExternalIdentity> {
+        let encoded = external_key(key);
+        let mut guard = self.identity.lock().unwrap();
+        let identity = guard
+            .external
+            .get(&encoded)
+            .cloned()
+            .ok_or_else(|| RepoError::NotFound(format!("external identity {encoded}")))?;
+        if &identity.account_id != account_id {
+            return Err(RepoError::Conflict(format!(
+                "external identity {encoded} belongs to another account"
+            )));
+        }
+        let linked = guard
+            .external
+            .values()
+            .filter(|candidate| &candidate.account_id == account_id)
+            .count();
+        if linked <= 1 {
+            return Err(RepoError::Conflict(format!(
+                "account {} must retain one external identity",
+                account_id.0
+            )));
+        }
+        guard.external.remove(&encoded);
+        Ok(identity)
     }
 }
 

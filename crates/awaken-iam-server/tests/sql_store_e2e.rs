@@ -15,11 +15,12 @@ use awaken_iam_contract::{
     ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo, Effect,
-    ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo,
-    LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota,
-    RateLimit, RateWindow, RegisteredClient, RepoError, ResourceEdge, ResourceModelRepo,
-    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
+    AuthCodeRepo, Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group,
+    GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId,
+    PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient, RepoError, ResourceEdge,
+    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
+    StoredAuthorizationCode,
 };
 use awaken_iam_server::{
     PostgresBackend, SqlConn, SqlStore, postgres_migrated_store, sqlite_in_memory_store,
@@ -117,6 +118,45 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
             .unwrap()
             .len(),
         1
+    );
+
+    // Cause/effect decision table for the Account aggregate command:
+    // R1 new account + new provider subject -> both rows commit atomically.
+    // R2 new account + occupied provider subject -> neither row commits.
+    // R3 account with two identities -> exact owned unlink succeeds.
+    // R4 account with one identity -> unlink fails and preserves login access.
+    AccountIdentityRepo::provision(store, account("c"), external("e3", "c", "sub-3")).unwrap();
+    assert!(
+        AccountRepo::get(store, &AccountId("c".into()))
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        AccountIdentityRepo::provision(store, account("orphan"), external("e4", "orphan", "sub-3")),
+        Err(RepoError::Conflict(_))
+    ));
+    assert_eq!(
+        AccountRepo::get(store, &AccountId("orphan".into())).unwrap(),
+        None
+    );
+    ExternalIdentityRepo::link(store, external("e5", "c", "sub-5")).unwrap();
+    let key_5 = ExternalIdentityKey {
+        provider_key: IdentityProviderKey("github".into()),
+        subject: ExternalSubject("sub-5".into()),
+    };
+    AccountIdentityRepo::unlink(store, &key_5, &AccountId("c".into())).unwrap();
+    let key_3 = ExternalIdentityKey {
+        provider_key: IdentityProviderKey("github".into()),
+        subject: ExternalSubject("sub-3".into()),
+    };
+    assert!(matches!(
+        AccountIdentityRepo::unlink(store, &key_3, &AccountId("c".into())),
+        Err(RepoError::Conflict(_))
+    ));
+    assert!(
+        ExternalIdentityRepo::get_by_key(store, &key_3)
+            .unwrap()
+            .is_some()
     );
 
     // --- sessions: id + token-hash lookup, conflict, in-place revoke ---
