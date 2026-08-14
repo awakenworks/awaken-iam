@@ -260,6 +260,7 @@ POST /v1/admin/authz/profiles
 POST /v1/admin/authz/profiles/{namespace}/{revision}/validate
 POST /v1/admin/authz/profiles/{namespace}/{revision}/activate
 POST /v1/admin/authz/profiles/{namespace}/{revision}/rollback
+POST /v1/admin/authz/profiles/{namespace}/retire
 GET  /v1/admin/authz/profiles/{namespace}
 GET  /v1/admin/authz/profiles/{namespace}/{revision}
 GET  /v1/admin/authz/profiles/{namespace}/active
@@ -298,6 +299,57 @@ The migration proceeds through four observable phases:
    `scope_kind_not_allowed` before matching any grant.
 4. **D — retire legacy:** consumers remove their public `DEFAULT_SCOPE` and
    additive policy mutation paths after embedded/remote conformance passes.
+
+### 2026-08-15 amendment: active namespaces have an explicit CAS retirement
+
+Immutable revision history and active evaluation are different facts. A
+consumer namespace that has been consolidated or removed must be able to stop
+participating in the composed PDP without deleting its historical profile
+revisions. Replacing that namespace with an empty profile is forbidden: it
+would preserve a misleading active owner and create a second representation of
+retirement.
+
+The PAP therefore owns one compare-and-set retirement command:
+
+```text
+POST /v1/admin/authz/profiles/{namespace}/retire
+body: { expected_active_revision }
+
+expected active head
+  -> atomically remove the namespace head
+  -> mark that immutable revision retired
+  -> rebuild the live PDP from the base policy plus remaining active heads
+```
+
+`authorization_profile_heads` remains the sole active-profile authority. The
+revision document and checksum remain immutable audit and rollback evidence;
+retirement removes only the head and changes lifecycle metadata. A later
+rollback is an ordinary validated CAS activation from no active head. The
+command is separately administrator-authenticated, idempotent only after the
+caller observes the absent head, and never selects a replacement namespace.
+
+Static structure:
+
+```text
+consumer release owner -> AuthorizationProfileAdmin -> AuthorizationProfileRepo
+                                      |                         |
+                                      v                         v
+                              live AuthzApi/PDP       immutable revisions
+                                                        + active heads
+```
+
+Dynamic decision table:
+
+| Namespace head | Expected revision | Repository effect | PDP outcome |
+|---|---:|---|---|
+| absent | any | not found; no write | unchanged |
+| revision A | B | conflict; no write | unchanged |
+| revision A | A | remove head; mark A retired | rebuild without namespace |
+| repository failure | any | fail closed | existing in-memory policy unchanged |
+
+The application replaces the in-memory policy only after the repository has
+confirmed retirement. Restart hydration reads the same remaining head set, so
+the terminal result is identical in embedded, SQLite, and PostgreSQL modes.
 
 ### 7. Reuse contracts and conformance suites, not a cross-repository framework
 

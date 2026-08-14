@@ -16,14 +16,14 @@
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationDecision, AuthorizationOutcome, AuthorizationProfile,
-    AuthorizationProfileActivated, AuthorizationProfileValidation, AuthorizationRequest,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    CreateInvitation, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    GrantSnapshot, InvitationDto, InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery,
-    NamespaceId, OrgDto, PolicySnapshot, ResendInvitation, ResourceModelRegistered,
-    ResourceModelRegistration, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
-    WorkspaceOrgEdge,
+    AuthorizationProfileActivated, AuthorizationProfileRetired, AuthorizationProfileValidation,
+    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
+    CreateAuthorizationProfile, CreateInvitation, EntitlementCheckResponse, EntitlementDecision,
+    EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId, InvitationQuery,
+    IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot, ResendInvitation,
+    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
+    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -243,6 +243,16 @@ pub trait AuthzTransport {
         _revision: u64,
         _request: &ActivateAuthorizationProfile,
     ) -> Result<AuthorizationProfileActivated, RemoteError> {
+        Err(RemoteError(
+            "authorization profile PAP is not supported".into(),
+        ))
+    }
+
+    fn retire_profile(
+        &self,
+        _namespace: &NamespaceId,
+        _request: &RetireAuthorizationProfile,
+    ) -> Result<AuthorizationProfileRetired, RemoteError> {
         Err(RemoteError(
             "authorization profile PAP is not supported".into(),
         ))
@@ -482,6 +492,14 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     ) -> Result<AuthorizationProfileActivated, RemoteError> {
         self.transport
             .rollback_profile(namespace, revision, request)
+    }
+
+    pub fn retire_profile(
+        &self,
+        namespace: &NamespaceId,
+        request: &RetireAuthorizationProfile,
+    ) -> Result<AuthorizationProfileRetired, RemoteError> {
+        self.transport.retire_profile(namespace, request)
     }
 
     pub fn active_profile(

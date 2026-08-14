@@ -312,6 +312,12 @@ pub trait AuthorizationProfileRepo: Send + Sync {
         revision: u64,
         expected_active_revision: Option<u64>,
     ) -> RepoResult<Option<u64>>;
+    /// Compare-and-set removal of one active head while retaining the revision.
+    fn retire_active_profile(
+        &self,
+        namespace: &NamespaceId,
+        expected_active_revision: u64,
+    ) -> RepoResult<AuthorizationProfile>;
     /// Resolve the active revision for a namespace.
     fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>>;
     /// List the active profile of every namespace for process-start hydration.

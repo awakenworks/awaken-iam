@@ -22,13 +22,14 @@ use std::time::Duration;
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationOutcome, AuthorizationProfile, AuthorizationProfileActivated,
-    AuthorizationProfileValidation, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId,
-    InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot,
-    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration, RoleBindingSnapshot,
-    RoleDto, ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest,
-    TokenIntrospectionResponse, UserInfo, WorkspaceOrgEdge,
+    AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    CreateInvitation, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationDto,
+    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto,
+    PolicySnapshot, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
+    WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -528,6 +529,16 @@ impl AuthzTransport for HttpAuthzTransport {
             "/v1/admin/authz/profiles/{}/{revision}/rollback",
             namespace.0
         );
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn retire_profile(
+        &self,
+        namespace: &NamespaceId,
+        request: &RetireAuthorizationProfile,
+    ) -> Result<AuthorizationProfileRetired, RemoteError> {
+        let path = format!("/v1/admin/authz/profiles/{}/retire", namespace.0);
         let response = self.send_with_retry(|| self.client.post(self.url(&path)).json(request))?;
         Self::decode(response)
     }

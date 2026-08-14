@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use awaken_iam_contract::{
     ActivateAuthorizationProfile, AuthorizationProfile, AuthorizationProfileActivated,
-    AuthorizationProfileDocument, AuthorizationProfileValidation, CreateAuthorizationProfile,
-    NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
+    AuthorizationProfileDocument, AuthorizationProfileRetired, AuthorizationProfileValidation,
+    CreateAuthorizationProfile, NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
 };
 use awaken_iam_core::{AuthorizationProfileRepo, PolicySet, RepoError};
 use sha2::{Digest, Sha256};
@@ -170,6 +170,32 @@ impl AuthorizationProfileAdmin {
                 expected_active_revision: Some(expected_active_revision),
             },
         )
+    }
+
+    /// Retire one active namespace without deleting its immutable revisions.
+    pub fn retire(
+        &self,
+        authz: &mut AuthzApi,
+        base: &PolicySnapshot,
+        namespace: &NamespaceId,
+        expected_active_revision: u64,
+    ) -> Result<AuthorizationProfileRetired, ProfileAdminError> {
+        let retired = self
+            .repository
+            .retire_active_profile(namespace, expected_active_revision)?;
+        let mut profiles = authz.snapshot().active_profiles;
+        profiles.retain(|profile| profile.namespace != *namespace);
+        let policy_version = authz.policy_version().max(base.version) + 1;
+        authz.replace_policy_at_version(
+            PolicySet::from_snapshot_and_profiles(base, &profiles),
+            policy_version,
+        );
+        Ok(AuthorizationProfileRetired {
+            namespace: namespace.clone(),
+            retired_revision: retired.revision,
+            policy_version,
+            checksum: retired.checksum,
+        })
     }
 
     pub fn get(
@@ -603,6 +629,87 @@ mod tests {
     }
 
     #[test]
+    fn retirement_cas_removes_only_the_expected_namespace_from_the_live_policy() {
+        // Cause-effect graph: active-head presence and expected-revision equality
+        // control the only mutation. A mismatch/absence preserves both repository
+        // and PDP; an exact match retires the revision, removes its grants, and
+        // preserves unrelated base policy.
+        //
+        // | active head | expected | effect |
+        // | A | B | conflict; A still authorizes |
+        // | A | A | retire A; profile action denied; base action allowed |
+        // | absent | A | not found; policy unchanged |
+        let repository = Arc::new(crate::InMemoryStore::new());
+        let pap = AuthorizationProfileAdmin::new(repository);
+        let mut authz = AuthzApi::new();
+        let base = base_policy();
+        let profile = pap.create_draft(request(ScopeKind::Workspace)).unwrap();
+        pap.validate(&profile.namespace, profile.revision).unwrap();
+        pap.activate(
+            &mut authz,
+            &base,
+            &profile.namespace,
+            profile.revision,
+            ActivateAuthorizationProfile {
+                expected_active_revision: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            pap.retire(&mut authz, &base, &profile.namespace, profile.revision + 1),
+            Err(ProfileAdminError::Conflict(_))
+        ));
+        assert_eq!(
+            authz
+                .authorize(&auth_request(ScopeRef::Workspace {
+                    workspace_id: WorkspaceId("ws".into()),
+                }))
+                .decision,
+            AuthorizationDecision::Allow
+        );
+
+        let retired = pap
+            .retire(&mut authz, &base, &profile.namespace, profile.revision)
+            .unwrap();
+        assert_eq!(retired.retired_revision, profile.revision);
+        assert!(pap.active(&profile.namespace).unwrap().is_none());
+        assert_eq!(
+            pap.get(&profile.namespace, profile.revision)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            ProfileLifecycle::Retired
+        );
+        assert_eq!(
+            authz
+                .authorize(&auth_request(ScopeRef::Workspace {
+                    workspace_id: WorkspaceId("ws".into()),
+                }))
+                .decision,
+            AuthorizationDecision::Deny
+        );
+        assert_eq!(
+            authz
+                .authorize(&AuthorizationRequest::direct(
+                    PrincipalRef::Service {
+                        service_id: "runtime".into(),
+                    },
+                    ActionKey("console.tenant.admin.access".into()),
+                    ScopeRef::Org {
+                        org_id: awaken_iam_contract::OrgId("personal:ada".into()),
+                    },
+                ))
+                .decision,
+            AuthorizationDecision::Allow
+        );
+        assert!(matches!(
+            pap.retire(&mut authz, &base, &profile.namespace, profile.revision),
+            Err(ProfileAdminError::NotFound)
+        ));
+    }
+
+    #[test]
     fn sqlite_profile_head_and_revision_survive_restart() {
         let dir = test_dir("profile-restart");
         let path = dir.join("iam.sqlite");
@@ -637,6 +744,60 @@ mod tests {
             Some(1)
         );
         assert_eq!(authz.snapshot().active_profiles[0].revision, 1);
+        drop(pap);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sqlite_retirement_survives_restart_without_deleting_revision_evidence() {
+        // Cause-effect coverage: exact active SQLite head -> retirement removes
+        // hydration authority; immutable revision -> remains readable as retired.
+        // Restart is the independent effect proving durable PDP composition does
+        // not resurrect the namespace.
+        let dir = test_dir("profile-retirement-restart");
+        let path = dir.join("iam.sqlite");
+        let namespace = NamespaceId("awaken.runtime".into());
+        {
+            let store = Arc::new(
+                sqlite_migrated_store(SqliteBackend::open_path(&path).unwrap(), "iam").unwrap(),
+            );
+            let pap = AuthorizationProfileAdmin::new(store);
+            let mut authz = AuthzApi::new();
+            let profile = pap.create_draft(request(ScopeKind::Workspace)).unwrap();
+            pap.validate(&namespace, profile.revision).unwrap();
+            pap.activate(
+                &mut authz,
+                &PolicySnapshot::default(),
+                &namespace,
+                profile.revision,
+                ActivateAuthorizationProfile {
+                    expected_active_revision: None,
+                },
+            )
+            .unwrap();
+            pap.retire(
+                &mut authz,
+                &PolicySnapshot::default(),
+                &namespace,
+                profile.revision,
+            )
+            .unwrap();
+        }
+        let store = Arc::new(
+            sqlite_migrated_store(SqliteBackend::open_path(&path).unwrap(), "iam").unwrap(),
+        );
+        let pap = AuthorizationProfileAdmin::new(store);
+        let mut authz = AuthzApi::new();
+        assert_eq!(
+            pap.hydrate(&mut authz, &PolicySnapshot::default(), &namespace)
+                .unwrap(),
+            None
+        );
+        assert!(authz.snapshot().active_profiles.is_empty());
+        assert_eq!(
+            pap.get(&namespace, 1).unwrap().unwrap().lifecycle,
+            ProfileLifecycle::Retired
+        );
         drop(pap);
         std::fs::remove_dir_all(dir).unwrap();
     }

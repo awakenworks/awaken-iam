@@ -82,6 +82,12 @@ pub struct ActivateAuthorizationProfile {
     pub expected_active_revision: Option<u64>,
 }
 
+/// Optimistic request to retire the current active namespace head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireAuthorizationProfile {
+    pub expected_active_revision: u64,
+}
+
 /// Validation result. Invalid drafts remain drafts and cannot be activated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationProfileValidation {
@@ -99,6 +105,15 @@ pub struct AuthorizationProfileActivated {
     pub active_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_active_revision: Option<u64>,
+    pub policy_version: u64,
+    pub checksum: String,
+}
+
+/// Result of retiring one active namespace head without deleting its revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationProfileRetired {
+    pub namespace: NamespaceId,
+    pub retired_revision: u64,
     pub policy_version: u64,
     pub checksum: String,
 }

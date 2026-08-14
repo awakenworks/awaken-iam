@@ -826,6 +826,35 @@ impl AuthorizationProfileRepo for InMemoryStore {
         Ok(previous)
     }
 
+    fn retire_active_profile(
+        &self,
+        namespace: &NamespaceId,
+        expected_active_revision: u64,
+    ) -> RepoResult<AuthorizationProfile> {
+        let mut authz = self.authz.lock().unwrap();
+        let Some(active_revision) = authz.active_profiles.get(&namespace.0).copied() else {
+            return Err(RepoError::NotFound("active profile head not found".into()));
+        };
+        if active_revision != expected_active_revision {
+            return Err(RepoError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        if !authz
+            .profiles
+            .contains_key(&(namespace.0.clone(), active_revision))
+        {
+            return Err(RepoError::Backend("active profile head is dangling".into()));
+        }
+        authz.active_profiles.remove(&namespace.0);
+        let profile = authz
+            .profiles
+            .get_mut(&(namespace.0.clone(), active_revision))
+            .expect("profile existence checked while holding the same lock");
+        profile.lifecycle = ProfileLifecycle::Retired;
+        Ok(profile.clone())
+    }
+
     fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>> {
         let authz = self.authz.lock().unwrap();
         let Some(revision) = authz.active_profiles.get(&namespace.0) else {

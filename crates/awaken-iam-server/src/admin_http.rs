@@ -48,8 +48,8 @@ use awaken_iam_contract::{
     BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, OrgId,
-    PolicySnapshot, ResendInvitation, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
-    Timestamp, WorkspaceOrgEdge,
+    PolicySnapshot, ResendInvitation, RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto,
+    ScopeMembershipQuery, Timestamp, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
@@ -230,6 +230,10 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
         .route(
             "/v1/admin/authz/profiles/{namespace}/active",
             get(active_profile),
+        )
+        .route(
+            "/v1/admin/authz/profiles/{namespace}/retire",
+            post(retire_profile),
         )
         .route(
             "/v1/admin/authz/profiles/{namespace}/{revision}",
@@ -482,6 +486,34 @@ async fn rollback_profile(
         &NamespaceId(namespace),
         revision,
         expected,
+    ))
+}
+
+async fn retire_profile(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+    Json(request): Json<RetireAuthorizationProfile>,
+) -> Response {
+    let mut guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    let profiles = guard.profiles.clone();
+    let base = match guard.admin.policy().and_then(|policy| {
+        guard
+            .admin
+            .store_version()
+            .map(|version| policy.snapshot(version))
+    }) {
+        Ok(base) => base,
+        Err(error) => return admin_error_response(&error),
+    };
+    profile_result(profiles.retire(
+        &mut guard.authz,
+        &base,
+        &NamespaceId(namespace),
+        request.expected_active_revision,
     ))
 }
 

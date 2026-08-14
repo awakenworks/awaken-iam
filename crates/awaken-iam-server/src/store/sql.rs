@@ -1592,6 +1592,57 @@ impl<B: SqlConn> AuthorizationProfileRepo for SqlStore<B> {
         Ok(previous)
     }
 
+    fn retire_active_profile(
+        &self,
+        namespace: &NamespaceId,
+        expected_active_revision: u64,
+    ) -> RepoResult<AuthorizationProfile> {
+        let mut profile = self
+            .get_profile(namespace, expected_active_revision)?
+            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+        let profiles = self.table("authorization_profiles");
+        let heads = self.table("authorization_profile_heads");
+        let affected = self.backend.execute_transaction(&[
+            SqlWrite {
+                sql: format!(
+                    "UPDATE {profiles} SET lifecycle = 'retired' \
+                     WHERE namespace = ? AND revision = ? \
+                       AND EXISTS (SELECT 1 FROM {heads} \
+                                   WHERE namespace = ? AND active_revision = ?)"
+                ),
+                params: vec![
+                    p(namespace.0.clone()),
+                    p(revision_key(expected_active_revision)),
+                    p(namespace.0.clone()),
+                    p(revision_key(expected_active_revision)),
+                ],
+            },
+            SqlWrite {
+                sql: format!(
+                    "DELETE FROM {heads} WHERE namespace = ? AND active_revision = ? \
+                     AND EXISTS (SELECT 1 FROM {profiles} \
+                                 WHERE namespace = ? AND revision = ? AND lifecycle = 'retired')"
+                ),
+                params: vec![
+                    p(namespace.0.clone()),
+                    p(revision_key(expected_active_revision)),
+                    p(namespace.0.clone()),
+                    p(revision_key(expected_active_revision)),
+                ],
+            },
+        ])?;
+        if affected.as_slice() != [1, 1] {
+            return match self.active_revision(namespace)? {
+                None => Err(RepoError::NotFound("active profile head not found".into())),
+                Some(_) => Err(RepoError::Conflict(
+                    "active profile revision changed".into(),
+                )),
+            };
+        }
+        profile.lifecycle = ProfileLifecycle::Retired;
+        Ok(profile)
+    }
+
     fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>> {
         let Some(revision) = self.active_revision(namespace)? else {
             return Ok(None);
