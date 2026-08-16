@@ -590,3 +590,105 @@ async fn postgres_backend_serves_every_port_when_configured() {
     let store = postgres_migrated_store(&url, "iam").expect("migrate postgres");
     exercise_every_port(&store);
 }
+
+#[test]
+fn postgres_backend_clones_recover_after_transport_loss_when_configured() {
+    // Cause/effect graph:
+    // C1=all repository adapters clone one PostgresBackend connection pool;
+    // C2=Postgres terminates its sole slot after startup;
+    // C3=checkout validation either detects the stale slot before SQL or the
+    //    operation itself observes the transport loss;
+    // C4=a replacement connection is available to a subsequent checkout.
+    // E1=the write closure runs at most once (zero or one durable effect);
+    // E2=the pool discards the broken client;
+    // E3=both clones use one replacement connection with a different PID.
+    //
+    // Decision table:
+    // | stale known at checkout | replacement | write outcome | effects    |
+    // | yes                     | available   | success       | E1+E2+E3   |
+    // | no; fails during SQL    | later avail | error         | E1+E2+E3*  |
+    // | yes                     | unavailable | pool error    | E2, no SQL |
+    // `*` is the unavoidable response-loss/COMMIT ambiguity. The adapter must
+    // never replay that write; callers reconcile from durable state under their
+    // own idempotency fence. This test admits the ambiguity but rejects a second
+    // effect and proves a subsequent read recovers the sole shared slot.
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        eprintln!("skipping: set IAM_TEST_POSTGRES_URL to run the reconnect e2e");
+        return;
+    };
+
+    let backend = PostgresBackend::connect(&url).expect("connect shared backend");
+    let clone = backend.clone();
+    let initial_pid = backend
+        .query("SELECT pg_backend_pid()::text", &[])
+        .expect("read initial PID")[0][0]
+        .as_deref()
+        .expect("PID cell")
+        .parse::<i32>()
+        .expect("PID integer");
+    let clone_pid = clone
+        .query("SELECT pg_backend_pid()::text", &[])
+        .expect("clone reads PID")[0][0]
+        .as_deref()
+        .expect("clone PID cell")
+        .parse::<i32>()
+        .expect("clone PID integer");
+    assert_eq!(clone_pid, initial_pid, "clones share one connection slot");
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("admin connection");
+    let table = format!(
+        "iam_reconnect_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_nanos()
+    );
+    admin
+        .batch_execute(&format!("CREATE TABLE {table} (value BIGINT NOT NULL)"))
+        .expect("create reconnect fixture");
+    assert!(
+        admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&initial_pid])
+            .expect("terminate initial backend")
+            .get::<_, bool>(0),
+        "initial backend must be terminated"
+    );
+
+    let _write_result = backend.execute(&format!("INSERT INTO {table} VALUES (1)"), &[]);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let replacement_pid = loop {
+        if let Ok(rows) = clone.query("SELECT pg_backend_pid()::text", &[])
+            && let Some(Some(value)) = rows.first().and_then(|row| row.first())
+        {
+            break value.parse::<i32>().expect("replacement PID integer");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared connection slot did not recover before deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_ne!(replacement_pid, initial_pid);
+    assert_eq!(
+        backend
+            .query("SELECT pg_backend_pid()::text", &[])
+            .expect("original handle uses replacement")[0][0]
+            .as_deref()
+            .expect("replacement PID cell")
+            .parse::<i32>()
+            .expect("replacement PID integer"),
+        replacement_pid,
+        "every clone must observe the one replacement connection"
+    );
+
+    let effects: i64 = admin
+        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .expect("count durable effects")
+        .get(0);
+    assert!(effects <= 1, "an interrupted write must never be replayed");
+    admin
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .expect("drop reconnect fixture");
+}

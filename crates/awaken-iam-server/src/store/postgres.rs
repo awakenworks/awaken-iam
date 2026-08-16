@@ -8,14 +8,19 @@
 //! single-applier guard implemented as a transaction-scoped `pg_advisory_lock`
 //! rather than `BEGIN IMMEDIATE`.
 //!
-//! The client is `!Sync`, so it lives behind a [`Mutex`]; clones share it.
+//! The client is `!Sync`. A caller-supplied client lives behind a [`Mutex`]; the
+//! production constructor builds one checked `r2d2_postgres` slot. Clones share
+//! that owner. An operation that observes transport loss fails closed and is
+//! never replayed; a later checkout replaces the broken client.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use postgres::error::SqlState;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls};
+use r2d2_postgres::PostgresConnectionManager;
 
 use awaken_scoped_migration::{
     AppliedMigration, Dialect as MigrationDialect, LedgerBootstrapAction, LedgerSchema,
@@ -51,10 +56,17 @@ fn run_outside_tokio<T: Send>(component: &'static str, operation: impl FnOnce() 
 }
 
 /// A Postgres connection usable as both a migration executor and a repository
-/// backend. Cheap to [`Clone`]: clones share one client.
+/// backend. Cheap to [`Clone`]: clones share one connection owner.
 #[derive(Clone)]
 pub struct PostgresBackend {
-    client: Arc<PlainThreadOwner<Mutex<Client>>>,
+    client: Arc<PlainThreadOwner<ConnectionOwner>>,
+}
+
+type PostgresPool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
+
+enum ConnectionOwner {
+    Direct(Box<Mutex<Client>>),
+    Reconnecting(PostgresPool),
 }
 
 /// Own a value whose destructor may start its own async runtime.
@@ -101,35 +113,61 @@ impl std::fmt::Debug for PostgresBackend {
 
 impl PostgresBackend {
     /// Wrap an already-connected client.
+    ///
+    /// This compatibility constructor has no connection parameters with which
+    /// to replace a disconnected client. Production hosts should use
+    /// [`Self::connect`] to get checked replacement after transport loss.
     pub fn new(client: Client) -> Self {
         Self {
-            client: Arc::new(PlainThreadOwner::new(Mutex::new(client))),
+            client: Arc::new(PlainThreadOwner::new(ConnectionOwner::Direct(Box::new(
+                Mutex::new(client),
+            )))),
         }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Client> {
-        self.client
-            .get()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn with_client<T: Send>(
         &self,
         component: &'static str,
-        operation: impl FnOnce(&mut Client) -> T + Send,
-    ) -> T {
-        run_outside_tokio(component, || {
-            let mut client = self.lock();
-            operation(&mut client)
+        operation: impl FnOnce(&mut Client) -> RepoResult<T> + Send,
+    ) -> RepoResult<T> {
+        run_outside_tokio(component, || match self.client.get() {
+            ConnectionOwner::Direct(client) => {
+                let mut client = client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                operation(&mut client)
+            }
+            ConnectionOwner::Reconnecting(pool) => {
+                let mut client = pool.get().map_err(pool_err)?;
+                // Invoke the repository operation exactly once. r2d2 validates
+                // before checkout and discards a client that becomes broken,
+                // but it never replays SQL after an operation error: COMMIT may
+                // have reached Postgres even when its response was lost.
+                operation(&mut client)
+            }
         })
     }
 
     /// Connect to Postgres using a libpq-style connection string or URL.
     pub fn connect(params: &str) -> RepoResult<Self> {
-        let client =
-            run_outside_tokio("connect", || Client::connect(params, NoTls)).map_err(backend_err)?;
-        Ok(Self::new(client))
+        let config = params
+            .parse()
+            .map_err(|error: postgres::Error| RepoError::Backend(error.to_string()))?;
+        let manager = PostgresConnectionManager::new(config, NoTls);
+        let pool = run_outside_tokio("connect", || {
+            r2d2::Pool::builder()
+                // Preserve the existing one-client serialization and advisory
+                // transaction semantics while adding checked replacement.
+                .max_size(1)
+                .min_idle(Some(1))
+                .test_on_check_out(true)
+                .connection_timeout(Duration::from_secs(5))
+                .build(manager)
+        })
+        .map_err(pool_err)?;
+        Ok(Self {
+            client: Arc::new(PlainThreadOwner::new(ConnectionOwner::Reconnecting(pool))),
+        })
     }
 }
 
@@ -147,6 +185,10 @@ fn backend_err(err: postgres::Error) -> RepoError {
     {
         return RepoError::Conflict(db.message().to_owned());
     }
+    RepoError::Backend(err.to_string())
+}
+
+fn pool_err(err: r2d2::Error) -> RepoError {
     RepoError::Backend(err.to_string())
 }
 

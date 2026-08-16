@@ -38,6 +38,8 @@ ed25519-dalek = "2"
 # test-guarded by the `rusqlite-floor` CI job; move both together.
 rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
 postgres = "0.19.14"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = [
