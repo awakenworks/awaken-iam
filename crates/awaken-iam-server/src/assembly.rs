@@ -256,11 +256,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     /// shared database, isolated by the `iam` prefix and its own ledger. Runs the
     /// `iam.*` bundles before returning.
     pub fn embedded(pool: Pool) -> RepoResult<Self> {
-        Self::assemble(
-            Deployment::Embedded,
-            pool,
-            EntitlementEngine::default_allow(),
-        )
+        Self::assemble(Deployment::Embedded, pool, EntitlementEngine::unlicensed())
     }
 
     /// Build the standalone assembly over the daemon's own pool.
@@ -271,7 +267,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         Self::assemble(
             Deployment::Standalone,
             pool,
-            EntitlementEngine::default_allow(),
+            EntitlementEngine::unlicensed(),
         )
     }
 
@@ -295,8 +291,9 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     /// Verifies the configured claim offline and installs the resolved provider
     /// through the same injection point as [`with_entitlements`](Self::with_entitlements):
     /// a claim that verifies installs the licensed provider, while a missing or
-    /// rejected claim installs default-allow so an unlicensed deployment keeps
-    /// full functionality. The returned [`LicenseStatus`] explains the outcome
+    /// rejected claim installs the fail-closed unlicensed provider. Open product
+    /// functionality remains outside commercial checks. The returned
+    /// [`LicenseStatus`] explains the outcome
     /// (and carries the claim's `not_after` for the re-verify cadence — re-call
     /// [`resolve`](crate::LicenseConfig::resolve) and
     /// [`set_entitlements`](Self::set_entitlements) before it).
@@ -891,7 +888,7 @@ mod tests {
         );
 
         // The re-verify cadence seam swaps the provider in place; an unlicensed
-        // resolution falls back to default-allow without rebuilding the assembly.
+        // resolution denies commercial checks without rebuilding the assembly.
         let unlicensed = LicenseConfig::unlicensed().resolve(&now);
         assert_eq!(unlicensed.status, LicenseStatus::Unlicensed);
         assembly.set_entitlements(unlicensed.provider);
@@ -900,7 +897,7 @@ mod tests {
                 .authz()
                 .check_entitlement(&entitled("model.strong_access"))
                 .decision,
-            EntitlementDecision::Allow
+            EntitlementDecision::Deny
         );
     }
 }

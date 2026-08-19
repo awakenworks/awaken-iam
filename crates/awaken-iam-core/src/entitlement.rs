@@ -7,10 +7,10 @@
 //! scope graph, and grant evaluation never consults plans. Product services call
 //! both planes independently.
 //!
-//! v1 keeps the policy open (default-allow) while still exercising the real
-//! seam, so paid packs, private namespaces, and product-plan limits can be added
-//! later without threading billing state through grant evaluation. Two further
-//! modes exist today: a local plan catalog and a remote delegation seam.
+//! The production default is unlicensed and denies explicit commercial checks.
+//! A deliberately selected development-only default-allow mode still exercises
+//! the seam, while local catalog, remote, and verified-license modes provide
+//! actual policy.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -186,6 +186,10 @@ impl Plan {
 /// Why an entitlement check resolved the way it did, for audit/debug surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntitlementReason {
+    /// No commercial entitlement provider is installed. Product functionality
+    /// that does not require an entitlement remains available, while every
+    /// explicit commercial entitlement check fails closed.
+    Unlicensed,
     /// The engine runs in default-allow mode; no plan policy was consulted.
     DefaultAllow,
     /// The principal's plan includes the requested feature/SKU key.
@@ -246,6 +250,7 @@ impl EntitlementReason {
     /// protocol's `reason` field.
     pub fn code(&self) -> &'static str {
         match self {
+            EntitlementReason::Unlicensed => "unlicensed",
             EntitlementReason::DefaultAllow => "default_allow",
             EntitlementReason::PlanEntitles { .. } => "plan_entitles",
             EntitlementReason::PlanLacksFeature { .. } => "plan_lacks_feature",
@@ -504,8 +509,11 @@ pub trait EntitlementResolver: fmt::Debug + Send + Sync {
 /// Evaluation mode for the entitlement plane.
 #[derive(Debug, Default)]
 pub enum EntitlementMode {
-    /// v1 default: allow every entitlement check without consulting policy.
+    /// No commercial entitlement is installed. Explicit entitlement checks
+    /// fail closed; ordinary authorization remains unaffected.
     #[default]
+    Unlicensed,
+    /// Explicit development/test mode: allow every entitlement check.
     DefaultAllow,
     /// Evaluate against a local plan catalog.
     Local(EntitlementCatalog),
@@ -520,7 +528,8 @@ pub enum EntitlementMode {
 ///
 /// Authorization and entitlement are distinct planes; this trait is the
 /// entitlement side. The control plane ships open implementations behind it —
-/// [`EntitlementEngine::default_allow`] and [`EntitlementEngine::local`] — and a
+/// [`EntitlementEngine::unlicensed`], explicit development
+/// [`EntitlementEngine::default_allow`], and [`EntitlementEngine::local`] — and a
 /// closed, licensed implementation (held in awaken-cloud) can plug in at deploy
 /// through the same `with_entitlements` injection point without changing any
 /// call site. Implementations must be `Send + Sync` so a provider can be shared
@@ -602,7 +611,18 @@ pub struct EntitlementEngine {
 }
 
 impl EntitlementEngine {
-    /// Construct an engine in v1 default-allow mode.
+    /// Construct the production-safe open-core baseline.
+    ///
+    /// Open functionality must not be modeled as a paid entitlement check.
+    /// Consequently a deployment without a commercial provider denies every
+    /// explicit entitlement instead of accidentally unlocking paid features.
+    pub fn unlicensed() -> Self {
+        Self {
+            mode: EntitlementMode::Unlicensed,
+        }
+    }
+
+    /// Construct an explicit development/test default-allow engine.
     pub fn default_allow() -> Self {
         Self {
             mode: EntitlementMode::DefaultAllow,
@@ -630,8 +650,8 @@ impl EntitlementEngine {
     /// [`LicenseEntitlements`]). The caller must verify the claim with
     /// [`LicenseClaim::verify`] before installing the resulting engine; an
     /// unverified or rejected claim must fall back to
-    /// [`default_allow`](EntitlementEngine::default_allow) so an unlicensed
-    /// deployment keeps full functionality.
+    /// [`unlicensed`](EntitlementEngine::unlicensed). Open functionality must
+    /// remain outside commercial entitlement checks.
     pub fn from_license(claim: &LicenseClaim) -> Self {
         Self {
             mode: EntitlementMode::License(LicenseEntitlements::from_claim(claim)),
@@ -646,6 +666,7 @@ impl EntitlementEngine {
     /// Evaluate a request into a reasoned outcome.
     pub fn evaluate(&self, request: &EntitlementRequest) -> EntitlementOutcome {
         match &self.mode {
+            EntitlementMode::Unlicensed => EntitlementOutcome::deny(EntitlementReason::Unlicensed),
             EntitlementMode::DefaultAllow => {
                 EntitlementOutcome::allow(EntitlementReason::DefaultAllow)
             }
@@ -667,6 +688,7 @@ impl EntitlementEngine {
     /// plan catalog; remote mode delegates to the resolver.
     pub fn quota(&self, principal: &PrincipalRef, feature: &str) -> Option<Quota> {
         match &self.mode {
+            EntitlementMode::Unlicensed => None,
             EntitlementMode::DefaultAllow => None,
             EntitlementMode::Local(catalog) => catalog.quota_for(principal, feature),
             EntitlementMode::Remote(resolver) => resolver.quota(principal, feature),
@@ -680,6 +702,7 @@ impl EntitlementEngine {
     /// the window and enforces. Default-allow mode imposes no rate limits.
     pub fn rate_limit(&self, principal: &PrincipalRef, feature: &str) -> Option<RateLimit> {
         match &self.mode {
+            EntitlementMode::Unlicensed => None,
             EntitlementMode::DefaultAllow => None,
             EntitlementMode::Local(catalog) => catalog.rate_limit_for(principal, feature),
             EntitlementMode::Remote(resolver) => resolver.rate_limit(principal, feature),
@@ -702,6 +725,7 @@ impl EntitlementEngine {
         observed_usage: u64,
     ) -> EntitlementOutcome {
         match &self.mode {
+            EntitlementMode::Unlicensed => EntitlementOutcome::deny(EntitlementReason::Unlicensed),
             EntitlementMode::DefaultAllow => {
                 EntitlementOutcome::allow(EntitlementReason::DefaultAllow)
             }
@@ -758,6 +782,27 @@ mod tests {
             entitlement: entitlement.into(),
             resource: resource.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn unlicensed_mode_denies_every_explicit_entitlement() {
+        // Cause/effect graph: C1=commercial provider installed. R1 !C1 gives
+        // Deny(Unlicensed), advertises no quota/rate, and leaves the independent
+        // authorization plane untouched. Provider-specific allow/deny rules are
+        // covered by the local, remote, and license decision tables below.
+        let engine = EntitlementEngine::unlicensed();
+        let who = account("acct_1");
+        let outcome = engine.evaluate(&request(who.clone(), "enterprise.sso", None));
+        assert_eq!(outcome.decision, EntitlementDecision::Deny);
+        assert_eq!(outcome.reason, EntitlementReason::Unlicensed);
+        assert_eq!(engine.quota(&who, "enterprise.sso"), None);
+        assert_eq!(engine.rate_limit(&who, "enterprise.sso"), None);
+        assert_eq!(
+            engine
+                .check_quota(&request(who, "enterprise.sso", None), 0)
+                .reason,
+            EntitlementReason::Unlicensed
+        );
     }
 
     #[test]

@@ -149,17 +149,18 @@ fn license_config_returns_a_load_error_when_the_file_path_is_unreadable() {
             _
         )))
     ));
-    // The fallback keeps the deployment functional.
+    // The fallback keeps open functionality independent but cannot unlock a
+    // commercial entitlement.
     assert_eq!(
         resolved.provider.evaluate(&request("any")).decision,
-        EntitlementDecision::Allow
+        EntitlementDecision::Deny
     );
 }
 
 #[test]
 fn license_config_loads_and_rejects_a_malformed_file_payload() {
     // A file that exists but is not a valid LicenseClaim JSON: load_claim
-    // returns the parse error and resolve falls back to default-allow with
+    // returns the parse error and resolve falls back to unlicensed denial with
     // a `Rejected(Load(Parse))` status — never panics.
     let file_path = std::env::temp_dir().join("awaken-iam-malformed-license.json");
     std::fs::write(&file_path, "{ not a claim").expect("write bad claim");
@@ -177,7 +178,7 @@ fn license_config_loads_and_rejects_a_malformed_file_payload() {
     ));
     assert_eq!(
         resolved.provider.evaluate(&request("any")).decision,
-        EntitlementDecision::Allow
+        EntitlementDecision::Deny
     );
 
     let _ = std::fs::remove_file(std::env::temp_dir().join("awaken-iam-malformed-license.json"));
@@ -202,17 +203,20 @@ fn license_status_is_licensed_predicates_on_the_variants() {
 }
 
 #[test]
-fn license_config_unlicensed_yields_default_allow_provider() {
+fn license_config_unlicensed_denies_commercial_entitlements() {
+    // Cause/effect rule: no configured claim is the open-core baseline. It
+    // leaves ordinary authorization untouched and denies every explicit paid
+    // entitlement, preventing deletion of a claim from becoming an unlock.
     let config = LicenseConfig::unlicensed();
     let resolved = config.resolve(&Timestamp("2026-07-01T00:00:00Z".into()));
     assert_eq!(
         resolved.status,
         awaken_iam_server::LicenseStatus::Unlicensed
     );
-    // No quota on the unlicensed default-allow provider.
+    // No commercial quota is advertised and the feature is denied.
     assert_eq!(resolved.provider.quota(&account("acct_1"), "any"), None);
     assert_eq!(
         resolved.provider.evaluate(&request("any")).decision,
-        EntitlementDecision::Allow
+        EntitlementDecision::Deny
     );
 }

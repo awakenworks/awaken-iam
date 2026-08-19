@@ -3,11 +3,12 @@
 This document specifies `check_entitlement`, the plane that answers
 *does this account/org/plan allow this feature or package access* — kept strictly
 separate from authorization. It extends
-[IAM model](iam-model.md#authorization-vs-entitlement) and replaces the
-placeholder `entitlement_default_allow() -> Allow` stub.
+[IAM model](iam-model.md#authorization-vs-entitlement). Production construction
+defaults to an unlicensed provider that denies explicit commercial checks;
+`default_allow` remains an explicit development/test mode only.
 
 > **Open seam, closed issuance.** This plane is an injection seam. The open repo
-> ships the generic evaluation, the `default_allow` no-op, and — so a self-hosted
+> ships the generic evaluation, an explicit development-only `default_allow`, and — so a self-hosted
 > build is fully functional and can honor a presented license without calling
 > home — the open `LicenseClaim` wire shape and its *offline verification* against
 > a pinned JWKS of public keys. What stays *proprietary* and injected at deploy
@@ -104,15 +105,15 @@ quota check and resolves `Deny(plan_missing)` first.
 
 ```toml
 [entitlements]
-mode = "default_allow"   # default_allow | remote
+mode = "unlicensed"   # unlicensed | remote | license
 ```
 
-`default_allow` is the v1 path: the seam exists, every check returns
-`Allow(entitled)`, and no plan data is required — so paid packs, private
-namespaces, and product-plan limits can be switched on later without reworking
-grants. `remote` resolves against real subscriptions. The mode is explicit per
-[service configuration](iam-model.md#service-configuration); it is never a silent
-fallback for an unreachable billing service (that is a `Deny`, not an `Allow`).
+`unlicensed` leaves ordinary open functionality outside this plane and denies
+every explicit commercial entitlement. `remote` resolves against Cloud Billing;
+`license` resolves against a verified offline claim. `default_allow` may be
+selected only by tests or local development fixtures and is never a production
+fallback. An unreachable billing service and an unreadable, expired, fenced, or
+invalid license both deny commercial checks.
 
 ## Where it applies
 

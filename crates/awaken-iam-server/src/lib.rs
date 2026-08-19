@@ -116,11 +116,11 @@ impl Default for IamServer {
 }
 
 impl IamServer {
-    /// Create an IAM server facade with v1 default-allow entitlements.
+    /// Create an IAM server facade with unlicensed commercial entitlements.
     pub fn new() -> Self {
         Self {
             core: IamCore::new(),
-            entitlements: Box::new(EntitlementEngine::default_allow()),
+            entitlements: Box::new(EntitlementEngine::unlicensed()),
         }
     }
 

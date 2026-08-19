@@ -87,12 +87,12 @@ impl Default for AuthzApi {
 }
 
 impl AuthzApi {
-    /// Build an API with an empty default-deny policy and v1 default-allow
-    /// entitlements at policy version 1.
+    /// Build an API with an empty default-deny policy and an unlicensed,
+    /// fail-closed commercial entitlement plane at policy version 1.
     pub fn new() -> Self {
         Self {
             core: IamCore::new(),
-            entitlements: Box::new(EntitlementEngine::default_allow()),
+            entitlements: Box::new(EntitlementEngine::unlicensed()),
             trust: NamespaceTrustDirectory::new(),
             policy_version: 1,
             api_tokens: ApiTokenDirectory::new(),

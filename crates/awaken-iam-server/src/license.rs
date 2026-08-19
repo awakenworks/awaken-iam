@@ -11,14 +11,15 @@
 //!
 //! The policy is fail-open toward *functionality*, fail-closed toward *unlocks*:
 //!
-//! - **No claim configured** ⇒ [`EntitlementEngine::default_allow`]: an unlicensed
-//!   build is fully functional with no ceilings.
+//! - **No claim configured** ⇒ [`EntitlementEngine::unlicensed`]: ordinary open
+//!   functionality remains available, while explicit commercial entitlement
+//!   checks fail closed.
 //! - **A claim that verifies** ⇒ [`EntitlementEngine::from_license`]: its features
 //!   and limits become the entitlement policy.
 //! - **A claim that fails verification** (expired, epoch-fenced, bad signature,
-//!   unreadable, malformed) ⇒ falls back to [`EntitlementEngine::default_allow`]
-//!   and records why, never panicking. A deployment is never *locked out* by a
-//!   bad license; it simply does not gain the license's extra unlocks.
+//!   unreadable, malformed) ⇒ falls back to [`EntitlementEngine::unlicensed`]
+//!   and records why, never panicking. A rejected claim can never unlock a
+//!   commercial entitlement.
 //!
 //! Verification is offline: the caller supplies "now", so the host re-resolves on
 //! a cadence (claims expire at their `not_after`) and re-installs the resolved
@@ -32,11 +33,11 @@ use awaken_iam_core::{EntitlementEngine, EntitlementProvider};
 /// Where the deployment's license claim is loaded from.
 ///
 /// A claim is the JSON wire form of a [`LicenseClaim`]. Absence is the
-/// unlicensed default — [`LicenseSource::None`] keeps the deployment on
-/// default-allow.
+/// unlicensed default — [`LicenseSource::None`] keeps explicit commercial
+/// checks denied.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LicenseSource {
-    /// No license: the deployment is unlicensed and stays default-allow.
+    /// No license: the deployment is unlicensed and commercial checks deny.
     #[default]
     None,
     /// A claim supplied inline as its JSON wire form (for example from an
@@ -114,7 +115,7 @@ impl std::error::Error for LicenseRejection {}
 /// cadence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LicenseStatus {
-    /// No claim was configured; the provider is default-allow.
+    /// No claim was configured; the provider denies commercial entitlements.
     Unlicensed,
     /// A claim verified and was bridged into a licensed provider. The
     /// `not_after` instant tells the host when to re-resolve.
@@ -122,7 +123,7 @@ pub enum LicenseStatus {
         /// The claim's expiry; re-resolve before this instant.
         not_after: Timestamp,
     },
-    /// A claim was present but rejected; the provider fell back to default-allow.
+    /// A claim was present but rejected; commercial entitlements fail closed.
     Rejected(LicenseRejection),
 }
 
@@ -161,7 +162,7 @@ pub struct LicenseConfig {
 
 impl LicenseConfig {
     /// An unlicensed configuration: no keys, no claim. [`resolve`](Self::resolve)
-    /// always yields [`EntitlementEngine::default_allow`].
+    /// always yields [`EntitlementEngine::unlicensed`].
     pub fn unlicensed() -> Self {
         Self {
             jwks: Jwks { keys: Vec::new() },
@@ -200,21 +201,21 @@ impl LicenseConfig {
     /// Resolve the entitlement provider to install at instant `now`.
     ///
     /// Never errors and never panics: a missing, unreadable, malformed, or
-    /// unverifiable claim resolves to [`EntitlementEngine::default_allow`] with a
+    /// unverifiable claim resolves to [`EntitlementEngine::unlicensed`] with a
     /// [`LicenseStatus`] explaining why. A claim that verifies resolves to
     /// [`EntitlementEngine::from_license`].
     pub fn resolve(&self, now: &Timestamp) -> LicenseResolution {
         let claim = match self.load_claim() {
             Ok(None) => {
                 return LicenseResolution {
-                    provider: Box::new(EntitlementEngine::default_allow()),
+                    provider: Box::new(EntitlementEngine::unlicensed()),
                     status: LicenseStatus::Unlicensed,
                 };
             }
             Ok(Some(claim)) => claim,
             Err(err) => {
                 return LicenseResolution {
-                    provider: Box::new(EntitlementEngine::default_allow()),
+                    provider: Box::new(EntitlementEngine::unlicensed()),
                     status: LicenseStatus::Rejected(LicenseRejection::Load(err)),
                 };
             }
@@ -228,7 +229,7 @@ impl LicenseConfig {
                 },
             },
             Err(err) => LicenseResolution {
-                provider: Box::new(EntitlementEngine::default_allow()),
+                provider: Box::new(EntitlementEngine::unlicensed()),
                 status: LicenseStatus::Rejected(LicenseRejection::Verify(err)),
             },
         }
@@ -305,14 +306,19 @@ mod tests {
     }
 
     #[test]
-    fn no_claim_resolves_to_default_allow() {
+    fn no_claim_denies_explicit_commercial_entitlements() {
+        // Cause/effect decision table: C1=claim configured, C2=claim verifies.
+        // R1 !C1 -> unlicensed status + deny; R2 C1+C2 -> licensed policy
+        // (covered below); R3 C1+!C2 -> rejected status + deny (covered by the
+        // expired, fenced, and malformed cases). Open product functionality has
+        // no entitlement request and is therefore outside this gate.
         let config = LicenseConfig::unlicensed();
         let resolved = config.resolve(&Timestamp("2026-07-01T00:00:00Z".into()));
         assert_eq!(resolved.status, LicenseStatus::Unlicensed);
-        // default-allow permits any feature and imposes no ceilings.
+        // Absence must never unlock a commercial feature.
         assert_eq!(
             resolved.provider.evaluate(&request("anything")).decision,
-            EntitlementDecision::Allow
+            EntitlementDecision::Deny
         );
         assert_eq!(
             resolved.provider.quota(&account("acct_1"), "anything"),
@@ -359,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_claim_falls_back_to_default_allow() {
+    fn an_expired_claim_falls_back_to_unlicensed_denial() {
         let key = signing_key();
         let claim = signed_claim(&key, "lic-1", 3, "2026-06-15T00:00:00Z");
         let config = inline_config(&claim, jwks_for(&key, "lic-1"), 3);
@@ -370,18 +376,18 @@ mod tests {
             resolved.status,
             LicenseStatus::Rejected(LicenseRejection::Verify(LicenseVerifyError::Expired))
         );
-        // No panic; deployment keeps full functionality.
+        // No panic; open functionality remains, but paid unlocks fail closed.
         assert_eq!(
             resolved
                 .provider
                 .evaluate(&request("pack.publish"))
                 .decision,
-            EntitlementDecision::Allow
+            EntitlementDecision::Deny
         );
     }
 
     #[test]
-    fn an_epoch_fenced_claim_falls_back_to_default_allow() {
+    fn an_epoch_fenced_claim_falls_back_to_unlicensed_denial() {
         let key = signing_key();
         let claim = signed_claim(&key, "lic-1", 2, "2026-12-01T00:00:00Z");
         // Floor above the claim's epoch fences it out.
@@ -394,12 +400,12 @@ mod tests {
         );
         assert_eq!(
             resolved.provider.evaluate(&request("anything")).decision,
-            EntitlementDecision::Allow
+            EntitlementDecision::Deny
         );
     }
 
     #[test]
-    fn malformed_claim_json_falls_back_to_default_allow() {
+    fn malformed_claim_json_falls_back_to_unlicensed_denial() {
         let config = LicenseConfig::new(
             Jwks { keys: Vec::new() },
             0,
@@ -412,7 +418,7 @@ mod tests {
         ));
         assert_eq!(
             resolved.provider.evaluate(&request("anything")).decision,
-            EntitlementDecision::Allow
+            EntitlementDecision::Deny
         );
     }
 

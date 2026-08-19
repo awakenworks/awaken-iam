@@ -77,7 +77,7 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
     let mut directory = ApiTokenDirectory::new();
     let mut minter = ApiTokenMinter::new(OsEntropy);
 
-    let mut authz = AuthzApi::with_entitlements(EntitlementEngine::default_allow());
+    let mut authz = AuthzApi::with_entitlements(EntitlementEngine::unlicensed());
 
     let issued = minter
         .mint(

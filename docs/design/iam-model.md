@@ -271,7 +271,10 @@ authorize(AuthorizationRequest) -> AuthorizationDecision
 check_entitlement(EntitlementRequest) -> EntitlementDecision
 ```
 
-v1 entitlement may be default-allow, but the seam must exist so paid packs, private namespaces, and product-plan limits do not get mixed into grant evaluation.
+The production entitlement default is unlicensed and denies explicit commercial
+checks. A deliberately selected development fixture may use default-allow, but
+paid packs, private namespaces, and product-plan limits never mix into grant
+evaluation.
 
 ## Integration patterns
 
@@ -341,7 +344,7 @@ default_org = "local"
 default_workspace = "local"
 
 [entitlements]
-mode = "default_allow" # default_allow | remote
+mode = "unlicensed" # unlicensed | remote | license
 ```
 
 Local mode is explicit. It is not a permissive fallback for unresolved identity.

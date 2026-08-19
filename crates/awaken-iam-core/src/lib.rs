@@ -728,7 +728,10 @@ mod tests {
     }
 
     #[test]
-    fn entitlement_seam_defaults_allow() {
+    fn entitlement_seam_defaults_to_unlicensed_denial() {
+        // Cause/effect rule: constructing the core without an injected
+        // commercial provider must not unlock paid features. Authorization is a
+        // separate engine and remains independently testable above.
         let request = awaken_iam_contract::EntitlementRequest {
             principal: awaken_iam_contract::PrincipalRef::Account {
                 account_id: AccountId("test".into()),
@@ -739,8 +742,8 @@ mod tests {
         let outcome = IamCore::new().entitle().evaluate(&request);
         assert_eq!(
             outcome.decision,
-            awaken_iam_contract::EntitlementDecision::Allow
+            awaken_iam_contract::EntitlementDecision::Deny
         );
-        assert_eq!(outcome.reason, EntitlementReason::DefaultAllow);
+        assert_eq!(outcome.reason, EntitlementReason::Unlicensed);
     }
 }

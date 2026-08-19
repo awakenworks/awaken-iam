@@ -62,3 +62,15 @@ crates, never on sibling IAM crates.
   without re-deriving trust.
 - The entitlement-plane callout is updated in lockstep to describe the open
   shape + verification / closed issuance split rather than a blanket exclusion.
+
+## Amendment: rejected licenses cannot unlock commercial features (2026-08-19)
+
+The original open-core wording was implemented with a blanket `default_allow`
+fallback. Once real commercial gates existed, deleting or corrupting a license
+would therefore allow more than presenting a valid restrictive claim. Production
+construction now installs `EntitlementEngine::unlicensed`: ordinary open
+functionality remains outside entitlement checks, while every explicit
+commercial entitlement denies. Missing, unreadable, malformed, expired,
+signature-invalid, and epoch-fenced claims all resolve to that same restricted
+provider. `default_allow` remains available only as an explicit development/test
+fixture.
