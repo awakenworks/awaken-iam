@@ -38,8 +38,10 @@ The **open** `awaken-iam-contract` crate carries:
 - an offline verification primitive that checks a claim against a pinned JWKS of
   Ed25519 public keys, with a caller-supplied `now` and epoch floor, returning a
   closed rejection taxonomy (unsupported schema, missing/mismatched binding,
-  unknown or unsupported key, malformed or bad signature, not-yet-valid,
-  expired, epoch-fenced). It performs no I/O and reads no clock.
+  unknown or unsupported key, malformed or bad signature, malformed/inverted
+  RFC 3339 validity, not-yet-valid, expired, epoch-fenced). Temporal comparison
+  uses parsed instants rather than wire-string ordering, so fractional seconds
+  and equivalent offsets remain correct. It performs no I/O and reads no clock.
 
 The **closed** commercial platform (`awaken-cloud`) keeps everything that mints
 trust: the private signing store, the plan catalog, quota leases, billing, and

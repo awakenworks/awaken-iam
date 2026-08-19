@@ -20,6 +20,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::Timestamp;
 use crate::identity::{JsonWebKey, Jwks};
@@ -144,10 +145,20 @@ impl LicenseClaim {
 
     /// Whether `now` falls within `[issued_at, not_after)`.
     ///
-    /// Timestamps are compared as RFC 3339 UTC strings, which orders
-    /// chronologically for the fixed-width `Z` form IAM emits.
+    /// RFC 3339 instants are parsed before comparison, so equivalent encodings
+    /// with fractional seconds or offsets cannot change temporal ordering.
+    /// Malformed timestamps or an inverted validity window are never current.
     pub fn is_current(&self, now: &Timestamp) -> bool {
-        self.issued_at.0.as_str() <= now.0.as_str() && now.0.as_str() < self.not_after.0.as_str()
+        let Ok(issued_at) = parse_timestamp(&self.issued_at) else {
+            return false;
+        };
+        let Ok(not_after) = parse_timestamp(&self.not_after) else {
+            return false;
+        };
+        let Ok(now) = parse_timestamp(now) else {
+            return false;
+        };
+        issued_at < not_after && issued_at <= now && now < not_after
     }
 
     /// Verify the claim offline against the pinned `jwks`.
@@ -193,10 +204,16 @@ impl LicenseClaim {
             .verify_strict(&self.signing_input(), &signature)
             .map_err(|_| LicenseVerifyError::BadSignature)?;
 
-        if now.0.as_str() < self.issued_at.0.as_str() {
+        let issued_at = parse_timestamp(&self.issued_at)?;
+        let not_after = parse_timestamp(&self.not_after)?;
+        let now = parse_timestamp(now)?;
+        if issued_at >= not_after {
+            return Err(LicenseVerifyError::InvalidValidityWindow);
+        }
+        if now < issued_at {
             return Err(LicenseVerifyError::NotYetValid);
         }
-        if now.0.as_str() >= self.not_after.0.as_str() {
+        if now >= not_after {
             return Err(LicenseVerifyError::Expired);
         }
         if self.epoch < min_epoch {
@@ -246,6 +263,10 @@ pub enum LicenseVerifyError {
     MalformedSignature,
     /// The signature does not verify against the claim payload.
     BadSignature,
+    /// One of `issued_at`, `not_after`, or caller-supplied `now` is not RFC 3339.
+    InvalidTimestamp,
+    /// The signed validity window is empty or inverted.
+    InvalidValidityWindow,
     /// `now` is before the claim's `issued_at`.
     NotYetValid,
     /// `now` is at or after the claim's `not_after`.
@@ -269,6 +290,12 @@ impl std::fmt::Display for LicenseVerifyError {
             LicenseVerifyError::UnsupportedKey => "license signing key is not a usable Ed25519 key",
             LicenseVerifyError::MalformedSignature => "license signature is not well-formed",
             LicenseVerifyError::BadSignature => "license signature does not verify",
+            LicenseVerifyError::InvalidTimestamp => {
+                "license validity contains an invalid RFC 3339 timestamp"
+            }
+            LicenseVerifyError::InvalidValidityWindow => {
+                "license validity window is empty or inverted"
+            }
             LicenseVerifyError::NotYetValid => "license is not yet valid",
             LicenseVerifyError::Expired => "license has expired",
             LicenseVerifyError::EpochFenced => "license epoch is below the pinned floor",
@@ -278,6 +305,10 @@ impl std::fmt::Display for LicenseVerifyError {
 }
 
 impl std::error::Error for LicenseVerifyError {}
+
+fn parse_timestamp(timestamp: &Timestamp) -> Result<OffsetDateTime, LicenseVerifyError> {
+    OffsetDateTime::parse(&timestamp.0, &Rfc3339).map_err(|_| LicenseVerifyError::InvalidTimestamp)
+}
 
 fn verifying_key_from_jwk(jwk: &JsonWebKey) -> Result<VerifyingKey, LicenseVerifyError> {
     if jwk.kty != LICENSE_KTY
@@ -353,6 +384,10 @@ mod tests {
         claim
     }
 
+    fn resign(claim: &mut LicenseClaim, key: &SigningKey) {
+        claim.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&claim.signing_input()).to_bytes());
+    }
+
     #[test]
     fn round_trips_through_json_with_an_absent_limits_map() {
         let json = r#"{
@@ -420,7 +455,7 @@ mod tests {
 
         let mut legacy = signed_claim(&key, "lic-1");
         legacy.schema_version = 1;
-        legacy.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&legacy.signing_input()).to_bytes());
+        resign(&mut legacy, &key);
         assert_eq!(
             legacy.verify(&jwks, &now, 0),
             Err(LicenseVerifyError::UnsupportedSchemaVersion)
@@ -435,7 +470,7 @@ mod tests {
                 3 => claim.catalog_release.clear(),
                 _ => unreachable!(),
             }
-            claim.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&claim.signing_input()).to_bytes());
+            resign(&mut claim, &key);
             assert_eq!(
                 claim.verify(&jwks, &now, 0),
                 Err(LicenseVerifyError::MissingBinding)
@@ -497,6 +532,13 @@ mod tests {
 
     #[test]
     fn the_validity_window_is_enforced() {
+        // Cause/effect decision table:
+        // | RFC3339 fields | issued < expires | now position       | effect |
+        // | valid          | true             | before issued      | NotYetValid |
+        // | valid          | true             | inside, fractional | verify/current |
+        // | valid          | true             | at expiry          | Expired |
+        // | malformed      | any              | any                | InvalidTimestamp |
+        // | valid          | false            | any                | InvalidValidityWindow |
         let key = signing_key();
         let claim = signed_claim(&key, "lic-1");
         let jwks = jwks_for(&key, "lic-1");
@@ -508,7 +550,44 @@ mod tests {
             claim.verify(&jwks, &Timestamp("2026-12-01T00:00:00Z".into()), 0),
             Err(LicenseVerifyError::Expired)
         );
+        assert_eq!(
+            claim.verify(
+                &jwks,
+                &Timestamp("2026-06-01T00:00:00.500000000Z".into()),
+                0
+            ),
+            Ok(())
+        );
+        assert!(claim.is_current(&Timestamp("2026-06-01T00:00:00.500Z".into())));
         assert!(claim.is_current(&Timestamp("2026-07-01T00:00:00Z".into())));
+
+        for field in ["issued_at", "not_after"] {
+            let mut malformed = signed_claim(&key, "lic-1");
+            if field == "issued_at" {
+                malformed.issued_at = Timestamp("not-a-time".into());
+            } else {
+                malformed.not_after = Timestamp("not-a-time".into());
+            }
+            resign(&mut malformed, &key);
+            assert_eq!(
+                malformed.verify(&jwks, &Timestamp("2026-07-01T00:00:00Z".into()), 0),
+                Err(LicenseVerifyError::InvalidTimestamp)
+            );
+            assert!(!malformed.is_current(&Timestamp("2026-07-01T00:00:00Z".into())));
+        }
+        assert_eq!(
+            claim.verify(&jwks, &Timestamp("not-a-time".into()), 0),
+            Err(LicenseVerifyError::InvalidTimestamp)
+        );
+
+        let mut inverted = signed_claim(&key, "lic-1");
+        inverted.not_after = inverted.issued_at.clone();
+        resign(&mut inverted, &key);
+        assert_eq!(
+            inverted.verify(&jwks, &Timestamp("2026-07-01T00:00:00Z".into()), 0),
+            Err(LicenseVerifyError::InvalidValidityWindow)
+        );
+        assert!(!inverted.is_current(&Timestamp("2026-07-01T00:00:00Z".into())));
     }
 
     #[test]

@@ -123,6 +123,12 @@ development fixtures and is never a production fallback. An unreachable billing
 service and an unreadable, expired, fenced, misbound, or invalid license both
 deny commercial checks.
 
+License validity is the half-open RFC 3339 interval `[issued_at, not_after)`.
+IAM parses all three instants (`issued_at`, `not_after`, and caller-supplied
+`now`) before comparison; malformed timestamps and empty or inverted windows
+fail closed. Fractional seconds and equivalent RFC 3339 offsets therefore do
+not depend on lexicographic wire ordering.
+
 Production license composition uses these environment inputs:
 
 ```text
