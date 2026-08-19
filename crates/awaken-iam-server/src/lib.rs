@@ -58,8 +58,9 @@ pub use capability_token::{
     MintCapability, attenuate, mint_capability, verify_capability,
 };
 pub use license::{
-    ENV_LICENSE_FILE, ENV_LICENSE_INLINE, LicenseConfig, LicenseLoadError, LicenseRejection,
-    LicenseResolution, LicenseSource, LicenseStatus,
+    ENV_LICENSE_CUSTOMER_ID, ENV_LICENSE_DEPLOYMENT_ID, ENV_LICENSE_FILE, ENV_LICENSE_INLINE,
+    ENV_LICENSE_JWKS, ENV_LICENSE_JWKS_FILE, LicenseConfig, LicenseFloorStore, LicenseLoadError,
+    LicenseRejection, LicenseResolution, LicenseSource, LicenseStateError, LicenseStatus,
 };
 pub use local_setup::{
     BeginLocalSetup, ExchangeLocalSetup, IssuedLocalSetup, LocalSetupError, LocalSetupGateway,

@@ -87,3 +87,28 @@ lifecycle payload. Production resolution requires exact customer and deployment
 matches through `LicenseClaim::verify_for`; V1, missing bindings, and either
 mismatch fail closed to the unlicensed provider. There is no legacy acceptance
 path to synchronize or accidentally leave enabled.
+
+## Amendment: live verification and durable rollback floor (2026-08-19)
+
+A signature-valid old claim must not regain removed capacity after the host has
+already accepted a newer subscription projection. IAM therefore owns one
+durable high-water mark per customer/deployment: accepted `epoch` and
+`billing_version`. Resolution verifies against that floor and advances it with
+an owner-only, atomic, fsynced replacement before enabling the claim. A lower
+value, malformed state, cross-deployment state, symlink, insecure permissions,
+or persistence failure denies commercial entitlements. Product repositories do
+not implement their own rollback files or verifier.
+
+The production provider reloads and re-verifies the configured claim for each
+commercial entitlement decision. Expiry and operator rotation therefore take
+effect without a restart or a product-specific refresh timer. The pinned JWKS
+is loaded once at composition time; changing the license file cannot change the
+trusted issuer.
+
+This raises the cost of accidental rollback and non-administrative tampering; it
+does not claim DRM-style impossibility. A customer with root access can patch a
+binary, replace both binary and state, or remove the policy-enforcement point.
+Commercial protection therefore also relies on short claim lifetimes, signed
+release artifacts, controlled update/support access, audit evidence, and the
+contract. Hardware-backed measured boot or online activation may strengthen a
+managed appliance, but is not a hidden requirement for offline self-hosting.

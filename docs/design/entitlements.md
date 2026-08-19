@@ -22,6 +22,9 @@ defaults to an unlicensed provider that denies explicit commercial checks;
 > production resolution verifies both bindings in addition to signature,
 > validity window, and epoch. Copying a valid claim to another installation
 > therefore resolves to the same unlicensed denial as an invalid claim.
+> IAM also persists the highest accepted `epoch` and `billing_version` for that
+> installation and re-verifies the live claim on each commercial entitlement
+> decision. Old, expired, replaced, malformed, or rebound claims fail closed.
 
 ## Why a separate plane
 
@@ -119,6 +122,36 @@ customer and deployment. `default_allow` may be selected only by tests or local
 development fixtures and is never a production fallback. An unreachable billing
 service and an unreadable, expired, fenced, misbound, or invalid license both
 deny commercial checks.
+
+Production license composition uses these environment inputs:
+
+```text
+AWAKEN_IAM_LICENSE or AWAKEN_IAM_LICENSE_FILE
+AWAKEN_IAM_LICENSE_JWKS or AWAKEN_IAM_LICENSE_JWKS_FILE
+AWAKEN_IAM_LICENSE_CUSTOMER_ID
+AWAKEN_IAM_LICENSE_DEPLOYMENT_ID
+```
+
+The product supplies only its protected data-directory path for IAM's canonical
+rollback-floor file. The floor is an atomic owner-only high-water mark, not a
+second entitlement source. If it cannot be trusted or advanced, paid unlocks
+deny. The JWKS must be provisioned through an immutable image/configuration or a
+protected secret mount; it is public key material, but replacing it changes the
+trust root.
+
+### Threat boundary
+
+Offline licensing can prevent claim forgery, casual copying, stale-claim reuse,
+and tampering by principals that cannot replace the running program or its
+protected state. It cannot make a customer-controlled host mathematically
+unbreakable: root can patch the executable or remove a call site. Rust and
+symbol stripping increase reverse-engineering cost but are not trust anchors.
+Operational controls complete the boundary: Ed25519 private keys remain in
+Cloud KMS/HSM, claims are short-lived, release images and manifests are signed,
+SBOM/provenance are published, privileged changes are audited, and update/support
+eligibility is contractually tied to a valid subscription. Optional online
+activation or TPM-backed measured boot is a separate stronger deployment mode,
+not part of the offline baseline.
 
 ## Where it applies
 

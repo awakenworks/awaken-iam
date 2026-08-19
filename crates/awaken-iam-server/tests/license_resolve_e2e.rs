@@ -125,6 +125,8 @@ fn license_config_loads_a_verifying_claim_from_a_file() {
         resolved.status,
         awaken_iam_server::LicenseStatus::Licensed {
             not_after: Timestamp("2026-12-01T00:00:00Z".into()),
+            epoch: 3,
+            billing_version: 7,
         }
     );
     assert_eq!(
@@ -205,7 +207,9 @@ fn license_status_is_licensed_predicates_on_the_variants() {
     use awaken_iam_server::LicenseStatus;
     assert!(
         LicenseStatus::Licensed {
-            not_after: Timestamp("2026-12-01T00:00:00Z".into())
+            not_after: Timestamp("2026-12-01T00:00:00Z".into()),
+            epoch: 3,
+            billing_version: 7,
         }
         .is_licensed()
     );
