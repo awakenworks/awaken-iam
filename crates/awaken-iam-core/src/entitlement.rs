@@ -1053,8 +1053,14 @@ mod tests {
     }
 
     fn license_claim(features: &[&str], limits: &[(&str, u64)]) -> LicenseClaim {
-        use awaken_iam_contract::{LicenseSignature, Timestamp};
+        use awaken_iam_contract::{LICENSE_CLAIM_SCHEMA_VERSION, LicenseSignature, Timestamp};
         LicenseClaim {
+            schema_version: LICENSE_CLAIM_SCHEMA_VERSION,
+            license_id: "license_1".into(),
+            customer_id: "customer_1".into(),
+            deployment_id: "deployment_1".into(),
+            catalog_release: "catalog_2026_06".into(),
+            billing_version: 7,
             features: features.iter().map(|f| (*f).to_owned()).collect(),
             limits: limits.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
             issued_at: Timestamp("2026-06-01T00:00:00Z".into()),

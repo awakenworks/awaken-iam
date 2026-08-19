@@ -1,7 +1,7 @@
 # ADR-0005 - License claim shape and offline verification are open; issuance stays closed
 
 - **Status:** Proposed
-- **Implementation:** in-progress
+- **Implementation:** done
 - **Date:** 2026-06-23
 
 ## Context
@@ -31,13 +31,15 @@ exists to provide.
 
 The **open** `awaken-iam-contract` crate carries:
 
-- the `LicenseClaim` wire shape (`features`, `limits`, `issued_at`, `not_after`,
-  `epoch`, detached `sig`) and its canonical signing-input serialization, and
+- the versioned `LicenseClaim` wire shape (`license_id`, `customer_id`,
+  `deployment_id`, `catalog_release`, `billing_version`, `features`, `limits`,
+  `issued_at`, `not_after`, `epoch`, detached `sig`) and its canonical
+  signing-input serialization, and
 - an offline verification primitive that checks a claim against a pinned JWKS of
   Ed25519 public keys, with a caller-supplied `now` and epoch floor, returning a
-  closed rejection taxonomy (unknown key, unsupported key, malformed signature,
-  bad signature, not-yet-valid, expired, epoch-fenced). It performs no I/O and
-  reads no clock.
+  closed rejection taxonomy (unsupported schema, missing/mismatched binding,
+  unknown or unsupported key, malformed or bad signature, not-yet-valid,
+  expired, epoch-fenced). It performs no I/O and reads no clock.
 
 The **closed** commercial platform (`awaken-cloud`) keeps everything that mints
 trust: the private signing store, the plan catalog, quota leases, billing, and
@@ -74,3 +76,14 @@ commercial entitlement denies. Missing, unreadable, malformed, expired,
 signature-invalid, and epoch-fenced claims all resolve to that same restricted
 provider. `default_allow` remains available only as an explicit development/test
 fixture.
+
+## Amendment: V2 claims bind one customer and deployment (2026-08-19)
+
+Signature validity alone does not authorize a license for the current host: an
+otherwise-valid unbound claim could be copied to another customer or
+installation. Schema V2 signs `license_id`, `customer_id`, `deployment_id`, the
+immutable `catalog_release`, and `billing_version` together with the feature and
+lifecycle payload. Production resolution requires exact customer and deployment
+matches through `LicenseClaim::verify_for`; V1, missing bindings, and either
+mismatch fail closed to the unlicensed provider. There is no legacy acceptance
+path to synchronize or accidentally leave enabled.

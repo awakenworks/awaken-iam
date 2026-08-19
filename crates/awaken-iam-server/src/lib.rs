@@ -153,6 +153,8 @@ mod tests {
 
     #[test]
     fn server_implements_client_trait() {
+        // Cause/effect rule: the default facade has neither authorization grants
+        // nor a commercial license/provider, so both independent planes deny.
         let server = IamServer::new();
         let principal = PrincipalRef::Service {
             service_id: "svc".into(),
@@ -170,7 +172,7 @@ mod tests {
             entitlement: "pack.read".into(),
             resource: None,
         });
-        assert_eq!(ent, EntitlementDecision::Allow);
+        assert_eq!(ent, EntitlementDecision::Deny);
     }
 
     #[test]

@@ -35,7 +35,9 @@ pub use identity::{
     RefreshTokenChainId, RefreshTokenId, RefreshTokenView, Session, SessionId, SessionView,
     Timestamp, UserInfo,
 };
-pub use license::{LicenseClaim, LicenseSignature, LicenseVerifyError};
+pub use license::{
+    LICENSE_CLAIM_SCHEMA_VERSION, LicenseClaim, LicenseSignature, LicenseVerifyError,
+};
 pub use protocol::{
     ApiTokenStatus, ApprovalAuthority, ApprovalObligation, AuthorizationOutcome,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect,

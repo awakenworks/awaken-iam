@@ -18,6 +18,10 @@ defaults to an unlicensed provider that denies explicit commercial checks;
 > the public-key verification check; it never carries a signing key or the issuing
 > pipeline. A build with no claim is unlicensed by default. The open/closed split
 > is recorded in [ADR-0005](../adr/0005-open-license-claim-verification.md).
+> A V2 claim is signed for exactly one `customer_id` and `deployment_id`;
+> production resolution verifies both bindings in addition to signature,
+> validity window, and epoch. Copying a valid claim to another installation
+> therefore resolves to the same unlicensed denial as an invalid claim.
 
 ## Why a separate plane
 
@@ -110,10 +114,11 @@ mode = "unlicensed"   # unlicensed | remote | license
 
 `unlicensed` leaves ordinary open functionality outside this plane and denies
 every explicit commercial entitlement. `remote` resolves against Cloud Billing;
-`license` resolves against a verified offline claim. `default_allow` may be
-selected only by tests or local development fixtures and is never a production
-fallback. An unreachable billing service and an unreadable, expired, fenced, or
-invalid license both deny commercial checks.
+`license` resolves against a verified offline claim bound to the configured
+customer and deployment. `default_allow` may be selected only by tests or local
+development fixtures and is never a production fallback. An unreachable billing
+service and an unreadable, expired, fenced, misbound, or invalid license both
+deny commercial checks.
 
 ## Where it applies
 

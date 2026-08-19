@@ -4,10 +4,11 @@
 //! [`verify`](awaken_iam_contract::LicenseClaim::verify), and the claim →
 //! [`EntitlementProvider`](awaken_iam_core::EntitlementProvider) bridge
 //! ([`EntitlementEngine::from_license`]). This module is the assembly-time seam
-//! that ties them together: it pins the platform JWKS and an epoch floor, loads
-//! the deployment's claim (from an inline string or a file), verifies it offline
-//! at a caller-supplied instant, and resolves the entitlement provider to install
-//! through the existing `with_entitlements` injection point.
+//! that ties them together: it pins the platform JWKS, an epoch floor, and the
+//! expected customer/deployment binding; loads the deployment's claim (from an
+//! inline string or a file); verifies it offline at a caller-supplied instant;
+//! and resolves the entitlement provider to install through the existing
+//! `with_entitlements` injection point.
 //!
 //! The policy is fail-open toward *functionality*, fail-closed toward *unlocks*:
 //!
@@ -156,6 +157,10 @@ pub struct LicenseConfig {
     pub jwks: Jwks,
     /// Epoch floor: claims minted below this are fenced out.
     pub min_epoch: u64,
+    /// Customer id provisioned for this installation.
+    pub expected_customer_id: String,
+    /// Stable id of this exact installation.
+    pub expected_deployment_id: String,
     /// Where to load the claim from.
     pub source: LicenseSource,
 }
@@ -167,16 +172,26 @@ impl LicenseConfig {
         Self {
             jwks: Jwks { keys: Vec::new() },
             min_epoch: 0,
+            expected_customer_id: String::new(),
+            expected_deployment_id: String::new(),
             source: LicenseSource::None,
         }
     }
 
     /// Build a configuration that verifies a claim against `jwks` with the given
-    /// epoch floor, loading the claim from `source`.
-    pub fn new(jwks: Jwks, min_epoch: u64, source: LicenseSource) -> Self {
+    /// epoch floor and installation binding, loading the claim from `source`.
+    pub fn new(
+        jwks: Jwks,
+        min_epoch: u64,
+        source: LicenseSource,
+        expected_customer_id: impl Into<String>,
+        expected_deployment_id: impl Into<String>,
+    ) -> Self {
         Self {
             jwks,
             min_epoch,
+            expected_customer_id: expected_customer_id.into(),
+            expected_deployment_id: expected_deployment_id.into(),
             source,
         }
     }
@@ -221,7 +236,13 @@ impl LicenseConfig {
             }
         };
 
-        match claim.verify(&self.jwks, now, self.min_epoch) {
+        match claim.verify_for(
+            &self.jwks,
+            now,
+            self.min_epoch,
+            &self.expected_customer_id,
+            &self.expected_deployment_id,
+        ) {
             Ok(()) => LicenseResolution {
                 provider: Box::new(EntitlementEngine::from_license(&claim)),
                 status: LicenseStatus::Licensed {
@@ -240,7 +261,8 @@ impl LicenseConfig {
 mod tests {
     use super::*;
     use awaken_iam_contract::{
-        EntitlementDecision, EntitlementRequest, JsonWebKey, LicenseSignature, PrincipalRef,
+        EntitlementDecision, EntitlementRequest, JsonWebKey, LICENSE_CLAIM_SCHEMA_VERSION,
+        LicenseSignature, PrincipalRef,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -282,6 +304,12 @@ mod tests {
         let mut limits = BTreeMap::new();
         limits.insert("namespace.private".to_owned(), 5);
         let mut claim = LicenseClaim {
+            schema_version: LICENSE_CLAIM_SCHEMA_VERSION,
+            license_id: "license_1".into(),
+            customer_id: "customer_1".into(),
+            deployment_id: "deployment_1".into(),
+            catalog_release: "catalog_2026_06".into(),
+            billing_version: 7,
             features: vec!["pack.publish".into(), "namespace.private".into()],
             limits,
             issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
@@ -302,6 +330,8 @@ mod tests {
             jwks,
             min_epoch,
             LicenseSource::Inline(serde_json::to_string(claim).unwrap()),
+            "customer_1",
+            "deployment_1",
         )
     }
 
@@ -365,6 +395,51 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_for_another_installation_falls_back_to_unlicensed_denial() {
+        // Cause/effect decision table extension: C1=claim verifies structurally
+        // and cryptographically, C2=customer binding matches, C3=deployment
+        // binding matches. R1 C1+C2+C3 -> licensed (covered above); R2 C1+!C2
+        // or R3 C1+C2+!C3 -> rejected + unlicensed provider. These two rules
+        // prevent a copied, otherwise-valid license from unlocking this host.
+        let key = signing_key();
+        let claim = signed_claim(&key, "lic-1", 3, "2026-12-01T00:00:00Z");
+        let source = LicenseSource::Inline(serde_json::to_string(&claim).unwrap());
+
+        for (customer, deployment, expected_error) in [
+            (
+                "other_customer",
+                "deployment_1",
+                LicenseVerifyError::CustomerMismatch,
+            ),
+            (
+                "customer_1",
+                "other_deployment",
+                LicenseVerifyError::DeploymentMismatch,
+            ),
+        ] {
+            let config = LicenseConfig::new(
+                jwks_for(&key, "lic-1"),
+                0,
+                source.clone(),
+                customer,
+                deployment,
+            );
+            let resolved = config.resolve(&Timestamp("2026-07-01T00:00:00Z".into()));
+            assert_eq!(
+                resolved.status,
+                LicenseStatus::Rejected(LicenseRejection::Verify(expected_error))
+            );
+            assert_eq!(
+                resolved
+                    .provider
+                    .evaluate(&request("pack.publish"))
+                    .decision,
+                EntitlementDecision::Deny
+            );
+        }
+    }
+
+    #[test]
     fn an_expired_claim_falls_back_to_unlicensed_denial() {
         let key = signing_key();
         let claim = signed_claim(&key, "lic-1", 3, "2026-06-15T00:00:00Z");
@@ -410,6 +485,8 @@ mod tests {
             Jwks { keys: Vec::new() },
             0,
             LicenseSource::Inline("{ not a claim".into()),
+            "customer_1",
+            "deployment_1",
         );
         let resolved = config.resolve(&Timestamp("2026-07-01T00:00:00Z".into()));
         assert!(matches!(

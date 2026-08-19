@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use awaken_iam_contract::{
-    EntitlementDecision, EntitlementRequest, JsonWebKey, Jwks, LicenseClaim, LicenseSignature,
-    PrincipalRef, Timestamp,
+    EntitlementDecision, EntitlementRequest, JsonWebKey, Jwks, LICENSE_CLAIM_SCHEMA_VERSION,
+    LicenseClaim, LicenseSignature, PrincipalRef, Timestamp,
 };
 use awaken_iam_core::Quota;
 use awaken_iam_server::{LicenseConfig, LicenseLoadError, LicenseRejection, LicenseSource};
@@ -50,6 +50,12 @@ fn signed_claim(key: &SigningKey, kid: &str, epoch: u64, not_after: &str) -> Lic
     let mut limits = BTreeMap::new();
     limits.insert("seats".to_owned(), 7);
     let mut claim = LicenseClaim {
+        schema_version: LICENSE_CLAIM_SCHEMA_VERSION,
+        license_id: "license_1".into(),
+        customer_id: "customer_1".into(),
+        deployment_id: "deployment_1".into(),
+        catalog_release: "catalog_2026_06".into(),
+        billing_version: 7,
         features: vec!["pack.publish".into(), "seats".into()],
         limits,
         issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
@@ -100,6 +106,8 @@ fn license_config_loads_a_verifying_claim_from_a_file() {
         jwks_for(&key, "lic-file-1"),
         0,
         LicenseSource::File(file_path.clone()),
+        "customer_1",
+        "deployment_1",
     );
 
     // load_claim returns Some and round-trips through the JSON the operator wrote.
@@ -141,6 +149,8 @@ fn license_config_returns_a_load_error_when_the_file_path_is_unreadable() {
         Jwks { keys: Vec::new() },
         0,
         LicenseSource::File(std::env::temp_dir().join("does-not-exist-license.json")),
+        "customer_1",
+        "deployment_1",
     );
     let resolved = config.resolve(&Timestamp("2026-07-01T00:00:00Z".into()));
     assert!(matches!(
@@ -165,7 +175,13 @@ fn license_config_loads_and_rejects_a_malformed_file_payload() {
     let file_path = std::env::temp_dir().join("awaken-iam-malformed-license.json");
     std::fs::write(&file_path, "{ not a claim").expect("write bad claim");
 
-    let config = LicenseConfig::new(Jwks { keys: Vec::new() }, 0, LicenseSource::File(file_path));
+    let config = LicenseConfig::new(
+        Jwks { keys: Vec::new() },
+        0,
+        LicenseSource::File(file_path),
+        "customer_1",
+        "deployment_1",
+    );
     let loaded = config.load_claim().unwrap_err();
     assert!(matches!(loaded, LicenseLoadError::Parse(_)));
 

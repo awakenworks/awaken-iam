@@ -258,6 +258,9 @@ mod tests {
 
     #[tokio::test]
     async fn entitlement_route_evaluates_live() {
+        // Cause/effect rule: no explicit entitlement provider/license is the
+        // production unlicensed baseline, so an HTTP commercial check must deny.
+        // Explicit licensed/local providers are covered by their focused tests.
         let router = authz_router(Arc::new(AuthzApi::new()));
         let body = serde_json::json!({
             "principal": { "kind": "service", "service_id": "svc" },
@@ -270,8 +273,7 @@ mod tests {
             .expect("dispatch");
         let decoded: EntitlementCheckResponse =
             serde_json::from_value(body_json(response).await).expect("entitlement");
-        // The v1 engine is default-allow.
-        assert_eq!(decoded.decision, EntitlementDecision::Allow);
+        assert_eq!(decoded.decision, EntitlementDecision::Deny);
     }
 
     #[tokio::test]

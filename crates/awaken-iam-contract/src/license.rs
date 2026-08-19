@@ -30,6 +30,9 @@ const LICENSE_CRV: &str = "Ed25519";
 const LICENSE_ALG: &str = "EdDSA";
 const LICENSE_USE: &str = "sig";
 
+/// Current wire/signature schema accepted by the offline verifier.
+pub const LICENSE_CLAIM_SCHEMA_VERSION: u16 = 2;
+
 /// A detached signature binding a [`LicenseClaim`] to the key that minted it.
 ///
 /// The issuer is closed; the open repo only ever *checks* this value. `kid`
@@ -52,6 +55,19 @@ pub struct LicenseSignature {
 /// claim simply has no extra features and no ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LicenseClaim {
+    /// Wire/signature schema. Version 2 binds the claim to one customer and
+    /// deployment so a valid license cannot be copied to another installation.
+    pub schema_version: u16,
+    /// Stable issuer-selected identifier used for audit and support.
+    pub license_id: String,
+    /// Customer or Organization that purchased the entitlement.
+    pub customer_id: String,
+    /// Exact installation that may consume the entitlement.
+    pub deployment_id: String,
+    /// Immutable commercial catalog release used to derive this claim.
+    pub catalog_release: String,
+    /// Subscription ledger version projected into this claim.
+    pub billing_version: u64,
     /// Feature / SKU keys this license entitles (for example `pack.publish`,
     /// `model.strong_access`). Order is preserved as issued and is part of the
     /// signed payload.
@@ -80,6 +96,12 @@ pub struct LicenseClaim {
 /// the issuer and the verifier agree on the canonical bytes byte-for-byte.
 #[derive(Debug, Serialize)]
 struct LicensePayload<'a> {
+    schema_version: u16,
+    license_id: &'a str,
+    customer_id: &'a str,
+    deployment_id: &'a str,
+    catalog_release: &'a str,
+    billing_version: u64,
     features: &'a [String],
     limits: &'a BTreeMap<String, u64>,
     issued_at: &'a Timestamp,
@@ -94,6 +116,12 @@ impl LicenseClaim {
     /// produced over these bytes by the closed issuer verifies here.
     pub fn signing_input(&self) -> Vec<u8> {
         let payload = LicensePayload {
+            schema_version: self.schema_version,
+            license_id: &self.license_id,
+            customer_id: &self.customer_id,
+            deployment_id: &self.deployment_id,
+            catalog_release: &self.catalog_release,
+            billing_version: self.billing_version,
             features: &self.features,
             limits: &self.limits,
             issued_at: &self.issued_at,
@@ -124,17 +152,35 @@ impl LicenseClaim {
 
     /// Verify the claim offline against the pinned `jwks`.
     ///
-    /// Checks, in order: the signing key is present in `jwks` and is a usable
-    /// Ed25519 verification key; the Ed25519 signature is valid over
+    /// Checks, in order: this is the current schema and all binding fields are
+    /// present; the signing key is present in `jwks` and is a usable Ed25519
+    /// verification key; the Ed25519 signature is valid over
     /// [`LicenseClaim::signing_input`]; `now` is within the validity window; and
-    /// the claim's [`LicenseClaim::epoch`] is at least `min_epoch`. No network or
-    /// clock access happens — the caller supplies `now` and the epoch floor.
+    /// the claim's [`LicenseClaim::epoch`] is at least `min_epoch`. This proves
+    /// claim integrity, but a deployment must call [`Self::verify_for`] to also
+    /// authorize the claim for its expected customer and installation. No
+    /// network or clock access happens — the caller supplies `now` and the epoch
+    /// floor.
     pub fn verify(
         &self,
         jwks: &Jwks,
         now: &Timestamp,
         min_epoch: u64,
     ) -> Result<(), LicenseVerifyError> {
+        if self.schema_version != LICENSE_CLAIM_SCHEMA_VERSION {
+            return Err(LicenseVerifyError::UnsupportedSchemaVersion);
+        }
+        if [
+            self.license_id.as_str(),
+            self.customer_id.as_str(),
+            self.deployment_id.as_str(),
+            self.catalog_release.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(LicenseVerifyError::MissingBinding);
+        }
         let jwk = jwks
             .keys
             .iter()
@@ -158,11 +204,38 @@ impl LicenseClaim {
         }
         Ok(())
     }
+
+    /// Verify integrity/lifecycle and require the exact installation binding.
+    pub fn verify_for(
+        &self,
+        jwks: &Jwks,
+        now: &Timestamp,
+        min_epoch: u64,
+        expected_customer_id: &str,
+        expected_deployment_id: &str,
+    ) -> Result<(), LicenseVerifyError> {
+        self.verify(jwks, now, min_epoch)?;
+        if self.customer_id != expected_customer_id {
+            return Err(LicenseVerifyError::CustomerMismatch);
+        }
+        if self.deployment_id != expected_deployment_id {
+            return Err(LicenseVerifyError::DeploymentMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Why an offline [`LicenseClaim::verify`] rejected a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LicenseVerifyError {
+    /// Only the current bound claim schema is accepted.
+    UnsupportedSchemaVersion,
+    /// A required customer/deployment/audit binding is absent.
+    MissingBinding,
+    /// The claim belongs to a different customer.
+    CustomerMismatch,
+    /// The claim belongs to a different deployment.
+    DeploymentMismatch,
     /// No key in the pinned JWKS matches the signature's `kid`.
     UnknownKey,
     /// The selected key is not a usable Ed25519 verification key (wrong
@@ -184,6 +257,14 @@ pub enum LicenseVerifyError {
 impl std::fmt::Display for LicenseVerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
+            LicenseVerifyError::UnsupportedSchemaVersion => {
+                "license claim schema version is unsupported"
+            }
+            LicenseVerifyError::MissingBinding => "license claim is missing a required binding",
+            LicenseVerifyError::CustomerMismatch => "license claim belongs to a different customer",
+            LicenseVerifyError::DeploymentMismatch => {
+                "license claim belongs to a different deployment"
+            }
             LicenseVerifyError::UnknownKey => "no pinned key matches the license signature kid",
             LicenseVerifyError::UnsupportedKey => "license signing key is not a usable Ed25519 key",
             LicenseVerifyError::MalformedSignature => "license signature is not well-formed",
@@ -251,6 +332,12 @@ mod tests {
         let mut limits = BTreeMap::new();
         limits.insert("namespace.private".to_owned(), 5);
         let mut claim = LicenseClaim {
+            schema_version: LICENSE_CLAIM_SCHEMA_VERSION,
+            license_id: "license_1".into(),
+            customer_id: "customer_1".into(),
+            deployment_id: "deployment_1".into(),
+            catalog_release: "catalog_2026_06".into(),
+            billing_version: 7,
             features: vec!["pack.publish".into(), "model.strong_access".into()],
             limits,
             issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
@@ -269,6 +356,12 @@ mod tests {
     #[test]
     fn round_trips_through_json_with_an_absent_limits_map() {
         let json = r#"{
+            "schema_version": 2,
+            "license_id": "license_1",
+            "customer_id": "customer_1",
+            "deployment_id": "deployment_1",
+            "catalog_release": "catalog_2026_06",
+            "billing_version": 7,
             "features": ["pack.read"],
             "issued_at": "2026-06-01T00:00:00Z",
             "not_after": "2026-12-01T00:00:00Z",
@@ -292,12 +385,80 @@ mod tests {
 
     #[test]
     fn a_well_formed_claim_verifies_against_the_pinned_jwks() {
+        // Cause/effect decision table for claim verification:
+        // C1=schema V2, C2=bindings present, C3=signature/key valid,
+        // C4=current, C5=epoch admitted, C6=customer matches,
+        // C7=deployment matches. R1 all true -> verified. R2 !C1 or !C2 ->
+        // structural rejection; R3 !C3 -> cryptographic rejection; R4 !C4 or
+        // !C5 -> lifecycle rejection; R5 !C6 or !C7 -> target rejection.
+        // This test covers R1; the focused tests below cover every false cause.
         let key = signing_key();
         let claim = signed_claim(&key, "lic-1");
         let now = Timestamp("2026-07-01T00:00:00Z".into());
-        assert_eq!(claim.verify(&jwks_for(&key, "lic-1"), &now, 3), Ok(()));
+        assert_eq!(
+            claim.verify_for(
+                &jwks_for(&key, "lic-1"),
+                &now,
+                3,
+                "customer_1",
+                "deployment_1"
+            ),
+            Ok(())
+        );
         // An equal-or-lower floor still admits the claim.
         assert_eq!(claim.verify(&jwks_for(&key, "lic-1"), &now, 0), Ok(()));
+    }
+
+    #[test]
+    fn unsupported_or_unbound_claims_are_rejected_before_signature_use() {
+        // Decision-table R2: each required structural cause independently false
+        // produces its precise fail-closed effect. Re-sign after mutation so this
+        // test proves schema/binding validation, not an incidental bad signature.
+        let key = signing_key();
+        let now = Timestamp("2026-07-01T00:00:00Z".into());
+        let jwks = jwks_for(&key, "lic-1");
+
+        let mut legacy = signed_claim(&key, "lic-1");
+        legacy.schema_version = 1;
+        legacy.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&legacy.signing_input()).to_bytes());
+        assert_eq!(
+            legacy.verify(&jwks, &now, 0),
+            Err(LicenseVerifyError::UnsupportedSchemaVersion)
+        );
+
+        for clear_binding in 0..4 {
+            let mut claim = signed_claim(&key, "lic-1");
+            match clear_binding {
+                0 => claim.license_id.clear(),
+                1 => claim.customer_id = "  ".into(),
+                2 => claim.deployment_id.clear(),
+                3 => claim.catalog_release.clear(),
+                _ => unreachable!(),
+            }
+            claim.sig.value = URL_SAFE_NO_PAD.encode(key.sign(&claim.signing_input()).to_bytes());
+            assert_eq!(
+                claim.verify(&jwks, &now, 0),
+                Err(LicenseVerifyError::MissingBinding)
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_is_authorized_only_for_its_bound_customer_and_deployment() {
+        // Decision-table R5: the integrity-valid claim must still match both
+        // installation coordinates; either mismatch denies the paid unlock.
+        let key = signing_key();
+        let claim = signed_claim(&key, "lic-1");
+        let now = Timestamp("2026-07-01T00:00:00Z".into());
+        let jwks = jwks_for(&key, "lic-1");
+        assert_eq!(
+            claim.verify_for(&jwks, &now, 0, "other_customer", "deployment_1"),
+            Err(LicenseVerifyError::CustomerMismatch)
+        );
+        assert_eq!(
+            claim.verify_for(&jwks, &now, 0, "customer_1", "other_deployment"),
+            Err(LicenseVerifyError::DeploymentMismatch)
+        );
     }
 
     #[test]

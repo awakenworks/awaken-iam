@@ -818,8 +818,8 @@ mod tests {
     fn license_config_wires_through_with_license_and_set_entitlements() {
         use crate::{LicenseConfig, LicenseSource, LicenseStatus};
         use awaken_iam_contract::{
-            AccountId, EntitlementDecision, EntitlementRequest, JsonWebKey, Jwks, LicenseClaim,
-            LicenseSignature, PrincipalRef, Timestamp,
+            AccountId, EntitlementDecision, EntitlementRequest, JsonWebKey, Jwks,
+            LICENSE_CLAIM_SCHEMA_VERSION, LicenseClaim, LicenseSignature, PrincipalRef, Timestamp,
         };
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -837,6 +837,12 @@ mod tests {
             }],
         };
         let mut claim = LicenseClaim {
+            schema_version: LICENSE_CLAIM_SCHEMA_VERSION,
+            license_id: "license_1".into(),
+            customer_id: "customer_1".into(),
+            deployment_id: "deployment_1".into(),
+            catalog_release: "catalog_2026_06".into(),
+            billing_version: 7,
             features: vec!["pack.publish".into()],
             limits: Default::default(),
             issued_at: Timestamp("2026-06-01T00:00:00Z".into()),
@@ -853,6 +859,8 @@ mod tests {
             jwks,
             0,
             LicenseSource::Inline(serde_json::to_string(&claim).unwrap()),
+            "customer_1",
+            "deployment_1",
         );
         let now = Timestamp("2026-07-01T00:00:00Z".into());
         let entitled = |feature: &str| EntitlementRequest {

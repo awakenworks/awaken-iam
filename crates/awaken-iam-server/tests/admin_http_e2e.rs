@@ -1242,11 +1242,12 @@ async fn check_entitlement_returns_decision_for_known_and_unknown_features() {
     assert_eq!(response.status(), StatusCode::OK);
     let result: EntitlementCheckResponse =
         serde_json::from_value(body_json(response).await).expect("entitlement");
-    // The default-allow entitlement engine permits anything; the seam surfaces
-    // that decision faithfully.
+    // Cause/effect rule: the production daemon has no configured commercial
+    // provider in this fixture, so the HTTP seam faithfully returns the
+    // unlicensed fail-closed decision for any feature.
     assert_eq!(
         result.decision,
-        awaken_iam_contract::EntitlementDecision::Allow
+        awaken_iam_contract::EntitlementDecision::Deny
     );
 }
 
