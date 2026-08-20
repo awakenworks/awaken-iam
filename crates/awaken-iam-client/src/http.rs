@@ -333,6 +333,12 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response).map(Some)
     }
 
+    fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
+        let path = format!("/v1/admin/orgs/{org_id}");
+        let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
+        Self::decode(response)
+    }
+
     fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
@@ -797,6 +803,25 @@ mod tests {
     fn missing_org_is_an_empty_canonical_query() {
         let server = StubServer::start(vec![Reply::Status(404)]);
         assert_eq!(transport(&server).get_org("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn organization_deletion_uses_the_canonical_admin_path() {
+        // Cause/effect decision table:
+        // R1 existing org + 2xx ack -> one DELETE to the canonical PAP route,
+        //    return the decoded version (covered here);
+        // R2 non-2xx response -> RemoteError, never synthesize success
+        //    (covered by `non_success_status_is_an_error` for shared decoding);
+        // R3 transient 5xx -> bounded shared retry
+        //    (covered by `retries_transient_server_error_then_succeeds`).
+        // Constraint: deletion must not become a GET-then-DELETE sequence in
+        // this transport; idempotency belongs to the application caller.
+        let server = StubServer::start(vec![Reply::Ok(r#"{"version":9}"#.into())]);
+
+        assert_eq!(transport(&server).delete_org("acme").unwrap().version, 9);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("DELETE /v1/admin/orgs/acme "));
     }
 
     #[test]

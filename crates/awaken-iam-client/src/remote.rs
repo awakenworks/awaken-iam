@@ -118,6 +118,10 @@ pub trait AuthzTransport {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
+    fn delete_org(&self, _org_id: &str) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("organization PAP is not supported".into()))
+    }
+
     fn create_role(&self, _role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("role PAP is not supported".into()))
     }
@@ -376,6 +380,11 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
 
     pub fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
         self.transport.get_org(org_id)
+    }
+
+    /// Delete organization metadata through IAM's canonical policy-admin path.
+    pub fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.delete_org(org_id)
     }
 
     pub fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
