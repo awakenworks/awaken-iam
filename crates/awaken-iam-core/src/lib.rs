@@ -16,6 +16,7 @@ mod login;
 mod oauth_provider;
 mod policy_composition;
 mod ports;
+mod privacy;
 mod provider;
 mod provision;
 mod refresh_token;
@@ -73,9 +74,11 @@ pub use oauth_provider::{
 pub use ports::{
     AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
     AuthorizationProfileRepo, ExternalIdentityRepo, GrantRepo, GroupRepo, InvitationRepo,
-    LoginFlowRepo, OAuthClientRepo, OrgRepo, PlanRepo, RepoError, RepoResult, ResourceModelRepo,
-    RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint, seed_roles,
+    LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo, OrgRepo, PlanRepo, RepoError, RepoResult,
+    ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint,
+    seed_roles,
 };
+pub use privacy::OrganizationPrivacyScope;
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,

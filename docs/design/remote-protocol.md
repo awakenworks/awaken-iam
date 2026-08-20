@@ -156,11 +156,20 @@ same admin credential and version fence as organization and membership writes.
 | `DELETE` | `/v1/admin/invitations/{id}` | revoke pending invitation |
 | `POST` | `/v1/admin/invitations/{id}/resend` | rotated one-time token |
 | `POST` | `/v1/admin/invitations/{id}/accept` | accepted invitation + visible policy version |
+| `DELETE` | `/v1/admin/orgs/{id}` | idempotently erase the IAM-owned organization scope closure |
 
 The clear token is never persisted. Accept requires an IAM account id and a
 verified email assertion obtained from IAM UserInfo by the trusted relying
 party; the PAP compares that routing claim to the invitation and atomically
 materializes every declared RoleBinding.
+
+Organization deletion is the single IAM privacy lifecycle command. The server
+derives the owned scope closure from its existing Workspace→Org and resource
+graph, atomically removes IAM projections in that closure, and advances the
+ordinary policy version exactly once. A retry after success returns the current
+version rather than `404`; consumers therefore use the same guarded admin
+transport in embedded and remote deployments. Global accounts, sessions, and
+append-only audit are outside this Org-scoped command.
 
 ```text
 transport error / timeout (remote)  -> Deny(reason = iam_unavailable)

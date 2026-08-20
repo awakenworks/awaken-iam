@@ -21,8 +21,8 @@ use awaken_iam_contract::{
     AuthorizationProfileDocument, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
     ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, InvitationBinding, InvitationId,
     InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProfileLifecycle, ResourceId, ResourceType, Session, SessionId, Timestamp, WorkspaceId,
-    WorkspaceOrgEdge,
+    ProfileLifecycle, ResourceId, ResourceType, ScopeRef, Session, SessionId, Timestamp,
+    WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
@@ -36,6 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::migration::Dialect;
 use super::{Fence, FenceStore};
+
+mod privacy;
 
 /// A bound parameter value. Every IAM column is text or JSON-as-text, so a
 /// nullable string is the only shape a backend has to bind.

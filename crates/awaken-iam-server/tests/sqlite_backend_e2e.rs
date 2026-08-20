@@ -12,10 +12,14 @@
 use std::collections::BTreeMap;
 
 use awaken_iam_contract::{
-    AcceptInvitation, AccountId, CreateInvitation, InvitationBinding, InvitationStatus, OrgId,
-    PrincipalRef, ScopeRef, Timestamp,
+    AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateInvitation,
+    InvitationBinding, InvitationStatus, OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef,
+    Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
-use awaken_iam_core::{ActionPattern, Organization, RepoError, RoleBinding, RoleDef, RoleId};
+use awaken_iam_core::{
+    ActionPattern, ApiTokenRepo, Grant, GrantId, GrantRepo, GrantSubject, Organization, RepoError,
+    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
+};
 use awaken_iam_server::{
     Dialect, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
     sqlite_migrated_store,
@@ -230,6 +234,116 @@ fn sqlite_invitation_acceptance_is_atomic_and_restart_visible() {
             .unwrap()
             .len(),
         1,
+    );
+}
+
+#[test]
+fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() {
+    // Cause/effect decision table:
+    // C1 existing Org with Workspace, descendant Resource, grant, membership
+    // and Workspace token -> E1 one DELETE command removes the
+    // complete IAM-owned closure in one SQL write transaction and advances the
+    // PAP fence once; C2 foreign Org state -> E2 retained; C3 exact retry -> E3
+    // success with no write and no additional fence advance.
+    let backend = SqliteBackend::open_in_memory().expect("open");
+    let store = sqlite_migrated_store(backend, "iam").expect("migrate");
+    let now = Timestamp("2026-08-02T00:00:00Z".into());
+    let principal = PrincipalRef::Account {
+        account_id: AccountId("owner".into()),
+    };
+    let mut pap = PolicyAdminApi::new(store.clone());
+    for org in ["org-a", "org-b"] {
+        pap.create_org(
+            Organization {
+                id: OrgId(org.into()),
+                display_name: None,
+                owner: principal.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            now.clone(),
+        )
+        .unwrap();
+    }
+    for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
+        pap.assign_workspace_org(
+            WorkspaceOrgEdge {
+                workspace_id: WorkspaceId(workspace.into()),
+                org_id: OrgId(org.into()),
+            },
+            now.clone(),
+        )
+        .unwrap();
+    }
+    let resource = ResourceEdge {
+        resource_type: ResourceType("issue".into()),
+        resource_id: ResourceId("owned".into()),
+        parent: ScopeRef::Workspace {
+            workspace_id: WorkspaceId("ws-a".into()),
+        },
+    };
+    ResourceModelRepo::put_edge(&store, resource.clone()).unwrap();
+    GrantRepo::put(
+        &store,
+        Grant {
+            id: GrantId("grant-a".into()),
+            subject: GrantSubject::Principal(principal.clone()),
+            action_pattern: ActionPattern("issue.read".into()),
+            scope: ScopeRef::Resource {
+                resource_type: resource.resource_type,
+                resource_id: resource.resource_id,
+            },
+            effect: awaken_iam_core::Effect::Allow,
+        },
+    )
+    .unwrap();
+    RoleBindingRepo::add(
+        &store,
+        RoleBinding {
+            principal: principal.clone(),
+            role: RoleId("member".into()),
+            scope: ScopeRef::Workspace {
+                workspace_id: WorkspaceId("ws-a".into()),
+            },
+        },
+    )
+    .unwrap();
+    for (id, workspace) in [("token-a", "ws-a"), ("token-b", "ws-b")] {
+        ApiTokenRepo::create(
+            &store,
+            ApiToken {
+                id: ApiTokenId(id.into()),
+                prefix: ApiTokenPrefix(format!("prefix-{id}")),
+                principal: principal.clone(),
+                secret_hash: "hash".into(),
+                workspace: WorkspaceId(workspace.into()),
+                created_at: now.clone(),
+                expires_at: None,
+                revoked_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let deleted_version = pap.delete_org(&OrgId("org-a".into()), now.clone()).unwrap();
+    assert_eq!(
+        pap.delete_org(&OrgId("org-a".into()), now).unwrap(),
+        deleted_version
+    );
+    assert!(pap.get_org(&OrgId("org-a".into())).unwrap().is_none());
+    assert!(pap.get_org(&OrgId("org-b".into())).unwrap().is_some());
+    assert!(GrantRepo::list(&store).unwrap().is_empty());
+    assert!(RoleBindingRepo::list(&store).unwrap().is_empty());
+    assert!(ResourceModelRepo::list_edges(&store).unwrap().is_empty());
+    assert!(
+        ApiTokenRepo::get(&store, &ApiTokenId("token-a".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ApiTokenRepo::get(&store, &ApiTokenId("token-b".into()))
+            .unwrap()
+            .is_some()
     );
 }
 

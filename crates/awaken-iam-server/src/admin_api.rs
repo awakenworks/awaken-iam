@@ -38,8 +38,8 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
-    InvitationRepo, OrgRepo, Organization, PolicySet, RepoError, ResourceEdge, ResourceModelRepo,
-    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
+    InvitationRepo, OrgPrivacyRepo, OrgRepo, Organization, PolicySet, RepoError, ResourceEdge,
+    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
     normalize_invitation_email,
 };
 use base64::Engine;
@@ -55,6 +55,7 @@ use crate::FenceStore;
 /// operation in a second forwarding interface.
 pub trait PolicyStore:
     OrgRepo
+    + OrgPrivacyRepo
     + GroupRepo
     + RoleRepo
     + GrantRepo
@@ -68,6 +69,7 @@ pub trait PolicyStore:
 
 impl<T> PolicyStore for T where
     T: OrgRepo
+        + OrgPrivacyRepo
         + GroupRepo
         + RoleRepo
         + GrantRepo
@@ -432,10 +434,14 @@ where
         self.commit(DomainEvent::OrganizationUpdated(id), at)
     }
 
-    /// Delete an organization, failing closed when it is absent.
+    /// Idempotently erase an organization and every IAM-owned projection in
+    /// its authoritative scope closure.
     pub fn delete_org(&mut self, id: &OrgId, at: Timestamp) -> AdminResult<u64> {
-        OrgRepo::remove(&self.store, id)?;
-        self.commit(DomainEvent::OrganizationDeleted(id.clone()), at)
+        if self.store.erase_org_privacy(id)? {
+            self.commit(DomainEvent::OrganizationDeleted(id.clone()), at)
+        } else {
+            self.store_version()
+        }
     }
 
     /// Resolve an organization by id.
@@ -1393,7 +1399,12 @@ mod tests {
     }
 
     #[test]
-    fn create_is_conflict_and_update_delete_require_existence() {
+    fn create_update_require_existence_and_privacy_delete_is_idempotent() {
+        // Cause/effect decision table:
+        // R1 duplicate create -> conflict/no version change; R2 missing update
+        // -> not found/no version change; R3 missing privacy delete -> exact
+        // idempotent success/no version change; R4 existing Org -> delete and
+        // one version advance; R5 exact retry -> success at the same version.
         let mut pap = pap();
         pap.create_org(org("acme"), at()).unwrap();
         assert_eq!(
@@ -1407,15 +1418,17 @@ mod tests {
             pap.update_org(org("ghost"), at()),
             Err(AdminError::NotFound(_))
         ));
-        assert!(matches!(
-            pap.delete_org(&OrgId("ghost".into()), at()),
-            Err(AdminError::NotFound(_))
-        ));
+        assert_eq!(pap.delete_org(&OrgId("ghost".into()), at()).unwrap(), 2);
         assert_eq!(pap.version(), 2);
 
         pap.update_org(org("acme"), at()).unwrap();
-        pap.delete_org(&OrgId("acme".into()), at()).unwrap();
+        let deleted = pap.delete_org(&OrgId("acme".into()), at()).unwrap();
         assert!(pap.list_orgs().unwrap().is_empty());
+        assert_eq!(pap.version(), 4);
+        assert_eq!(
+            pap.delete_org(&OrgId("acme".into()), at()).unwrap(),
+            deleted
+        );
         assert_eq!(pap.version(), 4);
     }
 

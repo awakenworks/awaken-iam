@@ -55,6 +55,20 @@ cluster; references across aggregates are by id.
 | **Subscription** | → billing scope, plan, status | one active plan per billing scope |
 | **ResourceModel** | a product's resource types, actions, scope edges | registered, never inferred; the genericity seam |
 
+Organization privacy lifecycle is an application command over these existing
+aggregates, not another aggregate or tenant registry. `OrganizationPrivacyScope`
+derives the exact transitive closure from the authoritative Workspace→Org and
+resource-parent edges. `OrgPrivacyRepo::erase_org_privacy` then removes the Org,
+its groups and invitations, owned-scope grants and memberships, resource edges,
+and Workspace API tokens in one storage transaction. Exact retries succeed
+without a second version advance.
+
+Accounts, external identities, sessions, global roles/profiles, namespaces, and
+append-only audit remain global or independently governed records and are not
+silently deleted with one organization. A caller that also needs an account
+privacy lifecycle must invoke that separate, account-owned process after
+checking cross-organization membership and legal-retention policy.
+
 `Membership` is sugar that expands into grants, kept explicit so "who is a member
 of X" is a cheap query. `ResourceModel` is how a product teaches IAM its scope
 hierarchy and action catalog **as data**, so IAM authorizes deep product scopes
@@ -103,7 +117,7 @@ awaken-iam            facade
 Ports the core declares (the server provides adapters): `AccountRepo`,
 `SessionRepo`, `LoginFlowRepo`, `ApiTokenRepo`, `OrgRepo`, `GroupRepo`,
 `RoleRepo`, `GrantRepo`, `MembershipRepo`, `NamespaceRepo`, `PlanRepo`,
-`SubscriptionRepo`, `ResourceModelRepo`, `AuditSink`. An in-memory adapter backs
+`SubscriptionRepo`, `ResourceModelRepo`, `OrgPrivacyRepo`, `AuditSink`. An in-memory adapter backs
 tests and local mode; a database adapter backs the service. The database adapter
 owns IAM's schema as scope-partitioned `awaken-scoped-migration` bundles — the
 discipline that lets IAM deploy embedded or standalone. See

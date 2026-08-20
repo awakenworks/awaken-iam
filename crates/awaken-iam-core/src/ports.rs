@@ -183,6 +183,16 @@ pub trait OrgRepo: Send + Sync {
     fn remove(&self, id: &OrgId) -> RepoResult<()>;
 }
 
+/// One idempotent IAM-owned organization privacy lifecycle command.
+///
+/// Implementations remove the organization plus every IAM authorization and
+/// credential projection reachable from its authoritative scope graph.  The
+/// boolean reports whether this invocation changed any row; an exact retry is
+/// a successful `false`, never a not-found error.
+pub trait OrgPrivacyRepo: Send + Sync {
+    fn erase_org_privacy(&self, id: &OrgId) -> RepoResult<bool>;
+}
+
 /// Persistence for [`Group`] aggregates.
 pub trait GroupRepo: Send + Sync {
     /// Resolve a group by id, returning `None` when absent.

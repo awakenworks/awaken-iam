@@ -17,11 +17,11 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{
     AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, ExternalIdentityRepo, Grant, GrantId, GrantRepo, Group, GroupId,
-    GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization,
-    Plan, PlanId, PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge,
-    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
-    StoredAuthorizationCode,
+    AuthorizationProfileRepo, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group,
+    GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo,
+    OrgRepo, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepo, RegisteredClient,
+    RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef,
+    RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -463,6 +463,75 @@ impl OrgRepo for InMemoryStore {
             .remove(&id.0)
             .map(|_| ())
             .ok_or_else(|| RepoError::NotFound(format!("organization {} not found", id.0)))
+    }
+}
+
+impl OrgPrivacyRepo for InMemoryStore {
+    fn erase_org_privacy(&self, id: &OrgId) -> RepoResult<bool> {
+        let mut authz = self.authz.lock().unwrap_or_else(|error| error.into_inner());
+        let workspace_edges = authz.workspace_orgs.values().cloned().collect::<Vec<_>>();
+        let resource_edges = authz.resource_edges.values().cloned().collect::<Vec<_>>();
+        let privacy = OrganizationPrivacyScope::resolve(id, &workspace_edges, &resource_edges);
+        let group_ids = authz
+            .groups
+            .values()
+            .filter(|group| &group.org == id)
+            .map(|group| group.id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let authz_before = authz.orgs.len()
+            + authz.groups.len()
+            + authz.grants.len()
+            + authz.role_bindings.len()
+            + authz.invitations.len()
+            + authz.resource_edges.len()
+            + authz.workspace_orgs.len();
+
+        authz.orgs.remove(&id.0);
+        authz.groups.retain(|_, group| &group.org != id);
+        authz
+            .invitations
+            .retain(|_, invitation| &invitation.org_id != id);
+        authz.workspace_orgs.retain(|_, edge| &edge.org_id != id);
+        authz
+            .role_bindings
+            .retain(|_, binding| !privacy.contains(&binding.scope));
+        authz.grants.retain(|_, grant| {
+            !privacy.contains(&grant.scope)
+                && !matches!(
+                    &grant.subject,
+                    GrantSubject::Group(group) if group_ids.contains(&group.0)
+                )
+        });
+        authz.resource_edges.retain(|_, edge| {
+            !privacy.contains(&edge.parent)
+                && !privacy.contains(&ScopeRef::Resource {
+                    resource_type: edge.resource_type.clone(),
+                    resource_id: edge.resource_id.clone(),
+                })
+        });
+        let authz_after = authz.orgs.len()
+            + authz.groups.len()
+            + authz.grants.len()
+            + authz.role_bindings.len()
+            + authz.invitations.len()
+            + authz.resource_edges.len()
+            + authz.workspace_orgs.len();
+        drop(authz);
+
+        let mut identity = self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let token_count = identity.api_tokens.len();
+        identity
+            .api_tokens
+            .retain(|_, token| !privacy.contains_workspace(&token.workspace.0));
+        let retained_token_ids = identity.api_tokens.keys().cloned().collect::<BTreeSet<_>>();
+        identity
+            .api_tokens_by_prefix
+            .retain(|_, token_id| retained_token_ids.contains(token_id));
+
+        Ok(authz_before != authz_after || token_count != identity.api_tokens.len())
     }
 }
 
@@ -1545,6 +1614,131 @@ mod tests {
         assert_eq!(
             PlanRepo::get(&store, &PlanId("absent".into())).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn organization_privacy_erases_owned_closure_and_retains_foreign_state() {
+        // Cause/effect decision table:
+        // C1 row is the Org, its group/invitation, owned Workspace, Project or
+        // recursive Resource scope -> E1 remove; C2 API token is bound to an
+        // owned Workspace -> E2 remove; C3 row belongs to a foreign Org -> E3
+        // retain; C4 exact retry after E1/E2 -> E4 false with no new effect.
+        let store = InMemoryStore::new();
+        let owner = PrincipalRef::Account {
+            account_id: AccountId("owner".into()),
+        };
+        for id in ["org-a", "org-b"] {
+            OrgRepo::upsert(
+                &store,
+                Organization {
+                    id: OrgId(id.into()),
+                    display_name: None,
+                    owner: owner.clone(),
+                    created_at: ts("2026-06-19T00:00:00Z"),
+                    updated_at: ts("2026-06-19T00:00:00Z"),
+                },
+            )
+            .unwrap();
+        }
+        GroupRepo::upsert(
+            &store,
+            Group {
+                id: GroupId("group-a".into()),
+                org: OrgId("org-a".into()),
+                display_name: None,
+                members: vec![owner.clone()],
+                created_at: ts("2026-06-19T00:00:00Z"),
+                updated_at: ts("2026-06-19T00:00:00Z"),
+            },
+        )
+        .unwrap();
+        for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
+            ResourceModelRepo::put_workspace_org(
+                &store,
+                WorkspaceOrgEdge {
+                    workspace_id: WorkspaceId(workspace.into()),
+                    org_id: OrgId(org.into()),
+                },
+            )
+            .unwrap();
+        }
+        let owned_resource = ResourceEdge {
+            resource_type: awaken_iam_contract::ResourceType("issue".into()),
+            resource_id: awaken_iam_contract::ResourceId("owned".into()),
+            parent: ScopeRef::Project {
+                workspace_id: WorkspaceId("ws-a".into()),
+                project_id: awaken_iam_contract::ProjectId("project-a".into()),
+            },
+        };
+        ResourceModelRepo::put_edge(&store, owned_resource.clone()).unwrap();
+        GrantRepo::put(
+            &store,
+            Grant {
+                id: GrantId("owned-grant".into()),
+                subject: GrantSubject::Group(GroupId("group-a".into())),
+                action_pattern: ActionPattern("issue.read".into()),
+                scope: ScopeRef::Resource {
+                    resource_type: owned_resource.resource_type.clone(),
+                    resource_id: owned_resource.resource_id.clone(),
+                },
+                effect: Effect::Allow,
+            },
+        )
+        .unwrap();
+        RoleBindingRepo::add(
+            &store,
+            RoleBinding {
+                principal: owner.clone(),
+                role: RoleId("member".into()),
+                scope: ScopeRef::Workspace {
+                    workspace_id: WorkspaceId("ws-a".into()),
+                },
+            },
+        )
+        .unwrap();
+        for (id, workspace) in [("token-a", "ws-a"), ("token-b", "ws-b")] {
+            ApiTokenRepo::create(
+                &store,
+                ApiToken {
+                    id: ApiTokenId(id.into()),
+                    prefix: ApiTokenPrefix(format!("prefix-{id}")),
+                    principal: owner.clone(),
+                    secret_hash: "hash".into(),
+                    workspace: WorkspaceId(workspace.into()),
+                    created_at: ts("2026-06-19T00:00:00Z"),
+                    expires_at: None,
+                    revoked_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
+        assert!(!store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
+        assert!(
+            OrgRepo::get(&store, &OrgId("org-a".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            OrgRepo::get(&store, &OrgId("org-b".into()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(GroupRepo::list(&store).unwrap().is_empty());
+        assert!(GrantRepo::list(&store).unwrap().is_empty());
+        assert!(RoleBindingRepo::list(&store).unwrap().is_empty());
+        assert!(ResourceModelRepo::list_edges(&store).unwrap().is_empty());
+        assert!(
+            ApiTokenRepo::get(&store, &ApiTokenId("token-a".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ApiTokenRepo::get(&store, &ApiTokenId("token-b".into()))
+                .unwrap()
+                .is_some()
         );
     }
 
