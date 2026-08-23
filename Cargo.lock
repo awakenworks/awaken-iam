@@ -49,10 +49,14 @@ version = "0.1.2-dev"
 dependencies = [
  "awaken-iam-contract",
  "awaken-iam-core",
+ "base64",
+ "getrandom 0.3.4",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -147,6 +151,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "url",
 ]
 
 [[package]]

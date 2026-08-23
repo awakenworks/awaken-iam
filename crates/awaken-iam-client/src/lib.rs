@@ -2,13 +2,19 @@
 
 #[cfg(feature = "credential-cache")]
 mod cache;
+#[cfg(feature = "desktop-oauth")]
+mod desktop_oauth;
 #[cfg(feature = "http")]
 mod http;
 mod remote;
 mod snapshot;
 
 #[cfg(feature = "credential-cache")]
-pub use cache::{CacheError, CachedCredential, Credential, CredentialCache, RedactedString};
+pub use cache::{
+    CacheError, CachedCredential, CachedOAuthGrant, Credential, CredentialCache, RedactedString,
+};
+#[cfg(feature = "desktop-oauth")]
+pub use desktop_oauth::{DesktopOAuthClient, DesktopOAuthConfig, DesktopOAuthError};
 #[cfg(feature = "http")]
 pub use http::{DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, HttpAuthzTransport, HttpTransportConfig};
 mod outbox;

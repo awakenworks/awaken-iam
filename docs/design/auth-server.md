@@ -91,6 +91,23 @@ The product never calls a provider-specific login URL as its normal entrypoint.
 That keeps GitHub, Google, enterprise SSO, account chooser, and future factors
 inside IAM's bounded context.
 
+Native desktop products use the same discovery and authorization endpoint
+through `awaken-iam-client`'s loopback PKCE adapter. When the browser has no IAM
+session, the authorization endpoint renders IAM's configured provider choices;
+the chosen provider login receives the original, server-reconstructed authorize
+request as its safe relative `return_to`. The provider callback establishes the
+canonical IAM session and resumes that same authorization request. Products do
+not build provider pickers, retain upstream credentials, or call a
+provider-specific login route directly.
+
+The client adapter stores the short-lived access token and rotating refresh
+token through the existing `CredentialCache` port. The current filesystem
+adapter is owner-only (`0600`), writes atomically, and redacts token material;
+it is the compatibility implementation until an operating-system keychain
+adapter is introduced behind that port. Expired access credentials are
+refreshed before product startup, and invalid refresh credentials return to the
+same interactive authorization flow rather than creating another login state.
+
 Hosted browser products may proxy `/v1/oauth/*` to this same OP and use
 `/v1/oauth/browser/start` plus `/v1/oauth/browser/callback`. These two pages are
 the canonical browser PKCE adapter: the start page creates state/verifier values

@@ -216,6 +216,7 @@ async fn authorize(
     if query.response_type != "code" {
         return oauth_error(StatusCode::BAD_REQUEST, "unsupported_response_type");
     }
+    let return_to = authorize_return_to(&query);
     let now = crate::clock::unix_seconds();
     let cookie_header = headers
         .get(header::COOKIE)
@@ -236,14 +237,86 @@ async fn authorize(
         now: crate::clock::timestamp(now),
         code_expires_at: crate::clock::timestamp(now + AUTHORIZATION_CODE_TTL_SECS),
     };
-    match state.auth.lock().await.authorize(request) {
+    let authorization = state.auth.lock().await.authorize(request);
+    match authorization {
         Ok(outcome) => Redirect::to(&outcome.redirect_to).into_response(),
         Err(AuthApiError::Unauthenticated | AuthApiError::Login(_)) => {
-            oauth_error(StatusCode::UNAUTHORIZED, "login_required")
+            login_required(&state, &return_to).await
         }
         Err(AuthApiError::OAuthProvider(error)) => oauth_provider_error(error),
         Err(_) => oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
     }
+}
+
+fn authorize_return_to(query: &AuthorizeQuery) -> String {
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    encoded
+        .append_pair("client_id", &query.client_id)
+        .append_pair("redirect_uri", &query.redirect_uri)
+        .append_pair("response_type", &query.response_type)
+        .append_pair("scope", &query.scope);
+    for (key, value) in [
+        ("state", query.state.as_deref()),
+        ("code_challenge", query.code_challenge.as_deref()),
+        (
+            "code_challenge_method",
+            query.code_challenge_method.as_deref(),
+        ),
+        ("nonce", query.nonce.as_deref()),
+    ] {
+        if let Some(value) = value {
+            encoded.append_pair(key, value);
+        }
+    }
+    format!("/v1/oauth/authorize?{}", encoded.finish())
+}
+
+async fn login_required(state: &OpHttpState, return_to: &str) -> Response {
+    let providers = state.auth.lock().await.list_providers();
+    if providers.is_empty() {
+        return oauth_error(StatusCode::UNAUTHORIZED, "login_required");
+    }
+
+    let login_url = |provider_key: &str| {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("return_to", return_to);
+        let mut path = url::Url::parse("https://iam.invalid/v1/auth/login/")
+            .expect("static login base URL is valid");
+        path.path_segments_mut()
+            .expect("static login base URL can hold path segments")
+            .pop_if_empty()
+            .push(provider_key);
+        format!("{}?{}", path.path(), query.finish())
+    };
+    if providers.len() == 1 {
+        return Redirect::to(&login_url(&providers[0].provider_key.0)).into_response();
+    }
+
+    let choices = providers
+        .into_iter()
+        .map(|provider| {
+            format!(
+                "<li><a href=\"{}\">Continue with {}</a></li>",
+                html_escape(&login_url(&provider.provider_key.0)),
+                html_escape(&provider.display_name),
+            )
+        })
+        .collect::<String>();
+    Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Sign in to Awaken</title>\
+         <main><h1>Sign in to Awaken</h1><p>Choose your account provider.</p>\
+         <ul>{choices}</ul></main>"
+    ))
+    .into_response()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) -> Response {
@@ -433,7 +506,7 @@ mod tests {
         }
     }
 
-    async fn logged_in_router() -> (Router, String) {
+    fn configured_auth(providers: &[(&str, &str)]) -> AuthApi {
         let issuer = "https://accounts.example";
         let mut auth = AuthApi::new().with_issuer(issuer);
         auth.register_oauth_client(RegisteredClient::public(
@@ -442,24 +515,32 @@ mod tests {
             ["openid", "email", "profile"],
         ))
         .unwrap();
-        auth.register_provider(crate::ProviderRegistration {
-            config: IdentityProviderConfig {
-                id: IdentityProviderConfigId("fake-config".into()),
-                provider_key: IdentityProviderKey("fake".into()),
-                kind: IdentityProviderKind::Fake,
-                display_name: "Fake".into(),
-                issuer_url: Some("https://idp.example".into()),
-                authorization_endpoint: Some("https://idp.example/authorize".into()),
-                token_endpoint: Some("https://idp.example/token".into()),
-                client_id: Some("iam".into()),
-                enabled: true,
-            },
-            adapter: Box::new(FakeAdapter),
-            redirect_uri: format!("{issuer}/v1/auth/callback/fake"),
-            scopes: vec!["openid".into(), "email".into()],
-            include_nonce: true,
-            include_pkce: true,
-        });
+        for (provider_key, display_name) in providers {
+            auth.register_provider(crate::ProviderRegistration {
+                config: IdentityProviderConfig {
+                    id: IdentityProviderConfigId(format!("{provider_key}-config")),
+                    provider_key: IdentityProviderKey((*provider_key).into()),
+                    kind: IdentityProviderKind::Fake,
+                    display_name: (*display_name).into(),
+                    issuer_url: Some("https://idp.example".into()),
+                    authorization_endpoint: Some("https://idp.example/authorize".into()),
+                    token_endpoint: Some("https://idp.example/token".into()),
+                    client_id: Some("iam".into()),
+                    enabled: true,
+                },
+                adapter: Box::new(FakeAdapter),
+                redirect_uri: format!("{issuer}/v1/auth/callback/{provider_key}"),
+                scopes: vec!["openid".into(), "email".into()],
+                include_nonce: true,
+                include_pkce: true,
+            });
+        }
+        auth
+    }
+
+    async fn logged_in_router() -> (Router, String) {
+        let issuer = "https://accounts.example";
+        let mut auth = configured_auth(&[("fake", "Fake")]);
         let now = crate::clock::unix_seconds();
         let started = auth
             .start_login(crate::StartLogin {
@@ -658,6 +739,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Logged-out authorization cause/effect decision table:
+    ///
+    /// | live IAM session | enabled providers | effect |
+    /// | yes | any | issue the product code through the existing OP path |
+    /// | no | one | redirect to that IAM-owned provider login and preserve every authorize field |
+    /// | no | multiple | render escaped IAM-owned provider choices |
+    /// | no | none | return `login_required`; no unusable link or product-owned picker |
+    ///
+    /// The reconstructed `return_to` is always a relative canonical OP path;
+    /// caller input cannot select the post-provider host.
+    #[tokio::test]
+    async fn logged_out_desktop_authorize_resumes_through_iam_provider_login() {
+        let (app, _) = logged_in_router().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/oauth/authorize?client_id=desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A9234%2Fcallback&response_type=code&scope=openid%20email&state=state-1&code_challenge=challenge-1&code_challenge_method=S256")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        assert!(location.starts_with("/v1/auth/login/fake?return_to="));
+        let parsed = url::Url::parse(&format!("https://accounts.example{location}")).unwrap();
+        let return_to = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "return_to").then(|| value.into_owned()))
+            .unwrap();
+        assert!(return_to.starts_with("/v1/oauth/authorize?"));
+        assert!(return_to.contains("client_id=desktop"));
+        assert!(return_to.contains("state=state-1"));
+        assert!(return_to.contains("code_challenge=challenge-1"));
+        assert!(!return_to.contains("accounts.example"));
+    }
+
+    #[tokio::test]
+    async fn logged_out_authorize_handles_zero_or_multiple_enabled_providers() {
+        let authorize = "/v1/oauth/authorize?client_id=desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A9234%2Fcallback&response_type=code&scope=openid&state=state-1&code_challenge=challenge-1&code_challenge_method=S256";
+        let empty = op_router(
+            Arc::new(Mutex::new(configured_auth(&[]))),
+            "https://accounts.example",
+        )
+        .oneshot(
+            Request::builder()
+                .uri(authorize)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.status(), StatusCode::UNAUTHORIZED);
+
+        let choices = op_router(
+            Arc::new(Mutex::new(configured_auth(&[
+                ("github", "GitHub"),
+                ("google", "Google"),
+            ]))),
+            "https://accounts.example",
+        )
+        .oneshot(
+            Request::builder()
+                .uri(authorize)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(choices.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(choices.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Continue with GitHub"));
+        assert!(html.contains("Continue with Google"));
+        assert!(html.contains("/v1/auth/login/github?return_to="));
     }
 }
 /// OAuth storage failure cause/effect rule: C1=the authoritative client or

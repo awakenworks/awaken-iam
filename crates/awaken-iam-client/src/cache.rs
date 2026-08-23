@@ -104,6 +104,22 @@ pub struct CachedCredential {
     /// The cache returns `None` from [`CredentialCache::load`] once the clock
     /// passes this value.
     pub expires_at: u64,
+    /// OAuth refresh state when this entry came from a public-client grant.
+    /// Absent for long-lived API tokens and legacy cache entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<CachedOAuthGrant>,
+}
+
+/// Refresh state for an OAuth public client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedOAuthGrant {
+    /// Rotating refresh token. Never logged or displayed.
+    pub refresh_token: RedactedString,
+    /// Registered public-client id that owns the refresh-token chain.
+    pub client_id: String,
+    /// Effective scopes returned by the token endpoint.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 impl CachedCredential {
@@ -139,7 +155,9 @@ struct CacheFile {
 ///
 /// ```text
 /// // Login flow
-/// let cred = CachedCredential { token: RedactedString::new(token), principal, expires_at };
+/// let cred = CachedCredential {
+///     token: RedactedString::new(token), principal, expires_at, oauth: None
+/// };
 /// CredentialCache::open().store(&base_url, cred)?;
 ///
 /// // Subsequent invocations
@@ -186,9 +204,16 @@ impl CredentialCache {
     /// entry has expired. Stale entries remain on disk until replaced by
     /// [`store`](Self::store) or removed by [`clear`](Self::clear).
     pub fn load(&self, base_url: &str) -> Option<CachedCredential> {
-        let file = self.read_file().ok()?;
-        let entry = file.entries.get(base_url)?;
+        let entry = self.load_entry(base_url)?;
         entry.is_valid().then(|| entry.clone())
+    }
+
+    /// Load an entry regardless of access-token expiry.
+    ///
+    /// OAuth clients use this to recover the refresh token from an expired
+    /// access credential. Ordinary request paths should use [`Self::load`].
+    pub fn load_entry(&self, base_url: &str) -> Option<CachedCredential> {
+        self.read_file().ok()?.entries.get(base_url).cloned()
     }
 
     /// Persist a credential for `base_url`, replacing any existing entry.
@@ -233,23 +258,45 @@ impl CredentialCache {
 
 /// Write `contents` to `path` with mode 0600 on Unix.
 fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<(), CacheError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = path.with_file_name(format!(".{file_name}.{}.{nonce}.tmp", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)
+            .open(&temporary)
             .map_err(|e| CacheError::Io(e.to_string()))?;
         file.write_all(contents)
-            .map_err(|e| CacheError::Io(e.to_string()))
+            .and_then(|()| file.sync_all())
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        std::fs::rename(&temporary, path).map_err(|e| CacheError::Io(e.to_string()))
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents).map_err(|e| CacheError::Io(e.to_string()))
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| CacheError::Io(e.to_string()))?;
+        }
+        std::fs::rename(&temporary, path).map_err(|e| CacheError::Io(e.to_string()))
     }
 }
 
@@ -301,6 +348,7 @@ mod tests {
             token: RedactedString::new(token),
             principal: make_principal(),
             expires_at,
+            oauth: None,
         }
     }
 
@@ -350,6 +398,28 @@ mod tests {
         let loaded = cache.load(url).expect("entry should be present");
         assert_eq!(loaded.token.expose(), entry.token.expose());
         assert_eq!(loaded.expires_at, entry.expires_at);
+    }
+
+    /// Refresh-state cause/effect rule: an expired access token is unavailable
+    /// to request callers but remains readable through the explicit refresh
+    /// path; legacy and API-token entries deserialize with no OAuth state.
+    #[test]
+    fn expired_oauth_entry_remains_available_only_for_refresh() {
+        let cache = CredentialCache::at(temp_cache_path());
+        let url = "https://iam.example.com";
+        let mut entry = make_cred("expired-access", 0);
+        entry.oauth = Some(CachedOAuthGrant {
+            refresh_token: RedactedString::new("rotating-refresh"),
+            client_id: "awaken-desktop".into(),
+            scopes: vec!["openid".into()],
+        });
+        cache.store(url, entry).unwrap();
+
+        assert!(cache.load(url).is_none());
+        let refreshable = cache.load_entry(url).unwrap();
+        let oauth = refreshable.oauth.unwrap();
+        assert_eq!(oauth.refresh_token.expose(), "rotating-refresh");
+        assert_eq!(oauth.client_id, "awaken-desktop");
     }
 
     #[test]

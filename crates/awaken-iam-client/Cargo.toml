@@ -16,6 +16,16 @@ http = ["dep:reqwest", "dep:serde"]
 # Shared on-disk credential cache: login-once, reuse-until-expiry.
 # Persists at ${XDG_CONFIG_HOME:-~/.config}/awaken/credentials.json (mode 0600).
 credential-cache = ["dep:serde", "dep:serde_json"]
+# Native public-client Authorization Code + PKCE over a loopback callback.
+# Reuses the HTTP transport dependencies and the canonical credential cache.
+desktop-oauth = [
+    "http",
+    "credential-cache",
+    "dep:base64",
+    "dep:getrandom",
+    "dep:sha2",
+    "dep:url",
+]
 
 [dependencies]
 awaken-iam-contract.workspace = true
@@ -28,6 +38,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 ], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.3", optional = true }
+sha2 = { version = "0.10", optional = true }
+url = { version = "2", optional = true }
 
 [lints]
 workspace = true
