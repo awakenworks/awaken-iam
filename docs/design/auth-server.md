@@ -105,8 +105,14 @@ token through the existing `CredentialCache` port. The current filesystem
 adapter is owner-only (`0600`), writes atomically, and redacts token material;
 it is the compatibility implementation until an operating-system keychain
 adapter is introduced behind that port. Expired access credentials are
-refreshed before product startup, and invalid refresh credentials return to the
-same interactive authorization flow rather than creating another login state.
+refreshed through the same adapter before startup or before an authenticated
+product request. The adapter exposes a non-interactive cache/refresh operation
+for request paths: a live credential is returned, a matching rotating grant is
+refreshed, and missing or incompatible state reports that interaction is
+required. Product UI coordination may then start the existing interactive
+operation and display its authorization URL; it does not implement OAuth or
+persist a second login state. Invalid refresh credentials return to that same
+interactive authorization flow.
 
 Hosted browser products may proxy `/v1/oauth/*` to this same OP and use
 `/v1/oauth/browser/start` plus `/v1/oauth/browser/callback`. These two pages are

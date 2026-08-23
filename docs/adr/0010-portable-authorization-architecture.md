@@ -433,3 +433,21 @@ verified claims           -> exact PrincipalRef -> one PDP key
 Consumers must bind and authorize the resulting typed principal. They must not
 infer Service identity from a subject prefix or persist a workload as a fake
 Account.
+
+## Amendment — 2026-08-23: desktop reauthentication reuses the canonical grant
+
+Local products may discover that an Awaken Cloud access token expired after
+startup. They must not create a product-owned refresh protocol or a second
+credential cache. `awaken-iam-client` remains the sole desktop OAuth owner and
+provides two operations over the same `CredentialCache` entry:
+
+1. a non-interactive operation returns a live token or refreshes a matching
+   rotating grant; and
+2. the existing loopback PKCE operation is entered only when interaction is
+   required.
+
+The product application may coordinate the latter as a single in-flight UI
+operation and expose secret-free status, but IAM continues to own discovery,
+PKCE, callback validation, token exchange, rotation, and logout persistence.
+Cloud model or tool authorization remains a separate downstream decision; a
+successful login is not itself an entitlement.

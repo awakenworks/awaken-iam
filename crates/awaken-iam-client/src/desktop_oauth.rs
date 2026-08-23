@@ -91,19 +91,33 @@ impl DesktopOAuthClient {
     where
         F: FnOnce(&str) -> Result<(), String>,
     {
-        if let Some(credential) = self.cache.load(&self.issuer) {
+        if let Ok(Some(credential)) = self.cached_credential() {
             return Ok(credential);
         }
-        if let Some(stale) = self.cache.load_entry(&self.issuer)
-            && stale
-                .oauth
-                .as_ref()
-                .is_some_and(|oauth| oauth.client_id == self.config.client_id)
-            && let Ok(refreshed) = self.refresh(&stale)
-        {
-            return Ok(refreshed);
-        }
         self.login(launch)
+    }
+
+    /// Return or refresh the canonical cached credential without starting a
+    /// browser interaction.
+    ///
+    /// `Ok(None)` means the caller must explicitly enter the interactive PKCE
+    /// operation. A refresh transport or protocol failure remains observable so
+    /// request paths can distinguish IAM unavailability from absent login state.
+    pub fn cached_credential(&self) -> Result<Option<CachedCredential>, DesktopOAuthError> {
+        if let Some(credential) = self.cache.load(&self.issuer) {
+            return Ok(Some(credential));
+        }
+        let Some(stale) = self.cache.load_entry(&self.issuer) else {
+            return Ok(None);
+        };
+        if !stale
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.client_id == self.config.client_id)
+        {
+            return Ok(None);
+        }
+        self.refresh(&stale).map(Some)
     }
 
     fn login<F>(&self, launch: F) -> Result<CachedCredential, DesktopOAuthError>
@@ -547,6 +561,66 @@ mod tests {
                 "accepted {issuer} {redirect}"
             );
         }
+    }
+
+    /// Non-interactive credential decision table:
+    ///
+    /// | cached access | OAuth grant owner | effect |
+    /// | live | any | return the live canonical entry |
+    /// | absent | n/a | report interaction required without network/browser |
+    /// | expired | another public client | report interaction required |
+    ///
+    /// Matching expired grants are covered by
+    /// `expired_credential_refreshes_and_rotates_without_browser_login`, which
+    /// proves the remaining rule: refresh and atomically return the replacement.
+    #[test]
+    fn cached_credential_distinguishes_live_and_interaction_required() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "awaken-desktop-oauth-cached-{}-{}.json",
+            std::process::id(),
+            unix_seconds()
+        ));
+        let cache = CredentialCache::at(cache_path.clone());
+        let client = DesktopOAuthClient::new(config(), cache.clone()).unwrap();
+        assert!(client.cached_credential().unwrap().is_none());
+
+        cache
+            .store(
+                "https://accounts.example",
+                CachedCredential {
+                    token: RedactedString::new("live"),
+                    principal: PrincipalRef::Account {
+                        account_id: AccountId("acct-live".into()),
+                    },
+                    expires_at: u64::MAX,
+                    oauth: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            client.cached_credential().unwrap().unwrap().token.expose(),
+            "live"
+        );
+
+        cache
+            .store(
+                "https://accounts.example",
+                CachedCredential {
+                    token: RedactedString::new("expired"),
+                    principal: PrincipalRef::Account {
+                        account_id: AccountId("acct-old".into()),
+                    },
+                    expires_at: 0,
+                    oauth: Some(CachedOAuthGrant {
+                        refresh_token: RedactedString::new("other-refresh"),
+                        client_id: "another-client".into(),
+                        scopes: vec!["openid".into()],
+                    }),
+                },
+            )
+            .unwrap();
+        assert!(client.cached_credential().unwrap().is_none());
+        let _ = std::fs::remove_file(cache_path);
     }
 
     /// Callback decision table:
