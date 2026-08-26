@@ -20,7 +20,7 @@ awaken-iam-client.workspace = true
 # crate's optional `postgres` runner targets async sqlx (the canonical SQLite
 # shell lives in the sibling crate `awaken-scoped-migration-sqlite`, foundation
 # ADR-0005), so the runner is deliberately left off.
-awaken-scoped-migration = { version = "=0.1.0-dev", git = "https://github.com/awakenworks/awaken-foundation", rev = "bc863fd83935b24ce73ca27014f35440321ff906" }
+awaken-scoped-migration = { version = "=0.1.0-dev", git = "https://github.com/awakenworks/awaken-foundation.git", rev = "248ca11e94e6ad8aa39bcf43699c725e2a96da70" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
