@@ -11,20 +11,23 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ScopeRef, Session,
-    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    DirectoryNodeId, ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus,
+    NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpaceBinding,
+    ProductSpaceRef, ProfileLifecycle, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group,
-    GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo,
-    OrgRepo, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepo, RegisteredClient,
-    RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef,
-    RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AuthorizationProfileRepo, DirectoryNode, DirectoryRepo, ExternalIdentityRepo, Grant, GrantId,
+    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
+    OAuthClientRepo, OrgPrivacyRepo, OrgRepo, Organization, OrganizationPrivacyScope, Plan, PlanId,
+    PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo,
+    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
+
+mod directory;
 
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
@@ -57,6 +60,9 @@ struct Authz {
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
+    directory_nodes: BTreeMap<String, DirectoryNode>,
+    product_space_bindings: BTreeMap<String, ProductSpaceBinding>,
+    directory_revision: u64,
 }
 
 #[derive(Default)]
@@ -484,7 +490,9 @@ impl OrgPrivacyRepo for InMemoryStore {
             + authz.role_bindings.len()
             + authz.invitations.len()
             + authz.resource_edges.len()
-            + authz.workspace_orgs.len();
+            + authz.workspace_orgs.len()
+            + authz.directory_nodes.len()
+            + authz.product_space_bindings.len();
 
         authz.orgs.remove(&id.0);
         authz.groups.retain(|_, group| &group.org != id);
@@ -492,6 +500,10 @@ impl OrgPrivacyRepo for InMemoryStore {
             .invitations
             .retain(|_, invitation| &invitation.org_id != id);
         authz.workspace_orgs.retain(|_, edge| &edge.org_id != id);
+        authz
+            .product_space_bindings
+            .retain(|_, binding| &binding.org_id != id);
+        authz.directory_nodes.retain(|_, node| &node.org_id != id);
         authz
             .role_bindings
             .retain(|_, binding| !privacy.contains(&binding.scope));
@@ -515,7 +527,9 @@ impl OrgPrivacyRepo for InMemoryStore {
             + authz.role_bindings.len()
             + authz.invitations.len()
             + authz.resource_edges.len()
-            + authz.workspace_orgs.len();
+            + authz.workspace_orgs.len()
+            + authz.directory_nodes.len()
+            + authz.product_space_bindings.len();
         drop(authz);
 
         let mut identity = self
@@ -1621,9 +1635,10 @@ mod tests {
     fn organization_privacy_erases_owned_closure_and_retains_foreign_state() {
         // Cause/effect decision table:
         // C1 row is the Org, its group/invitation, owned Workspace, Project or
-        // recursive Resource scope -> E1 remove; C2 API token is bound to an
-        // owned Workspace -> E2 remove; C3 row belongs to a foreign Org -> E3
-        // retain; C4 exact retry after E1/E2 -> E4 false with no new effect.
+        // recursive Resource scope or Directory placement -> E1 remove; C2 API
+        // token is bound to an owned Workspace -> E2 remove; C3 row belongs to
+        // a foreign Org -> E3 retain; C4 exact retry after E1/E2 -> E4 false
+        // with no new effect.
         let store = InMemoryStore::new();
         let owner = PrincipalRef::Account {
             account_id: AccountId("owner".into()),
@@ -1638,6 +1653,33 @@ mod tests {
                     created_at: ts("2026-06-19T00:00:00Z"),
                     updated_at: ts("2026-06-19T00:00:00Z"),
                 },
+            )
+            .unwrap();
+        }
+        for suffix in ["a", "b"] {
+            let org_id = OrgId(format!("org-{suffix}"));
+            let node_id = DirectoryNodeId(format!("node-{suffix}"));
+            DirectoryRepo::create_directory_node(
+                &store,
+                DirectoryNode {
+                    id: node_id.clone(),
+                    org_id: org_id.clone(),
+                    parent_id: None,
+                    name: format!("Root {suffix}"),
+                    slug: format!("root-{suffix}"),
+                    description: None,
+                    archived: false,
+                    created_at: ts("2026-06-19T00:00:00Z"),
+                    updated_at: ts("2026-06-19T00:00:00Z"),
+                },
+                Some(ProductSpaceBinding {
+                    product_space: ProductSpaceRef {
+                        product: "agents".into(),
+                        space_id: format!("space-{suffix}"),
+                    },
+                    org_id,
+                    node_id,
+                }),
             )
             .unwrap();
         }
@@ -1725,6 +1767,22 @@ mod tests {
             OrgRepo::get(&store, &OrgId("org-b".into()))
                 .unwrap()
                 .is_some()
+        );
+        assert!(
+            DirectoryRepo::directory_node(&store, &DirectoryNodeId("node-a".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            DirectoryRepo::product_space_binding(
+                &store,
+                &ProductSpaceRef {
+                    product: "agents".into(),
+                    space_id: "space-b".into(),
+                },
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(GroupRepo::list(&store).unwrap().is_empty());
         assert!(GrantRepo::list(&store).unwrap().is_empty());

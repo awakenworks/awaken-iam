@@ -31,7 +31,30 @@ impl<B: SqlConn> OrgPrivacyRepo for SqlStore<B> {
             ),
             &[],
         )?;
-        let mut writes = Vec::new();
+        let mut writes = vec![
+            SqlWrite {
+                // Directory creation/move/archive uses the same row as its
+                // command mutex. Privacy deletion must serialize with those
+                // commands or a node could outlive its tenant partition.
+                sql: format!(
+                    "UPDATE {} SET revision = revision WHERE id = 1",
+                    self.table("directory_fence")
+                ),
+                params: Vec::new(),
+            },
+            SqlWrite {
+                // Advance the independent Directory fence only when this Org
+                // actually owns placement state; exact privacy retries remain
+                // revision-idempotent.
+                sql: format!(
+                    "UPDATE {} SET revision = revision + 1 \
+                     WHERE id = 1 AND EXISTS (SELECT 1 FROM {} WHERE org_id = ?)",
+                    self.table("directory_fence"),
+                    self.table("directory_nodes")
+                ),
+                params: vec![p(id.0.clone())],
+            },
+        ];
         for row in token_rows {
             let token_id = req(&row, 0, "api token id")?;
             let workspace_id = req(&row, 1, "api token workspace")?;
@@ -85,6 +108,8 @@ impl<B: SqlConn> OrgPrivacyRepo for SqlStore<B> {
             }
         }
         for (table, column) in [
+            ("product_space_bindings", "org_id"),
+            ("directory_nodes", "org_id"),
             ("invitations", "org_id"),
             ("groups", "org_id"),
             ("workspace_org_edges", "org_id"),
@@ -100,6 +125,7 @@ impl<B: SqlConn> OrgPrivacyRepo for SqlStore<B> {
             .backend
             .execute_transaction(&writes)?
             .into_iter()
+            .skip(2)
             .any(|affected| affected != 0))
     }
 }

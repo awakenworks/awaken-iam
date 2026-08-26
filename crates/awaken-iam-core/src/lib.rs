@@ -37,7 +37,9 @@ pub use authorization::{
     GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
 };
 pub use consumer_namespace::{ConsumerNamespaces, action_namespace};
-pub use directory::{Group, GroupId, Organization, RoleDef, RoleInvariant};
+pub use directory::{
+    DirectoryInvariant, DirectoryNode, Group, GroupId, Organization, RoleDef, RoleInvariant,
+};
 pub use entitlement::{
     EntitlementCatalog, EntitlementEngine, EntitlementMode, EntitlementOutcome,
     EntitlementProvider, EntitlementReason, EntitlementResolver, LicenseEntitlements, Plan, PlanId,
@@ -73,10 +75,10 @@ pub use oauth_provider::{
 };
 pub use ports::{
     AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, ExternalIdentityRepo, GrantRepo, GroupRepo, InvitationRepo,
-    LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo, OrgRepo, PlanRepo, RepoError, RepoResult,
-    ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo, external_identity_id_hint,
-    seed_roles,
+    AuthorizationProfileRepo, DirectoryRepo, ExternalIdentityRepo, GrantRepo, GroupRepo,
+    InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo, OrgRepo, PlanRepo, RepoError,
+    RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo,
+    external_identity_id_hint, seed_roles,
 };
 pub use privacy::OrganizationPrivacyScope;
 pub use provider::{

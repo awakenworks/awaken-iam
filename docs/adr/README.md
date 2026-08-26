@@ -14,3 +14,4 @@
 | [0009](0009-abac-gap-assessment.md) | ABAC gap assessment for consumer authorization | Accepted |
 | [0010](0010-portable-authorization-architecture.md) | Portable authorization control plane and resource-service integration | Proposed |
 | [0011](0011-isolate-profile-action-namespaces.md) | Isolate authorization profile action namespaces | Proposed |
+| [0013](0013-directory-placement-independent-product-spaces.md) | Directory placement is independent from product-space identity | Proposed |

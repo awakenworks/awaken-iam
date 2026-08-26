@@ -15,15 +15,15 @@
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId, OAuthLoginState,
-    OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, Session, SessionId, Timestamp,
-    WorkspaceId, WorkspaceOrgEdge,
+    DirectoryNodeId, ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpaceBinding, ProductSpaceRef,
+    ProfileLifecycle, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::oauth_provider::StoredAuthorizationCode;
 use crate::{
-    Grant, GrantId, Group, GroupId, Invitation, Organization, Plan, PlanId, RegisteredClient,
-    ResourceEdge, RoleBinding, RoleDef, RoleId,
+    DirectoryNode, Grant, GrantId, Group, GroupId, Invitation, Organization, Plan, PlanId,
+    RegisteredClient, ResourceEdge, RoleBinding, RoleDef, RoleId,
 };
 
 /// Error surface shared by every repository port.
@@ -181,6 +181,56 @@ pub trait OrgRepo: Send + Sync {
     fn list(&self) -> RepoResult<Vec<Organization>>;
     /// Remove an organization, failing closed when it is absent.
     fn remove(&self, id: &OrgId) -> RepoResult<()>;
+}
+
+/// Persistence authority for the user-visible, arbitrary-depth directory.
+///
+/// Every mutation is one adapter-owned transaction that advances the directory
+/// revision exactly once. The directory revision is deliberately independent
+/// from the authorization policy fence because moving placement metadata does
+/// not change a product-space id or its permissions.
+pub trait DirectoryRepo: Send + Sync {
+    /// Atomically insert a node and its optional initial product-space binding.
+    fn create_directory_node(
+        &self,
+        node: DirectoryNode,
+        binding: Option<ProductSpaceBinding>,
+    ) -> RepoResult<u64>;
+    fn directory_node(&self, id: &DirectoryNodeId) -> RepoResult<Option<DirectoryNode>>;
+    fn directory_children(
+        &self,
+        org_id: &OrgId,
+        parent_id: Option<&DirectoryNodeId>,
+    ) -> RepoResult<Vec<DirectoryNode>>;
+    /// Move a live node inside its immutable organization, rejecting cycles.
+    fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        parent_id: Option<&DirectoryNodeId>,
+        updated_at: &Timestamp,
+    ) -> RepoResult<u64>;
+    /// Replace display metadata while preserving parent and product binding.
+    fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        name: &str,
+        slug: &str,
+        description: Option<&str>,
+        updated_at: &Timestamp,
+    ) -> RepoResult<u64>;
+    /// Archive a live leaf. Product-space bindings remain stable and resolvable.
+    fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        updated_at: &Timestamp,
+    ) -> RepoResult<u64>;
+    /// Resolve the current placement of one stable product space.
+    fn product_space_binding(
+        &self,
+        product_space: &ProductSpaceRef,
+    ) -> RepoResult<Option<ProductSpaceBinding>>;
+    /// Read the authoritative directory freshness fence.
+    fn directory_revision(&self) -> RepoResult<u64>;
 }
 
 /// One idempotent IAM-owned organization privacy lifecycle command.

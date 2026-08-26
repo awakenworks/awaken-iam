@@ -87,6 +87,138 @@ async fn body_json(response: Response<Body>) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn directory_http_preserves_stable_space_identity_across_move() {
+    // Cause/effect graph over the public remote seam: C1 authenticated valid Org
+    // and root/child nodes -> E1 both creates succeed with increasing Directory
+    // revisions; C2 product space bound to child -> E2 query resolves that exact
+    // stable space; C3 metadata update -> E3 display fields change without
+    // changing identity; C4 child moved to root -> E4 placement changes while
+    // the binding identity is unchanged; C5 unauthenticated read -> E5 deny.
+    // Rules H1-H5 cover transport auth, create, update, list, move, and binding
+    // lookup.
+    let app = daemon();
+    assert_eq!(
+        app.clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("acme")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let node = |id: &str, parent_id: Option<&str>, bind: bool| {
+        let mut node = serde_json::json!({
+            "id": id,
+            "org_id": "acme",
+            "name": id,
+            "slug": id,
+            "created_at": "2026-08-27T00:00:00Z",
+            "updated_at": "2026-08-27T00:00:00Z"
+        });
+        if let Some(parent_id) = parent_id {
+            node["parent_id"] = parent_id.into();
+        }
+        let mut command = serde_json::json!({ "node": node });
+        if bind {
+            command["binding"] = serde_json::json!({
+                "product_space": {"product":"agents", "space_id":"space-a"},
+                "org_id":"acme",
+                "node_id":id
+            });
+        }
+        command
+    };
+    let root = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/directory/nodes",
+            node("root", None, false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK, "H1");
+    assert_eq!(body_json(root).await["revision"], 2);
+    let child = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/directory/nodes",
+            node("team", Some("root"), true),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(child.status(), StatusCode::OK, "H1");
+    assert_eq!(body_json(child).await["revision"], 3);
+
+    let updated = app
+        .clone()
+        .oneshot(authed_json(
+            "PATCH",
+            "/v1/admin/directory/nodes/team",
+            serde_json::json!({
+                "name":"Platform Team",
+                "slug":"platform",
+                "description":"Shared platform",
+                "updated_at":"2026-08-27T00:30:00Z"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK, "H3");
+    assert_eq!(body_json(updated).await["revision"], 4);
+    let current = app
+        .clone()
+        .oneshot(authed_get("/v1/admin/directory/nodes/team"))
+        .await
+        .unwrap();
+    let current = body_json(current).await;
+    assert_eq!(current["name"], "Platform Team", "E3");
+    assert_eq!(current["slug"], "platform", "E3");
+
+    let moved = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            "/v1/admin/directory/nodes/team",
+            serde_json::json!({"updated_at":"2026-08-27T01:00:00Z"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), StatusCode::OK, "H4");
+    assert_eq!(body_json(moved).await["revision"], 5);
+    let roots = app
+        .clone()
+        .oneshot(authed_get("/v1/admin/directory/nodes?org_id=acme"))
+        .await
+        .unwrap();
+    assert_eq!(roots.status(), StatusCode::OK);
+    assert_eq!(body_json(roots).await.as_array().unwrap().len(), 2, "E4");
+
+    let binding = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/query",
+            serde_json::json!({"product":"agents", "space_id":"space-a"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(binding.status(), StatusCode::OK, "H2");
+    assert_eq!(body_json(binding).await["node_id"], "team", "E2/E4");
+
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/admin/directory/nodes?org_id=acme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "H5");
+}
+
+#[tokio::test]
 async fn capability_http_uses_one_admin_issuer_and_public_fail_closed_verifier() {
     // Capability HTTP cause/effect decision table:
     // C1=admin credential, C2=forward window + non-empty coordinates/scopes,

@@ -36,6 +36,11 @@ use awaken_iam_contract::{
     IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp,
     WorkspaceId, WorkspaceOrgEdge,
 };
+#[cfg(test)]
+use awaken_iam_contract::{
+    CreateDirectoryNode, DirectoryNodeDto, DirectoryNodeId, MoveDirectoryNode, ProductSpaceBinding,
+    ProductSpaceRef,
+};
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
     InvitationRepo, OrgPrivacyRepo, OrgRepo, Organization, PolicySet, RepoError, ResourceEdge,
@@ -1555,6 +1560,112 @@ mod tests {
         ));
         let audit = AuditSink::events(pap.store()).unwrap();
         assert_eq!(audit[0].action, "resource_model.register");
+    }
+
+    #[test]
+    fn directory_hierarchy_is_arbitrary_and_moves_do_not_advance_policy() {
+        // Cause-effect graph: C1 parent is absent/present and live in the same
+        // Org; C2 product space is unbound/already bound; C3 move target is a
+        // descendant/not a descendant; C4 archive target has/has no live child.
+        // Effects: E1 atomically create node+binding and advance only directory
+        // revision; E2 reject duplicate binding; E3 reject cycles; E4 reject a
+        // non-leaf archive and accept a leaf archive. Decision rules D1-D5 cover
+        // the success path and each structural failure without a fixed tier.
+        let mut pap = pap();
+        pap.create_org(org("acme"), at()).unwrap();
+        let directory = crate::DirectoryApi::new(pap.store().clone());
+        let policy_version = pap.store_version().unwrap();
+        let make = |id: &str, parent: Option<&str>, space: Option<&str>| CreateDirectoryNode {
+            node: DirectoryNodeDto {
+                id: DirectoryNodeId(id.into()),
+                org_id: OrgId("acme".into()),
+                parent_id: parent.map(|value| DirectoryNodeId(value.into())),
+                name: id.into(),
+                slug: id.into(),
+                description: None,
+                archived: false,
+                created_at: at(),
+                updated_at: at(),
+            },
+            binding: space.map(|space_id| ProductSpaceBinding {
+                product_space: ProductSpaceRef {
+                    product: "agents".into(),
+                    space_id: space_id.into(),
+                },
+                org_id: OrgId("acme".into()),
+                node_id: DirectoryNodeId(id.into()),
+            }),
+        };
+
+        assert_eq!(
+            directory
+                .create_node(make("root", None, None))
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(
+            directory
+                .create_node(make("team", Some("root"), Some("space-a")))
+                .unwrap()
+                .revision,
+            3
+        );
+        assert_eq!(pap.store_version().unwrap(), policy_version);
+        assert_eq!(
+            directory
+                .update_node(
+                    &DirectoryNodeId("team".into()),
+                    awaken_iam_contract::UpdateDirectoryNode {
+                        name: "Platform team".into(),
+                        slug: "platform-team".into(),
+                        description: Some("renamed without moving".into()),
+                        updated_at: at(),
+                    },
+                )
+                .unwrap()
+                .revision,
+            4
+        );
+        let renamed = directory
+            .node(&DirectoryNodeId("team".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.slug, "platform-team");
+        assert_eq!(pap.store_version().unwrap(), policy_version);
+        assert_eq!(
+            directory
+                .product_space_binding(&ProductSpaceRef {
+                    product: "agents".into(),
+                    space_id: "space-a".into(),
+                })
+                .unwrap()
+                .unwrap()
+                .node_id,
+            DirectoryNodeId("team".into())
+        );
+
+        let duplicate = directory.create_node(make("other", None, Some("space-a")));
+        assert!(matches!(duplicate, Err(AdminError::AlreadyExists(_))));
+        let cycle = directory.move_node(
+            &DirectoryNodeId("root".into()),
+            MoveDirectoryNode {
+                parent_id: Some(DirectoryNodeId("team".into())),
+                updated_at: at(),
+            },
+        );
+        assert!(matches!(cycle, Err(AdminError::AlreadyExists(_))));
+        assert!(matches!(
+            directory.archive_node(&DirectoryNodeId("root".into()), &at()),
+            Err(AdminError::AlreadyExists(_))
+        ));
+        assert_eq!(
+            directory
+                .archive_node(&DirectoryNodeId("team".into()), &at())
+                .unwrap()
+                .revision,
+            5
+        );
     }
 
     #[test]

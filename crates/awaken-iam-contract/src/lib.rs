@@ -22,10 +22,12 @@ pub use profile::{
 };
 
 pub use admin::{
-    AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateInvitation, GroupDto,
+    AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateDirectoryNode, CreateInvitation,
+    DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeDto, DirectoryNodeId, GroupDto,
     InvitationBinding, InvitationDto, InvitationId, InvitationQuery, InvitationStatus,
-    IssuedInvitation, MembershipQuery, OrgDto, ReplaceScopedMemberships, ResendInvitation, RoleDto,
-    ScopeMembershipQuery,
+    IssuedInvitation, MembershipQuery, MoveDirectoryNode, OrgDto, ProductSpaceBinding,
+    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RoleDto, ScopeMembershipQuery,
+    UpdateDirectoryNode,
 };
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

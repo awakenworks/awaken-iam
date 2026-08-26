@@ -24,11 +24,13 @@ use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationProfile, AuthorizationProfileActivated,
     AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    CreateInvitation, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationDto,
-    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto,
-    PolicySnapshot, ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered,
-    ResourceModelRegistration, RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto,
-    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryMutationAck,
+    DirectoryNodeDto, DirectoryNodeId, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
+    InvitationDto, InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery,
+    MoveDirectoryNode, NamespaceId, OrgDto, PolicySnapshot, ProductSpaceBinding, ProductSpaceRef,
+    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
     UserInfo, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
@@ -337,6 +339,86 @@ impl AuthzTransport for HttpAuthzTransport {
         let path = format!("/v1/admin/orgs/{org_id}");
         let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
         Self::decode(response)
+    }
+
+    fn create_directory_node(
+        &self,
+        request: &CreateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/nodes"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
+    fn get_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+
+    fn directory_children(
+        &self,
+        query: &DirectoryChildrenQuery,
+    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .get(self.url("/v1/admin/directory/nodes"))
+                .query(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.put(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.patch(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn product_space_binding(
+        &self,
+        space: &ProductSpaceRef,
+    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/product-spaces/query"))
+                .json(space)
+        })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
     }
 
     fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
@@ -686,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_pap_uses_the_canonical_admin_paths() {
+    fn iam_admin_uses_the_canonical_admin_paths() {
         let binding_json = r#"[{"principal":{"kind":"account","account_id":"acct_1"},"role_id":"tenant-admin","scope":{"kind":"org","org_id":"acme"}}]"#;
         let server = StubServer::start(vec![
             Reply::Ok(r#"{"version":2}"#.into()),
@@ -762,6 +844,34 @@ mod tests {
         assert!(requests[4].starts_with("POST /v1/admin/memberships "));
         assert!(requests[5].starts_with("POST /v1/admin/memberships/query "));
         assert!(requests[6].starts_with("POST /v1/admin/scope/workspace-orgs "));
+    }
+
+    #[test]
+    fn directory_metadata_update_uses_one_canonical_patch() {
+        // Cause/effect transport table: R1 valid typed metadata command + 2xx
+        // ack -> exactly one PATCH to the Directory node path and decoded
+        // revision; R2 non-2xx -> shared decoder returns RemoteError (covered by
+        // `non_success_status_is_an_error`). No read-before-write or product
+        // metadata fallback is allowed.
+        let server = StubServer::start(vec![Reply::Ok(r#"{"revision":7}"#.into())]);
+        let request = UpdateDirectoryNode {
+            name: "Platform Team".into(),
+            slug: "platform".into(),
+            description: Some("Shared platform".into()),
+            updated_at: awaken_iam_contract::Timestamp("2026-08-27T00:30:00Z".into()),
+        };
+
+        assert_eq!(
+            transport(&server)
+                .update_directory_node(&DirectoryNodeId("team".into()), &request)
+                .unwrap()
+                .revision,
+            7
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("PATCH /v1/admin/directory/nodes/team "));
+        assert!(requests[0].contains("Platform Team"));
     }
 
     #[test]

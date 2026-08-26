@@ -15,9 +15,125 @@
 //! [`RoleRepo`](crate::RoleRepo) ports, and policy administration over them lives
 //! in the server's Policy Administration Point.
 
-use awaken_iam_contract::{OrgId, PrincipalRef, Timestamp};
+use awaken_iam_contract::{
+    DirectoryNodeDto, DirectoryNodeId, OrgId, PrincipalRef, ProductSpaceBinding, Timestamp,
+};
 
 use crate::{ActionPattern, RoleId};
+
+/// One arbitrary-depth, user-visible placement node inside an organization.
+///
+/// Directory placement is deliberately independent of product identity and
+/// authorization scope. The aggregate owns display metadata and its parent
+/// edge; products retain their own stable space ids through
+/// [`ProductSpaceBinding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryNode {
+    pub id: DirectoryNodeId,
+    pub org_id: OrgId,
+    pub parent_id: Option<DirectoryNodeId>,
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub archived: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl From<DirectoryNodeDto> for DirectoryNode {
+    fn from(node: DirectoryNodeDto) -> Self {
+        Self {
+            id: node.id,
+            org_id: node.org_id,
+            parent_id: node.parent_id,
+            name: node.name,
+            slug: node.slug,
+            description: node.description,
+            archived: node.archived,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
+        }
+    }
+}
+
+impl From<DirectoryNode> for DirectoryNodeDto {
+    fn from(node: DirectoryNode) -> Self {
+        Self {
+            id: node.id,
+            org_id: node.org_id,
+            parent_id: node.parent_id,
+            name: node.name,
+            slug: node.slug,
+            description: node.description,
+            archived: node.archived,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
+        }
+    }
+}
+
+/// Why a directory node or binding is invalid before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DirectoryInvariant {
+    #[error("directory node id must not be empty")]
+    EmptyNodeId,
+    #[error("directory node name must not be empty")]
+    EmptyName,
+    #[error("directory slug must be lowercase alphanumeric with internal hyphens")]
+    InvalidSlug,
+    #[error("a directory node cannot be its own parent")]
+    SelfParent,
+    #[error("product namespace and space id must not be empty")]
+    EmptyProductSpace,
+    #[error("product-space binding must target the same organization as its node")]
+    CrossTenantBinding,
+}
+
+impl DirectoryNode {
+    /// Validate representation invariants that do not require repository state.
+    pub fn validate(&self) -> Result<(), DirectoryInvariant> {
+        if self.id.0.trim().is_empty() {
+            return Err(DirectoryInvariant::EmptyNodeId);
+        }
+        if self.name.trim().is_empty() {
+            return Err(DirectoryInvariant::EmptyName);
+        }
+        if !directory_slug_is_valid(&self.slug) {
+            return Err(DirectoryInvariant::InvalidSlug);
+        }
+        if self.parent_id.as_ref() == Some(&self.id) {
+            return Err(DirectoryInvariant::SelfParent);
+        }
+        Ok(())
+    }
+
+    /// Validate an optional product-space placement against this node.
+    pub fn validate_binding(
+        &self,
+        binding: &ProductSpaceBinding,
+    ) -> Result<(), DirectoryInvariant> {
+        if binding.product_space.product.trim().is_empty()
+            || binding.product_space.space_id.trim().is_empty()
+        {
+            return Err(DirectoryInvariant::EmptyProductSpace);
+        }
+        if binding.org_id != self.org_id || binding.node_id != self.id {
+            return Err(DirectoryInvariant::CrossTenantBinding);
+        }
+        Ok(())
+    }
+}
+
+fn directory_slug_is_valid(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || bytes.len() > 50 {
+        return false;
+    }
+    let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    alnum(bytes[0])
+        && alnum(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| alnum(*byte) || *byte == b'-')
+}
 
 /// Identifier of a [`Group`] (a named bundle of member principals).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -146,6 +262,54 @@ mod tests {
         PrincipalRef::Account {
             account_id: awaken_iam_contract::AccountId(id.into()),
         }
+    }
+
+    fn node(parent_id: Option<&str>) -> DirectoryNode {
+        DirectoryNode {
+            id: DirectoryNodeId("node-a".into()),
+            org_id: OrgId("org-a".into()),
+            parent_id: parent_id.map(|id| DirectoryNodeId(id.into())),
+            name: "Engineering".into(),
+            slug: "engineering".into(),
+            description: None,
+            archived: false,
+            created_at: ts(),
+            updated_at: ts(),
+        }
+    }
+
+    #[test]
+    fn directory_node_and_binding_validate_without_fixed_levels() {
+        // Cause/effect graph: C1 valid metadata, C2 parent is self, C3 binding
+        // product identity is empty, C4 binding tenant/node disagrees. Effects:
+        // E1 accept any non-self parent (no Org/Workspace/Project tier enum),
+        // E2 reject a one-node cycle, E3 reject an unqualified product space,
+        // E4 reject cross-tenant or wrong-node placement. Rules R1-R4 exercise
+        // every representation invariant before a repository transaction.
+        let valid = node(Some("arbitrary-parent"));
+        assert_eq!(valid.validate(), Ok(()));
+
+        let self_parent = node(Some("node-a"));
+        assert_eq!(self_parent.validate(), Err(DirectoryInvariant::SelfParent));
+
+        let mut binding = ProductSpaceBinding {
+            product_space: awaken_iam_contract::ProductSpaceRef {
+                product: String::new(),
+                space_id: "space-a".into(),
+            },
+            org_id: valid.org_id.clone(),
+            node_id: valid.id.clone(),
+        };
+        assert_eq!(
+            valid.validate_binding(&binding),
+            Err(DirectoryInvariant::EmptyProductSpace)
+        );
+        binding.product_space.product = "agents".into();
+        binding.org_id = OrgId("org-b".into());
+        assert_eq!(
+            valid.validate_binding(&binding),
+            Err(DirectoryInvariant::CrossTenantBinding)
+        );
     }
 
     #[test]

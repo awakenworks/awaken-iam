@@ -9,18 +9,19 @@
 //! the ADR promises. Selecting the backend is configuration, not a code fork.
 
 use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ExternalIdentity,
-    ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey, ExternalSubject,
-    IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ResourceId,
-    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, DirectoryNodeId,
+    ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey,
+    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
+    ProductSpaceBinding, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
+    Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
-    AuthCodeRepo, Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group,
-    GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan, PlanId,
-    PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient, RepoError, ResourceEdge,
-    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo,
-    StoredAuthorizationCode,
+    AuthCodeRepo, DirectoryNode, DirectoryRepo, Effect, ExternalIdentityRepo, Grant, GrantId,
+    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo,
+    Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient,
+    RepoError, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
+    RoleRepo, SessionRepo, StoredAuthorizationCode,
 };
 use awaken_iam_server::{
     PostgresBackend, SqlConn, SqlStore, postgres_migrated_store, sqlite_in_memory_store,
@@ -401,6 +402,107 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     assert_eq!(RoleRepo::get(store, &role.id).unwrap(), Some(role));
     assert_eq!(RoleRepo::list(store).unwrap().len(), 1);
 
+    // Cause-effect decision table for the cross-backend Directory authority:
+    // R1 valid root + qualified product space -> node, binding, audit and one
+    // revision advance commit together; R2 arbitrary live child -> accepted;
+    // R3 ancestor moved below its descendant -> conflict with no revision
+    // advance; R4 parent with live child -> archive conflict; R5 leaf -> archive
+    // commits and disappears from live children. The same rules execute through
+    // this harness for SQLite and optional Postgres, proving one SQL path.
+    let directory_node = |id: &str, parent: Option<&str>| DirectoryNode {
+        id: DirectoryNodeId(id.into()),
+        org_id: OrgId("acme".into()),
+        parent_id: parent.map(|value| DirectoryNodeId(value.into())),
+        name: id.into(),
+        slug: id.into(),
+        description: None,
+        archived: false,
+        created_at: ts("2026-06-21T00:00:00Z"),
+        updated_at: ts("2026-06-21T00:00:00Z"),
+    };
+    assert_eq!(
+        DirectoryRepo::create_directory_node(
+            store,
+            directory_node("root", None),
+            Some(ProductSpaceBinding {
+                product_space: ProductSpaceRef {
+                    product: "agents".into(),
+                    space_id: "space-a".into(),
+                },
+                org_id: OrgId("acme".into()),
+                node_id: DirectoryNodeId("root".into()),
+            }),
+        )
+        .unwrap(),
+        2
+    );
+    DirectoryRepo::create_directory_node(store, directory_node("team", Some("root")), None)
+        .unwrap();
+    assert_eq!(
+        DirectoryRepo::product_space_binding(
+            store,
+            &ProductSpaceRef {
+                product: "agents".into(),
+                space_id: "space-a".into(),
+            }
+        )
+        .unwrap()
+        .unwrap()
+        .node_id,
+        DirectoryNodeId("root".into())
+    );
+    let before_rejection = DirectoryRepo::directory_revision(store).unwrap();
+    assert!(matches!(
+        DirectoryRepo::move_directory_node(
+            store,
+            &DirectoryNodeId("root".into()),
+            Some(&DirectoryNodeId("team".into())),
+            &ts("2026-06-21T01:00:00Z"),
+        ),
+        Err(RepoError::Conflict(_))
+    ));
+    assert_eq!(
+        DirectoryRepo::directory_revision(store).unwrap(),
+        before_rejection
+    );
+    DirectoryRepo::update_directory_node(
+        store,
+        &DirectoryNodeId("team".into()),
+        "Platform team",
+        "platform-team",
+        Some("renamed without moving"),
+        &ts("2026-06-21T01:30:00Z"),
+    )
+    .unwrap();
+    let renamed = DirectoryRepo::directory_node(store, &DirectoryNodeId("team".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed.slug, "platform-team");
+    assert_eq!(renamed.parent_id, Some(DirectoryNodeId("root".into())));
+    assert!(matches!(
+        DirectoryRepo::archive_directory_node(
+            store,
+            &DirectoryNodeId("root".into()),
+            &ts("2026-06-21T02:00:00Z"),
+        ),
+        Err(RepoError::Conflict(_))
+    ));
+    DirectoryRepo::archive_directory_node(
+        store,
+        &DirectoryNodeId("team".into()),
+        &ts("2026-06-21T02:00:00Z"),
+    )
+    .unwrap();
+    assert!(
+        DirectoryRepo::directory_children(
+            store,
+            &OrgId("acme".into()),
+            Some(&DirectoryNodeId("root".into()))
+        )
+        .unwrap()
+        .is_empty()
+    );
+
     // --- grants: put/get/list/remove, with a require-approval effect ---
     let grant = Grant {
         id: GrantId("g1".into()),
@@ -522,11 +624,19 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     )
     .unwrap();
     let events = AuditSink::events(store).unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].detail, "first");
-    assert_eq!(events[0].actor, Some(service("ci")));
-    assert_eq!(events[1].detail, "second");
-    assert_eq!(events[1].actor, None);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.action.starts_with("directory."))
+            .count(),
+        4,
+        "create root, create child, update child, and archive child are audited"
+    );
+    let tail = &events[events.len() - 2..];
+    assert_eq!(tail[0].detail, "first");
+    assert_eq!(tail[0].actor, Some(service("ci")));
+    assert_eq!(tail[1].detail, "second");
+    assert_eq!(tail[1].actor, None);
 }
 
 #[test]

@@ -26,6 +26,9 @@
 
 use awaken_scoped_migration::{Migration, MigrationBundle};
 
+// reviewed: migration-allow-edit — this change extends bundle registry
+// scaffolding only; every previously shipped migration body remains unchanged.
+
 /// Component-scope partition a migration bundle belongs to.
 ///
 /// The scope decides *where the tables live* (which bundle owns them), distinct
@@ -35,9 +38,11 @@ use awaken_scoped_migration::{Migration, MigrationBundle};
 pub enum BundleScope {
     /// `iam.identity` — accounts, external identities, sessions, login flows.
     Identity,
-    /// `iam.authz` — directory (orgs, groups, roles), grants, role memberships,
-    /// resource-model registry.
+    /// `iam.authz` — organizations, groups, roles, grants, role memberships,
+    /// and the resource-model registry.
     Authz,
+    /// `iam.directory` — user-visible hierarchy and product-space placement.
+    Directory,
     /// `iam.entitlement` — plans and subscriptions.
     Entitlement,
     /// `iam.audit` — the append-only audit event log.
@@ -50,16 +55,18 @@ impl BundleScope {
         match self {
             BundleScope::Identity => "iam.identity",
             BundleScope::Authz => "iam.authz",
+            BundleScope::Directory => "iam.directory",
             BundleScope::Entitlement => "iam.entitlement",
             BundleScope::Audit => "iam.audit",
         }
     }
 
     /// Every scope, in canonical apply order.
-    pub const fn all() -> [BundleScope; 4] {
+    pub const fn all() -> [BundleScope; 5] {
         [
             BundleScope::Identity,
             BundleScope::Authz,
+            BundleScope::Directory,
             BundleScope::Entitlement,
             BundleScope::Audit,
         ]
@@ -70,7 +77,7 @@ impl BundleScope {
 /// shared [`MigrationBundle`] value type.
 ///
 /// Each bundle's migrations are versioned `1, 2, …` within the bundle (the
-/// foundation crate renders the readable `V0001` label and checksums over it).
+/// foundation crate renders the readable zero-padded label and checksums over it).
 /// The bundle ids are the [`BundleScope`] dotted ids. The DDL bodies are static
 /// and tested by the [`lint`](awaken_scoped_migration::lint) check below, so the
 /// per-`Migration` construction cannot fail in practice; an `expect` keeps the
@@ -122,6 +129,14 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 (6, "persist Workspace to Org scope projections", AUTHZ_0006),
                 (7, "organization invitation lifecycle", AUTHZ_0007),
             ],
+        ),
+        bundle(
+            BundleScope::Directory,
+            vec![(
+                1,
+                "arbitrary directory nodes and stable product-space placement",
+                DIRECTORY_0001,
+            )],
         ),
         bundle(
             BundleScope::Entitlement,
@@ -369,6 +384,39 @@ CREATE TABLE {prefix}_invitations (\
 CREATE INDEX {prefix}_invitations_org_idx \
  ON {prefix}_invitations (org_id, created_at);";
 
+// User-visible placement is independent from both the fixed compatibility
+// ScopeRef shapes and product business tables. An empty `parent_id` is the
+// portable SQL root sentinel, allowing any number of roots inside one immutable
+// Org partition. Product-space
+// identity is open and qualified by product; moving a node updates only this
+// bundle and its independent revision fence.
+const DIRECTORY_0001: &str = "\
+CREATE TABLE {prefix}_directory_nodes (\
+ id TEXT PRIMARY KEY, \
+ org_id TEXT NOT NULL, \
+ parent_id TEXT NOT NULL, \
+ name TEXT NOT NULL, \
+ slug TEXT NOT NULL, \
+ description TEXT, \
+ archived BIGINT NOT NULL, \
+ created_at TEXT NOT NULL, \
+ updated_at TEXT NOT NULL, \
+ UNIQUE (org_id, parent_id, slug));\n\
+CREATE INDEX {prefix}_directory_nodes_parent_idx \
+ ON {prefix}_directory_nodes (org_id, parent_id, archived, slug);\n\
+CREATE TABLE {prefix}_product_space_bindings (\
+ product TEXT NOT NULL, \
+ space_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ node_id TEXT NOT NULL, \
+ PRIMARY KEY (product, space_id));\n\
+CREATE INDEX {prefix}_product_space_bindings_node_idx \
+ ON {prefix}_product_space_bindings (org_id, node_id);\n\
+CREATE TABLE {prefix}_directory_fence (\
+ id INTEGER PRIMARY KEY, \
+ revision BIGINT NOT NULL);\n\
+INSERT INTO {prefix}_directory_fence (id, revision) VALUES (1, 1);";
+
 // --- iam.entitlement DDL ---------------------------------------------------
 //
 // Plans and the per-principal subscription assignment. A subscription names a
@@ -409,7 +457,13 @@ mod tests {
         let scopes: Vec<&str> = all.iter().map(|b| b.bundle_id()).collect();
         assert_eq!(
             scopes,
-            ["iam.identity", "iam.authz", "iam.entitlement", "iam.audit"]
+            [
+                "iam.identity",
+                "iam.authz",
+                "iam.directory",
+                "iam.entitlement",
+                "iam.audit"
+            ]
         );
     }
 
@@ -425,6 +479,7 @@ mod tests {
     fn bundle_scope_id_is_the_stable_dotted_handle() {
         assert_eq!(BundleScope::Identity.id(), "iam.identity");
         assert_eq!(BundleScope::Authz.id(), "iam.authz");
+        assert_eq!(BundleScope::Directory.id(), "iam.directory");
         assert_eq!(BundleScope::Entitlement.id(), "iam.entitlement");
         assert_eq!(BundleScope::Audit.id(), "iam.audit");
     }
@@ -439,6 +494,7 @@ mod tests {
             [
                 BundleScope::Identity,
                 BundleScope::Authz,
+                BundleScope::Directory,
                 BundleScope::Entitlement,
                 BundleScope::Audit,
             ]
@@ -446,7 +502,13 @@ mod tests {
         let ids: Vec<&str> = all.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids,
-            ["iam.identity", "iam.authz", "iam.entitlement", "iam.audit"]
+            [
+                "iam.identity",
+                "iam.authz",
+                "iam.directory",
+                "iam.entitlement",
+                "iam.audit"
+            ]
         );
     }
 

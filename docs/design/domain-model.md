@@ -28,7 +28,8 @@ Where to spend design effort (DDD core/supporting/generic):
 
 Account, External Identity, Provider, Login Flow, Session, API Token, Principal,
 Organization, Group, Membership, Role, Grant, Scope, Resource Model, Action,
-Decision, Namespace, Signer, Plan, Subscription, Entitlement.
+Decision, Namespace, Signer, Plan, Subscription, Entitlement, Directory Node,
+Product Space, Product-Space Binding.
 
 Notably: **email is a claim, never an identity key**; **Principal** is the
 resolved caller (chainable for delegation); **Scope** is an authorization target
@@ -46,6 +47,7 @@ cluster; references across aggregates are by id.
 | **Session** | → AccountId, token hash, expiry | authenticates only while unexpired and unrevoked; revocation is idempotent |
 | **ApiToken** | → Principal, scopes, secret hash | active until revoked; secret stored only as hash |
 | **Organization** | identity, ownership | one owner principal at all times |
+| **DirectoryNode** | display metadata, optional parent, Org partition | arbitrary depth; live parent stays in the same Org; no cycles |
 | **Group** | member principals | members resolve to existing accounts |
 | **Role** | action patterns, scope kind | patterns are exact or single-glob; no wildcard-all |
 | **Grant** | subject, action pattern, scope, effect | anchored at exactly one scope |
@@ -73,6 +75,12 @@ checking cross-organization membership and legal-retention policy.
 of X" is a cheap query. `ResourceModel` is how a product teaches IAM its scope
 hierarchy and action catalog **as data**, so IAM authorizes deep product scopes
 (e.g. issue → project → workspace) without depending on the product.
+
+`DirectoryNode` is user-visible placement, not an authorization Scope or a
+product aggregate. A `ProductSpaceBinding` places one stable,
+product-qualified opaque id at a node. Moving the node never changes product
+identity, tenant partition, or permissions; see
+[ADR-0013](../adr/0013-directory-placement-independent-product-spaces.md).
 
 ## Domain services
 
@@ -117,7 +125,8 @@ awaken-iam            facade
 Ports the core declares (the server provides adapters): `AccountRepo`,
 `SessionRepo`, `LoginFlowRepo`, `ApiTokenRepo`, `OrgRepo`, `GroupRepo`,
 `RoleRepo`, `GrantRepo`, `MembershipRepo`, `NamespaceRepo`, `PlanRepo`,
-`SubscriptionRepo`, `ResourceModelRepo`, `OrgPrivacyRepo`, `AuditSink`. An in-memory adapter backs
+`SubscriptionRepo`, `ResourceModelRepo`, `DirectoryRepo`, `OrgPrivacyRepo`,
+`AuditSink`. An in-memory adapter backs
 tests and local mode; a database adapter backs the service. The database adapter
 owns IAM's schema as scope-partitioned `awaken-scoped-migration` bundles — the
 discipline that lets IAM deploy embedded or standalone. See

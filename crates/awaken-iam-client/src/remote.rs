@@ -18,13 +18,15 @@ use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationProfile,
     AuthorizationProfileActivated, AuthorizationProfileRetired, AuthorizationProfileValidation,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    CreateAuthorizationProfile, CreateInvitation, EntitlementCheckResponse, EntitlementDecision,
-    EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId, InvitationQuery,
-    IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, PolicySnapshot,
-    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery,
+    DirectoryMutationAck, DirectoryNodeDto, DirectoryNodeId, EntitlementCheckResponse,
+    EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId,
+    InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgDto,
+    PolicySnapshot, ProductSpaceBinding, ProductSpaceRef, ReplaceScopedMemberships,
+    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
     RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UserInfo,
-    WorkspaceOrgEdge,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
+    UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -120,6 +122,57 @@ pub trait AuthzTransport {
 
     fn delete_org(&self, _org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
+    }
+
+    fn create_directory_node(
+        &self,
+        _request: &CreateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn get_directory_node(
+        &self,
+        _id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn directory_children(
+        &self,
+        _query: &DirectoryChildrenQuery,
+    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn move_directory_node(
+        &self,
+        _id: &DirectoryNodeId,
+        _request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn update_directory_node(
+        &self,
+        _id: &DirectoryNodeId,
+        _request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn archive_directory_node(
+        &self,
+        _id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn product_space_binding(
+        &self,
+        _space: &ProductSpaceRef,
+    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
     }
 
     fn create_role(&self, _role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
@@ -385,6 +438,57 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     /// Delete organization metadata through IAM's canonical policy-admin path.
     pub fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         self.transport.delete_org(org_id)
+    }
+
+    pub fn create_directory_node(
+        &self,
+        request: &CreateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.create_directory_node(request)
+    }
+
+    pub fn get_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+        self.transport.get_directory_node(id)
+    }
+
+    pub fn directory_children(
+        &self,
+        query: &DirectoryChildrenQuery,
+    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+        self.transport.directory_children(query)
+    }
+
+    pub fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.move_directory_node(id, request)
+    }
+
+    pub fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.update_directory_node(id, request)
+    }
+
+    pub fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.archive_directory_node(id)
+    }
+
+    pub fn product_space_binding(
+        &self,
+        space: &ProductSpaceRef,
+    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+        self.transport.product_space_binding(space)
     }
 
     pub fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {

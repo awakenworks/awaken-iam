@@ -46,11 +46,13 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateInvitation,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupDto,
-    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, NamespaceId, OrgDto, OrgId,
-    PolicySnapshot, ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
-    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, Timestamp, WorkspaceOrgEdge,
+    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
+    DirectoryChildrenQuery, DirectoryNodeId, EntitlementCheckResponse, EntitlementRequest,
+    GrantSnapshot, GrantSubjectRef, GroupDto, InvitationId, InvitationQuery, IssuedInvitation,
+    MembershipQuery, MoveDirectoryNode, NamespaceId, OrgDto, OrgId, PolicySnapshot,
+    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
+    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
@@ -112,6 +114,7 @@ impl AdminAuthPolicy {
 pub struct DaemonState<S = InMemoryStore> {
     authz: crate::AuthzApi,
     admin: PolicyAdminApi<S>,
+    directory: crate::DirectoryApi<S>,
     profiles: AuthorizationProfileAdmin,
     capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
@@ -143,7 +146,7 @@ impl DaemonState<InMemoryStore> {
     }
 }
 
-impl<S: PolicyStore> DaemonState<S> {
+impl<S: PolicyStore + awaken_iam_core::DirectoryRepo + Clone> DaemonState<S> {
     /// Assemble the daemon over one explicit policy store.
     ///
     /// Production passes the same migrated SQL store used for profiles. Tests
@@ -156,6 +159,7 @@ impl<S: PolicyStore> DaemonState<S> {
         store: S,
         capability_tokens: AccessTokenAuthority,
     ) -> Result<Self, AdminError> {
+        let directory = crate::DirectoryApi::new(store.clone());
         let admin = PolicyAdminApi::new(store);
         let version = admin.store_version()?;
         let base = admin.policy()?;
@@ -167,12 +171,15 @@ impl<S: PolicyStore> DaemonState<S> {
         Ok(Self {
             authz,
             admin,
+            directory,
             profiles,
             capability_tokens,
             auth,
         })
     }
+}
 
+impl<S: PolicyStore> DaemonState<S> {
     /// Refresh the live PDP from the same repositories the PAP just committed.
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;
@@ -191,7 +198,10 @@ pub type SharedDaemonState<S = InMemoryStore> = Arc<Mutex<DaemonState<S>>>;
 /// half of `/v1`, the operational `GET /healthz` probe, and the guarded
 /// `/v1/admin/*` policy-administration seam — all over one shared
 /// [`DaemonState`].
-pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> Router {
+pub fn daemon_router<S>(state: SharedDaemonState<S>) -> Router
+where
+    S: PolicyStore + awaken_iam_core::DirectoryRepo + Clone + 'static,
+{
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/authorize", post(authorize))
@@ -201,6 +211,21 @@ pub fn daemon_router<S: PolicyStore + 'static>(state: SharedDaemonState<S>) -> R
         .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
         .route("/v1/admin/orgs/{id}", put(update_org).delete(delete_org))
+        .route(
+            "/v1/admin/directory/nodes",
+            post(create_directory_node).get(list_directory_children),
+        )
+        .route(
+            "/v1/admin/directory/nodes/{id}",
+            get(get_directory_node)
+                .put(move_directory_node)
+                .patch(update_directory_node)
+                .delete(archive_directory_node),
+        )
+        .route(
+            "/v1/admin/directory/product-spaces/query",
+            post(get_product_space_binding),
+        )
         .route("/v1/admin/groups", post(create_group))
         .route(
             "/v1/admin/groups/{id}",
@@ -617,6 +642,90 @@ async fn list_orgs(
     })
 }
 
+async fn create_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDirectoryNode>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.create_node(request)
+    })
+}
+
+async fn get_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.directory.node(&DirectoryNodeId(id)) {
+        Ok(Some(node)) => Json(node).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+async fn list_directory_children(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Query(query): Query<DirectoryChildrenQuery>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.children(&query.org_id, query.parent_id.as_ref())
+    })
+}
+
+async fn move_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<MoveDirectoryNode>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.move_node(&DirectoryNodeId(id), request)
+    })
+}
+
+async fn update_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateDirectoryNode>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.update_node(&DirectoryNodeId(id), request)
+    })
+}
+
+async fn archive_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.archive_node(&DirectoryNodeId(id), &now_timestamp())
+    })
+}
+
+async fn get_product_space_binding(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    headers: HeaderMap,
+    Json(product_space): Json<ProductSpaceRef>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.directory.product_space_binding(&product_space) {
+        Ok(Some(binding)) => Json(binding).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
 async fn create_group(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
@@ -910,6 +1019,22 @@ where
         return rejection;
     }
     match op(&guard.admin) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+fn directory_read<S, T, F>(state: &SharedDaemonState<S>, headers: &HeaderMap, op: F) -> Response
+where
+    S: awaken_iam_core::DirectoryRepo,
+    T: serde::Serialize,
+    F: FnOnce(&crate::DirectoryApi<S>) -> Result<T, AdminError>,
+{
+    let guard = lock(state);
+    if let Some(rejection) = authorize_admin(&guard.auth, headers) {
+        return rejection;
+    }
+    match op(&guard.directory) {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => admin_error_response(&error),
     }

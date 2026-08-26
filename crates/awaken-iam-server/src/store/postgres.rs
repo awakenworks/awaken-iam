@@ -326,6 +326,34 @@ impl SqlConn for PostgresBackend {
             Ok(affected)
         })
     }
+
+    fn execute_transaction_checked(
+        &self,
+        writes: &[SqlWrite],
+        required: &[(usize, u64)],
+    ) -> RepoResult<Vec<u64>> {
+        self.with_client("checked transaction", |client| {
+            let mut tx = client.transaction().map_err(backend_err)?;
+            let mut affected = Vec::with_capacity(writes.len());
+            for write in writes {
+                affected.push(
+                    tx.execute(&render(&write.sql), &refs(&write.params))
+                        .map_err(backend_err)?,
+                );
+            }
+            if let Some((index, expected)) = required
+                .iter()
+                .find(|(index, expected)| affected.get(*index) != Some(expected))
+            {
+                return Err(RepoError::Conflict(format!(
+                    "transaction write {index} affected {} rows; expected {expected}",
+                    affected.get(*index).copied().unwrap_or(0)
+                )));
+            }
+            tx.commit().map_err(backend_err)?;
+            Ok(affected)
+        })
+    }
 }
 
 impl MigrationExecutor for PostgresBackend {

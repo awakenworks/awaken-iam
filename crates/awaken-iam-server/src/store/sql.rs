@@ -18,25 +18,27 @@
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    AuthorizationProfileDocument, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
-    ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey, InvitationBinding, InvitationId,
-    InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProfileLifecycle, ResourceId, ResourceType, ScopeRef, Session, SessionId, Timestamp,
-    WorkspaceId, WorkspaceOrgEdge,
+    AuthorizationProfileDocument, DirectoryNodeId, ExternalIdentity, ExternalIdentityClaims,
+    ExternalIdentityId, ExternalIdentityKey, GrantSubjectRef, IdentityProviderKey,
+    InvitationBinding, InvitationId, InvitationStatus, NamespaceId, OAuthLoginState,
+    OAuthLoginStateId, OrgId, PrincipalRef, ProductSpaceBinding, ProductSpaceRef, ProfileLifecycle,
+    ResourceId, ResourceType, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
-    AuthCodeRepo, AuthorizationProfileRepo, Effect, ExternalIdentityRepo, Grant, GrantId,
-    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
-    OAuthClientRepo, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit,
-    RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo, RoleBinding,
-    RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AuthCodeRepo, AuthorizationProfileRepo, DirectoryNode, DirectoryRepo, Effect,
+    ExternalIdentityRepo, Grant, GrantId, GrantRepo, GrantSubject, Group, GroupId, GroupRepo,
+    Invitation, InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo, Organization, Plan,
+    PlanId, PlanRepo, PlanTier, Quota, RateLimit, RegisteredClient, RepoError, RepoResult,
+    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo,
+    SessionRepo, StoredAuthorizationCode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::migration::Dialect;
 use super::{Fence, FenceStore};
 
+mod directory;
 mod privacy;
 
 /// A bound parameter value. Every IAM column is text or JSON-as-text, so a
@@ -69,6 +71,17 @@ pub trait SqlConn: Send + Sync {
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>>;
     /// Execute every write atomically and return each affected-row count.
     fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>>;
+    /// Execute every write atomically and roll back unless each indexed write
+    /// affected exactly the required number of rows.
+    ///
+    /// This is the portable compare-and-set seam for aggregate commands whose
+    /// invariants must be rechecked after a transaction-level serialization
+    /// lock is acquired. Adapters must check before commit.
+    fn execute_transaction_checked(
+        &self,
+        writes: &[SqlWrite],
+        required: &[(usize, u64)],
+    ) -> RepoResult<Vec<u64>>;
 }
 
 /// A storage adapter that serves every IAM repository port from a real database.

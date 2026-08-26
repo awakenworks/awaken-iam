@@ -19,6 +19,93 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AccountId, OrgId, PrincipalRef, ScopeRef, Timestamp};
 
+/// Stable identity of one user-visible node in an organization's directory.
+///
+/// A node is placement metadata only. Product business identity and IAM scope
+/// identity never derive from this value, so moving a node cannot rewrite a
+/// product aggregate or silently change authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DirectoryNodeId(pub String);
+
+/// Stable, product-qualified identity of a product-owned space.
+///
+/// `product` is an open namespace (`"agents"`, `"workforce"`, ...), not an IAM
+/// enum. `space_id` is opaque to IAM and remains stable when its directory node
+/// moves or is renamed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProductSpaceRef {
+    pub product: String,
+    pub space_id: String,
+}
+
+/// Public projection of one arbitrary-depth directory node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryNodeDto {
+    pub id: DirectoryNodeId,
+    /// Immutable security, billing, and data-partition root.
+    pub org_id: OrgId,
+    /// Direct parent inside the same organization; `None` denotes a root node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<DirectoryNodeId>,
+    pub name: String,
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// Placement of a stable product space in the user-visible directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductSpaceBinding {
+    pub product_space: ProductSpaceRef,
+    /// Immutable tenant partition of the product space and target node.
+    pub org_id: OrgId,
+    pub node_id: DirectoryNodeId,
+}
+
+/// Atomic create command for a node and its optional product-space placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDirectoryNode {
+    pub node: DirectoryNodeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<ProductSpaceBinding>,
+}
+
+/// Move one directory node without changing product-space or authorization ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveDirectoryNode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<DirectoryNodeId>,
+    pub updated_at: Timestamp,
+}
+
+/// Replace user-visible metadata without changing placement or product identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDirectoryNode {
+    pub name: String,
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+/// Query the direct children of one directory parent in an organization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryChildrenQuery {
+    pub org_id: OrgId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<DirectoryNodeId>,
+}
+
+/// Directory mutation acknowledgement, fenced independently from IAM policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryMutationAck {
+    pub revision: u64,
+}
+
 /// Stable identifier of an organization invitation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InvitationId(pub String);
@@ -264,5 +351,40 @@ mod tests {
             serde_json::from_str::<AdminMutationAck>(&json).unwrap(),
             ack
         );
+    }
+
+    #[test]
+    fn directory_wire_shape_keeps_placement_separate_from_product_identity() {
+        // Causes/effects: C1 optional parent/description/binding omitted -> E1
+        // backward-friendly defaults; C2 open product namespace supplied -> E2
+        // round-trip without a fixed product enum; C3 move omits parent -> E3
+        // represent a move to the directory root. Rules W1-W3 pin the public
+        // shape consumed identically by embedded and HTTP adapters.
+        let json = r#"{
+          "node": {
+            "id":"node-a", "org_id":"acme", "name":"Team", "slug":"team",
+            "created_at":"t0", "updated_at":"t0"
+          },
+          "binding": {
+            "product_space":{"product":"future-product","space_id":"space-a"},
+            "org_id":"acme", "node_id":"node-a"
+          }
+        }"#;
+        let command: CreateDirectoryNode = serde_json::from_str(json).unwrap();
+        assert!(command.node.parent_id.is_none());
+        assert!(command.node.description.is_none());
+        assert!(!command.node.archived);
+        assert_eq!(
+            command.binding.as_ref().unwrap().product_space.product,
+            "future-product"
+        );
+        assert_eq!(
+            serde_json::from_str::<CreateDirectoryNode>(&serde_json::to_string(&command).unwrap())
+                .unwrap(),
+            command
+        );
+        let move_to_root: MoveDirectoryNode =
+            serde_json::from_str(r#"{"updated_at":"t1"}"#).unwrap();
+        assert!(move_to_root.parent_id.is_none());
     }
 }

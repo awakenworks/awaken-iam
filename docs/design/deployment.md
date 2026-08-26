@@ -59,7 +59,9 @@ per subdomain scope:
 ```text
 iam.identity     accounts, external identities, login flows, sessions, api tokens,
                  OAuth clients and authorization codes
-iam.authz        roles, grants, memberships, resource-model registry
+iam.authz        roles, grants, memberships, resource-model registry,
+                 organizations and groups
+iam.directory    arbitrary Directory nodes, product-space bindings and revision
 iam.entitlement  plans, subscriptions
 iam.namespace    namespace ownership, signers        (only if split out)
 ```
@@ -141,6 +143,14 @@ standalone: iam-daemon builds its own pool (Postgres for cloud/HA)
 `store.migrate()` renders each bundle's dialect-neutral DDL for the active
 backend; see [ADR-0003](../adr/0003-storage-backends.md) for the type-token
 rendering and the single-applier migration guard.
+
+Directory uses the same assembly without joining the authorization bounded
+context. Embedded products call `DirectoryApi` directly over the migrated
+SQLite/Postgres store; hosted products call the same application path through
+`/v1/admin/directory/*`. Node, optional initial binding, audit, and
+Directory-revision writes form one database transaction. The Directory revision
+is independent of the policy version because placement changes do not change
+authorization.
 
 The client SDK's `local | remote` mode (see [remote protocol](remote-protocol.md))
 mirrors the deployment: embedded → local, standalone → remote. A consumer swaps

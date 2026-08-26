@@ -11,6 +11,7 @@ mod auth_redirect;
 mod authz_api;
 mod capability_token;
 mod clock;
+mod directory_api;
 pub mod http;
 mod license;
 mod local_setup;
@@ -57,6 +58,7 @@ pub use capability_token::{
     AttenuateCapability, CapabilityCheck, CapabilityClaims, CapabilityError, LeaseEpoch,
     MintCapability, attenuate, mint_capability, verify_capability,
 };
+pub use directory_api::DirectoryApi;
 pub use license::{
     ENV_LICENSE_CUSTOMER_ID, ENV_LICENSE_DEPLOYMENT_ID, ENV_LICENSE_FILE, ENV_LICENSE_INLINE,
     ENV_LICENSE_JWKS, ENV_LICENSE_JWKS_FILE, LicenseConfig, LicenseFloorStore, LicenseLoadError,

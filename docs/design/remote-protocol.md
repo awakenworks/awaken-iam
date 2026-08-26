@@ -34,6 +34,10 @@ correspond one-to-one with the HTTP endpoints below:
 | `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
 | `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
 | `introspect_token` | `POST /v1/tokens/introspect` |
+| `create_directory_node` | `POST /v1/admin/directory/nodes` |
+| `get_directory_node` / `directory_children` | `GET /v1/admin/directory/nodes...` |
+| `move_directory_node` / `update_directory_node` / `archive_directory_node` | `PUT` / `PATCH` / `DELETE /v1/admin/directory/nodes/{id}` |
+| `product_space_binding` | `POST /v1/admin/directory/product-spaces/query` |
 
 `introspect_token` has a default implementation that returns an unsupported error,
 so existing `AuthzTransport` implementations remain valid without change. The
@@ -68,6 +72,13 @@ GET  /v1/session
 POST /v1/tokens/introspect
 POST /v1/capabilities/introspect
 POST /v1/admin/capabilities
+POST /v1/admin/directory/nodes
+GET  /v1/admin/directory/nodes/{id}
+GET  /v1/admin/directory/nodes?org_id={org}&parent_id={optional_parent}
+PUT  /v1/admin/directory/nodes/{id}
+PATCH /v1/admin/directory/nodes/{id}
+DELETE /v1/admin/directory/nodes/{id}
+POST /v1/admin/directory/product-spaces/query
 ```
 
 ### POST /v1/authorize
@@ -144,8 +155,9 @@ to invalidate every older link. IAM stores no second share registry.
 
 ### Policy administration: invitations and member queries
 
-The guarded PAP adds the following product-neutral operations. They use the
-same admin credential and version fence as organization and membership writes.
+The guarded authorization administration API adds the following product-neutral
+operations. They use the same admin credential and policy-version fence as
+organization and membership writes.
 
 | Method | Path | Result |
 |---|---|---|

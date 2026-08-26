@@ -197,6 +197,35 @@ impl SqlConn for SqliteBackend {
         tx.commit().map_err(backend_err)?;
         Ok(affected)
     }
+
+    fn execute_transaction_checked(
+        &self,
+        writes: &[SqlWrite],
+        required: &[(usize, u64)],
+    ) -> RepoResult<Vec<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend_err)?;
+        let mut affected = Vec::with_capacity(writes.len());
+        for write in writes {
+            affected.push(
+                tx.execute(&render(&write.sql), params_from_iter(values(&write.params)))
+                    .map_err(backend_err)? as u64,
+            );
+        }
+        if let Some((index, expected)) = required
+            .iter()
+            .find(|(index, expected)| affected.get(*index) != Some(expected))
+        {
+            return Err(RepoError::Conflict(format!(
+                "transaction write {index} affected {} rows; expected {expected}",
+                affected.get(*index).copied().unwrap_or(0)
+            )));
+        }
+        tx.commit().map_err(backend_err)?;
+        Ok(affected)
+    }
 }
 
 impl MigrationExecutor for SqliteBackend {

@@ -12,8 +12,9 @@
 use std::collections::BTreeMap;
 
 use awaken_iam_contract::{
-    AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateInvitation,
-    InvitationBinding, InvitationStatus, OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef,
+    AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateDirectoryNode,
+    CreateInvitation, DirectoryNodeDto, DirectoryNodeId, InvitationBinding, InvitationStatus,
+    OrgId, PrincipalRef, ProductSpaceBinding, ProductSpaceRef, ResourceId, ResourceType, ScopeRef,
     Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
@@ -21,7 +22,7 @@ use awaken_iam_core::{
     ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
 };
 use awaken_iam_server::{
-    Dialect, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
+    Dialect, DirectoryApi, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
     sqlite_migrated_store,
 };
 
@@ -241,7 +242,7 @@ fn sqlite_invitation_acceptance_is_atomic_and_restart_visible() {
 fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() {
     // Cause/effect decision table:
     // C1 existing Org with Workspace, descendant Resource, grant, membership
-    // and Workspace token -> E1 one DELETE command removes the
+    // Directory placement and Workspace token -> E1 one DELETE command removes the
     // complete IAM-owned closure in one SQL write transaction and advances the
     // PAP fence once; C2 foreign Org state -> E2 retained; C3 exact retry -> E3
     // success with no write and no additional fence advance.
@@ -252,6 +253,7 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
         account_id: AccountId("owner".into()),
     };
     let mut pap = PolicyAdminApi::new(store.clone());
+    let directory = DirectoryApi::new(store.clone());
     for org in ["org-a", "org-b"] {
         pap.create_org(
             Organization {
@@ -264,6 +266,33 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
             now.clone(),
         )
         .unwrap();
+    }
+    for suffix in ["a", "b"] {
+        let org_id = OrgId(format!("org-{suffix}"));
+        let node_id = DirectoryNodeId(format!("node-{suffix}"));
+        directory
+            .create_node(CreateDirectoryNode {
+                node: DirectoryNodeDto {
+                    id: node_id.clone(),
+                    org_id: org_id.clone(),
+                    parent_id: None,
+                    name: format!("Root {suffix}"),
+                    slug: format!("root-{suffix}"),
+                    description: None,
+                    archived: false,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                binding: Some(ProductSpaceBinding {
+                    product_space: ProductSpaceRef {
+                        product: "agents".into(),
+                        space_id: format!("space-{suffix}"),
+                    },
+                    org_id,
+                    node_id,
+                }),
+            })
+            .unwrap();
     }
     for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
         pap.assign_workspace_org(
@@ -332,6 +361,21 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
     );
     assert!(pap.get_org(&OrgId("org-a".into())).unwrap().is_none());
     assert!(pap.get_org(&OrgId("org-b".into())).unwrap().is_some());
+    assert!(
+        directory
+            .node(&DirectoryNodeId("node-a".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        directory
+            .product_space_binding(&ProductSpaceRef {
+                product: "agents".into(),
+                space_id: "space-b".into(),
+            })
+            .unwrap()
+            .is_some()
+    );
     assert!(GrantRepo::list(&store).unwrap().is_empty());
     assert!(RoleBindingRepo::list(&store).unwrap().is_empty());
     assert!(ResourceModelRepo::list_edges(&store).unwrap().is_empty());
