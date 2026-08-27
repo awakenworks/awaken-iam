@@ -13,8 +13,8 @@
 //!   transaction, alongside the domain write.
 //!
 //! Either way application is **idempotent**: grants upsert by their own id
-//! through [`GrantRepo::put`] and each scope edge upserts by its
-//! `(resource_type, resource_id)` key through [`ResourceModelRepo::put_edge`], so
+//! through [`GrantRepository::put`] and each scope edge upserts by its
+//! `(resource_type, resource_id)` key through [`ResourceModelRepository::put_edge`], so
 //! re-applying an identical provision overwrites like with like and changes
 //! nothing. Edges are written before grants so a grant anchored at the new
 //! resource always resolves its ancestor scope the moment it lands — never a
@@ -24,7 +24,7 @@ use awaken_iam_contract::{GrantEffect, GrantSubjectRef, ResourceProvision};
 
 use crate::GroupId;
 use crate::authorization::{ActionPattern, Effect, Grant, GrantId, GrantSubject, RoleId};
-use crate::ports::{GrantRepo, RepoResult, ResourceModelRepo};
+use crate::repositories::{GrantRepository, RepositoryResult, ResourceModelRepository};
 use crate::resource_model::ResourceEdge;
 
 /// Apply one [`ResourceProvision`] to the IAM authorization plane idempotently.
@@ -37,9 +37,9 @@ use crate::resource_model::ResourceEdge;
 /// interpreted here.
 pub fn apply_resource_provision(
     provision: &ResourceProvision,
-    grants: &dyn GrantRepo,
-    edges: &dyn ResourceModelRepo,
-) -> RepoResult<()> {
+    grants: &dyn GrantRepository,
+    edges: &dyn ResourceModelRepository,
+) -> RepositoryResult<()> {
     for edge in &provision.scope_edges {
         edges.put_edge(ResourceEdge {
             resource_type: edge.resource_type.clone(),
@@ -74,7 +74,7 @@ pub fn apply_resource_provision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{RepoError, RepoResult};
+    use crate::repositories::{RepositoryError, RepositoryResult};
     use awaken_iam_contract::{
         AccountId, GrantSnapshot, PrincipalRef, ResourceId, ResourceParentEdge, ResourceType,
         ScopeRef,
@@ -87,8 +87,8 @@ mod tests {
         edges: Mutex<Vec<ResourceEdge>>,
     }
 
-    impl GrantRepo for FakeAuthz {
-        fn put(&self, grant: Grant) -> RepoResult<()> {
+    impl GrantRepository for FakeAuthz {
+        fn put(&self, grant: Grant) -> RepositoryResult<()> {
             let mut grants = self.grants.lock().unwrap();
             if let Some(existing) = grants.iter_mut().find(|g| g.id == grant.id) {
                 *existing = grant;
@@ -97,7 +97,7 @@ mod tests {
             }
             Ok(())
         }
-        fn get(&self, id: &GrantId) -> RepoResult<Option<Grant>> {
+        fn get(&self, id: &GrantId) -> RepositoryResult<Option<Grant>> {
             Ok(self
                 .grants
                 .lock()
@@ -106,22 +106,22 @@ mod tests {
                 .find(|g| &g.id == id)
                 .cloned())
         }
-        fn list(&self) -> RepoResult<Vec<Grant>> {
+        fn list(&self) -> RepositoryResult<Vec<Grant>> {
             Ok(self.grants.lock().unwrap().clone())
         }
-        fn remove(&self, id: &GrantId) -> RepoResult<()> {
+        fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
             let mut grants = self.grants.lock().unwrap();
             let before = grants.len();
             grants.retain(|g| &g.id != id);
             if grants.len() == before {
-                return Err(RepoError::NotFound(format!("grant {}", id.0)));
+                return Err(RepositoryError::NotFound(format!("grant {}", id.0)));
             }
             Ok(())
         }
     }
 
-    impl ResourceModelRepo for FakeAuthz {
-        fn put_edge(&self, edge: ResourceEdge) -> RepoResult<()> {
+    impl ResourceModelRepository for FakeAuthz {
+        fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
             let mut edges = self.edges.lock().unwrap();
             if let Some(existing) = edges.iter_mut().find(|e| {
                 e.resource_type == edge.resource_type && e.resource_id == edge.resource_id
@@ -132,7 +132,7 @@ mod tests {
             }
             Ok(())
         }
-        fn list_edges(&self) -> RepoResult<Vec<ResourceEdge>> {
+        fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>> {
             Ok(self.edges.lock().unwrap().clone())
         }
     }
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn fake_authz_get_returns_seeded_grants_and_remove_yields_not_found() {
         // The fake port's get/remove round-trip the same shape a real
-        // GrantRepo exposes: get returns Some/None by id, remove yields
+        // GrantRepository exposes: get returns Some/None by id, remove yields
         // NotFound for an unknown id and Ok(()) for a known one.
         let authz = FakeAuthz::default();
         apply_resource_provision(&provision(), &authz, &authz).unwrap();
@@ -201,6 +201,9 @@ mod tests {
         // Removing twice: first succeeds, second yields NotFound.
         authz.remove(&id).unwrap();
         assert!(authz.get(&id).unwrap().is_none());
-        assert!(matches!(authz.remove(&id), Err(RepoError::NotFound(_))));
+        assert!(matches!(
+            authz.remove(&id),
+            Err(RepositoryError::NotFound(_))
+        ));
     }
 }

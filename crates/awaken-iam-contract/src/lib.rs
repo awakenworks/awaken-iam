@@ -23,10 +23,11 @@ pub use profile::{
 
 pub use admin::{
     AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeDto, DirectoryNodeId, GroupDto,
-    InvitationBinding, InvitationDto, InvitationId, InvitationQuery, InvitationStatus,
-    IssuedInvitation, MembershipQuery, MoveDirectoryNode, OrgDto, ProductSpaceBinding,
-    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RoleDto, ScopeMembershipQuery,
+    DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult,
+    DirectoryNodeView, EnsureProductSpacePlacement, GroupView, InvitationBinding, InvitationId,
+    InvitationQuery, InvitationStatus, InvitationView, IssuedInvitation, MembershipQuery,
+    MoveDirectoryNode, OrgView, ProductSpacePlacement, ProductSpacePlacementResult,
+    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RoleView, ScopeMembershipQuery,
     UpdateDirectoryNode,
 };
 pub use identity::{

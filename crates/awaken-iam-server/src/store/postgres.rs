@@ -27,14 +27,14 @@ use awaken_scoped_migration::{
     MigrationBundle, MigrationError, check_ledger_version, plan, render as render_ddl,
 };
 
-use awaken_iam_core::{RepoError, RepoResult};
+use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
 use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
 
 /// Execute a synchronous-driver operation without an entered Tokio runtime.
 ///
-/// The `postgres` client owns a private runtime. Repository ports remain
+/// The `postgres` client owns a private runtime. Repository repository contracts remain
 /// synchronous, so an Axum host cannot safely call the driver on its Tokio
 /// worker. A scoped thread preserves the synchronous port and borrowed inputs
 /// while keeping runtime ownership inside this adapter. Existing plain-thread
@@ -128,8 +128,8 @@ impl PostgresBackend {
     fn with_client<T: Send>(
         &self,
         component: &'static str,
-        operation: impl FnOnce(&mut Client) -> RepoResult<T> + Send,
-    ) -> RepoResult<T> {
+        operation: impl FnOnce(&mut Client) -> RepositoryResult<T> + Send,
+    ) -> RepositoryResult<T> {
         run_outside_tokio(component, || match self.client.get() {
             ConnectionOwner::Direct(client) => {
                 let mut client = client
@@ -149,10 +149,10 @@ impl PostgresBackend {
     }
 
     /// Connect to Postgres using a libpq-style connection string or URL.
-    pub fn connect(params: &str) -> RepoResult<Self> {
+    pub fn connect(params: &str) -> RepositoryResult<Self> {
         let config = params
             .parse()
-            .map_err(|error: postgres::Error| RepoError::Backend(error.to_string()))?;
+            .map_err(|error: postgres::Error| RepositoryError::Backend(error.to_string()))?;
         let manager = PostgresConnectionManager::new(config, NoTls);
         let pool = run_outside_tokio("connect", || {
             r2d2::Pool::builder()
@@ -173,23 +173,23 @@ impl PostgresBackend {
 
 /// Connect, run every IAM migration under `prefix`, and return the repository
 /// adapter over the connection.
-pub fn migrated_store(params: &str, prefix: &str) -> RepoResult<SqlStore<PostgresBackend>> {
+pub fn migrated_store(params: &str, prefix: &str) -> RepositoryResult<SqlStore<PostgresBackend>> {
     let backend = PostgresBackend::connect(params)?;
     IamStore::with_prefix(backend.clone(), prefix)?.migrate()?;
     SqlStore::with_prefix(backend, prefix)
 }
 
-fn backend_err(err: postgres::Error) -> RepoError {
+fn backend_err(err: postgres::Error) -> RepositoryError {
     if let Some(db) = err.as_db_error()
         && db.code() == &SqlState::UNIQUE_VIOLATION
     {
-        return RepoError::Conflict(db.message().to_owned());
+        return RepositoryError::Conflict(db.message().to_owned());
     }
-    RepoError::Backend(err.to_string())
+    RepositoryError::Backend(err.to_string())
 }
 
-fn pool_err(err: r2d2::Error) -> RepoError {
-    RepoError::Backend(err.to_string())
+fn pool_err(err: r2d2::Error) -> RepositoryError {
+    RepositoryError::Backend(err.to_string())
 }
 
 /// Rewrite the portable placeholder dialect to Postgres numbered parameters:
@@ -239,7 +239,7 @@ impl PostgresBackend {
     /// Bootstrap or validate the foundation-owned ledger generation while
     /// holding the namespace lock. IAM owns only the synchronous driver calls;
     /// names, DDL, and the state decision remain authoritative in foundation.
-    fn ensure_ledger(client: &mut Client, prefix: &str) -> RepoResult<()> {
+    fn ensure_ledger(client: &mut Client, prefix: &str) -> RepositoryResult<()> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let mut tx = client.transaction().map_err(backend_err)?;
         tx.execute(
@@ -284,7 +284,7 @@ impl SqlConn for PostgresBackend {
         Dialect::Postgres
     }
 
-    fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64> {
+    fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
         self.with_client("execute", |client| {
             client
                 .execute(&render(sql), &refs(params))
@@ -292,7 +292,7 @@ impl SqlConn for PostgresBackend {
         })
     }
 
-    fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>> {
+    fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
         self.with_client("query", |client| {
             let rows = client
                 .query(&render(sql), &refs(params))
@@ -312,7 +312,7 @@ impl SqlConn for PostgresBackend {
         })
     }
 
-    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>> {
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
         self.with_client("transaction", |client| {
             let mut tx = client.transaction().map_err(backend_err)?;
             let mut affected = Vec::with_capacity(writes.len());
@@ -331,7 +331,7 @@ impl SqlConn for PostgresBackend {
         &self,
         writes: &[SqlWrite],
         required: &[(usize, u64)],
-    ) -> RepoResult<Vec<u64>> {
+    ) -> RepositoryResult<Vec<u64>> {
         self.with_client("checked transaction", |client| {
             let mut tx = client.transaction().map_err(backend_err)?;
             let mut affected = Vec::with_capacity(writes.len());
@@ -345,7 +345,7 @@ impl SqlConn for PostgresBackend {
                 .iter()
                 .find(|(index, expected)| affected.get(*index) != Some(expected))
             {
-                return Err(RepoError::Conflict(format!(
+                return Err(RepositoryError::Conflict(format!(
                     "transaction write {index} affected {} rows; expected {expected}",
                     affected.get(*index).copied().unwrap_or(0)
                 )));
@@ -365,7 +365,7 @@ impl MigrationExecutor for PostgresBackend {
         &mut self,
         prefix: &str,
         bundles: &[MigrationBundle],
-    ) -> RepoResult<Vec<AppliedMigration>> {
+    ) -> RepositoryResult<Vec<AppliedMigration>> {
         let dialect = Dialect::Postgres;
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
@@ -421,7 +421,11 @@ impl MigrationExecutor for PostgresBackend {
         })
     }
 
-    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
+    fn applied_versions(
+        &self,
+        prefix: &str,
+        bundle_id: &str,
+    ) -> RepositoryResult<BTreeMap<i64, String>> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
         self.with_client("migration-read", |client| {
@@ -451,7 +455,7 @@ fn read_applied(
     tx: &mut postgres::Transaction<'_>,
     ledger: &str,
     bundle_id: &str,
-) -> RepoResult<BTreeMap<i64, String>> {
+) -> RepositoryResult<BTreeMap<i64, String>> {
     let rows = tx
         .query(
             &format!(

@@ -78,5 +78,6 @@ client with rotation and revocation.
   `ResourceModel` registry. These are additive to the existing crate layout
   (contract / core / client / server); the guardrails in ADR-0001 are unchanged.
 - Design follows DDD and simple-design discipline: small aggregates, explicit
-  domain events, ports-and-adapters, and no speculative policy language beyond
+  domain events, repository contracts-and-adapters, and no speculative policy language beyond
   hierarchical RBAC until a second need appears.
+

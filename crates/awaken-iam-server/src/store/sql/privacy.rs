@@ -4,25 +4,25 @@ use std::collections::BTreeSet;
 
 use awaken_iam_contract::{OrgId, ScopeRef};
 use awaken_iam_core::{
-    GrantRepo, GrantSubject, GroupRepo, OrgPrivacyRepo, OrganizationPrivacyScope, RepoResult,
-    ResourceModelRepo, RoleBindingRepo,
+    GrantRepository, GrantSubject, GroupRepository, OrgPrivacyRepository, OrganizationPrivacyScope,
+    RepositoryResult, ResourceModelRepository, RoleBindingRepository,
 };
 
 use super::{SqlConn, SqlStore, SqlWrite, json_encode, p, req};
 
-impl<B: SqlConn> OrgPrivacyRepo for SqlStore<B> {
-    fn erase_org_privacy(&self, id: &OrgId) -> RepoResult<bool> {
-        let workspace_edges = ResourceModelRepo::list_workspace_orgs(self)?;
-        let resource_edges = ResourceModelRepo::list_edges(self)?;
+impl<B: SqlConn> OrgPrivacyRepository for SqlStore<B> {
+    fn erase_org_privacy(&self, id: &OrgId) -> RepositoryResult<bool> {
+        let workspace_edges = ResourceModelRepository::list_workspace_orgs(self)?;
+        let resource_edges = ResourceModelRepository::list_edges(self)?;
         let privacy = OrganizationPrivacyScope::resolve(id, &workspace_edges, &resource_edges);
-        let groups = GroupRepo::list(self)?;
+        let groups = GroupRepository::list(self)?;
         let group_ids = groups
             .iter()
             .filter(|group| &group.org == id)
             .map(|group| group.id.0.clone())
             .collect::<BTreeSet<_>>();
-        let grants = GrantRepo::list(self)?;
-        let bindings = RoleBindingRepo::list(self)?;
+        let grants = GrantRepository::list(self)?;
+        let bindings = RoleBindingRepository::list(self)?;
 
         let token_rows = self.backend.query(
             &format!(

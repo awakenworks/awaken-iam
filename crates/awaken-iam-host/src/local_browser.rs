@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{AccountId, SessionId, SessionView, Timestamp};
-use awaken_iam_core::{EntropySource, OsEntropy, SessionRepo};
+use awaken_iam_core::{EntropySource, OsEntropy, SessionRepository};
 use awaken_iam_server::{
     BeginLocalSetup, ExchangeLocalSetup, LocalSetupError, LocalSetupGateway, LocalSetupId,
     SameSite, SessionCookieConfig, SessionGateway,
@@ -62,7 +62,7 @@ impl LocalBrowserAuth {
     /// already own; no product-local session cache or hydration path is created.
     pub fn begin_with_session_repository(
         account_id: AccountId,
-        repository: Arc<dyn SessionRepo>,
+        repository: Arc<dyn SessionRepository>,
     ) -> Result<(Self, LocalSetupHandoff), LocalBrowserAuthError> {
         Self::begin_with_gateway(
             account_id,
@@ -409,12 +409,12 @@ mod tests {
     }
 
     /// Local-browser restart decision table:
-    /// C1=one exchanged cookie, C2=same SessionRepo after authority rebuild,
+    /// C1=one exchanged cookie, C2=same SessionRepository after authority rebuild,
     /// C3=persisted logout. R1(C1,C2,!C3) GETs the current session without the
     /// new setup token; R2(C1,C2,C3) rejects after another rebuild.
     #[tokio::test]
     async fn repository_backed_browser_cookie_survives_authority_restart() {
-        let repository: Arc<dyn SessionRepo> = Arc::new(InMemoryStore::new());
+        let repository: Arc<dyn SessionRepository> = Arc::new(InMemoryStore::new());
         let (first, handoff) = LocalBrowserAuth::begin_with_session_repository(
             AccountId("local-admin".into()),
             repository.clone(),

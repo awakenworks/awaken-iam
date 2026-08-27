@@ -273,25 +273,25 @@ fn runtime_user_role_is_confined_to_basic_actions() {
 /// seeding both catalogs populates each independently without collision.
 #[test]
 fn seed_runtime_roles_is_idempotent_and_independent_of_named_catalog() {
-    use awaken_iam::{ANTHROPIC_ROLE_IDS, RepoResult, RoleDef, seed_named_roles};
-    use awaken_iam_core::RoleRepo;
+    use awaken_iam::{ANTHROPIC_ROLE_IDS, RepositoryResult, RoleDef, seed_named_roles};
+    use awaken_iam_core::RoleRepository;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct MemRoles(Mutex<BTreeMap<String, RoleDef>>);
-    impl RoleRepo for MemRoles {
-        fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
+    impl RoleRepository for MemRoles {
+        fn get(&self, id: &RoleId) -> RepositoryResult<Option<RoleDef>> {
             Ok(self.0.lock().unwrap().get(&id.0).cloned())
         }
-        fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+        fn upsert(&self, role: RoleDef) -> RepositoryResult<()> {
             self.0.lock().unwrap().insert(role.id.0.clone(), role);
             Ok(())
         }
-        fn list(&self) -> RepoResult<Vec<RoleDef>> {
+        fn list(&self) -> RepositoryResult<Vec<RoleDef>> {
             Ok(self.0.lock().unwrap().values().cloned().collect())
         }
-        fn remove(&self, id: &RoleId) -> RepoResult<()> {
+        fn remove(&self, id: &RoleId) -> RepositoryResult<()> {
             self.0.lock().unwrap().remove(&id.0);
             Ok(())
         }

@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AdminMutationAck, AuthorizationOutcome, BatchAuthorizationResponse, EntitlementCheckResponse,
-    OrgDto, PolicySnapshot,
+    OrgView, PolicySnapshot,
 };
+use awaken_iam_core::AuthorizationProfileRepository;
 use awaken_iam_server::{
-    AdminAuthPolicy, AuthzApi, DaemonState, daemon_router, http, sqlite_in_memory_store,
+    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, SqlStore, SqliteBackend, daemon_router, http,
+    sqlite_in_memory_store,
 };
 use axum::Router;
 use axum::body::Body;
@@ -24,8 +26,24 @@ use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-secret";
 
+fn test_daemon_state(
+    authz: AuthzApi,
+    auth: AdminAuthPolicy,
+) -> DaemonState<SqlStore<SqliteBackend>> {
+    let store = sqlite_in_memory_store("iam_http_test").expect("migrated sqlite IAM store");
+    let profiles: Arc<dyn AuthorizationProfileRepository> = Arc::new(store.clone());
+    DaemonState::with_policy_store(
+        authz,
+        auth,
+        profiles,
+        store,
+        AuthApi::new().token_authority(),
+    )
+    .expect("hydrate test daemon")
+}
+
 fn daemon() -> Router {
-    let state = Arc::new(Mutex::new(DaemonState::new(
+    let state = Arc::new(Mutex::new(test_daemon_state(
         AuthzApi::new(),
         AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
     )));
@@ -105,70 +123,74 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
             .status(),
         StatusCode::OK
     );
-    let node = |id: &str, parent_id: Option<&str>, bind: bool| {
-        let mut node = serde_json::json!({
-            "id": id,
-            "org_id": "acme",
-            "name": id,
-            "slug": id,
-            "created_at": "2026-08-27T00:00:00Z",
-            "updated_at": "2026-08-27T00:00:00Z"
-        });
-        if let Some(parent_id) = parent_id {
-            node["parent_id"] = parent_id.into();
-        }
-        let mut command = serde_json::json!({ "node": node });
-        if bind {
-            command["binding"] = serde_json::json!({
-                "product_space": {"product":"agents", "space_id":"space-a"},
-                "org_id":"acme",
-                "node_id":id
-            });
-        }
-        command
-    };
     let root = app
         .clone()
         .oneshot(authed_json(
             "POST",
             "/v1/admin/directory/nodes",
-            node("root", None, false),
+            serde_json::json!({
+                "org_id":"acme",
+                "name":"Root",
+                "preferred_slug":"root"
+            }),
         ))
         .await
         .unwrap();
     assert_eq!(root.status(), StatusCode::OK, "H1");
-    assert_eq!(body_json(root).await["revision"], 2);
+    let root = body_json(root).await;
+    let root_revision = root["revision"].as_u64().unwrap();
+    let root_id = root["node"]["id"].as_str().unwrap().to_owned();
     let child = app
         .clone()
         .oneshot(authed_json(
             "POST",
-            "/v1/admin/directory/nodes",
-            node("team", Some("root"), true),
+            "/v1/admin/directory/product-spaces/ensure",
+            serde_json::json!({
+                "product_space":{"product":"agents", "space_id":"space-a"},
+                "org_id":"acme",
+                "parent_product_space":null,
+                "name":"Team",
+                "preferred_slug":"team"
+            }),
         ))
         .await
         .unwrap();
     assert_eq!(child.status(), StatusCode::OK, "H1");
-    assert_eq!(body_json(child).await["revision"], 3);
+    let child = body_json(child).await;
+    let child_revision = child["revision"].as_u64().unwrap();
+    let child_id = child["node"]["id"].as_str().unwrap().to_owned();
+    assert!(child_revision > root_revision, "E1");
+
+    let moved_under_root = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/v1/admin/directory/nodes/{child_id}"),
+            serde_json::json!({"parent_id":root_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(moved_under_root.status(), StatusCode::OK, "H4");
 
     let updated = app
         .clone()
         .oneshot(authed_json(
             "PATCH",
-            "/v1/admin/directory/nodes/team",
+            &format!("/v1/admin/directory/nodes/{child_id}"),
             serde_json::json!({
                 "name":"Platform Team",
                 "slug":"platform",
-                "description":"Shared platform",
-                "updated_at":"2026-08-27T00:30:00Z"
+                "description":"Shared platform"
             }),
         ))
         .await
         .unwrap();
     assert_eq!(updated.status(), StatusCode::OK, "H3");
-    assert_eq!(body_json(updated).await["revision"], 4);
+    let updated_revision = body_json(updated).await["revision"].as_u64().unwrap();
+    assert!(updated_revision > child_revision, "E3");
     let current = app
         .clone()
-        .oneshot(authed_get("/v1/admin/directory/nodes/team"))
+        .oneshot(authed_get(&format!("/v1/admin/directory/nodes/{child_id}")))
         .await
         .unwrap();
     let current = body_json(current).await;
@@ -179,13 +201,13 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
         .clone()
         .oneshot(authed_json(
             "PUT",
-            "/v1/admin/directory/nodes/team",
-            serde_json::json!({"updated_at":"2026-08-27T01:00:00Z"}),
+            &format!("/v1/admin/directory/nodes/{child_id}"),
+            serde_json::json!({}),
         ))
         .await
         .unwrap();
     assert_eq!(moved.status(), StatusCode::OK, "H4");
-    assert_eq!(body_json(moved).await["revision"], 5);
+    assert!(body_json(moved).await["revision"].as_u64().unwrap() > updated_revision);
     let roots = app
         .clone()
         .oneshot(authed_get("/v1/admin/directory/nodes?org_id=acme"))
@@ -204,7 +226,7 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
         .await
         .unwrap();
     assert_eq!(binding.status(), StatusCode::OK, "H2");
-    assert_eq!(body_json(binding).await["node_id"], "team", "E2/E4");
+    assert_eq!(body_json(binding).await["node_id"], child_id, "E2/E4");
 
     let denied = app
         .oneshot(
@@ -626,7 +648,7 @@ async fn admin_crud_is_served_over_http_and_advances_the_snapshot_version() {
         .await
         .expect("dispatch");
     assert_eq!(listed.status(), StatusCode::OK);
-    let orgs: Vec<OrgDto> = serde_json::from_value(body_json(listed).await).expect("orgs");
+    let orgs: Vec<OrgView> = serde_json::from_value(body_json(listed).await).expect("orgs");
     assert_eq!(orgs.len(), 1);
     assert_eq!(orgs[0].id.0, "acme");
 
@@ -660,7 +682,7 @@ async fn admin_crud_is_served_over_http_and_advances_the_snapshot_version() {
         .oneshot(authed_get("/v1/admin/orgs"))
         .await
         .expect("dispatch");
-    let orgs: Vec<OrgDto> = serde_json::from_value(body_json(empty).await).expect("orgs");
+    let orgs: Vec<OrgView> = serde_json::from_value(body_json(empty).await).expect("orgs");
     assert!(orgs.is_empty());
 }
 
@@ -790,7 +812,7 @@ async fn update_org_replaces_an_existing_organization() {
         .oneshot(authed_get("/v1/admin/orgs"))
         .await
         .expect("dispatch");
-    let orgs: Vec<OrgDto> = serde_json::from_value(body_json(listed).await).expect("orgs");
+    let orgs: Vec<OrgView> = serde_json::from_value(body_json(listed).await).expect("orgs");
     assert_eq!(orgs.len(), 1);
     assert_eq!(orgs[0].id.0, "acme");
     assert_eq!(orgs[0].display_name.as_deref(), Some("Renamed ACME"));
@@ -987,7 +1009,7 @@ async fn full_admin_crud_round_trip_orgs_groups_roles_grants_memberships() {
         .oneshot(authed_get("/v1/admin/orgs"))
         .await
         .expect("dispatch");
-    let orgs: Vec<OrgDto> = serde_json::from_value(body_json(empty).await).expect("orgs");
+    let orgs: Vec<OrgView> = serde_json::from_value(body_json(empty).await).expect("orgs");
     assert!(orgs.is_empty());
 }
 
@@ -1240,7 +1262,7 @@ async fn admin_auth_accepts_an_x_api_key_header_credential() {
     // The auth seam recognises an `x-api-key` admin credential as well as the
     // `Authorization: Bearer` shape — both forms must let the same admin call
     // through.
-    let state = Arc::new(Mutex::new(DaemonState::new(
+    let state = Arc::new(Mutex::new(test_daemon_state(
         AuthzApi::new(),
         AdminAuthPolicy::new(["sk-ant-admin-xyz".to_owned()]),
     )));

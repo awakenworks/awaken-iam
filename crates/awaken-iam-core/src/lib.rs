@@ -15,11 +15,11 @@ mod linking;
 mod login;
 mod oauth_provider;
 mod policy_composition;
-mod ports;
 mod privacy;
 mod provider;
 mod provision;
 mod refresh_token;
+mod repositories;
 mod resource_model;
 mod session;
 mod shadow;
@@ -73,13 +73,6 @@ pub use oauth_provider::{
     OAuthAuthorizationServer, OAuthClientRegistry, OAuthProviderError, RegisteredClient,
     StoredAuthorizationCode, TokenRedemption,
 };
-pub use ports::{
-    AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, DirectoryRepo, ExternalIdentityRepo, GrantRepo, GroupRepo,
-    InvitationRepo, LoginFlowRepo, OAuthClientRepo, OrgPrivacyRepo, OrgRepo, PlanRepo, RepoError,
-    RepoResult, ResourceModelRepo, RoleBindingRepo, RoleRepo, SessionRepo,
-    external_identity_id_hint, seed_roles,
-};
 pub use privacy::OrganizationPrivacyScope;
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
@@ -89,6 +82,15 @@ pub use provision::apply_resource_provision;
 pub use refresh_token::{
     IssuedRefreshToken, MintRefreshToken, RefreshTokenDirectory, RefreshTokenMinter,
     RotateRefreshToken, parse_presented_refresh_token,
+};
+pub use repositories::{
+    AccountIdentityRepository, AccountRepository, ApiTokenRepository, AuditEvent, AuditSink,
+    AuthCodeRepository, AuthorizationProfileRepository, DirectoryRepository,
+    ExternalIdentityRepository, GrantRepository, GroupRepository, InvitationRepository,
+    LoginFlowRepository, OAuthClientRepository, OrgPrivacyRepository, OrgRepository,
+    PlanRepository, RepositoryError, RepositoryResult, ResourceModelRepository,
+    RoleBindingRepository, RoleRepository, SessionRepository, external_identity_id_hint,
+    seed_roles,
 };
 pub use resource_model::{ResourceEdge, ResourceModel, ResourceTypeDef};
 pub use session::{EstablishSession, IssuedSession, SessionMinter, hash_session_token};
@@ -555,7 +557,7 @@ impl IdentityDirectory {
 
 /// In-memory directory enforcing legacy local session invariants.
 ///
-/// OAuth login challenges use the single authoritative [`LoginFlowRepo`] port;
+/// OAuth login challenges use the single authoritative [`LoginFlowRepository`] port;
 /// this directory owns only process-local sessions retained by the core API.
 ///
 /// Timestamps are compared as canonical RFC 3339 UTC strings (`...Z`), which is

@@ -2,7 +2,7 @@
 //!
 //! This is the framework-agnostic seam that lets an administrator manage the
 //! authorization model — organizations, groups, roles, grants, and memberships —
-//! on top of the [repository ports](awaken_iam_core). Like [`AuthApi`](crate::AuthApi)
+//! on top of the [repository contracts](awaken_iam_core). Like [`AuthApi`](crate::AuthApi)
 //! and [`AuthzApi`](crate::AuthzApi) it speaks in logical request/response values
 //! (the aggregates in [`awaken_iam_core`]) rather than binding to a concrete HTTP
 //! framework; a deployment maps these methods onto its router of choice:
@@ -38,14 +38,13 @@ use awaken_iam_contract::{
 };
 #[cfg(test)]
 use awaken_iam_contract::{
-    CreateDirectoryNode, DirectoryNodeDto, DirectoryNodeId, MoveDirectoryNode, ProductSpaceBinding,
-    ProductSpaceRef,
+    CreateDirectoryNode, DirectoryNodeId, MoveDirectoryNode, ProductSpaceRef,
 };
 use awaken_iam_core::{
-    AuditEvent, AuditSink, Grant, GrantId, GrantRepo, Group, GroupId, GroupRepo, Invitation,
-    InvitationRepo, OrgPrivacyRepo, OrgRepo, Organization, PolicySet, RepoError, ResourceEdge,
-    ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleInvariant, RoleRepo,
-    normalize_invitation_email,
+    AuditEvent, AuditSink, Grant, GrantId, GrantRepository, Group, GroupId, GroupRepository,
+    Invitation, InvitationRepository, OrgPrivacyRepository, OrgRepository, Organization, PolicySet,
+    RepositoryError, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
+    RoleDef, RoleId, RoleInvariant, RoleRepository, normalize_invitation_email,
 };
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -59,28 +58,28 @@ use crate::FenceStore;
 /// This marker keeps deployment selection generic without wrapping every PAP
 /// operation in a second forwarding interface.
 pub trait PolicyStore:
-    OrgRepo
-    + OrgPrivacyRepo
-    + GroupRepo
-    + RoleRepo
-    + GrantRepo
-    + RoleBindingRepo
-    + InvitationRepo
-    + ResourceModelRepo
+    OrgRepository
+    + OrgPrivacyRepository
+    + GroupRepository
+    + RoleRepository
+    + GrantRepository
+    + RoleBindingRepository
+    + InvitationRepository
+    + ResourceModelRepository
     + AuditSink
     + FenceStore
 {
 }
 
 impl<T> PolicyStore for T where
-    T: OrgRepo
-        + OrgPrivacyRepo
-        + GroupRepo
-        + RoleRepo
-        + GrantRepo
-        + RoleBindingRepo
-        + InvitationRepo
-        + ResourceModelRepo
+    T: OrgRepository
+        + OrgPrivacyRepository
+        + GroupRepository
+        + RoleRepository
+        + GrantRepository
+        + RoleBindingRepository
+        + InvitationRepository
+        + ResourceModelRepository
         + AuditSink
         + FenceStore
 {
@@ -263,12 +262,12 @@ pub enum AdminError {
     Backend(String),
 }
 
-impl From<RepoError> for AdminError {
-    fn from(err: RepoError) -> Self {
+impl From<RepositoryError> for AdminError {
+    fn from(err: RepositoryError) -> Self {
         match err {
-            RepoError::Conflict(message) => AdminError::AlreadyExists(message),
-            RepoError::NotFound(message) => AdminError::NotFound(message),
-            RepoError::Backend(message) => AdminError::Backend(message),
+            RepositoryError::Conflict(message) => AdminError::AlreadyExists(message),
+            RepositoryError::NotFound(message) => AdminError::NotFound(message),
+            RepositoryError::Backend(message) => AdminError::Backend(message),
         }
     }
 }
@@ -331,11 +330,12 @@ fn parse_timestamp(value: &Timestamp) -> AdminResult<OffsetDateTime> {
         .map_err(|_| AdminError::Invalid("timestamps must be RFC 3339".into()))
 }
 
-/// Policy Administration Point over a set of repository ports.
+/// Policy Administration Point over a set of repository contracts.
 ///
-/// `S` is any store implementing the policy repository ports, the audit sink,
-/// and the [`FenceStore`]; the in-memory [`InMemoryStore`](crate::InMemoryStore)
-/// backs tests and local mode, and a database adapter backs the service.
+/// `S` is any store implementing the policy repository contracts, the audit sink,
+/// and the [`FenceStore`]. The process-memory
+/// [`InMemoryStore`](crate::InMemoryStore) backs tests only; deployed embedded
+/// and standalone modes use a migrated SQL adapter.
 /// Mutating methods append a [`DomainEvent`] and advance the
 /// [snapshot version](PolicyAdminApi::version) **in the shared store**; read
 /// methods never advance it.
@@ -418,24 +418,24 @@ where
 
     /// Create an organization, failing closed when its id already exists.
     pub fn create_org(&mut self, org: Organization, at: Timestamp) -> AdminResult<u64> {
-        if OrgRepo::get(&self.store, &org.id)?.is_some() {
+        if OrgRepository::get(&self.store, &org.id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!(
                 "organization {}",
                 org.id.0
             )));
         }
         let id = org.id.clone();
-        OrgRepo::upsert(&self.store, org)?;
+        OrgRepository::upsert(&self.store, org)?;
         self.commit(DomainEvent::OrganizationCreated(id), at)
     }
 
     /// Replace an existing organization, failing closed when it is absent.
     pub fn update_org(&mut self, org: Organization, at: Timestamp) -> AdminResult<u64> {
-        if OrgRepo::get(&self.store, &org.id)?.is_none() {
+        if OrgRepository::get(&self.store, &org.id)?.is_none() {
             return Err(AdminError::NotFound(format!("organization {}", org.id.0)));
         }
         let id = org.id.clone();
-        OrgRepo::upsert(&self.store, org)?;
+        OrgRepository::upsert(&self.store, org)?;
         self.commit(DomainEvent::OrganizationUpdated(id), at)
     }
 
@@ -451,51 +451,51 @@ where
 
     /// Resolve an organization by id.
     pub fn get_org(&self, id: &OrgId) -> AdminResult<Option<Organization>> {
-        Ok(OrgRepo::get(&self.store, id)?)
+        Ok(OrgRepository::get(&self.store, id)?)
     }
 
     /// List every organization.
     pub fn list_orgs(&self) -> AdminResult<Vec<Organization>> {
-        Ok(OrgRepo::list(&self.store)?)
+        Ok(OrgRepository::list(&self.store)?)
     }
 
     // -- groups -------------------------------------------------------------
 
     /// Create a group, failing closed when its id already exists.
     pub fn create_group(&mut self, group: Group, at: Timestamp) -> AdminResult<u64> {
-        if GroupRepo::get(&self.store, &group.id)?.is_some() {
+        if GroupRepository::get(&self.store, &group.id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!("group {}", group.id.0)));
         }
         let id = group.id.clone();
-        GroupRepo::upsert(&self.store, group)?;
+        GroupRepository::upsert(&self.store, group)?;
         self.commit(DomainEvent::GroupCreated(id), at)
     }
 
     /// Replace an existing group (membership or metadata), failing closed when
     /// it is absent.
     pub fn update_group(&mut self, group: Group, at: Timestamp) -> AdminResult<u64> {
-        if GroupRepo::get(&self.store, &group.id)?.is_none() {
+        if GroupRepository::get(&self.store, &group.id)?.is_none() {
             return Err(AdminError::NotFound(format!("group {}", group.id.0)));
         }
         let id = group.id.clone();
-        GroupRepo::upsert(&self.store, group)?;
+        GroupRepository::upsert(&self.store, group)?;
         self.commit(DomainEvent::GroupUpdated(id), at)
     }
 
     /// Delete a group, failing closed when it is absent.
     pub fn delete_group(&mut self, id: &GroupId, at: Timestamp) -> AdminResult<u64> {
-        GroupRepo::remove(&self.store, id)?;
+        GroupRepository::remove(&self.store, id)?;
         self.commit(DomainEvent::GroupDeleted(id.clone()), at)
     }
 
     /// Resolve a group by id.
     pub fn get_group(&self, id: &GroupId) -> AdminResult<Option<Group>> {
-        Ok(GroupRepo::get(&self.store, id)?)
+        Ok(GroupRepository::get(&self.store, id)?)
     }
 
     /// List every group.
     pub fn list_groups(&self) -> AdminResult<Vec<Group>> {
-        Ok(GroupRepo::list(&self.store)?)
+        Ok(GroupRepository::list(&self.store)?)
     }
 
     // -- roles --------------------------------------------------------------
@@ -504,11 +504,11 @@ where
     /// already exists.
     pub fn define_role(&mut self, role: RoleDef, at: Timestamp) -> AdminResult<u64> {
         role.validate()?;
-        if RoleRepo::get(&self.store, &role.id)?.is_some() {
+        if RoleRepository::get(&self.store, &role.id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!("role {}", role.id.0)));
         }
         let id = role.id.clone();
-        RoleRepo::upsert(&self.store, role)?;
+        RoleRepository::upsert(&self.store, role)?;
         self.commit(DomainEvent::RoleDefined(id), at)
     }
 
@@ -516,28 +516,28 @@ where
     /// when it is absent.
     pub fn update_role(&mut self, role: RoleDef, at: Timestamp) -> AdminResult<u64> {
         role.validate()?;
-        if RoleRepo::get(&self.store, &role.id)?.is_none() {
+        if RoleRepository::get(&self.store, &role.id)?.is_none() {
             return Err(AdminError::NotFound(format!("role {}", role.id.0)));
         }
         let id = role.id.clone();
-        RoleRepo::upsert(&self.store, role)?;
+        RoleRepository::upsert(&self.store, role)?;
         self.commit(DomainEvent::RoleUpdated(id), at)
     }
 
     /// Delete a role, failing closed when it is absent.
     pub fn delete_role(&mut self, id: &RoleId, at: Timestamp) -> AdminResult<u64> {
-        RoleRepo::remove(&self.store, id)?;
+        RoleRepository::remove(&self.store, id)?;
         self.commit(DomainEvent::RoleDeleted(id.clone()), at)
     }
 
     /// Resolve a role by id.
     pub fn get_role(&self, id: &RoleId) -> AdminResult<Option<RoleDef>> {
-        Ok(RoleRepo::get(&self.store, id)?)
+        Ok(RoleRepository::get(&self.store, id)?)
     }
 
     /// List every role.
     pub fn list_roles(&self) -> AdminResult<Vec<RoleDef>> {
-        Ok(RoleRepo::list(&self.store)?)
+        Ok(RoleRepository::list(&self.store)?)
     }
 
     // -- grants -------------------------------------------------------------
@@ -545,24 +545,24 @@ where
     /// Issue a grant, inserting or replacing it by id.
     pub fn issue_grant(&mut self, grant: Grant, at: Timestamp) -> AdminResult<u64> {
         let id = grant.id.clone();
-        GrantRepo::put(&self.store, grant)?;
+        GrantRepository::put(&self.store, grant)?;
         self.commit(DomainEvent::GrantIssued(id), at)
     }
 
     /// Revoke a grant, failing closed when it is absent.
     pub fn revoke_grant(&mut self, id: &GrantId, at: Timestamp) -> AdminResult<u64> {
-        GrantRepo::remove(&self.store, id)?;
+        GrantRepository::remove(&self.store, id)?;
         self.commit(DomainEvent::GrantRevoked(id.clone()), at)
     }
 
     /// Resolve a grant by id.
     pub fn get_grant(&self, id: &GrantId) -> AdminResult<Option<Grant>> {
-        Ok(GrantRepo::get(&self.store, id)?)
+        Ok(GrantRepository::get(&self.store, id)?)
     }
 
     /// List every grant.
     pub fn list_grants(&self) -> AdminResult<Vec<Grant>> {
-        Ok(GrantRepo::list(&self.store)?)
+        Ok(GrantRepository::list(&self.store)?)
     }
 
     // -- memberships --------------------------------------------------------
@@ -576,13 +576,13 @@ where
             role: binding.role.clone(),
             scope: binding.scope.clone(),
         };
-        RoleBindingRepo::add(&self.store, binding)?;
+        RoleBindingRepository::add(&self.store, binding)?;
         self.commit(event, at)
     }
 
     /// Revoke a membership, failing closed when the exact binding is absent.
     pub fn revoke_membership(&mut self, binding: &RoleBinding, at: Timestamp) -> AdminResult<u64> {
-        RoleBindingRepo::remove(&self.store, binding)?;
+        RoleBindingRepository::remove(&self.store, binding)?;
         self.commit(
             DomainEvent::MembershipRevoked {
                 principal: binding.principal.clone(),
@@ -618,7 +618,7 @@ where
                 "replacement roles must be contained in the managed role family".into(),
             ));
         }
-        RoleBindingRepo::replace_scoped(
+        RoleBindingRepository::replace_scoped(
             &self.store,
             &principal,
             &scope,
@@ -638,7 +638,7 @@ where
 
     /// List every membership.
     pub fn list_memberships(&self) -> AdminResult<Vec<RoleBinding>> {
-        Ok(RoleBindingRepo::list(&self.store)?)
+        Ok(RoleBindingRepository::list(&self.store)?)
     }
 
     /// List the memberships held by a principal.
@@ -646,13 +646,16 @@ where
         &self,
         principal: &PrincipalRef,
     ) -> AdminResult<Vec<RoleBinding>> {
-        Ok(RoleBindingRepo::list_for_principal(&self.store, principal)?)
+        Ok(RoleBindingRepository::list_for_principal(
+            &self.store,
+            principal,
+        )?)
     }
 
     /// List exact bindings anchored at `scope`; inherited effective membership
     /// remains a read projection above this primitive.
     pub fn memberships_for_scope(&self, scope: &ScopeRef) -> AdminResult<Vec<RoleBinding>> {
-        Ok(RoleBindingRepo::list(&self.store)?
+        Ok(RoleBindingRepository::list(&self.store)?
             .into_iter()
             .filter(|binding| &binding.scope == scope)
             .collect())
@@ -733,7 +736,7 @@ where
     pub fn list_invitations(
         &self,
         org_id: &OrgId,
-    ) -> AdminResult<Vec<awaken_iam_contract::InvitationDto>> {
+    ) -> AdminResult<Vec<awaken_iam_contract::InvitationView>> {
         Ok(self
             .store
             .list_invitations_for_org(org_id)?
@@ -861,7 +864,7 @@ where
         org_id: &OrgId,
         targets: &[awaken_iam_contract::InvitationBinding],
     ) -> AdminResult<()> {
-        if OrgRepo::get(&self.store, org_id)?.is_none() {
+        if OrgRepository::get(&self.store, org_id)?.is_none() {
             return Err(AdminError::NotFound(format!("organization {}", org_id.0)));
         }
         if targets.is_empty() || !targets.iter().any(|target| matches!(&target.scope, ScopeRef::Org { org_id: target_org } if target_org == org_id)) {
@@ -914,7 +917,7 @@ where
         at: Timestamp,
     ) -> AdminResult<u64> {
         for edge in &registration.edges {
-            ResourceModelRepo::put_edge(&self.store, ResourceEdge::from(edge.clone()))?;
+            ResourceModelRepository::put_edge(&self.store, ResourceEdge::from(edge.clone()))?;
         }
         self.commit(
             DomainEvent::ResourceModelRegistered {
@@ -927,7 +930,7 @@ where
 
     /// List every persisted resource-model parent edge.
     pub fn list_resource_edges(&self) -> AdminResult<Vec<ResourceEdge>> {
-        Ok(ResourceModelRepo::list_edges(&self.store)?)
+        Ok(ResourceModelRepository::list_edges(&self.store)?)
     }
 
     /// Persist one product-owned Workspace → IAM Org projection.
@@ -939,13 +942,15 @@ where
         edge: WorkspaceOrgEdge,
         at: Timestamp,
     ) -> AdminResult<u64> {
-        if OrgRepo::get(&self.store, &edge.org_id)?.is_none() {
+        if OrgRepository::get(&self.store, &edge.org_id)?.is_none() {
             return Err(AdminError::NotFound(format!(
                 "organization {}",
                 edge.org_id.0
             )));
         }
-        if let Some(existing) = ResourceModelRepo::workspace_org(&self.store, &edge.workspace_id)? {
+        if let Some(existing) =
+            ResourceModelRepository::workspace_org(&self.store, &edge.workspace_id)?
+        {
             if existing == edge {
                 return self.store_version();
             }
@@ -954,7 +959,7 @@ where
                 existing.workspace_id.0, existing.org_id.0
             )));
         }
-        ResourceModelRepo::put_workspace_org(&self.store, edge.clone())?;
+        ResourceModelRepository::put_workspace_org(&self.store, edge.clone())?;
         self.commit(
             DomainEvent::WorkspaceOrgAssigned {
                 workspace_id: edge.workspace_id,
@@ -972,23 +977,23 @@ where
     /// membership response lie about effective authorization.
     pub fn policy(&self) -> AdminResult<PolicySet> {
         let mut policy = PolicySet::new();
-        for grant in GrantRepo::list(&self.store)? {
+        for grant in GrantRepository::list(&self.store)? {
             policy.add_grant(grant);
         }
-        for binding in RoleBindingRepo::list(&self.store)? {
+        for binding in RoleBindingRepository::list(&self.store)? {
             policy.bind_role(binding);
         }
-        for group in GroupRepo::list(&self.store)? {
+        for group in GroupRepository::list(&self.store)? {
             policy.set_group_roster(group.id, group.members);
         }
-        for edge in ResourceModelRepo::list_edges(&self.store)? {
+        for edge in ResourceModelRepository::list_edges(&self.store)? {
             policy.scope_graph_mut().assign_resource_parent(
                 edge.resource_type,
                 edge.resource_id,
                 edge.parent,
             );
         }
-        for edge in ResourceModelRepo::list_workspace_orgs(&self.store)? {
+        for edge in ResourceModelRepository::list_workspace_orgs(&self.store)? {
             policy
                 .scope_graph_mut()
                 .assign_workspace(edge.workspace_id, edge.org_id);
@@ -1566,105 +1571,143 @@ mod tests {
     fn directory_hierarchy_is_arbitrary_and_moves_do_not_advance_policy() {
         // Cause-effect graph: C1 parent is absent/present and live in the same
         // Org; C2 product space is unbound/already bound; C3 move target is a
-        // descendant/not a descendant; C4 archive target has/has no live child.
+        // descendant/not a descendant; C4 archive target has/has no live child;
+        // C5 an existing placement is active/archived and user-edited.
         // Effects: E1 atomically create node+binding and advance only directory
         // revision; E2 reject duplicate binding; E3 reject cycles; E4 reject a
-        // non-leaf archive and accept a leaf archive. Decision rules D1-D5 cover
-        // the success path and each structural failure without a fixed tier.
+        // non-leaf archive and accept a leaf archive; E5 replay preserves user
+        // metadata and restores an archived placement. Decision rules D1-D6
+        // cover the success path and each structural failure without a fixed tier.
         let mut pap = pap();
         pap.create_org(org("acme"), at()).unwrap();
         let directory = crate::DirectoryApi::new(pap.store().clone());
         let policy_version = pap.store_version().unwrap();
-        let make = |id: &str, parent: Option<&str>, space: Option<&str>| CreateDirectoryNode {
-            node: DirectoryNodeDto {
-                id: DirectoryNodeId(id.into()),
-                org_id: OrgId("acme".into()),
-                parent_id: parent.map(|value| DirectoryNodeId(value.into())),
-                name: id.into(),
-                slug: id.into(),
-                description: None,
-                archived: false,
-                created_at: at(),
-                updated_at: at(),
-            },
-            binding: space.map(|space_id| ProductSpaceBinding {
-                product_space: ProductSpaceRef {
-                    product: "agents".into(),
-                    space_id: space_id.into(),
-                },
-                org_id: OrgId("acme".into()),
-                node_id: DirectoryNodeId(id.into()),
-            }),
+        let context = || crate::DirectoryCommandContext::service("directory-test", at());
+        let make = |name: &str, parent_id: Option<DirectoryNodeId>| CreateDirectoryNode {
+            org_id: OrgId("acme".into()),
+            parent_id,
+            name: name.into(),
+            preferred_slug: name.into(),
+            description: None,
         };
 
-        assert_eq!(
-            directory
-                .create_node(make("root", None, None))
-                .unwrap()
-                .revision,
-            2
-        );
-        assert_eq!(
-            directory
-                .create_node(make("team", Some("root"), Some("space-a")))
-                .unwrap()
-                .revision,
-            3
-        );
+        let root = directory
+            .create_node(make("root", None), context())
+            .unwrap();
+        assert_eq!(root.revision, 2);
+        let team = directory
+            .create_node(make("team", Some(root.node.id.clone())), context())
+            .unwrap();
+        assert_eq!(team.revision, 3);
+        let product_space = ProductSpaceRef {
+            product: "agents".into(),
+            space_id: "workspace/space-a".into(),
+        };
+        let ensured = directory
+            .ensure_product_space_placement(
+                awaken_iam_contract::EnsureProductSpacePlacement {
+                    product_space: product_space.clone(),
+                    org_id: OrgId("acme".into()),
+                    parent_product_space: None,
+                    name: "Agent workspace".into(),
+                    preferred_slug: "Agent workspace".into(),
+                    description: None,
+                },
+                context(),
+            )
+            .unwrap();
+        assert!(ensured.created);
+        assert_eq!(ensured.revision, 4);
         assert_eq!(pap.store_version().unwrap(), policy_version);
         assert_eq!(
             directory
                 .update_node(
-                    &DirectoryNodeId("team".into()),
+                    &team.node.id,
                     awaken_iam_contract::UpdateDirectoryNode {
                         name: "Platform team".into(),
                         slug: "platform-team".into(),
                         description: Some("renamed without moving".into()),
-                        updated_at: at(),
                     },
+                    context(),
                 )
                 .unwrap()
                 .revision,
-            4
+            5
         );
-        let renamed = directory
-            .node(&DirectoryNodeId("team".into()))
-            .unwrap()
-            .unwrap();
+        let renamed = directory.node(&team.node.id).unwrap().unwrap();
         assert_eq!(renamed.slug, "platform-team");
         assert_eq!(pap.store_version().unwrap(), policy_version);
         assert_eq!(
             directory
-                .product_space_binding(&ProductSpaceRef {
-                    product: "agents".into(),
-                    space_id: "space-a".into(),
-                })
+                .product_space_binding(&product_space)
                 .unwrap()
                 .unwrap()
                 .node_id,
-            DirectoryNodeId("team".into())
+            ensured.node.id
         );
 
-        let duplicate = directory.create_node(make("other", None, Some("space-a")));
-        assert!(matches!(duplicate, Err(AdminError::AlreadyExists(_))));
+        let duplicate = directory
+            .ensure_product_space_placement(
+                awaken_iam_contract::EnsureProductSpacePlacement {
+                    product_space,
+                    org_id: OrgId("acme".into()),
+                    parent_product_space: None,
+                    name: "ignored on replay".into(),
+                    preferred_slug: "ignored".into(),
+                    description: None,
+                },
+                context(),
+            )
+            .unwrap();
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.revision, 5);
+        directory
+            .update_node(
+                &ensured.node.id,
+                awaken_iam_contract::UpdateDirectoryNode {
+                    name: "User-renamed workspace".into(),
+                    slug: "user-workspace".into(),
+                    description: Some("user-owned presentation metadata".into()),
+                },
+                context(),
+            )
+            .unwrap();
+        directory.archive_node(&ensured.node.id, context()).unwrap();
+        let restored = directory
+            .ensure_product_space_placement(
+                awaken_iam_contract::EnsureProductSpacePlacement {
+                    product_space: duplicate.placement.product_space.clone(),
+                    org_id: OrgId("acme".into()),
+                    parent_product_space: None,
+                    name: "must not overwrite".into(),
+                    preferred_slug: "must-not-overwrite".into(),
+                    description: None,
+                },
+                context(),
+            )
+            .unwrap();
+        assert!(!restored.created);
+        assert!(!restored.node.archived, "E5");
+        assert_eq!(restored.node.name, "User-renamed workspace", "E5");
+        assert_eq!(restored.node.slug, "user-workspace", "E5");
         let cycle = directory.move_node(
-            &DirectoryNodeId("root".into()),
+            &root.node.id,
             MoveDirectoryNode {
-                parent_id: Some(DirectoryNodeId("team".into())),
-                updated_at: at(),
+                parent_id: Some(team.node.id.clone()),
             },
+            context(),
         );
         assert!(matches!(cycle, Err(AdminError::AlreadyExists(_))));
         assert!(matches!(
-            directory.archive_node(&DirectoryNodeId("root".into()), &at()),
+            directory.archive_node(&root.node.id, context()),
             Err(AdminError::AlreadyExists(_))
         ));
         assert_eq!(
             directory
-                .archive_node(&DirectoryNodeId("team".into()), &at())
+                .archive_node(&team.node.id, context())
                 .unwrap()
                 .revision,
-            5
+            9
         );
     }
 
@@ -1813,15 +1856,15 @@ mod tests {
     #[test]
     fn repo_errors_map_onto_the_admin_error_surface() {
         assert_eq!(
-            AdminError::from(RepoError::Conflict("x".into())),
+            AdminError::from(RepositoryError::Conflict("x".into())),
             AdminError::AlreadyExists("x".into())
         );
         assert_eq!(
-            AdminError::from(RepoError::NotFound("x".into())),
+            AdminError::from(RepositoryError::NotFound("x".into())),
             AdminError::NotFound("x".into())
         );
         assert_eq!(
-            AdminError::from(RepoError::Backend("x".into())),
+            AdminError::from(RepositoryError::Backend("x".into())),
             AdminError::Backend("x".into())
         );
     }

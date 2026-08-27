@@ -8,7 +8,7 @@ use awaken_iam_contract::{
     AuthorizationProfileDocument, AuthorizationProfileRetired, AuthorizationProfileValidation,
     CreateAuthorizationProfile, NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
 };
-use awaken_iam_core::{AuthorizationProfileRepo, PolicySet, RepoError};
+use awaken_iam_core::{AuthorizationProfileRepository, PolicySet, RepositoryError};
 use sha2::{Digest, Sha256};
 
 use crate::AuthzApi;
@@ -26,12 +26,12 @@ pub enum ProfileAdminError {
     Repository(String),
 }
 
-impl From<RepoError> for ProfileAdminError {
-    fn from(error: RepoError) -> Self {
+impl From<RepositoryError> for ProfileAdminError {
+    fn from(error: RepositoryError) -> Self {
         match error {
-            RepoError::NotFound(_) => Self::NotFound,
-            RepoError::Conflict(message) => Self::Conflict(message),
-            RepoError::Backend(message) => Self::Repository(message),
+            RepositoryError::NotFound(_) => Self::NotFound,
+            RepositoryError::Conflict(message) => Self::Conflict(message),
+            RepositoryError::Backend(message) => Self::Repository(message),
         }
     }
 }
@@ -39,7 +39,7 @@ impl From<RepoError> for ProfileAdminError {
 /// Application service implementing draft, validate, activate, fetch, and rollback.
 #[derive(Clone)]
 pub struct AuthorizationProfileAdmin {
-    repository: Arc<dyn AuthorizationProfileRepo>,
+    repository: Arc<dyn AuthorizationProfileRepository>,
 }
 
 impl std::fmt::Debug for AuthorizationProfileAdmin {
@@ -51,7 +51,7 @@ impl std::fmt::Debug for AuthorizationProfileAdmin {
 }
 
 impl AuthorizationProfileAdmin {
-    pub fn new(repository: Arc<dyn AuthorizationProfileRepo>) -> Self {
+    pub fn new(repository: Arc<dyn AuthorizationProfileRepository>) -> Self {
         Self { repository }
     }
 

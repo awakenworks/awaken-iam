@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Reference adapter for conformance and product tests. Production Directory
+# assemblies select migrated SQLite or PostgreSQL storage and cannot obtain a
+# DirectoryRepository implementation from InMemoryStore without this feature.
+test-support = []
+
 [dependencies]
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true

@@ -25,11 +25,12 @@ use awaken_iam_contract::{
     AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
     CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryMutationAck,
-    DirectoryNodeDto, DirectoryNodeId, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
-    InvitationDto, InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery,
-    MoveDirectoryNode, NamespaceId, OrgDto, PolicySnapshot, ProductSpaceBinding, ProductSpaceRef,
+    DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView, EnsureProductSpacePlacement,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery,
+    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView,
+    PolicySnapshot, ProductSpacePlacement, ProductSpacePlacementResult, ProductSpaceRef,
     ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
     UserInfo, WorkspaceOrgEdge,
 };
@@ -315,18 +316,18 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
-    fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+    fn create_org(&self, org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/orgs")).json(org))?;
         Self::decode(response)
     }
 
-    fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+    fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {
         let response = self.send_with_retry(|| self.client.get(self.url("/v1/admin/orgs")))?;
         Self::decode(response)
     }
 
-    fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+    fn get_org(&self, org_id: &str) -> Result<Option<OrgView>, RemoteError> {
         let path = format!("/v1/admin/orgs/{org_id}");
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -344,7 +345,7 @@ impl AuthzTransport for HttpAuthzTransport {
     fn create_directory_node(
         &self,
         request: &CreateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
+    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
                 .post(self.url("/v1/admin/directory/nodes"))
@@ -353,10 +354,22 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn ensure_product_space_placement(
+        &self,
+        request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/product-spaces/ensure"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
     fn get_directory_node(
         &self,
         id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
         let path = format!("/v1/admin/directory/nodes/{}", id.0);
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -368,7 +381,7 @@ impl AuthzTransport for HttpAuthzTransport {
     fn directory_children(
         &self,
         query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
                 .get(self.url("/v1/admin/directory/nodes"))
@@ -406,10 +419,19 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}/restore", id.0);
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)))?;
+        Self::decode(response)
+    }
+
     fn product_space_binding(
         &self,
         space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
                 .post(self.url("/v1/admin/directory/product-spaces/query"))
@@ -421,13 +443,13 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response).map(Some)
     }
 
-    fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+    fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
         Self::decode(response)
     }
 
-    fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+    fn get_role(&self, role_id: &str) -> Result<Option<RoleView>, RemoteError> {
         let path = format!("/v1/admin/roles/{role_id}");
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -523,7 +545,10 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
-    fn list_invitations(&self, query: &InvitationQuery) -> Result<Vec<InvitationDto>, RemoteError> {
+    fn list_invitations(
+        &self,
+        query: &InvitationQuery,
+    ) -> Result<Vec<InvitationView>, RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
                 .post(self.url("/v1/admin/invitations/query"))
@@ -784,7 +809,7 @@ mod tests {
             account_id: AccountId("acct_1".into()),
         };
         transport
-            .create_org(&OrgDto {
+            .create_org(&OrgView {
                 id: awaken_iam_contract::OrgId("acme".into()),
                 display_name: None,
                 owner: principal.clone(),
@@ -794,7 +819,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             transport.list_orgs().unwrap(),
-            vec![OrgDto {
+            vec![OrgView {
                 id: awaken_iam_contract::OrgId("acme".into()),
                 display_name: None,
                 owner: principal.clone(),
@@ -803,7 +828,7 @@ mod tests {
             }]
         );
         transport
-            .create_role(&RoleDto {
+            .create_role(&RoleView {
                 id: "tenant-admin".into(),
                 display_name: Some("Tenant administrator".into()),
                 action_patterns: vec!["awaken.cloud::*".into()],
@@ -858,7 +883,6 @@ mod tests {
             name: "Platform Team".into(),
             slug: "platform".into(),
             description: Some("Shared platform".into()),
-            updated_at: awaken_iam_contract::Timestamp("2026-08-27T00:30:00Z".into()),
         };
 
         assert_eq!(

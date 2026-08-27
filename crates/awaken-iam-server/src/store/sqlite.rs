@@ -23,7 +23,7 @@ use awaken_scoped_migration::{
     MigrationBundle, MigrationError, check_ledger_version, plan, render as render_ddl,
 };
 
-use awaken_iam_core::{RepoError, RepoResult};
+use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
 use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
@@ -50,39 +50,42 @@ impl SqliteBackend {
     }
 
     /// Open a private in-memory database (tests, ephemeral deployments).
-    pub fn open_in_memory() -> RepoResult<Self> {
+    pub fn open_in_memory() -> RepositoryResult<Self> {
         let conn = Connection::open_in_memory().map_err(backend_err)?;
         Ok(Self::new(conn))
     }
 
     /// Open (creating if absent) a file-backed database at `path`.
-    pub fn open_path(path: impl AsRef<std::path::Path>) -> RepoResult<Self> {
+    pub fn open_path(path: impl AsRef<std::path::Path>) -> RepositoryResult<Self> {
         let conn = Connection::open(path).map_err(backend_err)?;
         Ok(Self::new(conn))
     }
 }
 
 /// Open an in-memory SQLite store, run every IAM migration, and return the
-/// repository adapter ready to serve the ports — the common test/embedded path.
-pub fn in_memory_store(prefix: &str) -> RepoResult<SqlStore<SqliteBackend>> {
+/// repository adapter ready to serve the repository contracts — the common test/embedded path.
+pub fn in_memory_store(prefix: &str) -> RepositoryResult<SqlStore<SqliteBackend>> {
     migrated_store(SqliteBackend::open_in_memory()?, prefix)
 }
 
 /// Migrate `backend` under `prefix` and return the repository adapter over it.
-pub fn migrated_store(backend: SqliteBackend, prefix: &str) -> RepoResult<SqlStore<SqliteBackend>> {
+pub fn migrated_store(
+    backend: SqliteBackend,
+    prefix: &str,
+) -> RepositoryResult<SqlStore<SqliteBackend>> {
     IamStore::with_prefix(backend.clone(), prefix)?.migrate()?;
     SqlStore::with_prefix(backend, prefix)
 }
 
-fn backend_err(err: rusqlite::Error) -> RepoError {
+fn backend_err(err: rusqlite::Error) -> RepositoryError {
     // A uniqueness/constraint failure is a domain conflict; everything else is an
     // opaque backend error.
     if let rusqlite::Error::SqliteFailure(e, msg) = &err
         && e.code == rusqlite::ErrorCode::ConstraintViolation
     {
-        return RepoError::Conflict(msg.clone().unwrap_or_else(|| err.to_string()));
+        return RepositoryError::Conflict(msg.clone().unwrap_or_else(|| err.to_string()));
     }
-    RepoError::Backend(err.to_string())
+    RepositoryError::Backend(err.to_string())
 }
 
 /// Rewrite the portable placeholder dialect to SQLite's: a JSON parameter (`?j`)
@@ -105,7 +108,7 @@ impl SqliteBackend {
     /// Bootstrap or validate the foundation-owned ledger generation under an
     /// IMMEDIATE transaction. IAM owns only the rusqlite calls; names, DDL, and
     /// the fail-closed state decision remain authoritative in foundation.
-    fn ensure_ledger(conn: &mut Connection, prefix: &str) -> RepoResult<()> {
+    fn ensure_ledger(conn: &mut Connection, prefix: &str) -> RepositoryResult<()> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -154,7 +157,7 @@ impl SqlConn for SqliteBackend {
         Dialect::Sqlite
     }
 
-    fn execute(&self, sql: &str, params: &[SqlParam]) -> RepoResult<u64> {
+    fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
         let conn = self.conn.lock().unwrap();
         let affected = conn
             .execute(&render(sql), params_from_iter(values(params)))
@@ -162,7 +165,7 @@ impl SqlConn for SqliteBackend {
         Ok(affected as u64)
     }
 
-    fn query(&self, sql: &str, params: &[SqlParam]) -> RepoResult<Vec<SqlRow>> {
+    fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&render(sql)).map_err(backend_err)?;
         let column_count = stmt.column_count();
@@ -182,7 +185,7 @@ impl SqlConn for SqliteBackend {
         Ok(collected)
     }
 
-    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepoResult<Vec<u64>> {
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -202,7 +205,7 @@ impl SqlConn for SqliteBackend {
         &self,
         writes: &[SqlWrite],
         required: &[(usize, u64)],
-    ) -> RepoResult<Vec<u64>> {
+    ) -> RepositoryResult<Vec<u64>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -218,7 +221,7 @@ impl SqlConn for SqliteBackend {
             .iter()
             .find(|(index, expected)| affected.get(*index) != Some(expected))
         {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "transaction write {index} affected {} rows; expected {expected}",
                 affected.get(*index).copied().unwrap_or(0)
             )));
@@ -237,7 +240,7 @@ impl MigrationExecutor for SqliteBackend {
         &mut self,
         prefix: &str,
         bundles: &[MigrationBundle],
-    ) -> RepoResult<Vec<AppliedMigration>> {
+    ) -> RepositoryResult<Vec<AppliedMigration>> {
         let dialect = Dialect::Sqlite;
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
@@ -288,7 +291,11 @@ impl MigrationExecutor for SqliteBackend {
         Ok(applied)
     }
 
-    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>> {
+    fn applied_versions(
+        &self,
+        prefix: &str,
+        bundle_id: &str,
+    ) -> RepositoryResult<BTreeMap<i64, String>> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let conn = self.conn.lock().unwrap();
         read_applied(&conn, schema.ledger_table(), bundle_id)
@@ -303,7 +310,7 @@ fn read_applied(
     conn: &Connection,
     ledger: &str,
     bundle_id: &str,
-) -> RepoResult<BTreeMap<i64, String>> {
+) -> RepositoryResult<BTreeMap<i64, String>> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT version, checksum FROM {ledger} WHERE bundle_id = ?1 ORDER BY version"

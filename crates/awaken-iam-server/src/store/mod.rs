@@ -1,7 +1,7 @@
 //! Storage edge for IAM: the in-memory adapter and the scope-partitioned
 //! migration bundles the database adapter applies.
 //!
-//! The core declares the [repository ports](awaken_iam_core); this module is
+//! The core declares the [repository contracts](awaken_iam_core); this module is
 //! the server-owned edge that provides adapters for them, keeping `contract`,
 //! `core`, and `client` storage-free. The SQLite executor is the first concrete
 //! database edge over the migration plan. See

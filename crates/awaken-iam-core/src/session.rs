@@ -90,7 +90,7 @@ impl<E: EntropySource> SessionMinter<E> {
 
     /// Mint one session without selecting a persistence adapter.
     ///
-    /// Server composition uses this seam with the canonical [`SessionRepo`](crate::SessionRepo),
+    /// Server composition uses this seam with the canonical [`SessionRepository`](crate::SessionRepository),
     /// while the legacy in-memory directory helper above remains available to
     /// core-only consumers. The cleartext token is still returned exactly once.
     pub fn issue(&mut self, request: EstablishSession) -> Result<IssuedSession, IamError> {

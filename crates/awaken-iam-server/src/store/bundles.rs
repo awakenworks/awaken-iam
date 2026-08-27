@@ -26,8 +26,8 @@
 
 use awaken_scoped_migration::{Migration, MigrationBundle};
 
-// reviewed: migration-allow-edit — this change extends bundle registry
-// scaffolding only; every previously shipped migration body remains unchanged.
+// reviewed: migration-allow-edit — append the next Directory step while preserving
+// every shipped body byte-for-byte; only rustfmt changed the registry shape.
 
 /// Component-scope partition a migration bundle belongs to.
 ///
@@ -132,11 +132,18 @@ pub fn bundles() -> Vec<MigrationBundle> {
         ),
         bundle(
             BundleScope::Directory,
-            vec![(
-                1,
-                "arbitrary directory nodes and stable product-space placement",
-                DIRECTORY_0001,
-            )],
+            vec![
+                (
+                    1,
+                    "arbitrary directory nodes and stable product-space placement",
+                    DIRECTORY_0001,
+                ),
+                (
+                    2,
+                    "enforce one product-space placement per Directory node",
+                    DIRECTORY_0002,
+                ),
+            ],
         ),
         bundle(
             BundleScope::Entitlement,
@@ -416,6 +423,15 @@ CREATE TABLE {prefix}_directory_fence (\
  id INTEGER PRIMARY KEY, \
  revision BIGINT NOT NULL);\n\
 INSERT INTO {prefix}_directory_fence (id, revision) VALUES (1, 1);";
+
+// A Directory node represents either one user folder or one product space. A
+// second product identity cannot share the same node and silently couple their
+// moves, archive state, or presentation metadata. The physical V0001 table name
+// remains append-only migration history; the published language calls rows
+// ProductSpacePlacement.
+const DIRECTORY_0002: &str = "\
+CREATE UNIQUE INDEX {prefix}_product_space_bindings_node_key \
+ ON {prefix}_product_space_bindings (node_id);";
 
 // --- iam.entitlement DDL ---------------------------------------------------
 //

@@ -1,7 +1,7 @@
 //! Organization invitation aggregate.
 
 use awaken_iam_contract::{
-    AccountId, InvitationBinding, InvitationDto, InvitationId, InvitationStatus, OrgId,
+    AccountId, InvitationBinding, InvitationId, InvitationStatus, InvitationView, OrgId,
     PrincipalRef, Timestamp,
 };
 
@@ -24,8 +24,8 @@ pub struct Invitation {
 
 impl Invitation {
     /// Project the aggregate without its token hash/idempotency internals.
-    pub fn to_dto(&self) -> InvitationDto {
-        InvitationDto {
+    pub fn to_dto(&self) -> InvitationView {
+        InvitationView {
             id: self.id.clone(),
             org_id: self.org_id.clone(),
             email: self.email.clone(),

@@ -140,7 +140,7 @@ stateless assembly and the bundle plan exist, the rest is not yet wired.
 Today the policy `version` and token `epoch` are **in-memory per node**, so a
 single process is already correct, and the fence now rides the store rather than
 per-node memory. Making every node interchangeable per the three rules is the
-remaining work, all of it edge adapters over existing ports, none of it a change
+remaining work, all of it edge adapters over existing repository contracts, none of it a change
 to `contract`, `core`, or `client`. Wired at the edge today:
 
 - store-backed `version` / `epoch` advancement, advanced in the same step as the
@@ -162,3 +162,4 @@ Still pending:
   rendering they share (only an in-memory adapter exists today);
 - an HTTP server binding the manifested `/v1` routes and probes (the assembly
   produces a route manifest, not yet a served router).
+

@@ -12,14 +12,14 @@
 use std::collections::BTreeMap;
 
 use awaken_iam_contract::{
-    AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateDirectoryNode,
-    CreateInvitation, DirectoryNodeDto, DirectoryNodeId, InvitationBinding, InvitationStatus,
-    OrgId, PrincipalRef, ProductSpaceBinding, ProductSpaceRef, ResourceId, ResourceType, ScopeRef,
-    Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateInvitation,
+    EnsureProductSpacePlacement, InvitationBinding, InvitationStatus, OrgId, PrincipalRef,
+    ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    ActionPattern, ApiTokenRepo, Grant, GrantId, GrantRepo, GrantSubject, Organization, RepoError,
-    ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
+    ActionPattern, ApiTokenRepository, Grant, GrantId, GrantRepository, GrantSubject, Organization,
+    RepositoryError, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
+    RoleDef, RoleId,
 };
 use awaken_iam_server::{
     Dialect, DirectoryApi, MigrationExecutor, PolicyAdminApi, SqlConn, SqliteBackend, bundles,
@@ -104,7 +104,7 @@ fn sqlite_backend_applied_versions_reports_each_step_after_running_migrations() 
 #[test]
 fn sqlite_backend_query_reports_a_malformed_sql_as_backend_error() {
     // The non-constraint branch of `backend_err`: a SQL syntax error or
-    // malformed statement must surface as `RepoError::Backend`, not as a
+    // malformed statement must surface as `RepositoryError::Backend`, not as a
     // domain `Conflict`. This is the path a deployment hits when its
     // migration rolls forward but a downstream query is malformed.
     let backend = SqliteBackend::open_in_memory().expect("open");
@@ -113,8 +113,8 @@ fn sqlite_backend_query_reports_a_malformed_sql_as_backend_error() {
         .execute("THIS IS NOT VALID SQL", &[])
         .expect_err("malformed SQL must error");
     assert!(
-        matches!(err, RepoError::Backend(_)),
-        "non-constraint errors must be RepoError::Backend, got {err:?}"
+        matches!(err, RepositoryError::Backend(_)),
+        "non-constraint errors must be RepositoryError::Backend, got {err:?}"
     );
 }
 
@@ -153,7 +153,7 @@ fn sqlite_backend_with_prefix_validates_the_identifier_in_sqlite_migrated_store(
     // rejected before any DDL is rendered.
     let backend = SqliteBackend::open_in_memory().expect("open");
     let bad = sqlite_migrated_store(backend.clone(), "iam-bad");
-    assert!(matches!(bad, Err(RepoError::Backend(_))));
+    assert!(matches!(bad, Err(RepositoryError::Backend(_))));
     let good = sqlite_migrated_store(backend, "iam");
     assert!(good.is_ok());
 }
@@ -267,32 +267,28 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
         )
         .unwrap();
     }
+    let mut org_a_node = None;
     for suffix in ["a", "b"] {
         let org_id = OrgId(format!("org-{suffix}"));
-        let node_id = DirectoryNodeId(format!("node-{suffix}"));
-        directory
-            .create_node(CreateDirectoryNode {
-                node: DirectoryNodeDto {
-                    id: node_id.clone(),
-                    org_id: org_id.clone(),
-                    parent_id: None,
-                    name: format!("Root {suffix}"),
-                    slug: format!("root-{suffix}"),
-                    description: None,
-                    archived: false,
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                },
-                binding: Some(ProductSpaceBinding {
+        let ensured = directory
+            .ensure_product_space_placement(
+                EnsureProductSpacePlacement {
                     product_space: ProductSpaceRef {
                         product: "agents".into(),
-                        space_id: format!("space-{suffix}"),
+                        space_id: format!("workspace/space-{suffix}"),
                     },
                     org_id,
-                    node_id,
-                }),
-            })
+                    parent_product_space: None,
+                    name: format!("Root {suffix}"),
+                    preferred_slug: format!("root-{suffix}"),
+                    description: None,
+                },
+                awaken_iam_server::DirectoryCommandContext::new(principal.clone(), now.clone()),
+            )
             .unwrap();
+        if suffix == "a" {
+            org_a_node = Some(ensured.node.id);
+        }
     }
     for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
         pap.assign_workspace_org(
@@ -311,8 +307,8 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
             workspace_id: WorkspaceId("ws-a".into()),
         },
     };
-    ResourceModelRepo::put_edge(&store, resource.clone()).unwrap();
-    GrantRepo::put(
+    ResourceModelRepository::put_edge(&store, resource.clone()).unwrap();
+    GrantRepository::put(
         &store,
         Grant {
             id: GrantId("grant-a".into()),
@@ -326,7 +322,7 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
         },
     )
     .unwrap();
-    RoleBindingRepo::add(
+    RoleBindingRepository::add(
         &store,
         RoleBinding {
             principal: principal.clone(),
@@ -338,7 +334,7 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
     )
     .unwrap();
     for (id, workspace) in [("token-a", "ws-a"), ("token-b", "ws-b")] {
-        ApiTokenRepo::create(
+        ApiTokenRepository::create(
             &store,
             ApiToken {
                 id: ApiTokenId(id.into()),
@@ -363,7 +359,7 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
     assert!(pap.get_org(&OrgId("org-b".into())).unwrap().is_some());
     assert!(
         directory
-            .node(&DirectoryNodeId("node-a".into()))
+            .node(&org_a_node.expect("org-a placement node"))
             .unwrap()
             .is_none()
     );
@@ -371,21 +367,25 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
         directory
             .product_space_binding(&ProductSpaceRef {
                 product: "agents".into(),
-                space_id: "space-b".into(),
+                space_id: "workspace/space-b".into(),
             })
             .unwrap()
             .is_some()
     );
-    assert!(GrantRepo::list(&store).unwrap().is_empty());
-    assert!(RoleBindingRepo::list(&store).unwrap().is_empty());
-    assert!(ResourceModelRepo::list_edges(&store).unwrap().is_empty());
+    assert!(GrantRepository::list(&store).unwrap().is_empty());
+    assert!(RoleBindingRepository::list(&store).unwrap().is_empty());
     assert!(
-        ApiTokenRepo::get(&store, &ApiTokenId("token-a".into()))
+        ResourceModelRepository::list_edges(&store)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ApiTokenRepository::get(&store, &ApiTokenId("token-a".into()))
             .unwrap()
             .is_none()
     );
     assert!(
-        ApiTokenRepo::get(&store, &ApiTokenId("token-b".into()))
+        ApiTokenRepository::get(&store, &ApiTokenId("token-b".into()))
             .unwrap()
             .is_some()
     );

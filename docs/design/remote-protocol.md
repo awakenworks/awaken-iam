@@ -35,8 +35,9 @@ correspond one-to-one with the HTTP endpoints below:
 | `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
 | `introspect_token` | `POST /v1/tokens/introspect` |
 | `create_directory_node` | `POST /v1/admin/directory/nodes` |
+| `ensure_product_space_placement` | `POST /v1/admin/directory/product-spaces/ensure` |
 | `get_directory_node` / `directory_children` | `GET /v1/admin/directory/nodes...` |
-| `move_directory_node` / `update_directory_node` / `archive_directory_node` | `PUT` / `PATCH` / `DELETE /v1/admin/directory/nodes/{id}` |
+| `move_directory_node` / `update_directory_node` / `archive_directory_node` / `restore_directory_node` | `PUT` / `PATCH` / `DELETE` / `POST /v1/admin/directory/nodes/{id}/restore` |
 | `product_space_binding` | `POST /v1/admin/directory/product-spaces/query` |
 
 `introspect_token` has a default implementation that returns an unsupported error,
@@ -73,11 +74,13 @@ POST /v1/tokens/introspect
 POST /v1/capabilities/introspect
 POST /v1/admin/capabilities
 POST /v1/admin/directory/nodes
+POST /v1/admin/directory/product-spaces/ensure
 GET  /v1/admin/directory/nodes/{id}
 GET  /v1/admin/directory/nodes?org_id={org}&parent_id={optional_parent}
 PUT  /v1/admin/directory/nodes/{id}
 PATCH /v1/admin/directory/nodes/{id}
 DELETE /v1/admin/directory/nodes/{id}
+POST /v1/admin/directory/nodes/{id}/restore
 POST /v1/admin/directory/product-spaces/query
 ```
 

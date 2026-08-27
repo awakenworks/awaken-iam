@@ -2,12 +2,12 @@
 
 use super::*;
 
-fn decode_directory_node(row: &SqlRow) -> RepoResult<DirectoryNode> {
+fn decode_directory_node(row: &SqlRow) -> RepositoryResult<DirectoryNode> {
     let archived = match req(row, 6, "directory_node.archived")?.as_str() {
         "0" => false,
         "1" => true,
         other => {
-            return Err(RepoError::Backend(format!(
+            return Err(RepositoryError::Backend(format!(
                 "invalid directory archived flag {other}"
             )));
         }
@@ -27,8 +27,8 @@ fn decode_directory_node(row: &SqlRow) -> RepoResult<DirectoryNode> {
     })
 }
 
-fn decode_product_space_binding(row: &SqlRow) -> RepoResult<ProductSpaceBinding> {
-    Ok(ProductSpaceBinding {
+fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpacePlacement> {
+    Ok(ProductSpacePlacement {
         product_space: ProductSpaceRef {
             product: req(row, 0, "product_space.product")?,
             space_id: req(row, 1, "product_space.space_id")?,
@@ -40,40 +40,41 @@ fn decode_product_space_binding(row: &SqlRow) -> RepoResult<ProductSpaceBinding>
 
 const DIRECTORY_NODE_COLUMNS: &str = "id, org_id, parent_id, name, slug, description, CAST(archived AS TEXT), created_at, updated_at";
 
-impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
+impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
     fn create_directory_node(
         &self,
         node: DirectoryNode,
-        binding: Option<ProductSpaceBinding>,
-    ) -> RepoResult<u64> {
+        placement: Option<ProductSpacePlacement>,
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
         node.validate()
-            .map_err(|error| RepoError::Conflict(error.to_string()))?;
-        if let Some(binding) = &binding {
-            node.validate_binding(binding)
-                .map_err(|error| RepoError::Conflict(error.to_string()))?;
+            .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
+        if let Some(placement) = &placement {
+            node.validate_placement(placement)
+                .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
         }
         let org_exists = self.backend.query(
             &format!("SELECT id FROM {} WHERE id = ?", self.table("orgs")),
             &[p(node.org_id.0.clone())],
         )?;
         if org_exists.is_empty() {
-            return Err(RepoError::NotFound(format!(
+            return Err(RepositoryError::NotFound(format!(
                 "organization {}",
                 node.org_id.0
             )));
         }
         if self.directory_node(&node.id)?.is_some() {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "directory node {} already exists",
                 node.id.0
             )));
         }
         if let Some(parent_id) = &node.parent_id {
-            let parent = self
-                .directory_node(parent_id)?
-                .ok_or_else(|| RepoError::NotFound(format!("directory parent {}", parent_id.0)))?;
+            let parent = self.directory_node(parent_id)?.ok_or_else(|| {
+                RepositoryError::NotFound(format!("directory parent {}", parent_id.0))
+            })?;
             if parent.archived || parent.org_id != node.org_id {
-                return Err(RepoError::Conflict(
+                return Err(RepositoryError::Conflict(
                     "directory parent must be live and in the same organization".into(),
                 ));
             }
@@ -83,19 +84,19 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             .iter()
             .any(|sibling| sibling.slug == node.slug)
         {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "directory slug {} already exists under this parent",
                 node.slug
             )));
         }
-        if let Some(binding) = &binding
+        if let Some(placement) = &placement
             && self
-                .product_space_binding(&binding.product_space)?
+                .product_space_binding(&placement.product_space)?
                 .is_some()
         {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "product space {}/{} is already placed",
-                binding.product_space.product, binding.product_space.space_id
+                placement.product_space.product, placement.product_space.space_id
             )));
         }
 
@@ -161,16 +162,16 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             sql: insert_sql,
             params: insert_params,
         });
-        if let Some(binding) = binding {
+        if let Some(placement) = placement {
             writes.push(SqlWrite {
                 sql: format!(
                     "INSERT INTO {bindings} (product, space_id, org_id, node_id) VALUES (?, ?, ?, ?)"
                 ),
                 params: vec![
-                    p(binding.product_space.product),
-                    p(binding.product_space.space_id),
-                    p(binding.org_id.0),
-                    p(binding.node_id.0),
+                    p(placement.product_space.product),
+                    p(placement.product_space.space_id),
+                    p(placement.org_id.0),
+                    p(placement.node_id.0),
                 ],
             });
         }
@@ -178,7 +179,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             sql: format!("INSERT INTO {audit} (at, actor, action, detail) VALUES (?, ?j, ?, ?)"),
             params: vec![
                 p(node.updated_at.0),
-                None,
+                p(json_encode(actor, "directory actor")?),
                 p("directory.node.create"),
                 p(format!("directory node {}", node.id.0)),
             ],
@@ -195,7 +196,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         self.directory_revision()
     }
 
-    fn directory_node(&self, id: &DirectoryNodeId) -> RepoResult<Option<DirectoryNode>> {
+    fn directory_node(&self, id: &DirectoryNodeId) -> RepositoryResult<Option<DirectoryNode>> {
         let sql = format!(
             "SELECT {DIRECTORY_NODE_COLUMNS} FROM {} WHERE id = ?",
             self.table("directory_nodes")
@@ -211,7 +212,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         &self,
         org_id: &OrgId,
         parent_id: Option<&DirectoryNodeId>,
-    ) -> RepoResult<Vec<DirectoryNode>> {
+    ) -> RepositoryResult<Vec<DirectoryNode>> {
         let params = vec![
             p(org_id.0.clone()),
             p(parent_id.map_or_else(String::new, |parent| parent.0.clone())),
@@ -233,16 +234,17 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         id: &DirectoryNodeId,
         parent_id: Option<&DirectoryNodeId>,
         updated_at: &Timestamp,
-    ) -> RepoResult<u64> {
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
         if parent_id == Some(id) {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "a directory node cannot be its own parent".into(),
             ));
         }
         let current = self
             .directory_node(id)?
             .filter(|node| !node.archived)
-            .ok_or_else(|| RepoError::NotFound(format!("live directory node {}", id.0)))?;
+            .ok_or_else(|| RepositoryError::NotFound(format!("live directory node {}", id.0)))?;
         if current.parent_id.as_ref() == parent_id {
             return self.directory_revision();
         }
@@ -250,16 +252,18 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             let parent = self
                 .directory_node(parent_id)?
                 .filter(|node| !node.archived)
-                .ok_or_else(|| RepoError::NotFound(format!("directory parent {}", parent_id.0)))?;
+                .ok_or_else(|| {
+                    RepositoryError::NotFound(format!("directory parent {}", parent_id.0))
+                })?;
             if parent.org_id != current.org_id {
-                return Err(RepoError::Conflict(
+                return Err(RepositoryError::Conflict(
                     "directory parent must be in the same organization".into(),
                 ));
             }
             let mut cursor = Some(parent);
             while let Some(candidate) = cursor {
                 if candidate.id == *id {
-                    return Err(RepoError::Conflict(
+                    return Err(RepositoryError::Conflict(
                         "directory move would create a cycle".into(),
                     ));
                 }
@@ -276,7 +280,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             .iter()
             .any(|sibling| sibling.id != current.id && sibling.slug == current.slug)
         {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "directory slug {} already exists under the target parent",
                 current.slug
             )));
@@ -329,7 +333,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
                 ),
                 params: vec![
                     p(updated_at.0.clone()),
-                    None,
+                    p(json_encode(actor, "directory actor")?),
                     p("directory.node.move"),
                     p(format!("directory node {}", id.0)),
                 ],
@@ -351,16 +355,17 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         &self,
         id: &DirectoryNodeId,
         updated_at: &Timestamp,
-    ) -> RepoResult<u64> {
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
         let node = self
             .directory_node(id)?
-            .ok_or_else(|| RepoError::NotFound(format!("directory node {}", id.0)))?;
+            .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
         if node.archived {
             return self.directory_revision();
         }
         let live_children = self.directory_children(&node.org_id, Some(id))?;
         if !live_children.is_empty() {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "a directory node with live children cannot be archived".into(),
             ));
         }
@@ -387,7 +392,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
                 ),
                 params: vec![
                     p(updated_at.0.clone()),
-                    None,
+                    p(json_encode(actor, "directory actor")?),
                     p("directory.node.archive"),
                     p(format!("directory node {}", id.0)),
                 ],
@@ -405,6 +410,57 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         self.directory_revision()
     }
 
+    fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        updated_at: &Timestamp,
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
+        let node = self
+            .directory_node(id)?
+            .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
+        if !node.archived {
+            return self.directory_revision();
+        }
+        let nodes = self.table("directory_nodes");
+        let fence = self.table("directory_fence");
+        let writes = [
+            SqlWrite {
+                sql: format!("UPDATE {fence} SET revision = revision WHERE id = 1"),
+                params: Vec::new(),
+            },
+            SqlWrite {
+                sql: format!(
+                    "UPDATE {nodes} SET archived = 0, updated_at = ? \
+                     WHERE id = ? AND archived = 1 \
+                       AND (parent_id = '' OR EXISTS (SELECT 1 FROM {nodes} parent \
+                         WHERE parent.id = {nodes}.parent_id \
+                           AND parent.org_id = ? AND parent.archived = 0))"
+                ),
+                params: vec![p(updated_at.0.clone()), p(id.0.clone()), p(node.org_id.0)],
+            },
+            SqlWrite {
+                sql: format!(
+                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                    self.table("audit_events")
+                ),
+                params: vec![
+                    p(updated_at.0.clone()),
+                    p(json_encode(actor, "directory actor")?),
+                    p("directory.node.restore"),
+                    p(format!("directory node {}", id.0)),
+                ],
+            },
+            SqlWrite {
+                sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE id = 1"),
+                params: Vec::new(),
+            },
+        ];
+        self.backend
+            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
+        self.directory_revision()
+    }
+
     fn update_directory_node(
         &self,
         id: &DirectoryNodeId,
@@ -412,11 +468,12 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         slug: &str,
         description: Option<&str>,
         updated_at: &Timestamp,
-    ) -> RepoResult<u64> {
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
         let current = self
             .directory_node(id)?
             .filter(|node| !node.archived)
-            .ok_or_else(|| RepoError::NotFound(format!("live directory node {}", id.0)))?;
+            .ok_or_else(|| RepositoryError::NotFound(format!("live directory node {}", id.0)))?;
         let mut updated = current.clone();
         updated.name = name.to_owned();
         updated.slug = slug.to_owned();
@@ -424,7 +481,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
         updated.updated_at = updated_at.clone();
         updated
             .validate()
-            .map_err(|error| RepoError::Conflict(error.to_string()))?;
+            .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
         if updated.name == current.name
             && updated.slug == current.slug
             && updated.description == current.description
@@ -470,7 +527,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
                 ),
                 params: vec![
                     p(updated_at.0.clone()),
-                    None,
+                    p(json_encode(actor, "directory actor")?),
                     p("directory.node.update"),
                     p(format!("directory node {}", id.0)),
                 ],
@@ -491,7 +548,7 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
     fn product_space_binding(
         &self,
         product_space: &ProductSpaceRef,
-    ) -> RepoResult<Option<ProductSpaceBinding>> {
+    ) -> RepositoryResult<Option<ProductSpacePlacement>> {
         let sql = format!(
             "SELECT product, space_id, org_id, node_id FROM {} WHERE product = ? AND space_id = ?",
             self.table("product_space_bindings")
@@ -505,11 +562,11 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
                 ],
             )?
             .first()
-            .map(decode_product_space_binding)
+            .map(decode_product_space_placement)
             .transpose()
     }
 
-    fn directory_revision(&self) -> RepoResult<u64> {
+    fn directory_revision(&self) -> RepositoryResult<u64> {
         let sql = format!(
             "SELECT CAST(revision AS TEXT) FROM {} WHERE id = 1",
             self.table("directory_fence")
@@ -519,9 +576,11 @@ impl<B: SqlConn> DirectoryRepo for SqlStore<B> {
             .first()
             .and_then(|row| row.first())
             .and_then(Option::as_deref)
-            .ok_or_else(|| RepoError::Backend("directory freshness fence is missing".into()))?;
-        revision
-            .parse()
-            .map_err(|error| RepoError::Backend(format!("invalid directory revision: {error}")))
+            .ok_or_else(|| {
+                RepositoryError::Backend("directory freshness fence is missing".into())
+            })?;
+        revision.parse().map_err(|error| {
+            RepositoryError::Backend(format!("invalid directory revision: {error}"))
+        })
     }
 }

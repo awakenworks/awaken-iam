@@ -26,7 +26,7 @@ use awaken_iam_contract::{
 };
 
 use crate::authorization::{AuthorizationTrace, DecisionReason};
-use crate::ports::{AuditEvent, AuditSink, RepoResult};
+use crate::repositories::{AuditEvent, AuditSink, RepositoryResult};
 use crate::{GrantId, PlanId, RoleId};
 
 /// The reasoned record of one authorization evaluation.
@@ -333,7 +333,7 @@ impl<S: AuditSink> AuditLedger<S> {
 
     /// Record `event` at `at` and advance the fence when the event fences,
     /// returning the version in effect afterward.
-    pub fn emit(&mut self, at: Timestamp, event: DomainEvent) -> RepoResult<u64> {
+    pub fn emit(&mut self, at: Timestamp, event: DomainEvent) -> RepositoryResult<u64> {
         self.sink.record(event.to_audit(at))?;
         if event.fences_snapshot() {
             self.version += 1;
@@ -347,7 +347,7 @@ impl<S: AuditSink> AuditLedger<S> {
     }
 
     /// The recorded audit events in append order.
-    pub fn events(&self) -> RepoResult<Vec<AuditEvent>> {
+    pub fn events(&self) -> RepositoryResult<Vec<AuditEvent>> {
         self.sink.events()
     }
 
@@ -402,7 +402,7 @@ fn join_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::RepoError;
+    use crate::repositories::RepositoryError;
     use std::sync::Mutex;
 
     use awaken_iam_contract::ActionKey;
@@ -415,12 +415,12 @@ mod tests {
     }
 
     impl AuditSink for VecSink {
-        fn record(&self, event: AuditEvent) -> RepoResult<()> {
+        fn record(&self, event: AuditEvent) -> RepositoryResult<()> {
             self.events.lock().unwrap().push(event);
             Ok(())
         }
 
-        fn events(&self) -> RepoResult<Vec<AuditEvent>> {
+        fn events(&self) -> RepositoryResult<Vec<AuditEvent>> {
             Ok(self.events.lock().unwrap().clone())
         }
     }
@@ -430,12 +430,12 @@ mod tests {
     struct FailingSink;
 
     impl AuditSink for FailingSink {
-        fn record(&self, _event: AuditEvent) -> RepoResult<()> {
-            Err(RepoError::Backend("sink down".into()))
+        fn record(&self, _event: AuditEvent) -> RepositoryResult<()> {
+            Err(RepositoryError::Backend("sink down".into()))
         }
 
-        fn events(&self) -> RepoResult<Vec<AuditEvent>> {
-            Err(RepoError::Backend("sink down".into()))
+        fn events(&self) -> RepositoryResult<Vec<AuditEvent>> {
+            Err(RepositoryError::Backend("sink down".into()))
         }
     }
 
@@ -635,7 +635,7 @@ mod tests {
                 grant: GrantId("g1".into()),
             },
         );
-        assert_eq!(result, Err(RepoError::Backend("sink down".into())));
+        assert_eq!(result, Err(RepositoryError::Backend("sink down".into())));
         // The fence never advances on a sink that failed to persist the event.
         assert_eq!(ledger.version(), 1);
     }

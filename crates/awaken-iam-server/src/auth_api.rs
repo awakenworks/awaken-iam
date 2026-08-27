@@ -42,7 +42,7 @@
 //! its own.
 //!
 //! The front half of the login loop mints a challenge whose hashes are persisted
-//! through the authoritative [`LoginFlowRepo`]. The one-time cleartext PKCE
+//! through the authoritative [`LoginFlowRepository`]. The one-time cleartext PKCE
 //! verifier and OIDC nonce are returned only in a second hardened, HttpOnly
 //! correlation cookie; their hashes bind them to the shared challenge row, so
 //! callback processing is stateless and any replica can complete it without
@@ -71,13 +71,14 @@ use awaken_iam_contract::{
     UserInfo,
 };
 use awaken_iam_core::{
-    AccountIdentityRepo, AccountRepo, AuthCodeRepo, AuthorizationUrlRequest, AuthorizedGrant,
-    BeginLogin, CallbackExchange, EntropySource, EstablishSession, ExternalIdentityRepo, IamError,
-    IdentityProviderAdapter, LoginAttempt, LoginFlowRepo, MintRefreshToken,
-    OAuthAuthorizationRequest, OAuthAuthorizationServer, OAuthChallengeService,
-    OAuthClientRegistry, OAuthClientRepo, OAuthProviderError, OsEntropy, ProviderError,
-    RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient, RepoError, RotateRefreshToken,
-    SessionRepo, TokenRedemption, parse_presented_refresh_token,
+    AccountIdentityRepository, AccountRepository, AuthCodeRepository, AuthorizationUrlRequest,
+    AuthorizedGrant, BeginLogin, CallbackExchange, EntropySource, EstablishSession,
+    ExternalIdentityRepository, IamError, IdentityProviderAdapter, LoginAttempt,
+    LoginFlowRepository, MintRefreshToken, OAuthAuthorizationRequest, OAuthAuthorizationServer,
+    OAuthChallengeService, OAuthClientRegistry, OAuthClientRepository, OAuthProviderError,
+    OsEntropy, ProviderError, RefreshTokenDirectory, RefreshTokenMinter, RegisteredClient,
+    RepositoryError, RotateRefreshToken, SessionRepository, TokenRedemption,
+    parse_presented_refresh_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -795,7 +796,7 @@ pub enum AuthApiError {
     /// The authoritative global identity repository was unavailable or rejected
     /// an invalid persistence transition.
     #[error(transparent)]
-    Repository(#[from] RepoError),
+    Repository(#[from] RepositoryError),
     /// Minting an asymmetric access token failed.
     #[error(transparent)]
     AccessToken(#[from] AccessTokenError),
@@ -815,11 +816,11 @@ pub enum AuthApiError {
 pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
     providers: Vec<RegisteredProvider>,
     challenge: OAuthChallengeService<E>,
-    login_flows: Arc<dyn LoginFlowRepo>,
+    login_flows: Arc<dyn LoginFlowRepository>,
     sessions: SessionGateway<E>,
-    accounts: Arc<dyn AccountRepo>,
-    external_identities: Arc<dyn ExternalIdentityRepo>,
-    identity_commands: Arc<dyn AccountIdentityRepo>,
+    accounts: Arc<dyn AccountRepository>,
+    external_identities: Arc<dyn ExternalIdentityRepository>,
+    identity_commands: Arc<dyn AccountIdentityRepository>,
     return_to: ReturnToPolicy,
     login_cookie: SessionCookieConfig,
     login_proof_cookie: SessionCookieConfig,
@@ -1853,10 +1854,9 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             last_seen_at: request.now.clone(),
         };
         if self.accounts.get(&request.account_id)?.is_none() {
-            return Err(AuthApiError::Repository(RepoError::NotFound(format!(
-                "account {}",
-                request.account_id.0
-            ))));
+            return Err(AuthApiError::Repository(RepositoryError::NotFound(
+                format!("account {}", request.account_id.0),
+            )));
         }
         if let Some(existing) = self.external_identities.get_by_key(&identity.key())? {
             return Err(AuthApiError::Login(IamError::DuplicateExternalIdentity {
@@ -1945,9 +1945,9 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         };
         match self.identity_commands.provision(account, identity) {
             Ok(()) => Ok((account_id, external_identity_id, true)),
-            Err(RepoError::Conflict(_)) => {
+            Err(RepositoryError::Conflict(_)) => {
                 let mut winner = self.external_identities.get_by_key(&key)?.ok_or_else(|| {
-                    RepoError::Backend(
+                    RepositoryError::Backend(
                         "identity provisioning conflicted without a durable winner".into(),
                     )
                 })?;

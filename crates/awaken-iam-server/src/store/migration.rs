@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use awaken_iam_core::{RepoError, RepoResult};
+use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 pub use awaken_scoped_migration::{
     AppliedMigration, Dialect, Migration, MigrationBundle, MigrationError,
@@ -52,8 +52,8 @@ use super::bundles::bundles;
 /// The whole migration mechanism reports through one error type; at the IAM edge
 /// every variant is an opaque backend failure (a drifted checksum, an unreachable
 /// ledger, an invalid prefix), surfaced verbatim so the cause is preserved.
-pub(crate) fn migration_err(err: MigrationError) -> RepoError {
-    RepoError::Backend(err.to_string())
+pub(crate) fn migration_err(err: MigrationError) -> RepositoryError {
+    RepositoryError::Backend(err.to_string())
 }
 
 /// A migration rendered for a concrete table prefix and dialect, ready to apply.
@@ -105,11 +105,15 @@ pub trait MigrationExecutor {
         &mut self,
         prefix: &str,
         bundles: &[MigrationBundle],
-    ) -> RepoResult<Vec<AppliedMigration>>;
+    ) -> RepositoryResult<Vec<AppliedMigration>>;
 
     /// Read the recorded `(version -> checksum)` map for `bundle_id` under
     /// `prefix`, the input [`awaken_scoped_migration::plan`] verifies against.
-    fn applied_versions(&self, prefix: &str, bundle_id: &str) -> RepoResult<BTreeMap<i64, String>>;
+    fn applied_versions(
+        &self,
+        prefix: &str,
+        bundle_id: &str,
+    ) -> RepositoryResult<BTreeMap<i64, String>>;
 }
 
 /// Storage adapter that owns IAM's schema for a given table prefix.
@@ -135,7 +139,7 @@ impl<Pool> IamStore<Pool> {
     /// `prefix` is validated by [`awaken_scoped_migration::sql_identifier`]
     /// (leading ASCII letter, then `[A-Za-z0-9_]`); it is concatenated into table
     /// names, so anything else is rejected to keep the rendered DDL injection-free.
-    pub fn with_prefix(pool: Pool, prefix: impl Into<String>) -> RepoResult<Self> {
+    pub fn with_prefix(pool: Pool, prefix: impl Into<String>) -> RepositoryResult<Self> {
         let prefix = prefix.into();
         let ledger = LedgerSchema::with_prefix(&prefix).map_err(migration_err)?;
         Ok(Self {
@@ -196,7 +200,7 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
     /// Idempotent and fail-closed: delegates the apply to the executor, which runs
     /// the foundation crate's plan under its single-applier guard so concurrent
     /// node startup is safe and a drifted step aborts the run.
-    pub fn migrate(&mut self) -> RepoResult<MigrateReport> {
+    pub fn migrate(&mut self) -> RepositoryResult<MigrateReport> {
         let bundles = bundles();
         let total: usize = bundles.iter().map(|b| b.migrations().len()).sum();
         let applied = self.pool.run_migrations(&self.prefix, &bundles)?;
@@ -212,7 +216,7 @@ impl<Pool: MigrationExecutor> IamStore<Pool> {
     /// confirms the node's own migrations are applied and, because it reads the
     /// ledger, proves the store is reachable. A pending step, a drifted checksum,
     /// or an unreadable ledger all report *not applied* — readiness fails closed.
-    pub fn migrations_applied(&self) -> RepoResult<bool> {
+    pub fn migrations_applied(&self) -> RepositoryResult<bool> {
         let dialect = self.pool.dialect();
         for bundle in bundles() {
             // An unreadable ledger errors here → not ready (fail closed).
@@ -287,7 +291,7 @@ impl MigrationExecutor for RecordingExecutor {
         &mut self,
         prefix: &str,
         bundles: &[MigrationBundle],
-    ) -> RepoResult<Vec<AppliedMigration>> {
+    ) -> RepositoryResult<Vec<AppliedMigration>> {
         if !self.ledger_created {
             let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
             self.executed.extend(schema.create_statements(self.dialect));
@@ -321,7 +325,7 @@ impl MigrationExecutor for RecordingExecutor {
         &self,
         _prefix: &str,
         bundle_id: &str,
-    ) -> RepoResult<BTreeMap<i64, String>> {
+    ) -> RepositoryResult<BTreeMap<i64, String>> {
         Ok(self
             .ledger
             .iter()
@@ -456,7 +460,7 @@ mod tests {
         executor.force_checksum("iam.identity", 1, "deadbeef");
         let mut store = IamStore::with_prefix(executor, "iam").expect("valid prefix");
         let err = store.migrate().expect_err("drift must fail closed");
-        assert!(matches!(err, RepoError::Backend(msg) if msg.contains("checksum mismatch")));
+        assert!(matches!(err, RepositoryError::Backend(msg) if msg.contains("checksum mismatch")));
     }
 
     #[test]

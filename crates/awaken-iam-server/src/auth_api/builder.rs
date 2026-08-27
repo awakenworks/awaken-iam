@@ -81,7 +81,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// and test compositions retain the in-memory default. Cookie configuration
     /// and repository selection are intentionally independent and may be
     /// applied in either builder order without reverting to an in-memory store.
-    pub fn with_session_repository(mut self, repository: Arc<dyn SessionRepo>) -> Self {
+    pub fn with_session_repository(mut self, repository: Arc<dyn SessionRepository>) -> Self {
         let cookie = self.sessions.cookie_config().clone();
         self.sessions = SessionGateway::with_repository(self.ids.clone(), cookie, repository);
         self
@@ -91,9 +91,9 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// atomic Account+ExternalIdentity command owner selected by deployment.
     pub fn with_identity_repositories(
         mut self,
-        accounts: Arc<dyn AccountRepo>,
-        external_identities: Arc<dyn ExternalIdentityRepo>,
-        identity_commands: Arc<dyn AccountIdentityRepo>,
+        accounts: Arc<dyn AccountRepository>,
+        external_identities: Arc<dyn ExternalIdentityRepository>,
+        identity_commands: Arc<dyn AccountIdentityRepository>,
     ) -> Self {
         self.accounts = accounts;
         self.external_identities = external_identities;
@@ -109,8 +109,8 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// repositories, with no hydrated per-process registry.
     pub fn with_oauth_repositories(
         mut self,
-        clients: Arc<dyn OAuthClientRepo>,
-        codes: Arc<dyn AuthCodeRepo>,
+        clients: Arc<dyn OAuthClientRepository>,
+        codes: Arc<dyn AuthCodeRepository>,
     ) -> Self {
         self.oauth_provider =
             OAuthAuthorizationServer::with_repositories(clients, codes, self.ids.clone());
@@ -121,7 +121,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     ///
     /// Durable compositions inject the same shared SQL store used by sessions
     /// and downstream OAuth state. No process-local compatibility path remains.
-    pub fn with_login_repository(mut self, repository: Arc<dyn LoginFlowRepo>) -> Self {
+    pub fn with_login_repository(mut self, repository: Arc<dyn LoginFlowRepository>) -> Self {
         self.login_flows = repository;
         self
     }

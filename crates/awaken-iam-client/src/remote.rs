@@ -19,12 +19,13 @@ use awaken_iam_contract::{
     AuthorizationProfileActivated, AuthorizationProfileRetired, AuthorizationProfileValidation,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery,
-    DirectoryMutationAck, DirectoryNodeDto, DirectoryNodeId, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationDto, InvitationId,
-    InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgDto,
-    PolicySnapshot, ProductSpaceBinding, ProductSpaceRef, ReplaceScopedMemberships,
+    DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
+    EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    GrantSnapshot, InvitationId, InvitationQuery, InvitationView, IssuedInvitation,
+    MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
+    ProductSpacePlacement, ProductSpacePlacementResult, ProductSpaceRef, ReplaceScopedMemberships,
     ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleDto, ScopeMembershipQuery,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
     UserInfo, WorkspaceOrgEdge,
 };
@@ -108,15 +109,15 @@ pub trait AuthzTransport {
         ))
     }
 
-    fn create_org(&self, _org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+    fn create_org(&self, _org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
-    fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+    fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
-    fn get_org(&self, _org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+    fn get_org(&self, _org_id: &str) -> Result<Option<OrgView>, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
     }
 
@@ -127,21 +128,28 @@ pub trait AuthzTransport {
     fn create_directory_node(
         &self,
         _request: &CreateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
+    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn ensure_product_space_placement(
+        &self,
+        _request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError> {
         Err(RemoteError("directory API is not supported".into()))
     }
 
     fn get_directory_node(
         &self,
         _id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
         Err(RemoteError("directory API is not supported".into()))
     }
 
     fn directory_children(
         &self,
         _query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
         Err(RemoteError("directory API is not supported".into()))
     }
 
@@ -168,18 +176,25 @@ pub trait AuthzTransport {
         Err(RemoteError("directory API is not supported".into()))
     }
 
-    fn product_space_binding(
+    fn restore_directory_node(
         &self,
-        _space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+        _id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
         Err(RemoteError("directory API is not supported".into()))
     }
 
-    fn create_role(&self, _role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+    fn product_space_binding(
+        &self,
+        _space: &ProductSpaceRef,
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
+        Err(RemoteError("directory API is not supported".into()))
+    }
+
+    fn create_role(&self, _role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("role PAP is not supported".into()))
     }
 
-    fn get_role(&self, _role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+    fn get_role(&self, _role_id: &str) -> Result<Option<RoleView>, RemoteError> {
         Err(RemoteError("role PAP is not supported".into()))
     }
 
@@ -236,7 +251,7 @@ pub trait AuthzTransport {
     fn list_invitations(
         &self,
         _query: &InvitationQuery,
-    ) -> Result<Vec<InvitationDto>, RemoteError> {
+    ) -> Result<Vec<InvitationView>, RemoteError> {
         Err(RemoteError("invitation PAP is not supported".into()))
     }
 
@@ -423,15 +438,15 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.introspect_token(request)
     }
 
-    pub fn create_org(&self, org: &OrgDto) -> Result<AdminMutationAck, RemoteError> {
+    pub fn create_org(&self, org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_org(org)
     }
 
-    pub fn list_orgs(&self) -> Result<Vec<OrgDto>, RemoteError> {
+    pub fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {
         self.transport.list_orgs()
     }
 
-    pub fn get_org(&self, org_id: &str) -> Result<Option<OrgDto>, RemoteError> {
+    pub fn get_org(&self, org_id: &str) -> Result<Option<OrgView>, RemoteError> {
         self.transport.get_org(org_id)
     }
 
@@ -443,21 +458,28 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     pub fn create_directory_node(
         &self,
         request: &CreateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
+    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
         self.transport.create_directory_node(request)
+    }
+
+    pub fn ensure_product_space_placement(
+        &self,
+        request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError> {
+        self.transport.ensure_product_space_placement(request)
     }
 
     pub fn get_directory_node(
         &self,
         id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
         self.transport.get_directory_node(id)
     }
 
     pub fn directory_children(
         &self,
         query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeDto>, RemoteError> {
+    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
         self.transport.directory_children(query)
     }
 
@@ -484,18 +506,25 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.archive_directory_node(id)
     }
 
+    pub fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.restore_directory_node(id)
+    }
+
     pub fn product_space_binding(
         &self,
         space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpaceBinding>, RemoteError> {
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
         self.transport.product_space_binding(space)
     }
 
-    pub fn create_role(&self, role: &RoleDto) -> Result<AdminMutationAck, RemoteError> {
+    pub fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_role(role)
     }
 
-    pub fn get_role(&self, role_id: &str) -> Result<Option<RoleDto>, RemoteError> {
+    pub fn get_role(&self, role_id: &str) -> Result<Option<RoleView>, RemoteError> {
         self.transport.get_role(role_id)
     }
 
@@ -552,7 +581,7 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     pub fn list_invitations(
         &self,
         query: &InvitationQuery,
-    ) -> Result<Vec<InvitationDto>, RemoteError> {
+    ) -> Result<Vec<InvitationView>, RemoteError> {
         self.transport.list_invitations(query)
     }
 

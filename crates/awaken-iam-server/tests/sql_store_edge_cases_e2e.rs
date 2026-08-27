@@ -12,9 +12,9 @@ use awaken_iam_contract::{
     PrincipalRef, ScopeRef, Timestamp,
 };
 use awaken_iam_core::{
-    AccountRepo, ActionPattern, Effect, ExternalIdentityRepo, Grant, GrantId, GrantRepo,
-    GrantSubject, GroupId, OrgRepo, Organization, Plan, PlanId, PlanRepo, PlanTier, Quota,
-    RateLimit, RateWindow, RoleDef, RoleId, RoleRepo,
+    AccountRepository, ActionPattern, Effect, ExternalIdentityRepository, Grant, GrantId,
+    GrantRepository, GrantSubject, GroupId, OrgRepository, Organization, Plan, PlanId,
+    PlanRepository, PlanTier, Quota, RateLimit, RateWindow, RoleDef, RoleId, RoleRepository,
 };
 use awaken_iam_server::{SqlStore, SqliteBackend, sqlite_in_memory_store, sqlite_migrated_store};
 
@@ -38,7 +38,7 @@ fn sql_store_with_prefix_rejects_empty_and_invalid_prefixes() {
     ] {
         let result = SqlStore::with_prefix(backend.clone(), bad);
         assert!(
-            matches!(result, Err(awaken_iam_core::RepoError::Backend(_))),
+            matches!(result, Err(awaken_iam_core::RepositoryError::Backend(_))),
             "prefix {bad:?} must be rejected"
         );
     }
@@ -70,7 +70,7 @@ fn effect_round_trips_through_allow_and_deny_branches() {
 
     // Need an org so grants can be looked up against a known scope graph.
     let org_id = OrgId("acme".into());
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: org_id.clone(),
@@ -103,8 +103,8 @@ fn effect_round_trips_through_allow_and_deny_branches() {
             },
             effect,
         };
-        GrantRepo::put(&store, grant.clone()).unwrap();
-        let round_tripped = GrantRepo::get(&store, &grant.id).unwrap().unwrap();
+        GrantRepository::put(&store, grant.clone()).unwrap();
+        let round_tripped = GrantRepository::get(&store, &grant.id).unwrap().unwrap();
         assert_eq!(round_tripped.effect, effect);
         assert_eq!(round_tripped.action_pattern.0, "pack.read");
     }
@@ -123,8 +123,8 @@ fn plan_tier_round_trips_through_free_team_and_enterprise() {
         let plan = Plan::new(PlanId(format!("plan_{label}")), tier, ["pack.read"])
             .with_quota("pack.publish", Quota::Limited(100))
             .with_rate_limit("pack.read", RateLimit::new(50, RateWindow::Minute));
-        PlanRepo::put(&store, plan.clone()).unwrap();
-        let round_tripped = PlanRepo::get(&store, &plan.id).unwrap().unwrap();
+        PlanRepository::put(&store, plan.clone()).unwrap();
+        let round_tripped = PlanRepository::get(&store, &plan.id).unwrap().unwrap();
         assert_eq!(round_tripped.tier, tier);
     }
 }
@@ -136,7 +136,7 @@ fn grant_subject_decodes_principal_role_and_group_variants() {
     let store = sqlite_in_memory_store("iam").expect("migrate");
 
     let org_id = OrgId("acme".into());
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: org_id.clone(),
@@ -149,7 +149,7 @@ fn grant_subject_decodes_principal_role_and_group_variants() {
         },
     )
     .unwrap();
-    RoleRepo::upsert(
+    RoleRepository::upsert(
         &store,
         RoleDef {
             id: RoleId("publisher".into()),
@@ -173,8 +173,8 @@ fn grant_subject_decodes_principal_role_and_group_variants() {
         },
         effect: Effect::Allow,
     };
-    GrantRepo::put(&store, grant).unwrap();
-    let loaded = GrantRepo::get(&store, &GrantId("g_principal".into()))
+    GrantRepository::put(&store, grant).unwrap();
+    let loaded = GrantRepository::get(&store, &GrantId("g_principal".into()))
         .unwrap()
         .unwrap();
     match loaded.subject {
@@ -194,8 +194,8 @@ fn grant_subject_decodes_principal_role_and_group_variants() {
         },
         effect: Effect::Allow,
     };
-    GrantRepo::put(&store, grant).unwrap();
-    let loaded = GrantRepo::get(&store, &GrantId("g_role".into()))
+    GrantRepository::put(&store, grant).unwrap();
+    let loaded = GrantRepository::get(&store, &GrantId("g_role".into()))
         .unwrap()
         .unwrap();
     assert!(matches!(loaded.subject, GrantSubject::Role(_)));
@@ -210,8 +210,8 @@ fn grant_subject_decodes_principal_role_and_group_variants() {
         },
         effect: Effect::Allow,
     };
-    GrantRepo::put(&store, grant).unwrap();
-    let loaded = GrantRepo::get(&store, &GrantId("g_group".into()))
+    GrantRepository::put(&store, grant).unwrap();
+    let loaded = GrantRepository::get(&store, &GrantId("g_group".into()))
         .unwrap()
         .unwrap();
     assert!(matches!(loaded.subject, GrantSubject::Group(_)));
@@ -230,7 +230,7 @@ fn sqlite_backend_open_path_creates_a_file_backed_database() {
 
     // The store round-trips an account over the file-backed connection.
     let id = AccountId("ada".into());
-    AccountRepo::upsert(
+    AccountRepository::upsert(
         &store,
         Account {
             id: id.clone(),
@@ -241,13 +241,13 @@ fn sqlite_backend_open_path_creates_a_file_backed_database() {
         },
     )
     .unwrap();
-    assert!(AccountRepo::get(&store, &id).unwrap().is_some());
+    assert!(AccountRepository::get(&store, &id).unwrap().is_some());
 
     // Reopen the file and confirm the data persists across processes —
     // a fresh connection must see what the previous one wrote.
     let backend2 = SqliteBackend::open_path(&path).expect("reopen");
     let store2 = sqlite_migrated_store(backend2, "iam").expect("migrate again");
-    assert!(AccountRepo::get(&store2, &id).unwrap().is_some());
+    assert!(AccountRepository::get(&store2, &id).unwrap().is_some());
 
     // Clean up the fixture.
     let _ = std::fs::remove_file(&path);
@@ -255,7 +255,7 @@ fn sqlite_backend_open_path_creates_a_file_backed_database() {
 
 #[test]
 fn external_identity_subject_decodes_through_the_sql_path() {
-    // ExternalIdentityRepo.get_by_key deserialises the stored claims JSON.
+    // ExternalIdentityRepository.get_by_key deserialises the stored claims JSON.
     // A real (provider, subject) round-trip exercises that path end-to-end.
     let store = sqlite_in_memory_store("iam").expect("migrate");
 
@@ -291,7 +291,7 @@ fn sql_store_rejects_grant_with_role_subject_whose_role_does_not_exist() {
     // when no role row is present — this is the documented behaviour, not a
     // bug.
     let store = sqlite_in_memory_store("iam").expect("migrate");
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: OrgId("acme".into()),
@@ -313,7 +313,7 @@ fn sql_store_rejects_grant_with_role_subject_whose_role_does_not_exist() {
         },
         effect: Effect::Allow,
     };
-    GrantRepo::put(&store, grant.clone()).unwrap();
-    let loaded = GrantRepo::get(&store, &grant.id).unwrap().unwrap();
+    GrantRepository::put(&store, grant.clone()).unwrap();
+    let loaded = GrantRepository::get(&store, &grant.id).unwrap().unwrap();
     assert_eq!(loaded.subject, GrantSubject::Role(RoleId("ghost".into())));
 }

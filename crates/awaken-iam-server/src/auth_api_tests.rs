@@ -267,7 +267,7 @@ fn full_login_loop_provisions_account_and_establishes_session() {
 }
 
 /// Durable server-session cause/effect decision table:
-/// C1=two AuthApi instances share one SessionRepo, C2=session is live,
+/// C1=two AuthApi instances share one SessionRepository, C2=session is live,
 /// C3=logout is persisted, C4=cookie/repository builders are applied in either
 /// order. R1(C1,C2,!C3,C4) lets the second instance authenticate a session
 /// minted by the first; R2(C1,C2,C3,C4) makes a third instance reject it. This
@@ -307,7 +307,7 @@ fn shared_session_repository_survives_auth_api_reconstruction_and_logout() {
 
 /// Upstream-login HA cause/effect decision table:
 /// C1=start and callback hit different AuthApi replicas, C2=both share one
-/// LoginFlowRepo, C3=the browser returns both hardened cookies, C4=bindings
+/// LoginFlowRepository, C3=the browser returns both hardened cookies, C4=bindings
 /// match. R1(C1+C2+C3+C4) consumes the shared row and establishes the session;
 /// R2(C1+!C2) rejects unknown state; R3(C1+C2+!C3) rejects missing correlation;
 /// R4(C1+C2+C3+!C4) burns the row and rejects. R2-R4 are covered by the

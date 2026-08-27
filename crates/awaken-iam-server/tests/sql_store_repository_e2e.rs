@@ -1,4 +1,4 @@
-//! End-to-end coverage of the SQL store's repository ports not exercised by
+//! End-to-end coverage of the SQL store's repository contracts not exercised by
 //! `sql_store_e2e::exercise_every_port`: list endpoints, role deletion, the
 //! api-token absent-update NotFound branch, and the unknown tier / effect
 //! string-error branches.
@@ -8,8 +8,9 @@ use awaken_iam_contract::{
     Timestamp, WorkspaceId,
 };
 use awaken_iam_core::{
-    ActionPattern, ApiTokenRepo, Effect, Group, GroupId, GroupRepo, OrgRepo, Organization, Plan,
-    PlanId, PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RepoError, RoleDef, RoleId, RoleRepo,
+    ActionPattern, ApiTokenRepository, Effect, Group, GroupId, GroupRepository, OrgRepository,
+    Organization, Plan, PlanId, PlanRepository, PlanTier, Quota, RateLimit, RateWindow,
+    RepositoryError, RoleDef, RoleId, RoleRepository,
 };
 use awaken_iam_server::sqlite_in_memory_store;
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,15 +37,15 @@ fn api_token_update_on_absent_token_yields_not_found() {
         expires_at: None,
         revoked_at: None,
     };
-    let result = ApiTokenRepo::update(&store, absent);
-    assert!(matches!(result, Err(RepoError::NotFound(_))));
+    let result = ApiTokenRepository::update(&store, absent);
+    assert!(matches!(result, Err(RepositoryError::NotFound(_))));
 }
 
 #[test]
 fn role_remove_returns_not_found_when_absent() {
     let store = sqlite_in_memory_store("iam").expect("migrate");
-    let result = RoleRepo::remove(&store, &RoleId("ghost".into()));
-    assert!(matches!(result, Err(RepoError::NotFound(_))));
+    let result = RoleRepository::remove(&store, &RoleId("ghost".into()));
+    assert!(matches!(result, Err(RepositoryError::NotFound(_))));
 }
 
 #[test]
@@ -59,27 +60,27 @@ fn role_remove_returns_ok_when_present() {
         created_at: ts(),
         updated_at: ts(),
     };
-    RoleRepo::upsert(&store, role).expect("upsert");
-    RoleRepo::remove(&store, &RoleId("publisher".into())).expect("remove");
+    RoleRepository::upsert(&store, role).expect("upsert");
+    RoleRepository::remove(&store, &RoleId("publisher".into())).expect("remove");
     assert!(
-        RoleRepo::get(&store, &RoleId("publisher".into()))
+        RoleRepository::get(&store, &RoleId("publisher".into()))
             .unwrap()
             .is_none()
     );
     // A second remove now fails closed.
     assert!(matches!(
-        RoleRepo::remove(&store, &RoleId("publisher".into())),
-        Err(RepoError::NotFound(_))
+        RoleRepository::remove(&store, &RoleId("publisher".into())),
+        Err(RepositoryError::NotFound(_))
     ));
 }
 
 #[test]
 fn group_list_returns_every_group_for_an_org() {
-    // The SQL store's `GroupRepo::list` path: every persisted group is
+    // The SQL store's `GroupRepository::list` path: every persisted group is
     // returned, in deterministic order, irrespective of insert order.
     let store = sqlite_in_memory_store("iam").expect("migrate");
     // Seed an org the groups belong to.
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: OrgId("acme".into()),
@@ -98,7 +99,7 @@ fn group_list_returns_every_group_for_an_org() {
         ("design", "Design"),
         ("ops", "Operations"),
     ] {
-        GroupRepo::upsert(
+        GroupRepository::upsert(
             &store,
             Group {
                 id: GroupId(id.into()),
@@ -114,7 +115,7 @@ fn group_list_returns_every_group_for_an_org() {
         .unwrap();
     }
 
-    let groups = GroupRepo::list(&store).unwrap();
+    let groups = GroupRepository::list(&store).unwrap();
     assert_eq!(groups.len(), 3);
     let ids: Vec<&str> = groups.iter().map(|g| g.id.0.as_str()).collect();
     assert_eq!(ids, vec!["design", "eng", "ops"]);
@@ -132,14 +133,14 @@ fn unknown_effect_string_fails_to_deserialize() {
     //
     // Since the Effect enum has only three variants, the unknown branch is
     // reachable only via raw column corruption; we verify the deserializer
-    // returns RepoError::Backend on a row it cannot parse.
+    // returns RepositoryError::Backend on a row it cannot parse.
     use awaken_iam_server::SqlConn;
     use awaken_iam_server::SqliteBackend;
     // Open the backend, then mount both the migrated store and the same
     // raw connection so corruption and read-back share one database.
     let backend = SqliteBackend::open_in_memory().expect("open");
     let store = awaken_iam_server::sqlite_migrated_store(backend.clone(), "iam").expect("migrate");
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: OrgId("acme".into()),
@@ -153,8 +154,8 @@ fn unknown_effect_string_fails_to_deserialize() {
     )
     .unwrap();
 
-    use awaken_iam_core::GrantRepo;
-    GrantRepo::put(
+    use awaken_iam_core::GrantRepository;
+    GrantRepository::put(
         &store,
         awaken_iam_core::Grant {
             id: awaken_iam_core::GrantId("g1".into()),
@@ -179,9 +180,9 @@ fn unknown_effect_string_fails_to_deserialize() {
     )
     .expect("corrupt effect");
 
-    let result = GrantRepo::get(&store, &awaken_iam_core::GrantId("g1".into()));
+    let result = GrantRepository::get(&store, &awaken_iam_core::GrantId("g1".into()));
     assert!(
-        matches!(result, Err(RepoError::Backend(_))),
+        matches!(result, Err(RepositoryError::Backend(_))),
         "unknown effect must surface as Backend error, got {result:?}"
     );
 }
@@ -195,7 +196,7 @@ fn unknown_plan_tier_string_fails_to_deserialize() {
     let backend = SqliteBackend::open_in_memory().expect("open");
     let store = awaken_iam_server::sqlite_migrated_store(backend.clone(), "iam").expect("migrate");
 
-    PlanRepo::put(
+    PlanRepository::put(
         &store,
         Plan::new(PlanId("plan-x".into()), PlanTier::Team, ["pack.read"])
             .with_quota("pack.publish", Quota::Limited(10))
@@ -211,9 +212,9 @@ fn unknown_plan_tier_string_fails_to_deserialize() {
     )
     .expect("corrupt tier");
 
-    let result = PlanRepo::get(&store, &PlanId("plan-x".into()));
+    let result = PlanRepository::get(&store, &PlanId("plan-x".into()));
     assert!(
-        matches!(result, Err(RepoError::Backend(_))),
+        matches!(result, Err(RepositoryError::Backend(_))),
         "unknown tier must surface as Backend error, got {result:?}"
     );
 }
@@ -233,8 +234,8 @@ fn plan_tier_round_trips_with_limits_and_rates() {
         limits: limits.clone(),
         rates: BTreeMap::new(),
     };
-    PlanRepo::put(&store, plan.clone()).unwrap();
-    let read = PlanRepo::get(&store, &PlanId("plan-pro".into()))
+    PlanRepository::put(&store, plan.clone()).unwrap();
+    let read = PlanRepository::get(&store, &PlanId("plan-pro".into()))
         .unwrap()
         .unwrap();
     assert_eq!(read.tier, PlanTier::Enterprise);
@@ -246,9 +247,9 @@ fn plan_tier_round_trips_with_limits_and_rates() {
 fn grant_subject_ref_round_trips_through_grant_storage() {
     // GrantSubjectRef is the wire form decoded when reading a grant back.
     // Every variant must round-trip cleanly.
-    use awaken_iam_core::GrantRepo;
+    use awaken_iam_core::GrantRepository;
     let store = sqlite_in_memory_store("iam").expect("migrate");
-    OrgRepo::upsert(
+    OrgRepository::upsert(
         &store,
         Organization {
             id: OrgId("acme".into()),
@@ -264,7 +265,7 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
 
     // Grant with a Service principal subject — a path the SQL store's
     // decoder recognises.
-    GrantRepo::put(
+    GrantRepository::put(
         &store,
         awaken_iam_core::Grant {
             id: awaken_iam_core::GrantId("g_service".into()),
@@ -279,7 +280,7 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
         },
     )
     .unwrap();
-    let loaded = GrantRepo::get(&store, &awaken_iam_core::GrantId("g_service".into()))
+    let loaded = GrantRepository::get(&store, &awaken_iam_core::GrantId("g_service".into()))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -296,7 +297,7 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
         GrantEffect::RequireApproval,
     ] {
         let id = format!("g_{effect:?}").to_lowercase();
-        GrantRepo::put(
+        GrantRepository::put(
             &store,
             awaken_iam_core::Grant {
                 id: awaken_iam_core::GrantId(id.clone()),
@@ -315,7 +316,7 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
             },
         )
         .unwrap();
-        let loaded = GrantRepo::get(&store, &awaken_iam_core::GrantId(id))
+        let loaded = GrantRepository::get(&store, &awaken_iam_core::GrantId(id))
             .unwrap()
             .unwrap();
         let expected = match effect {

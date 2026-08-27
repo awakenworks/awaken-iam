@@ -29,7 +29,7 @@
 //! and serves the canonical `/v1` API.
 
 use awaken_iam_contract::Timestamp;
-use awaken_iam_core::{EntitlementEngine, EntitlementProvider, RepoResult};
+use awaken_iam_core::{EntitlementEngine, EntitlementProvider, RepositoryResult};
 
 use crate::{
     AuthApi, AuthzApi, IamStore, LicenseConfig, LicenseStatus, Liveness, MigrateReport,
@@ -255,7 +255,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     /// The host owns the pool's lifecycle; IAM owns its *schema within* the
     /// shared database, isolated by the `iam` prefix and its own ledger. Runs the
     /// `iam.*` bundles before returning.
-    pub fn embedded(pool: Pool) -> RepoResult<Self> {
+    pub fn embedded(pool: Pool) -> RepositoryResult<Self> {
         Self::assemble(Deployment::Embedded, pool, EntitlementEngine::unlicensed())
     }
 
@@ -263,7 +263,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
     ///
     /// Identical code to [`embedded`](Self::embedded); only the pool (a distinct
     /// database) and the [`Deployment`] tag differ.
-    pub fn standalone(pool: Pool) -> RepoResult<Self> {
+    pub fn standalone(pool: Pool) -> RepositoryResult<Self> {
         Self::assemble(
             Deployment::Standalone,
             pool,
@@ -281,7 +281,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         deployment: Deployment,
         pool: Pool,
         entitlements: impl EntitlementProvider + 'static,
-    ) -> RepoResult<Self> {
+    ) -> RepositoryResult<Self> {
         Self::assemble(deployment, pool, entitlements)
     }
 
@@ -302,7 +302,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         pool: Pool,
         license: &LicenseConfig,
         now: &Timestamp,
-    ) -> RepoResult<(Self, LicenseStatus)> {
+    ) -> RepositoryResult<(Self, LicenseStatus)> {
         let resolved = license.resolve(now);
         let assembly = Self::assemble(deployment, pool, resolved.provider)?;
         Ok((assembly, resolved.status))
@@ -321,7 +321,7 @@ impl<Pool: MigrationExecutor> IamAssembly<Pool> {
         deployment: Deployment,
         pool: Pool,
         entitlements: impl EntitlementProvider + 'static,
-    ) -> RepoResult<Self> {
+    ) -> RepositoryResult<Self> {
         let mut store = IamStore::with_prefix(pool, IAM_TABLE_PREFIX)?;
         let migrate_report = store.migrate()?;
         Ok(Self {
@@ -466,7 +466,7 @@ pub struct IamDaemon<Pool> {
 
 impl<Pool: MigrationExecutor> IamDaemon<Pool> {
     /// Start the daemon over its own pool: assemble standalone and migrate.
-    pub fn start(pool: Pool) -> RepoResult<Self> {
+    pub fn start(pool: Pool) -> RepositoryResult<Self> {
         Ok(Self {
             assembly: IamAssembly::standalone(pool)?,
         })
@@ -476,7 +476,7 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
     pub fn with_entitlements(
         pool: Pool,
         entitlements: impl EntitlementProvider + 'static,
-    ) -> RepoResult<Self> {
+    ) -> RepositoryResult<Self> {
         Ok(Self {
             assembly: IamAssembly::with_entitlements(Deployment::Standalone, pool, entitlements)?,
         })
@@ -491,7 +491,7 @@ impl<Pool: MigrationExecutor> IamDaemon<Pool> {
         pool: Pool,
         license: &LicenseConfig,
         now: &Timestamp,
-    ) -> RepoResult<(Self, LicenseStatus)> {
+    ) -> RepositoryResult<(Self, LicenseStatus)> {
         let (assembly, status) =
             IamAssembly::with_license(Deployment::Standalone, pool, license, now)?;
         Ok((Self { assembly }, status))

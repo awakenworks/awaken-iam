@@ -4,8 +4,8 @@ use std::sync::{Arc, Barrier};
 
 use awaken_iam_contract::{AccountId, Timestamp};
 use awaken_iam_core::{
-    AuthCodeRepo, EntropySource, OAuthAuthorizationRequest, OAuthAuthorizationServer,
-    OAuthClientRepo, OAuthProviderError, RegisteredClient, TokenRedemption,
+    AuthCodeRepository, EntropySource, OAuthAuthorizationRequest, OAuthAuthorizationServer,
+    OAuthClientRepository, OAuthProviderError, RegisteredClient, TokenRedemption,
 };
 use awaken_iam_server::sqlite_in_memory_store;
 
@@ -58,8 +58,8 @@ fn redemption(code: String) -> TokenRedemption {
 #[test]
 fn sql_store_shares_clients_and_codes_across_authorization_servers() {
     let store = Arc::new(sqlite_in_memory_store("iam").expect("migrate IAM store"));
-    let clients: Arc<dyn OAuthClientRepo> = store.clone();
-    let codes: Arc<dyn AuthCodeRepo> = store;
+    let clients: Arc<dyn OAuthClientRepository> = store.clone();
+    let codes: Arc<dyn AuthCodeRepository> = store;
     let mut first =
         OAuthAuthorizationServer::with_repositories(clients.clone(), codes.clone(), TestEntropy(1));
     let mut second = OAuthAuthorizationServer::with_repositories(clients, codes, TestEntropy(2));
@@ -97,8 +97,8 @@ fn sql_store_shares_clients_and_codes_across_authorization_servers() {
 #[test]
 fn sql_store_concurrent_redeem_has_one_cas_winner() {
     let store = Arc::new(sqlite_in_memory_store("iam").expect("migrate IAM store"));
-    let clients: Arc<dyn OAuthClientRepo> = store.clone();
-    let codes: Arc<dyn AuthCodeRepo> = store;
+    let clients: Arc<dyn OAuthClientRepository> = store.clone();
+    let codes: Arc<dyn AuthCodeRepository> = store;
     let mut issuer =
         OAuthAuthorizationServer::with_repositories(clients.clone(), codes.clone(), TestEntropy(3));
     issuer

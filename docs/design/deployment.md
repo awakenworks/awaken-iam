@@ -12,7 +12,7 @@ migration bundles** with no cross-component coupling, built on the shared
 *which pool and router host IAM*, not a code fork.
 
 The database **backend** is likewise a choice, not a fork. IAM supports at least
-**Postgres** and **SQLite** behind the same repository ports; the backend is an
+**Postgres** and **SQLite** behind the same repository contracts; the backend is an
 edge adapter, and `contract`, `core`, and `client` never learn which one runs.
 See [ADR-0003](../adr/0003-storage-backends.md) for the backend decision, the
 DDL-dialect strategy, and the scenario matrix:
@@ -21,7 +21,7 @@ DDL-dialect strategy, and the scenario matrix:
 |---|---|---|
 | **SQLite** | embedded, local, single-process, development, small single-tenant | multi-node HA (single writer) |
 | **Postgres** | standalone, microservice, cloud, multi-node, highly available | — |
-| **In-memory** | tests, ephemeral `local` client | any durable deployment |
+| **Process memory** | tests only | every deployed mode |
 
 Running either mode highly available is the operational reading of this same
 assembly — N stateless nodes against one HA store. That topology requires
@@ -30,18 +30,18 @@ only. See [high availability](high-availability.md).
 
 The same rule applies specifically to browser authorization: durable server
 composition injects the shared SQL adapter through IAM's canonical
-`SessionRepo`; it does not retain a process-local session cache or introduce a
+`SessionRepository`; it does not retain a process-local session cache or introduce a
 separate browser-session database. Repository failure rejects the request, so
 an unhealthy replica cannot silently mint or accept an unshared session.
 
-Downstream product OAuth uses that same adapter through `OAuthClientRepo` and
-`AuthCodeRepo`. Registered product clients and the single-use authorization
+Downstream product OAuth uses that same adapter through `OAuthClientRepository` and
+`AuthCodeRepository`. Registered product clients and the single-use authorization
 code transition are therefore shared across replicas and process replacement;
 no deployment affinity is required for `/v1/oauth/authorize` followed by
 `/v1/oauth/token`. The code repository stores a hash, never the browser bearer,
 and its conditional live-to-consumed update is the atomic replay fence.
 
-Upstream provider login uses the existing `LoginFlowRepo` on that same adapter.
+Upstream provider login uses the existing `LoginFlowRepository` on that same adapter.
 The shared row contains only state/nonce/PKCE hashes and the single-use fence;
 the browser returns the cleartext nonce and verifier in a short-lived,
 HttpOnly correlation-proof cookie. Any replica can therefore consume the row
@@ -61,7 +61,7 @@ iam.identity     accounts, external identities, login flows, sessions, api token
                  OAuth clients and authorization codes
 iam.authz        roles, grants, memberships, resource-model registry,
                  organizations and groups
-iam.directory    arbitrary Directory nodes, product-space bindings and revision
+iam.directory    arbitrary Directory nodes, product-space placements and revision
 iam.entitlement  plans, subscriptions
 iam.namespace    namespace ownership, signers        (only if split out)
 ```
@@ -147,7 +147,7 @@ rendering and the single-applier migration guard.
 Directory uses the same assembly without joining the authorization bounded
 context. Embedded products call `DirectoryApi` directly over the migrated
 SQLite/Postgres store; hosted products call the same application path through
-`/v1/admin/directory/*`. Node, optional initial binding, audit, and
+`/v1/admin/directory/*`. Node, optional initial placement, audit, and
 Directory-revision writes form one database transaction. The Directory revision
 is independent of the policy version because placement changes do not change
 authorization.
@@ -159,7 +159,7 @@ deployment by changing configuration, not code.
 ## What IAM owns here
 
 - Its migration bundles (DDL), its table prefix, and the store adapter that
-  implements the core's [repository ports](domain-model.md#ports-and-adapters-hexagonal).
+  implements the core's [repository contracts](domain-model.md#repository contracts-and-adapters-hexagonal).
 - In embedded mode it owns its **schema within** the shared database, not the
   pool lifecycle (the host owns the pool).
 
@@ -168,10 +168,12 @@ deployment by changing configuration, not code.
 The backend adapters (Postgres and SQLite) and the `awaken-scoped-migration`
 dependency live in the server layer (`awaken-iam-server`, or a small
 `awaken-iam-store` module it owns). Each backend is a thin edge adapter over the
-shared repository ports and a `MigrationExecutor`; they differ only in the
+shared repository contracts and a `MigrationExecutor`; they differ only in the
 connection handle and lock/execution calls. Bundle planning, token rendering,
 ledger naming, bootstrap DDL, and bootstrap decisions come from foundation (see
 [ADR-0003](../adr/0003-storage-backends.md)). `contract`, `core`, and `client`
 stay storage-free, preserving the [guardrails](../../AGENTS.md): the core
-declares ports; only the edge knows SQL. An in-memory adapter backs tests and the
-`local` client.
+declares repository contracts; only the edge knows SQL. The process-memory
+adapter backs tests only. A local client is a call mode, not a persistence mode;
+deployed local composition still uses migrated SQLite.
+

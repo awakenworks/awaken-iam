@@ -30,7 +30,7 @@ server to provision. SQLite serves exactly that band and is the conventional
 companion to Postgres for "one codebase, two operational scales".
 
 The architecture already anticipates this. The core declares storage-free
-[repository ports](../design/domain-model.md#ports-and-adapters-hexagonal); the
+[repository contracts](../design/domain-model.md#repository contracts-and-adapters-hexagonal); the
 server-owned `store/` module provides adapters; `IamStore<Pool>` is generic over
 the pool handle and `MigrationExecutor` is a trait. What is Postgres-specific is
 not the architecture — it is the **DDL dialect**, the **migration concurrency
@@ -39,8 +39,8 @@ guard**, and the **prose in the docs**.
 ## Decision
 
 1. **Support at least Postgres and SQLite, both as edge adapters over the same
-   ports.** A backend is a `store/` adapter implementing the core's repository
-   ports plus a `MigrationExecutor`; `contract`, `core`, and `client` stay
+   repository contracts.** A backend is a `store/` adapter implementing the core's repository
+   repository contracts plus a `MigrationExecutor`; `contract`, `core`, and `client` stay
    storage-free and never learn the backend. Adding SQLite (or a later MySQL)
    changes only the edge. The in-memory adapter remains, backing tests and the
    `local` client where no durability is needed.
@@ -104,7 +104,7 @@ guard**, and the **prose in the docs**.
 ## Consequences
 
 - The store layer gains two concrete adapters (a Postgres adapter and a SQLite
-  adapter) behind the existing ports, plus the type-token renderer in the
+  adapter) behind the existing repository contracts, plus the type-token renderer in the
   migration plan. `contract`, `core`, and `client` are untouched; the ADR-0001
   guardrails hold.
 - `store/migration.rs` changes: `Migration.up_sql` is reframed as a
@@ -149,3 +149,4 @@ Axum/AuthApi -> repository port -> PostgresBackend
 | entered Tokio runtime | query/transaction | scoped plain thread | original result |
 | entered Tokio runtime | direct driver call | forbidden | nested-runtime panic |
 | either | backend error | same selected boundary | unchanged fail-closed error |
+

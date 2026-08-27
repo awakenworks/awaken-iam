@@ -17,14 +17,32 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use awaken_iam_contract::{
-    AdminMutationAck, AuthorizationDecision, OrgDto, PolicySnapshot, PrincipalRef,
+    AdminMutationAck, AuthorizationDecision, OrgView, PolicySnapshot, PrincipalRef,
 };
+use awaken_iam_core::AuthorizationProfileRepository;
 use awaken_iam_server::{
-    AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, daemon_router, http,
+    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor, SqlStore,
+    SqliteBackend, daemon_router, http, sqlite_in_memory_store,
 };
 use tokio::net::TcpListener;
 
 const ADMIN_TOKEN: &str = "ci-admin-token";
+
+fn test_daemon_state(
+    authz: AuthzApi,
+    auth: AdminAuthPolicy,
+) -> DaemonState<SqlStore<SqliteBackend>> {
+    let store = sqlite_in_memory_store("iam_daemon_test").expect("migrated sqlite IAM store");
+    let profiles: Arc<dyn AuthorizationProfileRepository> = Arc::new(store.clone());
+    DaemonState::with_policy_store(
+        authz,
+        auth,
+        profiles,
+        store,
+        AuthApi::new().token_authority(),
+    )
+    .expect("hydrate test daemon")
+}
 
 /// Bind a real loopback listener for the daemon, run the boot flow, return
 /// the resolved socket address and a join handle the test can use to stop it.
@@ -38,7 +56,7 @@ async fn boot_daemon() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
     let daemon = IamDaemon::start(RecordingExecutor::new()).expect("daemon boots");
     let authz = daemon.into_assembly().into_authz();
-    let state = Arc::new(Mutex::new(DaemonState::new(
+    let state = Arc::new(Mutex::new(test_daemon_state(
         authz,
         AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
     )));
@@ -218,7 +236,7 @@ async fn daemon_admin_crud_round_trip_advances_the_fence_over_the_wire() {
     assert_eq!(ack.version, base_version + 1);
 
     // List it back over the wire.
-    let orgs: Vec<OrgDto> = client
+    let orgs: Vec<OrgView> = client
         .get(format!("{base}/v1/admin/orgs"))
         .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
         .send()
@@ -301,7 +319,7 @@ async fn admin_auth_from_env_parses_comma_separated_tokens_and_deny_all_when_uns
                     .map(str::to_owned),
             ),
         };
-        let state = Arc::new(Mutex::new(DaemonState::new(authz, admin_auth)));
+        let state = Arc::new(Mutex::new(test_daemon_state(authz, admin_auth)));
         let router = daemon_router(state);
 
         tokio::spawn(async move {

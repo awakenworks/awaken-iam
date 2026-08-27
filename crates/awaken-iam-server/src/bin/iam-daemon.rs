@@ -22,7 +22,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_core::{AuthCodeRepo, OAuthClientRepo, RegisteredClient, SessionRepo};
+use awaken_iam_core::{
+    AuthCodeRepository, OAuthClientRepository, RegisteredClient, SessionRepository,
+};
 use awaken_iam_server::{
     AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi, SqliteBackend,
     daemon_router, http, op_router, sqlite_migrated_store,
@@ -44,9 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SqliteBackend::open_path(&database_path)?,
         "iam",
     )?);
-    let sessions: Arc<dyn SessionRepo> = profile_store.clone();
-    let oauth_clients: Arc<dyn OAuthClientRepo> = profile_store.clone();
-    let oauth_codes: Arc<dyn AuthCodeRepo> = profile_store.clone();
+    let sessions: Arc<dyn SessionRepository> = profile_store.clone();
+    let oauth_clients: Arc<dyn OAuthClientRepository> = profile_store.clone();
+    let oauth_codes: Arc<dyn AuthCodeRepository> = profile_store.clone();
     auth = auth
         .with_session_repository(sessions)
         .with_oauth_repositories(oauth_clients, oauth_codes);
@@ -163,15 +165,9 @@ mod tests {
     #[test]
     fn resolve_admin_auth_from_env_reads_the_env_var_or_unset() {
         // The env-reading variant either succeeds (var present) or returns the
-        // deny-all fallback (var unset); neither must panic, and the policy
-        // must round-trip through `DaemonState::new` unchanged.
-        use std::sync::{Arc, Mutex};
-        let _ = admin_auth_from_env();
-        let state = Arc::new(Mutex::new(DaemonState::new(
-            awaken_iam_server::AuthzApi::new(),
-            admin_auth_from_env(),
-        )));
-        // The state was constructed; the policy resolved one way or the other.
-        let _ = state;
+        // deny-all fallback (var unset); neither branch may panic. Durable
+        // DaemonState assembly is covered by daemon_boot_e2e over migrated
+        // SQLite rather than a process-memory policy store.
+        let _policy = admin_auth_from_env();
     }
 }

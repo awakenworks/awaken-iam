@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use awaken_iam_contract::{Session, SessionId, SessionView, Timestamp};
 use awaken_iam_core::{
-    EntropySource, EstablishSession, IamError, OsEntropy, RepoError, SessionMinter, SessionRepo,
-    hash_session_token,
+    EntropySource, EstablishSession, IamError, OsEntropy, RepositoryError, SessionMinter,
+    SessionRepository, hash_session_token,
 };
 
 use crate::store::InMemoryStore;
@@ -137,7 +137,7 @@ pub struct EstablishedSession {
 
 /// Server-side session manager backing the session cookie and `/v1/session`.
 pub struct SessionGateway<E: EntropySource = OsEntropy> {
-    repository: Arc<dyn SessionRepo>,
+    repository: Arc<dyn SessionRepository>,
     minter: SessionMinter<E>,
     cookie: SessionCookieConfig,
 }
@@ -145,7 +145,7 @@ pub struct SessionGateway<E: EntropySource = OsEntropy> {
 impl<E: EntropySource> std::fmt::Debug for SessionGateway<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionGateway")
-            .field("repository", &"SessionRepo")
+            .field("repository", &"SessionRepository")
             .field("cookie", &self.cookie)
             .finish_non_exhaustive()
     }
@@ -174,7 +174,7 @@ impl<E: EntropySource> SessionGateway<E> {
     pub fn with_repository(
         entropy: E,
         cookie: SessionCookieConfig,
-        repository: Arc<dyn SessionRepo>,
+        repository: Arc<dyn SessionRepository>,
     ) -> Self {
         Self {
             repository,
@@ -190,7 +190,7 @@ impl<E: EntropySource> SessionGateway<E> {
 
     /// Clone the authoritative repository handle for composition builders that
     /// replace cookie policy without changing storage ownership.
-    pub(crate) fn repository(&self) -> Arc<dyn SessionRepo> {
+    pub(crate) fn repository(&self) -> Arc<dyn SessionRepository> {
         Arc::clone(&self.repository)
     }
 
@@ -303,10 +303,12 @@ fn unknown_session() -> IamError {
     }
 }
 
-fn repository_error(error: RepoError, id: SessionId) -> IamError {
+fn repository_error(error: RepositoryError, id: SessionId) -> IamError {
     match error {
-        RepoError::Conflict(_) => IamError::DuplicateSession { id },
-        RepoError::NotFound(_) | RepoError::Backend(_) => IamError::SessionStorageUnavailable,
+        RepositoryError::Conflict(_) => IamError::DuplicateSession { id },
+        RepositoryError::NotFound(_) | RepositoryError::Backend(_) => {
+            IamError::SessionStorageUnavailable
+        }
     }
 }
 
@@ -315,23 +317,23 @@ mod tests {
     use super::*;
     use awaken_iam_contract::{AccountId, ExternalIdentityId};
 
-    struct UnavailableSessionRepo;
+    struct UnavailableSessionRepository;
 
-    impl SessionRepo for UnavailableSessionRepo {
-        fn get(&self, _: &SessionId) -> awaken_iam_core::RepoResult<Option<Session>> {
-            Err(RepoError::Backend("unavailable".into()))
+    impl SessionRepository for UnavailableSessionRepository {
+        fn get(&self, _: &SessionId) -> awaken_iam_core::RepositoryResult<Option<Session>> {
+            Err(RepositoryError::Backend("unavailable".into()))
         }
 
-        fn get_by_token_hash(&self, _: &str) -> awaken_iam_core::RepoResult<Option<Session>> {
-            Err(RepoError::Backend("unavailable".into()))
+        fn get_by_token_hash(&self, _: &str) -> awaken_iam_core::RepositoryResult<Option<Session>> {
+            Err(RepositoryError::Backend("unavailable".into()))
         }
 
-        fn create(&self, _: Session) -> awaken_iam_core::RepoResult<()> {
-            Err(RepoError::Backend("unavailable".into()))
+        fn create(&self, _: Session) -> awaken_iam_core::RepositoryResult<()> {
+            Err(RepositoryError::Backend("unavailable".into()))
         }
 
-        fn update(&self, _: Session) -> awaken_iam_core::RepoResult<()> {
-            Err(RepoError::Backend("unavailable".into()))
+        fn update(&self, _: Session) -> awaken_iam_core::RepositoryResult<()> {
+            Err(RepositoryError::Backend("unavailable".into()))
         }
     }
 
@@ -485,7 +487,7 @@ mod tests {
     /// is accepted and no backend detail crosses the session boundary.
     #[test]
     fn repository_failure_fails_every_session_transition_closed() {
-        let repository: Arc<dyn SessionRepo> = Arc::new(UnavailableSessionRepo);
+        let repository: Arc<dyn SessionRepository> = Arc::new(UnavailableSessionRepository);
         let mut gateway = SessionGateway::with_repository(
             SequentialEntropy::default(),
             SessionCookieConfig::default(),

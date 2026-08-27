@@ -50,7 +50,7 @@ session table, cookie parser, or setup-token implementation.
 
 The initial in-memory consequence is superseded for persistent local
 deployments. `SessionGateway` now uses the existing
-`awaken_iam_core::SessionRepo` port as its only session backing. Its default
+`awaken_iam_core::SessionRepository` port as its only session backing. Its default
 adapter remains the existing `InMemoryStore` for tests and explicitly
 ephemeral composition, while local products inject the same migrated
 `SqlStore<SqliteBackend>` that already owns `iam.identity` under their typed
@@ -61,7 +61,7 @@ Static ownership remains unchanged:
 | Owner | Responsibility |
 |---|---|
 | `SessionGateway` | mint, cookie parsing, liveness, activity refresh, logout |
-| `SessionRepo` | create, token-hash lookup, activity/revocation persistence |
+| `SessionRepository` | create, token-hash lookup, activity/revocation persistence |
 | local product composition | select its existing `iam.sqlite` adapter |
 | browser | retain only the opaque HttpOnly cookie |
 
@@ -73,3 +73,4 @@ restart, the unchanged cookie therefore resolves through the reopened
 `iam.sqlite`; the newly issued setup challenge is needed only by a browser
 without a live session. Setup challenges remain deliberately transient,
 five-minute, and single-use.
+

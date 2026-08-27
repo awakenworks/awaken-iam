@@ -11,12 +11,12 @@
 //! references other aggregates only by id — an [`Organization`] never loads its
 //! groups, a [`Group`] holds principal references rather than account internals.
 //! The aggregates are pure data; persistence is the responsibility of the
-//! [`OrgRepo`](crate::OrgRepo), [`GroupRepo`](crate::GroupRepo), and
-//! [`RoleRepo`](crate::RoleRepo) ports, and policy administration over them lives
+//! [`OrgRepository`](crate::OrgRepository), [`GroupRepository`](crate::GroupRepository), and
+//! [`RoleRepository`](crate::RoleRepository) repository contracts, and policy administration over them lives
 //! in the server's Policy Administration Point.
 
 use awaken_iam_contract::{
-    DirectoryNodeDto, DirectoryNodeId, OrgId, PrincipalRef, ProductSpaceBinding, Timestamp,
+    DirectoryNodeId, DirectoryNodeView, OrgId, PrincipalRef, ProductSpacePlacement, Timestamp,
 };
 
 use crate::{ActionPattern, RoleId};
@@ -26,7 +26,7 @@ use crate::{ActionPattern, RoleId};
 /// Directory placement is deliberately independent of product identity and
 /// authorization scope. The aggregate owns display metadata and its parent
 /// edge; products retain their own stable space ids through
-/// [`ProductSpaceBinding`].
+/// [`ProductSpacePlacement`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryNode {
     pub id: DirectoryNodeId,
@@ -40,8 +40,8 @@ pub struct DirectoryNode {
     pub updated_at: Timestamp,
 }
 
-impl From<DirectoryNodeDto> for DirectoryNode {
-    fn from(node: DirectoryNodeDto) -> Self {
+impl From<DirectoryNodeView> for DirectoryNode {
+    fn from(node: DirectoryNodeView) -> Self {
         Self {
             id: node.id,
             org_id: node.org_id,
@@ -56,7 +56,7 @@ impl From<DirectoryNodeDto> for DirectoryNode {
     }
 }
 
-impl From<DirectoryNode> for DirectoryNodeDto {
+impl From<DirectoryNode> for DirectoryNodeView {
     fn from(node: DirectoryNode) -> Self {
         Self {
             id: node.id,
@@ -108,16 +108,16 @@ impl DirectoryNode {
     }
 
     /// Validate an optional product-space placement against this node.
-    pub fn validate_binding(
+    pub fn validate_placement(
         &self,
-        binding: &ProductSpaceBinding,
+        placement: &ProductSpacePlacement,
     ) -> Result<(), DirectoryInvariant> {
-        if binding.product_space.product.trim().is_empty()
-            || binding.product_space.space_id.trim().is_empty()
+        if placement.product_space.product.trim().is_empty()
+            || placement.product_space.space_id.trim().is_empty()
         {
             return Err(DirectoryInvariant::EmptyProductSpace);
         }
-        if binding.org_id != self.org_id || binding.node_id != self.id {
+        if placement.org_id != self.org_id || placement.node_id != self.id {
             return Err(DirectoryInvariant::CrossTenantBinding);
         }
         Ok(())
@@ -292,7 +292,7 @@ mod tests {
         let self_parent = node(Some("node-a"));
         assert_eq!(self_parent.validate(), Err(DirectoryInvariant::SelfParent));
 
-        let mut binding = ProductSpaceBinding {
+        let mut binding = ProductSpacePlacement {
             product_space: awaken_iam_contract::ProductSpaceRef {
                 product: String::new(),
                 space_id: "space-a".into(),
@@ -301,13 +301,13 @@ mod tests {
             node_id: valid.id.clone(),
         };
         assert_eq!(
-            valid.validate_binding(&binding),
+            valid.validate_placement(&binding),
             Err(DirectoryInvariant::EmptyProductSpace)
         );
         binding.product_space.product = "agents".into();
         binding.org_id = OrgId("org-b".into());
         assert_eq!(
-            valid.validate_binding(&binding),
+            valid.validate_placement(&binding),
             Err(DirectoryInvariant::CrossTenantBinding)
         );
     }

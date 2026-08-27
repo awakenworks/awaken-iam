@@ -27,7 +27,9 @@ use sha2::{Digest, Sha256};
 
 use crate::EntropySource;
 use crate::hash_session_token;
-use crate::ports::{AuthCodeRepo, OAuthClientRepo, RepoError, RepoResult};
+use crate::repositories::{
+    AuthCodeRepository, OAuthClientRepository, RepositoryError, RepositoryResult,
+};
 
 /// Bytes of entropy in a freshly minted authorization code.
 const CODE_BYTES: usize = 32;
@@ -177,27 +179,27 @@ impl OAuthClientRegistry {
     }
 }
 
-impl OAuthClientRepo for OAuthClientRegistry {
-    fn upsert(&self, client: RegisteredClient) -> RepoResult<()> {
+impl OAuthClientRepository for OAuthClientRegistry {
+    fn upsert(&self, client: RegisteredClient) -> RepositoryResult<()> {
         self.register(client);
         Ok(())
     }
 
-    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>> {
+    fn get(&self, client_id: &str) -> RepositoryResult<Option<RegisteredClient>> {
         Ok(OAuthClientRegistry::get(self, client_id))
     }
 
-    fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+    fn list(&self) -> RepositoryResult<Vec<RegisteredClient>> {
         Ok(self.clients())
     }
 
-    fn remove(&self, client_id: &str) -> RepoResult<()> {
+    fn remove(&self, client_id: &str) -> RepositoryResult<()> {
         self.clients
             .write()
             .expect("oauth client registry lock poisoned")
             .remove(client_id)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("oauth client {client_id} not found")))
+            .ok_or_else(|| RepositoryError::NotFound(format!("oauth client {client_id} not found")))
     }
 }
 
@@ -287,21 +289,23 @@ pub struct StoredAuthorizationCode {
 /// Process-local authorization-code repository for tests and single-process
 /// compositions. Durable compositions inject their shared SQL store instead.
 #[derive(Debug, Default)]
-struct InMemoryAuthCodeRepo {
+struct InMemoryAuthCodeRepository {
     codes: RwLock<HashMap<String, StoredAuthorizationCode>>,
 }
 
-impl AuthCodeRepo for InMemoryAuthCodeRepo {
-    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()> {
+impl AuthCodeRepository for InMemoryAuthCodeRepository {
+    fn create(&self, code: StoredAuthorizationCode) -> RepositoryResult<()> {
         let mut codes = self.codes.write().expect("oauth code lock poisoned");
         if codes.contains_key(&code.code_hash) {
-            return Err(RepoError::Conflict("duplicate authorization code".into()));
+            return Err(RepositoryError::Conflict(
+                "duplicate authorization code".into(),
+            ));
         }
         codes.insert(code.code_hash.clone(), code);
         Ok(())
     }
 
-    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+    fn get(&self, code_hash: &str) -> RepositoryResult<Option<StoredAuthorizationCode>> {
         Ok(self
             .codes
             .read()
@@ -310,7 +314,7 @@ impl AuthCodeRepo for InMemoryAuthCodeRepo {
             .cloned())
     }
 
-    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool> {
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepositoryResult<bool> {
         let mut codes = self.codes.write().expect("oauth code lock poisoned");
         let Some(code) = codes.get_mut(code_hash) else {
             return Ok(false);
@@ -325,8 +329,8 @@ impl AuthCodeRepo for InMemoryAuthCodeRepo {
 
 /// IAM's downstream OAuth 2.0 authorization server.
 pub struct OAuthAuthorizationServer<E: EntropySource> {
-    clients: Arc<dyn OAuthClientRepo>,
-    codes: Arc<dyn AuthCodeRepo>,
+    clients: Arc<dyn OAuthClientRepository>,
+    codes: Arc<dyn AuthCodeRepository>,
     entropy: E,
 }
 
@@ -345,15 +349,15 @@ impl<E: EntropySource> OAuthAuthorizationServer<E> {
     pub fn new(registry: OAuthClientRegistry, entropy: E) -> Self {
         Self {
             clients: Arc::new(registry),
-            codes: Arc::new(InMemoryAuthCodeRepo::default()),
+            codes: Arc::new(InMemoryAuthCodeRepository::default()),
             entropy,
         }
     }
 
     /// Build over caller-selected authoritative repositories.
     pub fn with_repositories(
-        clients: Arc<dyn OAuthClientRepo>,
-        codes: Arc<dyn AuthCodeRepo>,
+        clients: Arc<dyn OAuthClientRepository>,
+        codes: Arc<dyn AuthCodeRepository>,
         entropy: E,
     ) -> Self {
         Self {
@@ -876,7 +880,7 @@ mod tests {
     #[test]
     fn shared_repositories_make_clients_and_codes_visible_across_instances() {
         let clients = Arc::new(OAuthClientRegistry::new());
-        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let codes = Arc::new(InMemoryAuthCodeRepository::default());
         let mut first = OAuthAuthorizationServer::with_repositories(
             clients.clone(),
             codes.clone(),
@@ -926,7 +930,7 @@ mod tests {
     #[test]
     fn concurrent_redemption_has_exactly_one_winner() {
         let clients = Arc::new(OAuthClientRegistry::new());
-        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let codes = Arc::new(InMemoryAuthCodeRepository::default());
         let mut issuer = OAuthAuthorizationServer::with_repositories(
             clients.clone(),
             codes.clone(),
@@ -985,7 +989,7 @@ mod tests {
     #[test]
     fn invalid_bindings_and_expiry_never_consume_a_code() {
         let clients = Arc::new(OAuthClientRegistry::new());
-        let codes = Arc::new(InMemoryAuthCodeRepo::default());
+        let codes = Arc::new(InMemoryAuthCodeRepository::default());
         let mut server = OAuthAuthorizationServer::with_repositories(
             clients,
             codes.clone(),
@@ -1052,40 +1056,40 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct FailingCodeRepo;
+    struct FailingCodeRepository;
 
-    impl AuthCodeRepo for FailingCodeRepo {
-        fn create(&self, _: StoredAuthorizationCode) -> RepoResult<()> {
-            Err(RepoError::Backend("offline".into()))
+    impl AuthCodeRepository for FailingCodeRepository {
+        fn create(&self, _: StoredAuthorizationCode) -> RepositoryResult<()> {
+            Err(RepositoryError::Backend("offline".into()))
         }
 
-        fn get(&self, _: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
-            Err(RepoError::Backend("offline".into()))
+        fn get(&self, _: &str) -> RepositoryResult<Option<StoredAuthorizationCode>> {
+            Err(RepositoryError::Backend("offline".into()))
         }
 
-        fn consume_if_live(&self, _: &str, _: &Timestamp) -> RepoResult<bool> {
-            Err(RepoError::Backend("offline".into()))
+        fn consume_if_live(&self, _: &str, _: &Timestamp) -> RepositoryResult<bool> {
+            Err(RepositoryError::Backend("offline".into()))
         }
     }
 
     #[derive(Debug)]
-    struct FailingClientRepo;
+    struct FailingClientRepository;
 
-    impl OAuthClientRepo for FailingClientRepo {
-        fn upsert(&self, _: RegisteredClient) -> RepoResult<()> {
-            Err(RepoError::Backend("offline".into()))
+    impl OAuthClientRepository for FailingClientRepository {
+        fn upsert(&self, _: RegisteredClient) -> RepositoryResult<()> {
+            Err(RepositoryError::Backend("offline".into()))
         }
 
-        fn get(&self, _: &str) -> RepoResult<Option<RegisteredClient>> {
-            Err(RepoError::Backend("offline".into()))
+        fn get(&self, _: &str) -> RepositoryResult<Option<RegisteredClient>> {
+            Err(RepositoryError::Backend("offline".into()))
         }
 
-        fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
-            Err(RepoError::Backend("offline".into()))
+        fn list(&self) -> RepositoryResult<Vec<RegisteredClient>> {
+            Err(RepositoryError::Backend("offline".into()))
         }
 
-        fn remove(&self, _: &str) -> RepoResult<()> {
-            Err(RepoError::Backend("offline".into()))
+        fn remove(&self, _: &str) -> RepositoryResult<()> {
+            Err(RepositoryError::Backend("offline".into()))
         }
     }
 
@@ -1105,7 +1109,7 @@ mod tests {
         ));
         let mut server = OAuthAuthorizationServer::with_repositories(
             clients,
-            Arc::new(FailingCodeRepo),
+            Arc::new(FailingCodeRepository),
             SeqEntropy { next: 140 },
         );
         let (verifier, challenge) = pkce_pair();
@@ -1128,8 +1132,8 @@ mod tests {
         );
 
         let mut client_store_offline = OAuthAuthorizationServer::with_repositories(
-            Arc::new(FailingClientRepo),
-            Arc::new(InMemoryAuthCodeRepo::default()),
+            Arc::new(FailingClientRepository),
+            Arc::new(InMemoryAuthCodeRepository::default()),
             SeqEntropy { next: 160 },
         );
         assert_eq!(

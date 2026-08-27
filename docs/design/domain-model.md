@@ -1,15 +1,17 @@
 # IAM domain model
 
-This document gives `awaken-iam` a DDD shape: one bounded context, a ubiquitous
-language, small aggregates, explicit events, and ports-and-adapters mapped onto
-the existing crates. It is the model behind [ADR-0002](../adr/0002-iam-consolidation.md).
+This document gives `awaken-iam` a DDD shape: explicit context boundaries,
+small aggregates, explicit events, and repository contracts mapped onto the
+existing crates. It is the model behind
+[ADR-0002](../adr/0002-iam-consolidation.md).
 
 ## Bounded context
 
-`awaken-iam` is one bounded context with a single ubiquitous language. It is
-**product-agnostic**: no product name appears in the model. Products are external
-contexts that integrate through the published contract; they do not leak their
-vocabulary inward.
+`awaken-iam` is one deployable component containing the Authorization/Identity
+context and the supporting Space Directory context. They share deployment,
+authentication, audit, and storage machinery, but not domain state or revision
+semantics. Both are **product-agnostic**: a product is represented only by an
+open `ProductSpaceRef`; product aggregates and vocabulary do not leak inward.
 
 ### Subdomain classification
 
@@ -23,13 +25,14 @@ Where to spend design effort (DDD core/supporting/generic):
 | Namespace & Trust | Supporting | Publishing-specific; enables publishing/registry models. |
 | Entitlement | Generic | A plan/feature seam; the money path lives elsewhere. |
 | Audit | Generic | Append-only decision/identity trail. |
+| Space Directory | Supporting | User-visible placement of stable product spaces; independent from authorization and product ownership. |
 
 ## Ubiquitous language
 
 Account, External Identity, Provider, Login Flow, Session, API Token, Principal,
 Organization, Group, Membership, Role, Grant, Scope, Resource Model, Action,
 Decision, Namespace, Signer, Plan, Subscription, Entitlement, Directory Node,
-Product Space, Product-Space Binding.
+Product Space, Product-Space Placement.
 
 Notably: **email is a claim, never an identity key**; **Principal** is the
 resolved caller (chainable for delegation); **Scope** is an authorization target
@@ -47,7 +50,7 @@ cluster; references across aggregates are by id.
 | **Session** | → AccountId, token hash, expiry | authenticates only while unexpired and unrevoked; revocation is idempotent |
 | **ApiToken** | → Principal, scopes, secret hash | active until revoked; secret stored only as hash |
 | **Organization** | identity, ownership | one owner principal at all times |
-| **DirectoryNode** | display metadata, optional parent, Org partition | arbitrary depth; live parent stays in the same Org; no cycles |
+| **DirectoryNode** | display metadata, optional parent, Org partition | arbitrary depth; live parent stays in the same Org; no cycles; placement identity is IAM-generated |
 | **Group** | member principals | members resolve to existing accounts |
 | **Role** | action patterns, scope kind | patterns are exact or single-glob; no wildcard-all |
 | **Grant** | subject, action pattern, scope, effect | anchored at exactly one scope |
@@ -60,7 +63,7 @@ cluster; references across aggregates are by id.
 Organization privacy lifecycle is an application command over these existing
 aggregates, not another aggregate or tenant registry. `OrganizationPrivacyScope`
 derives the exact transitive closure from the authoritative Workspace→Org and
-resource-parent edges. `OrgPrivacyRepo::erase_org_privacy` then removes the Org,
+resource-parent edges. `OrgPrivacyRepository::erase_org_privacy` then removes the Org,
 its groups and invitations, owned-scope grants and memberships, resource edges,
 and Workspace API tokens in one storage transaction. Exact retries succeed
 without a second version advance.
@@ -77,7 +80,7 @@ hierarchy and action catalog **as data**, so IAM authorizes deep product scopes
 (e.g. issue → project → workspace) without depending on the product.
 
 `DirectoryNode` is user-visible placement, not an authorization Scope or a
-product aggregate. A `ProductSpaceBinding` places one stable,
+product aggregate. A `ProductSpacePlacement` places one stable,
 product-qualified opaque id at a node. Moving the node never changes product
 identity, tenant partition, or permissions; see
 [ADR-0013](../adr/0013-directory-placement-independent-product-spaces.md).
@@ -109,25 +112,25 @@ SignerRegistered, SignerRevoked, SubscriptionChanged,
 AuthorizationDecided (audit only)
 ```
 
-## Ports and adapters (hexagonal)
+## Repository contracts and adapters
 
-The domain depends on repository **ports** (traits); adapters live at the edges.
+The domain depends on repository **repository contracts** (traits); adapters live at the edges.
 This maps onto the existing crates with no new boundaries:
 
 ```text
-awaken-iam-contract   Published Language: VOs, DTOs, ids, request/decision shapes
-awaken-iam-core       domain model + domain services + repository ports (pure, no I/O)
+awaken-iam-contract   Published Language: values, ids, commands, views, decisions
+awaken-iam-core       domain model + domain services + repository contracts (pure, no I/O)
 awaken-iam-server     application services + adapters: HTTP (OAuth/PDP/admin), storage
 awaken-iam-client     Policy Enforcement Point SDK: local | remote, used by products
 awaken-iam            facade
 ```
 
-Ports the core declares (the server provides adapters): `AccountRepo`,
-`SessionRepo`, `LoginFlowRepo`, `ApiTokenRepo`, `OrgRepo`, `GroupRepo`,
-`RoleRepo`, `GrantRepo`, `MembershipRepo`, `NamespaceRepo`, `PlanRepo`,
-`SubscriptionRepo`, `ResourceModelRepo`, `DirectoryRepo`, `OrgPrivacyRepo`,
-`AuditSink`. An in-memory adapter backs
-tests and local mode; a database adapter backs the service. The database adapter
+Repository contracts the core declares (the server provides adapters): `AccountRepository`,
+`SessionRepository`, `LoginFlowRepository`, `ApiTokenRepository`, `OrgRepository`, `GroupRepository`,
+`RoleRepository`, `GrantRepository`, `MembershipRepository`, `NamespaceRepository`, `PlanRepository`,
+`SubscriptionRepository`, `ResourceModelRepository`, `DirectoryRepository`, `OrgPrivacyRepository`,
+`AuditSink`. The process-memory adapter is compiled for tests/test-support only;
+local production uses migrated SQLite and hosted production uses Postgres. The SQL adapter
 owns IAM's schema as scope-partitioned `awaken-scoped-migration` bundles — the
 discipline that lets IAM deploy embedded or standalone. See
 [deployment](deployment.md).
@@ -173,3 +176,4 @@ on product runtime.
 - Aggregates stay small; no aggregate loads another's internals.
 - Providers limited to Google, GitHub, fake. Adding one is enum + config, but we
   ship only what is needed.
+

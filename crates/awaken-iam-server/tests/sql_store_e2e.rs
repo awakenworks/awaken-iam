@@ -1,5 +1,5 @@
 //! End-to-end proof that the real database adapters are switchable behind the
-//! repository ports (ADR-0003).
+//! repository contracts (ADR-0003).
 //!
 //! One harness, [`exercise_every_port`], drives every IAM repository port through
 //! its success, failure, and guardrail paths against an [`SqlStore`] without
@@ -12,16 +12,17 @@ use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, DirectoryNodeId,
     ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey,
     ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProductSpaceBinding, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
+    ProductSpacePlacement, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
     Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountIdentityRepo, AccountRepo, ActionPattern, ApiTokenRepo, AuditEvent, AuditSink,
-    AuthCodeRepo, DirectoryNode, DirectoryRepo, Effect, ExternalIdentityRepo, Grant, GrantId,
-    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, LoginFlowRepo, OAuthClientRepo, OrgRepo,
-    Organization, Plan, PlanId, PlanRepo, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient,
-    RepoError, ResourceEdge, ResourceModelRepo, RoleBinding, RoleBindingRepo, RoleDef, RoleId,
-    RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
+    AuditSink, AuthCodeRepository, DirectoryNode, DirectoryRepository, Effect,
+    ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
+    GroupRepository, LoginFlowRepository, OAuthClientRepository, OrgRepository, Organization, Plan,
+    PlanId, PlanRepository, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient,
+    RepositoryError, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
+    RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
 };
 use awaken_iam_server::{
     PostgresBackend, SqlConn, SqlStore, postgres_migrated_store, sqlite_in_memory_store,
@@ -70,15 +71,15 @@ fn service(name: &str) -> PrincipalRef {
 fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     // --- accounts: upsert is idempotent replace; list is ordered ---
     assert_eq!(
-        AccountRepo::get(store, &AccountId("a".into())).unwrap(),
+        AccountRepository::get(store, &AccountId("a".into())).unwrap(),
         None
     );
-    AccountRepo::upsert(store, account("a")).unwrap();
-    AccountRepo::upsert(store, account("b")).unwrap();
+    AccountRepository::upsert(store, account("a")).unwrap();
+    AccountRepository::upsert(store, account("b")).unwrap();
     let mut replaced = account("a");
     replaced.display_name = Some("Renamed".into());
-    AccountRepo::upsert(store, replaced).unwrap();
-    let accounts = AccountRepo::list(store).unwrap();
+    AccountRepository::upsert(store, replaced).unwrap();
+    let accounts = AccountRepository::list(store).unwrap();
     assert_eq!(accounts.len(), 2);
     assert_eq!(accounts[0].id.0, "a");
     assert_eq!(accounts[0].display_name.as_deref(), Some("Renamed"));
@@ -87,7 +88,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     store.link(external("e1", "a", "sub-1")).unwrap();
     let dup = store.link(external("e2", "a", "sub-1"));
     assert!(
-        matches!(dup, Err(RepoError::Conflict(_))),
+        matches!(dup, Err(RepositoryError::Conflict(_))),
         "duplicate subject must conflict"
     );
     let key = ExternalIdentityKey {
@@ -111,7 +112,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     );
     assert!(matches!(
         store.update_claims(external("e9", "a", "absent")),
-        Err(RepoError::NotFound(_))
+        Err(RepositoryError::NotFound(_))
     ));
     assert_eq!(
         store
@@ -126,36 +127,41 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     // R2 new account + occupied provider subject -> neither row commits.
     // R3 account with two identities -> exact owned unlink succeeds.
     // R4 account with one identity -> unlink fails and preserves login access.
-    AccountIdentityRepo::provision(store, account("c"), external("e3", "c", "sub-3")).unwrap();
+    AccountIdentityRepository::provision(store, account("c"), external("e3", "c", "sub-3"))
+        .unwrap();
     assert!(
-        AccountRepo::get(store, &AccountId("c".into()))
+        AccountRepository::get(store, &AccountId("c".into()))
             .unwrap()
             .is_some()
     );
     assert!(matches!(
-        AccountIdentityRepo::provision(store, account("orphan"), external("e4", "orphan", "sub-3")),
-        Err(RepoError::Conflict(_))
+        AccountIdentityRepository::provision(
+            store,
+            account("orphan"),
+            external("e4", "orphan", "sub-3")
+        ),
+        Err(RepositoryError::Conflict(_))
     ));
     assert_eq!(
-        AccountRepo::get(store, &AccountId("orphan".into())).unwrap(),
+        AccountRepository::get(store, &AccountId("orphan".into())).unwrap(),
         None
     );
-    ExternalIdentityRepo::link(store, external("e5", "c", "sub-5")).unwrap();
+    ExternalIdentityRepository::link(store, external("e5", "c", "sub-5")).unwrap();
     let key_5 = ExternalIdentityKey {
         provider_key: IdentityProviderKey("github".into()),
         subject: ExternalSubject("sub-5".into()),
     };
-    AccountIdentityRepo::unlink(store, &key_5, &AccountId("c".into())).unwrap();
+    AccountIdentityRepository::unlink(store, &key_5, &AccountId("c".into())).unwrap();
     let key_3 = ExternalIdentityKey {
         provider_key: IdentityProviderKey("github".into()),
         subject: ExternalSubject("sub-3".into()),
     };
     assert!(matches!(
-        AccountIdentityRepo::unlink(store, &key_3, &AccountId("c".into())),
-        Err(RepoError::Conflict(_))
+        AccountIdentityRepository::unlink(store, &key_3, &AccountId("c".into())),
+        Err(RepositoryError::Conflict(_))
     ));
     assert!(
-        ExternalIdentityRepo::get_by_key(store, &key_3)
+        ExternalIdentityRepository::get_by_key(store, &key_3)
             .unwrap()
             .is_some()
     );
@@ -171,10 +177,10 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         expires_at: ts("2026-06-20T00:00:00Z"),
         revoked_at: None,
     };
-    SessionRepo::create(store, session.clone()).unwrap();
+    SessionRepository::create(store, session.clone()).unwrap();
     assert!(matches!(
-        SessionRepo::create(store, session.clone()),
-        Err(RepoError::Conflict(_))
+        SessionRepository::create(store, session.clone()),
+        Err(RepositoryError::Conflict(_))
     ));
     assert_eq!(
         store.get_by_token_hash("hash-1").unwrap().unwrap().id.0,
@@ -182,9 +188,9 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     );
     let mut revoked = session;
     revoked.revoked_at = Some(ts("2026-06-19T01:00:00Z"));
-    SessionRepo::update(store, revoked).unwrap();
+    SessionRepository::update(store, revoked).unwrap();
     assert!(
-        SessionRepo::get(store, &SessionId("s1".into()))
+        SessionRepository::get(store, &SessionId("s1".into()))
             .unwrap()
             .unwrap()
             .revoked_at
@@ -202,8 +208,8 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     };
     ghost.token_hash = "y".into();
     assert!(matches!(
-        SessionRepo::update(store, ghost),
-        Err(RepoError::NotFound(_))
+        SessionRepository::update(store, ghost),
+        Err(RepositoryError::NotFound(_))
     ));
 
     // --- login flows: start once, consume at most once ---
@@ -219,9 +225,12 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         consumed_at: None,
     };
     store.start(flow.clone()).unwrap();
-    assert!(matches!(store.start(flow), Err(RepoError::Conflict(_))));
+    assert!(matches!(
+        store.start(flow),
+        Err(RepositoryError::Conflict(_))
+    ));
     assert_eq!(
-        LoginFlowRepo::get(store, &OAuthLoginStateId("l1".into()))
+        LoginFlowRepository::get(store, &OAuthLoginStateId("l1".into()))
             .unwrap()
             .unwrap()
             .return_to
@@ -233,14 +242,14 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         .unwrap();
     assert!(matches!(
         store.mark_consumed(&OAuthLoginStateId("l1".into()), ts("2026-06-19T00:06:00Z")),
-        Err(RepoError::Conflict(_))
+        Err(RepositoryError::Conflict(_))
     ));
     assert!(matches!(
         store.mark_consumed(
             &OAuthLoginStateId("absent".into()),
             ts("2026-06-19T00:06:00Z")
         ),
-        Err(RepoError::NotFound(_))
+        Err(RepositoryError::NotFound(_))
     ));
 
     // --- downstream OAuth: shared clients + atomic live code consumption ---
@@ -253,12 +262,12 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         vec!["https://awaken.example/callback".into()],
         ["openid", "email"],
     );
-    OAuthClientRepo::upsert(store, client.clone()).unwrap();
+    OAuthClientRepository::upsert(store, client.clone()).unwrap();
     assert_eq!(
-        OAuthClientRepo::get(store, "awaken-runtime").unwrap(),
+        OAuthClientRepository::get(store, "awaken-runtime").unwrap(),
         Some(client)
     );
-    assert_eq!(OAuthClientRepo::list(store).unwrap().len(), 1);
+    assert_eq!(OAuthClientRepository::list(store).unwrap().len(), 1);
     let code = StoredAuthorizationCode {
         code_hash: "code-hash-live".into(),
         client_id: "awaken-runtime".into(),
@@ -270,31 +279,37 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         expires_at: ts("2026-06-19T00:10:00Z"),
         consumed_at: None,
     };
-    AuthCodeRepo::create(store, code.clone()).unwrap();
+    AuthCodeRepository::create(store, code.clone()).unwrap();
     assert_eq!(
-        AuthCodeRepo::get(store, "code-hash-live").unwrap(),
+        AuthCodeRepository::get(store, "code-hash-live").unwrap(),
         Some(code)
     );
     assert!(
-        AuthCodeRepo::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:05:00Z"))
+        AuthCodeRepository::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:05:00Z"))
             .unwrap()
     );
     assert!(
-        !AuthCodeRepo::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:06:00Z"))
+        !AuthCodeRepository::consume_if_live(store, "code-hash-live", &ts("2026-06-19T00:06:00Z"))
             .unwrap()
     );
     let expired = StoredAuthorizationCode {
         code_hash: "code-hash-expired".into(),
         expires_at: ts("2026-06-19T00:04:00Z"),
         consumed_at: None,
-        ..AuthCodeRepo::get(store, "code-hash-live").unwrap().unwrap()
-    };
-    AuthCodeRepo::create(store, expired).unwrap();
-    assert!(
-        !AuthCodeRepo::consume_if_live(store, "code-hash-expired", &ts("2026-06-19T00:05:00Z"))
+        ..AuthCodeRepository::get(store, "code-hash-live")
             .unwrap()
+            .unwrap()
+    };
+    AuthCodeRepository::create(store, expired).unwrap();
+    assert!(
+        !AuthCodeRepository::consume_if_live(
+            store,
+            "code-hash-expired",
+            &ts("2026-06-19T00:05:00Z")
+        )
+        .unwrap()
     );
-    OAuthClientRepo::remove(store, "awaken-runtime").unwrap();
+    OAuthClientRepository::remove(store, "awaken-runtime").unwrap();
 
     // --- api tokens: unique id + prefix, prefix lookup, in-place revoke ---
     let token = ApiToken {
@@ -307,17 +322,17 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         expires_at: None,
         revoked_at: None,
     };
-    ApiTokenRepo::create(store, token.clone()).unwrap();
+    ApiTokenRepository::create(store, token.clone()).unwrap();
     assert!(matches!(
-        ApiTokenRepo::create(store, token.clone()),
-        Err(RepoError::Conflict(_))
+        ApiTokenRepository::create(store, token.clone()),
+        Err(RepositoryError::Conflict(_))
     ));
     let mut dup_prefix = token.clone();
     dup_prefix.id = ApiTokenId("tok_2".into());
     assert!(
         matches!(
-            ApiTokenRepo::create(store, dup_prefix),
-            Err(RepoError::Conflict(_))
+            ApiTokenRepository::create(store, dup_prefix),
+            Err(RepositoryError::Conflict(_))
         ),
         "duplicate prefix must conflict"
     );
@@ -330,16 +345,16 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         WorkspaceId("wrkspc_default".into())
     );
     assert_eq!(
-        ApiTokenRepo::list_for_principal(store, &service("ci"))
+        ApiTokenRepository::list_for_principal(store, &service("ci"))
             .unwrap()
             .len(),
         1
     );
     let mut revoked = token;
     revoked.revoked_at = Some(ts("2026-06-19T02:00:00Z"));
-    ApiTokenRepo::update(store, revoked).unwrap();
+    ApiTokenRepository::update(store, revoked).unwrap();
     assert!(
-        ApiTokenRepo::get(store, &ApiTokenId("tok_1".into()))
+        ApiTokenRepository::get(store, &ApiTokenId("tok_1".into()))
             .unwrap()
             .unwrap()
             .revoked_at
@@ -356,15 +371,15 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         created_at: ts("2026-06-21T00:00:00Z"),
         updated_at: ts("2026-06-21T00:00:00Z"),
     };
-    OrgRepo::upsert(store, org.clone()).unwrap();
+    OrgRepository::upsert(store, org.clone()).unwrap();
     assert_eq!(
-        OrgRepo::get(store, &OrgId("acme".into())).unwrap(),
+        OrgRepository::get(store, &OrgId("acme".into())).unwrap(),
         Some(org)
     );
-    assert_eq!(OrgRepo::list(store).unwrap().len(), 1);
+    assert_eq!(OrgRepository::list(store).unwrap().len(), 1);
     assert!(matches!(
-        OrgRepo::remove(store, &OrgId("ghost".into())),
-        Err(RepoError::NotFound(_))
+        OrgRepository::remove(store, &OrgId("ghost".into())),
+        Err(RepositoryError::NotFound(_))
     ));
 
     let group = Group {
@@ -380,12 +395,12 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         created_at: ts("2026-06-21T00:00:00Z"),
         updated_at: ts("2026-06-21T00:00:00Z"),
     };
-    GroupRepo::upsert(store, group.clone()).unwrap();
-    assert_eq!(GroupRepo::get(store, &group.id).unwrap(), Some(group));
-    GroupRepo::remove(store, &GroupId("eng".into())).unwrap();
+    GroupRepository::upsert(store, group.clone()).unwrap();
+    assert_eq!(GroupRepository::get(store, &group.id).unwrap(), Some(group));
+    GroupRepository::remove(store, &GroupId("eng".into())).unwrap();
     assert!(matches!(
-        GroupRepo::remove(store, &GroupId("eng".into())),
-        Err(RepoError::NotFound(_))
+        GroupRepository::remove(store, &GroupId("eng".into())),
+        Err(RepositoryError::NotFound(_))
     ));
 
     let role = RoleDef {
@@ -398,9 +413,9 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         created_at: ts("2026-06-21T00:00:00Z"),
         updated_at: ts("2026-06-21T00:00:00Z"),
     };
-    RoleRepo::upsert(store, role.clone()).unwrap();
-    assert_eq!(RoleRepo::get(store, &role.id).unwrap(), Some(role));
-    assert_eq!(RoleRepo::list(store).unwrap().len(), 1);
+    RoleRepository::upsert(store, role.clone()).unwrap();
+    assert_eq!(RoleRepository::get(store, &role.id).unwrap(), Some(role));
+    assert_eq!(RoleRepository::list(store).unwrap().len(), 1);
 
     // Cause-effect decision table for the cross-backend Directory authority:
     // R1 valid root + qualified product space -> node, binding, audit and one
@@ -420,11 +435,14 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         created_at: ts("2026-06-21T00:00:00Z"),
         updated_at: ts("2026-06-21T00:00:00Z"),
     };
+    let directory_actor = PrincipalRef::Service {
+        service_id: "sql-conformance".into(),
+    };
     assert_eq!(
-        DirectoryRepo::create_directory_node(
+        DirectoryRepository::create_directory_node(
             store,
             directory_node("root", None),
-            Some(ProductSpaceBinding {
+            Some(ProductSpacePlacement {
                 product_space: ProductSpaceRef {
                     product: "agents".into(),
                     space_id: "space-a".into(),
@@ -432,14 +450,20 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
                 org_id: OrgId("acme".into()),
                 node_id: DirectoryNodeId("root".into()),
             }),
+            &directory_actor,
         )
         .unwrap(),
         2
     );
-    DirectoryRepo::create_directory_node(store, directory_node("team", Some("root")), None)
-        .unwrap();
+    DirectoryRepository::create_directory_node(
+        store,
+        directory_node("team", Some("root")),
+        None,
+        &directory_actor,
+    )
+    .unwrap();
     assert_eq!(
-        DirectoryRepo::product_space_binding(
+        DirectoryRepository::product_space_binding(
             store,
             &ProductSpaceRef {
                 product: "agents".into(),
@@ -451,50 +475,54 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         .node_id,
         DirectoryNodeId("root".into())
     );
-    let before_rejection = DirectoryRepo::directory_revision(store).unwrap();
+    let before_rejection = DirectoryRepository::directory_revision(store).unwrap();
     assert!(matches!(
-        DirectoryRepo::move_directory_node(
+        DirectoryRepository::move_directory_node(
             store,
             &DirectoryNodeId("root".into()),
             Some(&DirectoryNodeId("team".into())),
             &ts("2026-06-21T01:00:00Z"),
+            &directory_actor,
         ),
-        Err(RepoError::Conflict(_))
+        Err(RepositoryError::Conflict(_))
     ));
     assert_eq!(
-        DirectoryRepo::directory_revision(store).unwrap(),
+        DirectoryRepository::directory_revision(store).unwrap(),
         before_rejection
     );
-    DirectoryRepo::update_directory_node(
+    DirectoryRepository::update_directory_node(
         store,
         &DirectoryNodeId("team".into()),
         "Platform team",
         "platform-team",
         Some("renamed without moving"),
         &ts("2026-06-21T01:30:00Z"),
+        &directory_actor,
     )
     .unwrap();
-    let renamed = DirectoryRepo::directory_node(store, &DirectoryNodeId("team".into()))
+    let renamed = DirectoryRepository::directory_node(store, &DirectoryNodeId("team".into()))
         .unwrap()
         .unwrap();
     assert_eq!(renamed.slug, "platform-team");
     assert_eq!(renamed.parent_id, Some(DirectoryNodeId("root".into())));
     assert!(matches!(
-        DirectoryRepo::archive_directory_node(
+        DirectoryRepository::archive_directory_node(
             store,
             &DirectoryNodeId("root".into()),
             &ts("2026-06-21T02:00:00Z"),
+            &directory_actor,
         ),
-        Err(RepoError::Conflict(_))
+        Err(RepositoryError::Conflict(_))
     ));
-    DirectoryRepo::archive_directory_node(
+    DirectoryRepository::archive_directory_node(
         store,
         &DirectoryNodeId("team".into()),
         &ts("2026-06-21T02:00:00Z"),
+        &directory_actor,
     )
     .unwrap();
     assert!(
-        DirectoryRepo::directory_children(
+        DirectoryRepository::directory_children(
             store,
             &OrgId("acme".into()),
             Some(&DirectoryNodeId("root".into()))
@@ -513,16 +541,16 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         },
         effect: Effect::RequireApproval,
     };
-    GrantRepo::put(store, grant.clone()).unwrap();
+    GrantRepository::put(store, grant.clone()).unwrap();
     assert_eq!(
-        GrantRepo::get(store, &GrantId("g1".into())).unwrap(),
+        GrantRepository::get(store, &GrantId("g1".into())).unwrap(),
         Some(grant)
     );
-    assert_eq!(GrantRepo::list(store).unwrap().len(), 1);
-    GrantRepo::remove(store, &GrantId("g1".into())).unwrap();
+    assert_eq!(GrantRepository::list(store).unwrap().len(), 1);
+    GrantRepository::remove(store, &GrantId("g1".into())).unwrap();
     assert!(matches!(
-        GrantRepo::remove(store, &GrantId("g1".into())),
-        Err(RepoError::NotFound(_))
+        GrantRepository::remove(store, &GrantId("g1".into())),
+        Err(RepositoryError::NotFound(_))
     ));
 
     // --- role bindings: idempotent add, filter, exact remove ---
@@ -535,17 +563,17 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     };
     store.add(binding.clone()).unwrap();
     store.add(binding.clone()).unwrap(); // idempotent
-    assert_eq!(RoleBindingRepo::list(store).unwrap().len(), 1);
+    assert_eq!(RoleBindingRepository::list(store).unwrap().len(), 1);
     assert_eq!(
-        RoleBindingRepo::list_for_principal(store, &binding.principal)
+        RoleBindingRepository::list_for_principal(store, &binding.principal)
             .unwrap()
             .len(),
         1
     );
-    RoleBindingRepo::remove(store, &binding).unwrap();
+    RoleBindingRepository::remove(store, &binding).unwrap();
     assert!(matches!(
-        RoleBindingRepo::remove(store, &binding),
-        Err(RepoError::NotFound(_))
+        RoleBindingRepository::remove(store, &binding),
+        Err(RepositoryError::NotFound(_))
     ));
 
     // --- resource edges: upsert and list ---
@@ -581,12 +609,12 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     .with_quota("pack.publish", Quota::Limited(100))
     .with_quota("seats", Quota::Unlimited)
     .with_rate_limit("pack.read", RateLimit::new(50, RateWindow::Minute));
-    PlanRepo::put(store, plan.clone()).unwrap();
+    PlanRepository::put(store, plan.clone()).unwrap();
     assert_eq!(
-        PlanRepo::get(store, &PlanId("pro".into())).unwrap(),
+        PlanRepository::get(store, &PlanId("pro".into())).unwrap(),
         Some(plan)
     );
-    assert_eq!(PlanRepo::list(store).unwrap().len(), 1);
+    assert_eq!(PlanRepository::list(store).unwrap().len(), 1);
     let principal = PrincipalRef::Account {
         account_id: AccountId("a".into()),
     };
@@ -652,9 +680,9 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
     let backend = awaken_iam_server::SqliteBackend::open_in_memory().expect("open");
     let iam = awaken_iam_server::sqlite_migrated_store(backend.clone(), "iam").expect("iam");
     let other = awaken_iam_server::sqlite_migrated_store(backend, "iamx").expect("iamx");
-    AccountRepo::upsert(&iam, account("only-in-iam")).unwrap();
-    assert_eq!(AccountRepo::list(&iam).unwrap().len(), 1);
-    assert_eq!(AccountRepo::list(&other).unwrap().len(), 0);
+    AccountRepository::upsert(&iam, account("only-in-iam")).unwrap();
+    assert_eq!(AccountRepository::list(&iam).unwrap().len(), 1);
+    assert_eq!(AccountRepository::list(&other).unwrap().len(), 0);
 }
 
 #[tokio::test]

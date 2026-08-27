@@ -143,29 +143,29 @@ OAuth provider or exposing an automation credential to browser JavaScript:
 5. Product middleware resolves that cookie to an Account principal and evaluates
    the same product action and scope policy used for bearer credentials.
 6. DELETE /v1/session revokes the session and clears the cookie.
-7. Persistent local compositions reopen the same `SessionRepo` after restart,
+7. Persistent local compositions reopen the same `SessionRepository` after restart,
    so an unexpired, unrevoked cookie continues without another setup exchange.
 ```
 
 The setup token is a bootstrap handoff, not a reusable API credential. It is
 never persisted by the browser. API tokens remain the credential for CLI and
-automation clients. The canonical `SessionRepo` stores only the opaque
+automation clients. The canonical `SessionRepository` stores only the opaque
 cookie's hash plus session metadata; authentication refresh and logout update
 that same row. Setup challenges remain in memory and are never a recovery
 credential.
 
 Hosted and standalone server compositions use the identical session port with a
 different adapter: every replica receives the same Postgres-backed
-`SqlStore<PostgresBackend>` as its `SessionRepo`. A cookie established by one
+`SqlStore<PostgresBackend>` as its `SessionRepository`. A cookie established by one
 replica is therefore resolvable by another replica and survives process
 replacement. PostgreSQL unavailability fails session creation, resolution, and
 logout closed; the server never falls back to an in-memory session directory.
 SQLite remains the single-process local adapter and is not an HA server store.
 
 The downstream authorization server follows the same one-store rule. Its
-`OAuthClientRepo` is the authoritative registered-client directory and its
-`AuthCodeRepo` holds only hashed, short-lived authorization-code records. A
-durable composition injects the same `SqlStore` behind both ports; it never
+`OAuthClientRepository` is the authoritative registered-client directory and its
+`AuthCodeRepository` holds only hashed, short-lived authorization-code records. A
+durable composition injects the same `SqlStore` behind both repository contracts; it never
 hydrates a process-local client snapshot or keeps issued codes in a replica.
 Code redemption first validates the stored client, redirect URI, expiry, and
 PKCE binding, then performs one conditional consume (`unconsumed && live`) in
@@ -175,14 +175,14 @@ not consume the code, while repository failure rejects issuance or redemption
 as temporarily unavailable rather than falling back to memory.
 
 ```text
-authorize on replica A -> OAuthClientRepo.get -> AuthCodeRepo.create(hash only)
-token on replica B     -> OAuthClientRepo.get -> AuthCodeRepo.get
+authorize on replica A -> OAuthClientRepository.get -> AuthCodeRepository.create(hash only)
+token on replica B     -> OAuthClientRepository.get -> AuthCodeRepository.get
                                             -> validate all bindings
                                             -> consume_if_live (atomic CAS)
                                             -> mint tokens
 ```
 
-Upstream provider correlation follows the same one-store rule. `LoginFlowRepo`
+Upstream provider correlation follows the same one-store rule. `LoginFlowRepository`
 stores only state, nonce, and PKCE hashes plus expiry/consumption metadata. The
 start response sets two short-lived, hardened cookies: an opaque login-row id
 and an HttpOnly proof containing the one-time nonce/PKCE verifier. On callback,
@@ -192,8 +192,8 @@ is cleared with the login-id cookie. There is no process-local pending map and
 load-balancer affinity is not a correctness requirement.
 
 ```text
-start on replica A    -> LoginFlowRepo.start(hashes) -> browser id+proof cookies
-callback on replica B -> LoginFlowRepo.get/consume -> verify proof -> provider exchange
+start on replica A    -> LoginFlowRepository.start(hashes) -> browser id+proof cookies
+callback on replica B -> LoginFlowRepository.get/consume -> verify proof -> provider exchange
 ```
 
 ## Provider login subflow
@@ -372,3 +372,5 @@ issuers set `subject_kind: service`. A verifier reconstructs the exact
   tools — those stay product-side (ADR-0001 guardrail).
 - It does not own product session *semantics* (what a workspace session means);
   it issues and validates the identity, products attach meaning.
+
+

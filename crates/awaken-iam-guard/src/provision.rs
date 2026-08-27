@@ -22,7 +22,7 @@
 //! (or runs a co-located store) needs this function.
 
 use awaken_iam_contract::Timestamp;
-use awaken_iam_core::{RepoError, RoleRepo};
+use awaken_iam_core::{RepositoryError, RoleRepository};
 use awaken_iam_preset::{seed_named_roles, seed_runtime_roles};
 
 /// Error returned by [`provision`].
@@ -33,8 +33,8 @@ pub enum ProvisionError {
     Seeding(String),
 }
 
-impl From<RepoError> for ProvisionError {
-    fn from(err: RepoError) -> Self {
+impl From<RepositoryError> for ProvisionError {
+    fn from(err: RepositoryError) -> Self {
         ProvisionError::Seeding(err.to_string())
     }
 }
@@ -52,10 +52,10 @@ impl From<RepoError> for ProvisionError {
 ///
 /// # Parameters
 ///
-/// - `store`: any [`RoleRepo`] implementation (e.g. `SqlStore<SqliteBackend>`,
+/// - `store`: any [`RoleRepository`] implementation (e.g. `SqlStore<SqliteBackend>`,
 ///   `SqlStore<PostgresBackend>`, `InMemoryStore`).
 /// - `now`: the timestamp stamped on newly seeded roles.
-pub fn provision(store: &dyn RoleRepo, now: &Timestamp) -> Result<(), ProvisionError> {
+pub fn provision(store: &dyn RoleRepository, now: &Timestamp) -> Result<(), ProvisionError> {
     seed_named_roles(store, now)?;
     seed_runtime_roles(store, now)?;
     Ok(())
@@ -65,7 +65,7 @@ pub fn provision(store: &dyn RoleRepo, now: &Timestamp) -> Result<(), ProvisionE
 mod tests {
     use super::*;
     use awaken_iam_contract::Timestamp;
-    use awaken_iam_core::{RoleId, RoleRepo};
+    use awaken_iam_core::{RoleId, RoleRepository};
     use awaken_iam_server::sqlite_in_memory_store;
 
     fn now() -> Timestamp {

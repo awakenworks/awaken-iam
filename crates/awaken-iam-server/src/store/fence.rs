@@ -16,7 +16,7 @@
 //! the fence cannot prove its caches are fresh, so the caller treats the store as
 //! unreachable rather than serving a stale `Allow`.
 
-use awaken_iam_core::RepoResult;
+use awaken_iam_core::RepositoryResult;
 
 /// The monotonic counters that fence cache freshness across nodes.
 ///
@@ -53,7 +53,7 @@ impl Default for Fence {
 /// **in the shared store**, in the same transaction as the change they fence, so
 /// a bump on one node is visible to every node on the next read. Keeping the port
 /// at the server edge (not in `core`) preserves the storage-free domain: HA is
-/// edge adapters over the existing ports, not a change to `contract`, `core`, or
+/// edge adapters over the existing repository contracts, not a change to `contract`, `core`, or
 /// `client`.
 ///
 /// All methods take `&self`: the adapter owns its own interior synchronisation
@@ -62,31 +62,31 @@ impl Default for Fence {
 pub trait FenceStore {
     /// Read the current fence. Fails closed: an unreadable fence means the node
     /// cannot prove freshness and must treat the store as unreachable.
-    fn fence(&self) -> RepoResult<Fence>;
+    fn fence(&self) -> RepositoryResult<Fence>;
 
     /// Atomically advance the policy `version`, returning the new value.
     ///
     /// Called in the same transaction as the grant/role/membership write it
     /// fences, so the bump and the change land together or not at all.
-    fn advance_version(&self) -> RepoResult<u64>;
+    fn advance_version(&self) -> RepositoryResult<u64>;
 
     /// Atomically advance the token `epoch`, returning the new value.
     ///
     /// Called in the same transaction as the session-revoke or capability-lease
     /// change it fences, invalidating every token minted at the prior epoch.
-    fn advance_epoch(&self) -> RepoResult<u64>;
+    fn advance_epoch(&self) -> RepositoryResult<u64>;
 }
 
 impl<T: FenceStore + ?Sized> FenceStore for &T {
-    fn fence(&self) -> RepoResult<Fence> {
+    fn fence(&self) -> RepositoryResult<Fence> {
         (**self).fence()
     }
 
-    fn advance_version(&self) -> RepoResult<u64> {
+    fn advance_version(&self) -> RepositoryResult<u64> {
         (**self).advance_version()
     }
 
-    fn advance_epoch(&self) -> RepoResult<u64> {
+    fn advance_epoch(&self) -> RepositoryResult<u64> {
         (**self).advance_epoch()
     }
 }

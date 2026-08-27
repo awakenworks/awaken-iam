@@ -1,4 +1,4 @@
-//! In-memory adapter implementing the core's repository ports.
+//! In-memory adapter implementing the core's repository contracts.
 //!
 //! This backs tests and the `local` client deployment. It enforces the same
 //! uniqueness and lifecycle invariants the database adapter does, so code
@@ -11,28 +11,35 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    DirectoryNodeId, ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus,
-    NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpaceBinding,
-    ProductSpaceRef, ProfileLifecycle, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
-    WorkspaceOrgEdge,
+    ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpacePlacement,
+    ProfileLifecycle, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
+#[cfg(any(test, feature = "test-support"))]
+use awaken_iam_contract::{DirectoryNodeId, ProductSpaceRef};
+#[cfg(any(test, feature = "test-support"))]
+use awaken_iam_core::DirectoryRepository;
 use awaken_iam_core::{
-    AccountIdentityRepo, AccountRepo, ApiTokenRepo, AuditEvent, AuditSink, AuthCodeRepo,
-    AuthorizationProfileRepo, DirectoryNode, DirectoryRepo, ExternalIdentityRepo, Grant, GrantId,
-    GrantRepo, GrantSubject, Group, GroupId, GroupRepo, Invitation, InvitationRepo, LoginFlowRepo,
-    OAuthClientRepo, OrgPrivacyRepo, OrgRepo, Organization, OrganizationPrivacyScope, Plan, PlanId,
-    PlanRepo, RegisteredClient, RepoError, RepoResult, ResourceEdge, ResourceModelRepo,
-    RoleBinding, RoleBindingRepo, RoleDef, RoleId, RoleRepo, SessionRepo, StoredAuthorizationCode,
+    AccountIdentityRepository, AccountRepository, ApiTokenRepository, AuditEvent, AuditSink,
+    AuthCodeRepository, AuthorizationProfileRepository, DirectoryNode, ExternalIdentityRepository,
+    Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId, GroupRepository, Invitation,
+    InvitationRepository, LoginFlowRepository, OAuthClientRepository, OrgPrivacyRepository,
+    OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepository,
+    RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge, ResourceModelRepository,
+    RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository, SessionRepository,
+    StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
 
+#[cfg(any(test, feature = "test-support"))]
 mod directory;
 
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
-fn json_key<T: serde::Serialize>(value: &T, what: &str) -> RepoResult<String> {
-    serde_json::to_string(value).map_err(|err| RepoError::Backend(format!("encode {what}: {err}")))
+fn json_key<T: serde::Serialize>(value: &T, what: &str) -> RepositoryResult<String> {
+    serde_json::to_string(value)
+        .map_err(|err| RepositoryError::Backend(format!("encode {what}: {err}")))
 }
 
 #[derive(Default)]
@@ -61,7 +68,8 @@ struct Authz {
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
     directory_nodes: BTreeMap<String, DirectoryNode>,
-    product_space_bindings: BTreeMap<String, ProductSpaceBinding>,
+    product_space_bindings: BTreeMap<String, ProductSpacePlacement>,
+    #[cfg(any(test, feature = "test-support"))]
     directory_revision: u64,
 }
 
@@ -98,12 +106,12 @@ fn external_key(key: &ExternalIdentityKey) -> String {
     format!("{}\u{1f}{}", key.provider_key.0, key.subject.0)
 }
 
-impl AccountRepo for InMemoryStore {
-    fn get(&self, id: &AccountId) -> RepoResult<Option<Account>> {
+impl AccountRepository for InMemoryStore {
+    fn get(&self, id: &AccountId) -> RepositoryResult<Option<Account>> {
         Ok(self.identity.lock().unwrap().accounts.get(&id.0).cloned())
     }
 
-    fn upsert(&self, account: Account) -> RepoResult<()> {
+    fn upsert(&self, account: Account) -> RepositoryResult<()> {
         self.identity
             .lock()
             .unwrap()
@@ -112,7 +120,7 @@ impl AccountRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list(&self) -> RepoResult<Vec<Account>> {
+    fn list(&self) -> RepositoryResult<Vec<Account>> {
         Ok(self
             .identity
             .lock()
@@ -124,8 +132,8 @@ impl AccountRepo for InMemoryStore {
     }
 }
 
-impl ExternalIdentityRepo for InMemoryStore {
-    fn get_by_key(&self, key: &ExternalIdentityKey) -> RepoResult<Option<ExternalIdentity>> {
+impl ExternalIdentityRepository for InMemoryStore {
+    fn get_by_key(&self, key: &ExternalIdentityKey) -> RepositoryResult<Option<ExternalIdentity>> {
         Ok(self
             .identity
             .lock()
@@ -135,11 +143,11 @@ impl ExternalIdentityRepo for InMemoryStore {
             .cloned())
     }
 
-    fn link(&self, identity: ExternalIdentity) -> RepoResult<()> {
+    fn link(&self, identity: ExternalIdentity) -> RepositoryResult<()> {
         let key = external_key(&identity.key());
         let mut guard = self.identity.lock().unwrap();
         if guard.external.contains_key(&key) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "external identity {key} is already linked"
             )));
         }
@@ -147,11 +155,11 @@ impl ExternalIdentityRepo for InMemoryStore {
         Ok(())
     }
 
-    fn update_claims(&self, identity: ExternalIdentity) -> RepoResult<()> {
+    fn update_claims(&self, identity: ExternalIdentity) -> RepositoryResult<()> {
         let key = external_key(&identity.key());
         let mut guard = self.identity.lock().unwrap();
         if !guard.external.contains_key(&key) {
-            return Err(RepoError::NotFound(format!(
+            return Err(RepositoryError::NotFound(format!(
                 "external identity {key} is not linked"
             )));
         }
@@ -159,7 +167,7 @@ impl ExternalIdentityRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list_for_account(&self, account_id: &AccountId) -> RepoResult<Vec<ExternalIdentity>> {
+    fn list_for_account(&self, account_id: &AccountId) -> RepositoryResult<Vec<ExternalIdentity>> {
         let guard = self.identity.lock().unwrap();
         let mut found: Vec<ExternalIdentity> = guard
             .external
@@ -172,12 +180,12 @@ impl ExternalIdentityRepo for InMemoryStore {
     }
 }
 
-impl AccountIdentityRepo for InMemoryStore {
-    fn provision(&self, account: Account, identity: ExternalIdentity) -> RepoResult<()> {
+impl AccountIdentityRepository for InMemoryStore {
+    fn provision(&self, account: Account, identity: ExternalIdentity) -> RepositoryResult<()> {
         let key = external_key(&identity.key());
         let mut guard = self.identity.lock().unwrap();
         if guard.accounts.contains_key(&account.id.0) || guard.external.contains_key(&key) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "account {} or external identity {key} already exists",
                 account.id.0
             )));
@@ -191,16 +199,16 @@ impl AccountIdentityRepo for InMemoryStore {
         &self,
         key: &ExternalIdentityKey,
         account_id: &AccountId,
-    ) -> RepoResult<ExternalIdentity> {
+    ) -> RepositoryResult<ExternalIdentity> {
         let encoded = external_key(key);
         let mut guard = self.identity.lock().unwrap();
         let identity = guard
             .external
             .get(&encoded)
             .cloned()
-            .ok_or_else(|| RepoError::NotFound(format!("external identity {encoded}")))?;
+            .ok_or_else(|| RepositoryError::NotFound(format!("external identity {encoded}")))?;
         if &identity.account_id != account_id {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "external identity {encoded} belongs to another account"
             )));
         }
@@ -210,7 +218,7 @@ impl AccountIdentityRepo for InMemoryStore {
             .filter(|candidate| &candidate.account_id == account_id)
             .count();
         if linked <= 1 {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "account {} must retain one external identity",
                 account_id.0
             )));
@@ -220,12 +228,12 @@ impl AccountIdentityRepo for InMemoryStore {
     }
 }
 
-impl SessionRepo for InMemoryStore {
-    fn get(&self, id: &SessionId) -> RepoResult<Option<Session>> {
+impl SessionRepository for InMemoryStore {
+    fn get(&self, id: &SessionId) -> RepositoryResult<Option<Session>> {
         Ok(self.identity.lock().unwrap().sessions.get(&id.0).cloned())
     }
 
-    fn get_by_token_hash(&self, token_hash: &str) -> RepoResult<Option<Session>> {
+    fn get_by_token_hash(&self, token_hash: &str) -> RepositoryResult<Option<Session>> {
         let guard = self.identity.lock().unwrap();
         Ok(guard
             .sessions_by_token
@@ -234,10 +242,10 @@ impl SessionRepo for InMemoryStore {
             .cloned())
     }
 
-    fn create(&self, session: Session) -> RepoResult<()> {
+    fn create(&self, session: Session) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         if guard.sessions.contains_key(&session.id.0) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "session {} already exists",
                 session.id.0
             )));
@@ -249,10 +257,10 @@ impl SessionRepo for InMemoryStore {
         Ok(())
     }
 
-    fn update(&self, session: Session) -> RepoResult<()> {
+    fn update(&self, session: Session) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         if !guard.sessions.contains_key(&session.id.0) {
-            return Err(RepoError::NotFound(format!(
+            return Err(RepositoryError::NotFound(format!(
                 "session {} does not exist",
                 session.id.0
             )));
@@ -265,11 +273,11 @@ impl SessionRepo for InMemoryStore {
     }
 }
 
-impl LoginFlowRepo for InMemoryStore {
-    fn start(&self, state: OAuthLoginState) -> RepoResult<()> {
+impl LoginFlowRepository for InMemoryStore {
+    fn start(&self, state: OAuthLoginState) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         if guard.login_flows.contains_key(&state.id.0) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "login flow {} already started",
                 state.id.0
             )));
@@ -278,7 +286,7 @@ impl LoginFlowRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get(&self, id: &OAuthLoginStateId) -> RepoResult<Option<OAuthLoginState>> {
+    fn get(&self, id: &OAuthLoginStateId) -> RepositoryResult<Option<OAuthLoginState>> {
         Ok(self
             .identity
             .lock()
@@ -288,14 +296,14 @@ impl LoginFlowRepo for InMemoryStore {
             .cloned())
     }
 
-    fn mark_consumed(&self, id: &OAuthLoginStateId, at: Timestamp) -> RepoResult<()> {
+    fn mark_consumed(&self, id: &OAuthLoginStateId, at: Timestamp) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         let flow = guard
             .login_flows
             .get_mut(&id.0)
-            .ok_or_else(|| RepoError::NotFound(format!("login flow {} not found", id.0)))?;
+            .ok_or_else(|| RepositoryError::NotFound(format!("login flow {} not found", id.0)))?;
         if flow.consumed_at.is_some() {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "login flow {} already consumed",
                 id.0
             )));
@@ -305,17 +313,17 @@ impl LoginFlowRepo for InMemoryStore {
     }
 }
 
-impl ApiTokenRepo for InMemoryStore {
-    fn create(&self, token: ApiToken) -> RepoResult<()> {
+impl ApiTokenRepository for InMemoryStore {
+    fn create(&self, token: ApiToken) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         if guard.api_tokens.contains_key(&token.id.0) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "api token {} already exists",
                 token.id.0
             )));
         }
         if guard.api_tokens_by_prefix.contains_key(&token.prefix.0) {
-            return Err(RepoError::Conflict(format!(
+            return Err(RepositoryError::Conflict(format!(
                 "api token prefix {} already exists",
                 token.prefix.0
             )));
@@ -327,11 +335,11 @@ impl ApiTokenRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get(&self, id: &ApiTokenId) -> RepoResult<Option<ApiToken>> {
+    fn get(&self, id: &ApiTokenId) -> RepositoryResult<Option<ApiToken>> {
         Ok(self.identity.lock().unwrap().api_tokens.get(&id.0).cloned())
     }
 
-    fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepoResult<Option<ApiToken>> {
+    fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepositoryResult<Option<ApiToken>> {
         let guard = self.identity.lock().unwrap();
         Ok(guard
             .api_tokens_by_prefix
@@ -340,7 +348,7 @@ impl ApiTokenRepo for InMemoryStore {
             .cloned())
     }
 
-    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<ApiToken>> {
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepositoryResult<Vec<ApiToken>> {
         let guard = self.identity.lock().unwrap();
         let mut found: Vec<ApiToken> = guard
             .api_tokens
@@ -352,10 +360,10 @@ impl ApiTokenRepo for InMemoryStore {
         Ok(found)
     }
 
-    fn update(&self, token: ApiToken) -> RepoResult<()> {
+    fn update(&self, token: ApiToken) -> RepositoryResult<()> {
         let mut guard = self.identity.lock().unwrap();
         if !guard.api_tokens.contains_key(&token.id.0) {
-            return Err(RepoError::NotFound(format!(
+            return Err(RepositoryError::NotFound(format!(
                 "api token {} does not exist",
                 token.id.0
             )));
@@ -368,8 +376,8 @@ impl ApiTokenRepo for InMemoryStore {
     }
 }
 
-impl OAuthClientRepo for InMemoryStore {
-    fn upsert(&self, client: RegisteredClient) -> RepoResult<()> {
+impl OAuthClientRepository for InMemoryStore {
+    fn upsert(&self, client: RegisteredClient) -> RepositoryResult<()> {
         self.identity
             .lock()
             .unwrap()
@@ -378,7 +386,7 @@ impl OAuthClientRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get(&self, client_id: &str) -> RepoResult<Option<RegisteredClient>> {
+    fn get(&self, client_id: &str) -> RepositoryResult<Option<RegisteredClient>> {
         Ok(self
             .identity
             .lock()
@@ -388,7 +396,7 @@ impl OAuthClientRepo for InMemoryStore {
             .cloned())
     }
 
-    fn list(&self) -> RepoResult<Vec<RegisteredClient>> {
+    fn list(&self) -> RepositoryResult<Vec<RegisteredClient>> {
         Ok(self
             .identity
             .lock()
@@ -399,28 +407,30 @@ impl OAuthClientRepo for InMemoryStore {
             .collect())
     }
 
-    fn remove(&self, client_id: &str) -> RepoResult<()> {
+    fn remove(&self, client_id: &str) -> RepositoryResult<()> {
         self.identity
             .lock()
             .unwrap()
             .oauth_clients
             .remove(client_id)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("oauth client {client_id} not found")))
+            .ok_or_else(|| RepositoryError::NotFound(format!("oauth client {client_id} not found")))
     }
 }
 
-impl AuthCodeRepo for InMemoryStore {
-    fn create(&self, code: StoredAuthorizationCode) -> RepoResult<()> {
+impl AuthCodeRepository for InMemoryStore {
+    fn create(&self, code: StoredAuthorizationCode) -> RepositoryResult<()> {
         let mut identity = self.identity.lock().unwrap();
         if identity.oauth_codes.contains_key(&code.code_hash) {
-            return Err(RepoError::Conflict("duplicate authorization code".into()));
+            return Err(RepositoryError::Conflict(
+                "duplicate authorization code".into(),
+            ));
         }
         identity.oauth_codes.insert(code.code_hash.clone(), code);
         Ok(())
     }
 
-    fn get(&self, code_hash: &str) -> RepoResult<Option<StoredAuthorizationCode>> {
+    fn get(&self, code_hash: &str) -> RepositoryResult<Option<StoredAuthorizationCode>> {
         Ok(self
             .identity
             .lock()
@@ -430,7 +440,7 @@ impl AuthCodeRepo for InMemoryStore {
             .cloned())
     }
 
-    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepoResult<bool> {
+    fn consume_if_live(&self, code_hash: &str, now: &Timestamp) -> RepositoryResult<bool> {
         let mut identity = self.identity.lock().unwrap();
         let Some(code) = identity.oauth_codes.get_mut(code_hash) else {
             return Ok(false);
@@ -443,12 +453,12 @@ impl AuthCodeRepo for InMemoryStore {
     }
 }
 
-impl OrgRepo for InMemoryStore {
-    fn get(&self, id: &OrgId) -> RepoResult<Option<Organization>> {
+impl OrgRepository for InMemoryStore {
+    fn get(&self, id: &OrgId) -> RepositoryResult<Option<Organization>> {
         Ok(self.authz.lock().unwrap().orgs.get(&id.0).cloned())
     }
 
-    fn upsert(&self, org: Organization) -> RepoResult<()> {
+    fn upsert(&self, org: Organization) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
@@ -457,23 +467,23 @@ impl OrgRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list(&self) -> RepoResult<Vec<Organization>> {
+    fn list(&self) -> RepositoryResult<Vec<Organization>> {
         Ok(self.authz.lock().unwrap().orgs.values().cloned().collect())
     }
 
-    fn remove(&self, id: &OrgId) -> RepoResult<()> {
+    fn remove(&self, id: &OrgId) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
             .orgs
             .remove(&id.0)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("organization {} not found", id.0)))
+            .ok_or_else(|| RepositoryError::NotFound(format!("organization {} not found", id.0)))
     }
 }
 
-impl OrgPrivacyRepo for InMemoryStore {
-    fn erase_org_privacy(&self, id: &OrgId) -> RepoResult<bool> {
+impl OrgPrivacyRepository for InMemoryStore {
+    fn erase_org_privacy(&self, id: &OrgId) -> RepositoryResult<bool> {
         let mut authz = self.authz.lock().unwrap_or_else(|error| error.into_inner());
         let workspace_edges = authz.workspace_orgs.values().cloned().collect::<Vec<_>>();
         let resource_edges = authz.resource_edges.values().cloned().collect::<Vec<_>>();
@@ -549,12 +559,12 @@ impl OrgPrivacyRepo for InMemoryStore {
     }
 }
 
-impl GroupRepo for InMemoryStore {
-    fn get(&self, id: &GroupId) -> RepoResult<Option<Group>> {
+impl GroupRepository for InMemoryStore {
+    fn get(&self, id: &GroupId) -> RepositoryResult<Option<Group>> {
         Ok(self.authz.lock().unwrap().groups.get(&id.0).cloned())
     }
 
-    fn upsert(&self, group: Group) -> RepoResult<()> {
+    fn upsert(&self, group: Group) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
@@ -563,7 +573,7 @@ impl GroupRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list(&self) -> RepoResult<Vec<Group>> {
+    fn list(&self) -> RepositoryResult<Vec<Group>> {
         Ok(self
             .authz
             .lock()
@@ -574,23 +584,23 @@ impl GroupRepo for InMemoryStore {
             .collect())
     }
 
-    fn remove(&self, id: &GroupId) -> RepoResult<()> {
+    fn remove(&self, id: &GroupId) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
             .groups
             .remove(&id.0)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("group {} not found", id.0)))
+            .ok_or_else(|| RepositoryError::NotFound(format!("group {} not found", id.0)))
     }
 }
 
-impl RoleRepo for InMemoryStore {
-    fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
+impl RoleRepository for InMemoryStore {
+    fn get(&self, id: &RoleId) -> RepositoryResult<Option<RoleDef>> {
         Ok(self.authz.lock().unwrap().roles.get(&id.0).cloned())
     }
 
-    fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+    fn upsert(&self, role: RoleDef) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
@@ -599,23 +609,23 @@ impl RoleRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list(&self) -> RepoResult<Vec<RoleDef>> {
+    fn list(&self) -> RepositoryResult<Vec<RoleDef>> {
         Ok(self.authz.lock().unwrap().roles.values().cloned().collect())
     }
 
-    fn remove(&self, id: &RoleId) -> RepoResult<()> {
+    fn remove(&self, id: &RoleId) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
             .roles
             .remove(&id.0)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("role {} not found", id.0)))
+            .ok_or_else(|| RepositoryError::NotFound(format!("role {} not found", id.0)))
     }
 }
 
-impl GrantRepo for InMemoryStore {
-    fn put(&self, grant: Grant) -> RepoResult<()> {
+impl GrantRepository for InMemoryStore {
+    fn put(&self, grant: Grant) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
@@ -624,11 +634,11 @@ impl GrantRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get(&self, id: &GrantId) -> RepoResult<Option<Grant>> {
+    fn get(&self, id: &GrantId) -> RepositoryResult<Option<Grant>> {
         Ok(self.authz.lock().unwrap().grants.get(&id.0).cloned())
     }
 
-    fn list(&self) -> RepoResult<Vec<Grant>> {
+    fn list(&self) -> RepositoryResult<Vec<Grant>> {
         Ok(self
             .authz
             .lock()
@@ -639,19 +649,19 @@ impl GrantRepo for InMemoryStore {
             .collect())
     }
 
-    fn remove(&self, id: &GrantId) -> RepoResult<()> {
+    fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
             .grants
             .remove(&id.0)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound(format!("grant {} not found", id.0)))
+            .ok_or_else(|| RepositoryError::NotFound(format!("grant {} not found", id.0)))
     }
 }
 
-impl RoleBindingRepo for InMemoryStore {
-    fn add(&self, binding: RoleBinding) -> RepoResult<()> {
+impl RoleBindingRepository for InMemoryStore {
+    fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
         let key = json_key(
             &(&binding.principal, &binding.role.0, &binding.scope),
             "role binding",
@@ -664,7 +674,7 @@ impl RoleBindingRepo for InMemoryStore {
         Ok(())
     }
 
-    fn list_for_principal(&self, principal: &PrincipalRef) -> RepoResult<Vec<RoleBinding>> {
+    fn list_for_principal(&self, principal: &PrincipalRef) -> RepositoryResult<Vec<RoleBinding>> {
         Ok(self
             .authz
             .lock()
@@ -676,7 +686,7 @@ impl RoleBindingRepo for InMemoryStore {
             .collect())
     }
 
-    fn list(&self) -> RepoResult<Vec<RoleBinding>> {
+    fn list(&self) -> RepositoryResult<Vec<RoleBinding>> {
         Ok(self
             .authz
             .lock()
@@ -687,7 +697,7 @@ impl RoleBindingRepo for InMemoryStore {
             .collect())
     }
 
-    fn remove(&self, binding: &RoleBinding) -> RepoResult<()> {
+    fn remove(&self, binding: &RoleBinding) -> RepositoryResult<()> {
         let key = json_key(
             &(&binding.principal, &binding.role.0, &binding.scope),
             "role binding",
@@ -698,7 +708,7 @@ impl RoleBindingRepo for InMemoryStore {
             .role_bindings
             .remove(&key)
             .map(|_| ())
-            .ok_or_else(|| RepoError::NotFound("role binding not found".to_owned()))
+            .ok_or_else(|| RepositoryError::NotFound("role binding not found".to_owned()))
     }
 
     fn replace_scoped(
@@ -707,7 +717,7 @@ impl RoleBindingRepo for InMemoryStore {
         scope: &ScopeRef,
         managed_roles: &[RoleId],
         replacement_roles: &[RoleId],
-    ) -> RepoResult<()> {
+    ) -> RepositoryResult<()> {
         let managed: BTreeSet<&str> = managed_roles.iter().map(|role| role.0.as_str()).collect();
         let mut guard = self.authz.lock().unwrap();
         guard.role_bindings.retain(|_, binding| {
@@ -731,8 +741,8 @@ impl RoleBindingRepo for InMemoryStore {
     }
 }
 
-impl InvitationRepo for InMemoryStore {
-    fn create_invitation(&self, invitation: Invitation) -> RepoResult<()> {
+impl InvitationRepository for InMemoryStore {
+    fn create_invitation(&self, invitation: Invitation) -> RepositoryResult<()> {
         let mut guard = self.authz.lock().unwrap();
         if guard.invitations.contains_key(&invitation.id.0)
             || guard.invitations.values().any(|existing| {
@@ -740,7 +750,9 @@ impl InvitationRepo for InMemoryStore {
                     && existing.idempotency_key == invitation.idempotency_key
             })
         {
-            return Err(RepoError::Conflict("invitation already exists".into()));
+            return Err(RepositoryError::Conflict(
+                "invitation already exists".into(),
+            ));
         }
         guard
             .invitations
@@ -748,7 +760,7 @@ impl InvitationRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get_invitation(&self, id: &InvitationId) -> RepoResult<Option<Invitation>> {
+    fn get_invitation(&self, id: &InvitationId) -> RepositoryResult<Option<Invitation>> {
         Ok(self.authz.lock().unwrap().invitations.get(&id.0).cloned())
     }
 
@@ -756,7 +768,7 @@ impl InvitationRepo for InMemoryStore {
         &self,
         org_id: &OrgId,
         idempotency_key: &str,
-    ) -> RepoResult<Option<Invitation>> {
+    ) -> RepositoryResult<Option<Invitation>> {
         Ok(self
             .authz
             .lock()
@@ -767,7 +779,7 @@ impl InvitationRepo for InMemoryStore {
             .cloned())
     }
 
-    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepoResult<Vec<Invitation>> {
+    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepositoryResult<Vec<Invitation>> {
         Ok(self
             .authz
             .lock()
@@ -783,10 +795,10 @@ impl InvitationRepo for InMemoryStore {
         &self,
         invitation: Invitation,
         expected_token_hash: &str,
-    ) -> RepoResult<bool> {
+    ) -> RepositoryResult<bool> {
         let mut guard = self.authz.lock().unwrap();
         let Some(current) = guard.invitations.get(&invitation.id.0) else {
-            return Err(RepoError::NotFound("invitation not found".into()));
+            return Err(RepositoryError::NotFound("invitation not found".into()));
         };
         if current.status != InvitationStatus::Pending || current.token_hash != expected_token_hash
         {
@@ -804,10 +816,10 @@ impl InvitationRepo for InMemoryStore {
         expected_token_hash: &str,
         account_id: &AccountId,
         at: &Timestamp,
-    ) -> RepoResult<Option<Invitation>> {
+    ) -> RepositoryResult<Option<Invitation>> {
         let mut guard = self.authz.lock().unwrap();
         let Some(current) = guard.invitations.get(&id.0).cloned() else {
-            return Err(RepoError::NotFound("invitation not found".into()));
+            return Err(RepositoryError::NotFound("invitation not found".into()));
         };
         if current.status == InvitationStatus::Accepted
             && current.accepted_by_account_id.as_ref() == Some(account_id)
@@ -843,14 +855,14 @@ impl InvitationRepo for InMemoryStore {
     }
 }
 
-impl ResourceModelRepo for InMemoryStore {
-    fn put_edge(&self, edge: ResourceEdge) -> RepoResult<()> {
+impl ResourceModelRepository for InMemoryStore {
+    fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
         let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
         self.authz.lock().unwrap().resource_edges.insert(key, edge);
         Ok(())
     }
 
-    fn list_edges(&self) -> RepoResult<Vec<ResourceEdge>> {
+    fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>> {
         Ok(self
             .authz
             .lock()
@@ -861,7 +873,7 @@ impl ResourceModelRepo for InMemoryStore {
             .collect())
     }
 
-    fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepoResult<()> {
+    fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
         self.authz
             .lock()
             .unwrap()
@@ -870,7 +882,10 @@ impl ResourceModelRepo for InMemoryStore {
         Ok(())
     }
 
-    fn workspace_org(&self, workspace_id: &WorkspaceId) -> RepoResult<Option<WorkspaceOrgEdge>> {
+    fn workspace_org(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> RepositoryResult<Option<WorkspaceOrgEdge>> {
         Ok(self
             .authz
             .lock()
@@ -880,7 +895,7 @@ impl ResourceModelRepo for InMemoryStore {
             .cloned())
     }
 
-    fn list_workspace_orgs(&self) -> RepoResult<Vec<WorkspaceOrgEdge>> {
+    fn list_workspace_orgs(&self) -> RepositoryResult<Vec<WorkspaceOrgEdge>> {
         Ok(self
             .authz
             .lock()
@@ -892,12 +907,12 @@ impl ResourceModelRepo for InMemoryStore {
     }
 }
 
-impl AuthorizationProfileRepo for InMemoryStore {
-    fn create_profile(&self, profile: AuthorizationProfile) -> RepoResult<()> {
+impl AuthorizationProfileRepository for InMemoryStore {
+    fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()> {
         let key = (profile.namespace.0.clone(), profile.revision);
         let mut authz = self.authz.lock().unwrap();
         if authz.profiles.contains_key(&key) {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "profile revision already exists".into(),
             ));
         }
@@ -909,7 +924,7 @@ impl AuthorizationProfileRepo for InMemoryStore {
         &self,
         namespace: &NamespaceId,
         revision: u64,
-    ) -> RepoResult<Option<AuthorizationProfile>> {
+    ) -> RepositoryResult<Option<AuthorizationProfile>> {
         let authz = self.authz.lock().unwrap();
         let mut profile = authz
             .profiles
@@ -923,7 +938,10 @@ impl AuthorizationProfileRepo for InMemoryStore {
         Ok(profile)
     }
 
-    fn list_profiles(&self, namespace: &NamespaceId) -> RepoResult<Vec<AuthorizationProfile>> {
+    fn list_profiles(
+        &self,
+        namespace: &NamespaceId,
+    ) -> RepositoryResult<Vec<AuthorizationProfile>> {
         let authz = self.authz.lock().unwrap();
         let active = authz.active_profiles.get(&namespace.0).copied();
         Ok(authz
@@ -945,12 +963,12 @@ impl AuthorizationProfileRepo for InMemoryStore {
         namespace: &NamespaceId,
         revision: u64,
         lifecycle: ProfileLifecycle,
-    ) -> RepoResult<()> {
+    ) -> RepositoryResult<()> {
         let mut authz = self.authz.lock().unwrap();
         let profile = authz
             .profiles
             .get_mut(&(namespace.0.clone(), revision))
-            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
         profile.lifecycle = lifecycle;
         Ok(())
     }
@@ -960,20 +978,20 @@ impl AuthorizationProfileRepo for InMemoryStore {
         namespace: &NamespaceId,
         revision: u64,
         expected_active_revision: Option<u64>,
-    ) -> RepoResult<Option<u64>> {
+    ) -> RepositoryResult<Option<u64>> {
         let mut authz = self.authz.lock().unwrap();
         let target = authz
             .profiles
             .get(&(namespace.0.clone(), revision))
-            .ok_or_else(|| RepoError::NotFound("profile revision not found".into()))?;
+            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
         if target.lifecycle == ProfileLifecycle::Draft {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "profile revision is not validated".into(),
             ));
         }
         let previous = authz.active_profiles.get(&namespace.0).copied();
         if previous != expected_active_revision {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "active profile revision changed".into(),
             ));
         }
@@ -991,13 +1009,15 @@ impl AuthorizationProfileRepo for InMemoryStore {
         &self,
         namespace: &NamespaceId,
         expected_active_revision: u64,
-    ) -> RepoResult<AuthorizationProfile> {
+    ) -> RepositoryResult<AuthorizationProfile> {
         let mut authz = self.authz.lock().unwrap();
         let Some(active_revision) = authz.active_profiles.get(&namespace.0).copied() else {
-            return Err(RepoError::NotFound("active profile head not found".into()));
+            return Err(RepositoryError::NotFound(
+                "active profile head not found".into(),
+            ));
         };
         if active_revision != expected_active_revision {
-            return Err(RepoError::Conflict(
+            return Err(RepositoryError::Conflict(
                 "active profile revision changed".into(),
             ));
         }
@@ -1005,7 +1025,9 @@ impl AuthorizationProfileRepo for InMemoryStore {
             .profiles
             .contains_key(&(namespace.0.clone(), active_revision))
         {
-            return Err(RepoError::Backend("active profile head is dangling".into()));
+            return Err(RepositoryError::Backend(
+                "active profile head is dangling".into(),
+            ));
         }
         authz.active_profiles.remove(&namespace.0);
         let profile = authz
@@ -1016,7 +1038,10 @@ impl AuthorizationProfileRepo for InMemoryStore {
         Ok(profile.clone())
     }
 
-    fn active_profile(&self, namespace: &NamespaceId) -> RepoResult<Option<AuthorizationProfile>> {
+    fn active_profile(
+        &self,
+        namespace: &NamespaceId,
+    ) -> RepositoryResult<Option<AuthorizationProfile>> {
         let authz = self.authz.lock().unwrap();
         let Some(revision) = authz.active_profiles.get(&namespace.0) else {
             return Ok(None);
@@ -1025,12 +1050,12 @@ impl AuthorizationProfileRepo for InMemoryStore {
             .profiles
             .get(&(namespace.0.clone(), *revision))
             .cloned()
-            .ok_or_else(|| RepoError::Backend("active profile head is dangling".into()))?;
+            .ok_or_else(|| RepositoryError::Backend("active profile head is dangling".into()))?;
         profile.lifecycle = ProfileLifecycle::Active;
         Ok(Some(profile))
     }
 
-    fn active_profiles(&self) -> RepoResult<Vec<AuthorizationProfile>> {
+    fn active_profiles(&self) -> RepositoryResult<Vec<AuthorizationProfile>> {
         let authz = self.authz.lock().unwrap();
         authz
             .active_profiles
@@ -1040,7 +1065,9 @@ impl AuthorizationProfileRepo for InMemoryStore {
                     .profiles
                     .get(&(namespace.clone(), *revision))
                     .cloned()
-                    .ok_or_else(|| RepoError::Backend("active profile head is dangling".into()))?;
+                    .ok_or_else(|| {
+                        RepositoryError::Backend("active profile head is dangling".into())
+                    })?;
                 profile.lifecycle = ProfileLifecycle::Active;
                 Ok(profile)
             })
@@ -1048,8 +1075,8 @@ impl AuthorizationProfileRepo for InMemoryStore {
     }
 }
 
-impl PlanRepo for InMemoryStore {
-    fn put(&self, plan: Plan) -> RepoResult<()> {
+impl PlanRepository for InMemoryStore {
+    fn put(&self, plan: Plan) -> RepositoryResult<()> {
         self.entitlement
             .lock()
             .unwrap()
@@ -1058,11 +1085,11 @@ impl PlanRepo for InMemoryStore {
         Ok(())
     }
 
-    fn get(&self, id: &PlanId) -> RepoResult<Option<Plan>> {
+    fn get(&self, id: &PlanId) -> RepositoryResult<Option<Plan>> {
         Ok(self.entitlement.lock().unwrap().plans.get(&id.0).cloned())
     }
 
-    fn list(&self) -> RepoResult<Vec<Plan>> {
+    fn list(&self) -> RepositoryResult<Vec<Plan>> {
         Ok(self
             .entitlement
             .lock()
@@ -1073,7 +1100,7 @@ impl PlanRepo for InMemoryStore {
             .collect())
     }
 
-    fn subscribe(&self, principal: PrincipalRef, plan: PlanId) -> RepoResult<()> {
+    fn subscribe(&self, principal: PrincipalRef, plan: PlanId) -> RepositoryResult<()> {
         let key = json_key(&principal, "principal")?;
         self.entitlement
             .lock()
@@ -1083,7 +1110,7 @@ impl PlanRepo for InMemoryStore {
         Ok(())
     }
 
-    fn subscription(&self, principal: &PrincipalRef) -> RepoResult<Option<PlanId>> {
+    fn subscription(&self, principal: &PrincipalRef) -> RepositoryResult<Option<PlanId>> {
         let key = json_key(principal, "principal")?;
         Ok(self
             .entitlement
@@ -1096,28 +1123,28 @@ impl PlanRepo for InMemoryStore {
 }
 
 impl AuditSink for InMemoryStore {
-    fn record(&self, event: AuditEvent) -> RepoResult<()> {
+    fn record(&self, event: AuditEvent) -> RepositoryResult<()> {
         self.audit.lock().unwrap().push(event);
         Ok(())
     }
 
-    fn events(&self) -> RepoResult<Vec<AuditEvent>> {
+    fn events(&self) -> RepositoryResult<Vec<AuditEvent>> {
         Ok(self.audit.lock().unwrap().clone())
     }
 }
 
 impl FenceStore for InMemoryStore {
-    fn fence(&self) -> RepoResult<Fence> {
+    fn fence(&self) -> RepositoryResult<Fence> {
         Ok(*self.fence.lock().unwrap())
     }
 
-    fn advance_version(&self) -> RepoResult<u64> {
+    fn advance_version(&self) -> RepositoryResult<u64> {
         let mut fence = self.fence.lock().unwrap();
         fence.version += 1;
         Ok(fence.version)
     }
 
-    fn advance_epoch(&self) -> RepoResult<u64> {
+    fn advance_epoch(&self) -> RepositoryResult<u64> {
         let mut fence = self.fence.lock().unwrap();
         fence.epoch += 1;
         Ok(fence.epoch)
@@ -1170,13 +1197,13 @@ mod tests {
     fn accounts_round_trip() {
         let store = InMemoryStore::new();
         assert_eq!(
-            AccountRepo::get(&store, &AccountId("a".into())).unwrap(),
+            AccountRepository::get(&store, &AccountId("a".into())).unwrap(),
             None
         );
-        AccountRepo::upsert(&store, account("a")).unwrap();
-        assert_eq!(AccountRepo::list(&store).unwrap().len(), 1);
+        AccountRepository::upsert(&store, account("a")).unwrap();
+        assert_eq!(AccountRepository::list(&store).unwrap().len(), 1);
         assert_eq!(
-            AccountRepo::get(&store, &AccountId("a".into()))
+            AccountRepository::get(&store, &AccountId("a".into()))
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1189,7 +1216,7 @@ mod tests {
         let store = InMemoryStore::new();
         store.link(external("e1", "a", "sub")).unwrap();
         let dup = store.link(external("e2", "a", "sub"));
-        assert!(matches!(dup, Err(RepoError::Conflict(_))));
+        assert!(matches!(dup, Err(RepositoryError::Conflict(_))));
         let key = ExternalIdentityKey {
             provider_key: IdentityProviderKey("fake".into()),
             subject: ExternalSubject("sub".into()),
@@ -1217,18 +1244,18 @@ mod tests {
             expires_at: ts("2026-06-20T00:00:00Z"),
             revoked_at: None,
         };
-        SessionRepo::create(&store, session.clone()).unwrap();
+        SessionRepository::create(&store, session.clone()).unwrap();
         assert!(matches!(
-            SessionRepo::create(&store, session.clone()),
-            Err(RepoError::Conflict(_))
+            SessionRepository::create(&store, session.clone()),
+            Err(RepositoryError::Conflict(_))
         ));
         assert_eq!(store.get_by_token_hash("hash").unwrap().unwrap().id.0, "s1");
 
         let mut revoked = session;
         revoked.revoked_at = Some(ts("2026-06-19T01:00:00Z"));
-        SessionRepo::update(&store, revoked).unwrap();
+        SessionRepository::update(&store, revoked).unwrap();
         assert!(
-            SessionRepo::get(&store, &SessionId("s1".into()))
+            SessionRepository::get(&store, &SessionId("s1".into()))
                 .unwrap()
                 .unwrap()
                 .revoked_at
@@ -1251,13 +1278,16 @@ mod tests {
             consumed_at: None,
         };
         store.start(flow.clone()).unwrap();
-        assert!(matches!(store.start(flow), Err(RepoError::Conflict(_))));
+        assert!(matches!(
+            store.start(flow),
+            Err(RepositoryError::Conflict(_))
+        ));
         store
             .mark_consumed(&OAuthLoginStateId("l1".into()), ts("2026-06-19T00:05:00Z"))
             .unwrap();
         let reuse =
             store.mark_consumed(&OAuthLoginStateId("l1".into()), ts("2026-06-19T00:06:00Z"));
-        assert!(matches!(reuse, Err(RepoError::Conflict(_))));
+        assert!(matches!(reuse, Err(RepositoryError::Conflict(_))));
     }
 
     #[test]
@@ -1275,11 +1305,11 @@ mod tests {
             expires_at: None,
             revoked_at: None,
         };
-        ApiTokenRepo::create(&store, token.clone()).unwrap();
+        ApiTokenRepository::create(&store, token.clone()).unwrap();
         // Duplicate id and duplicate prefix both fail closed.
         assert!(matches!(
-            ApiTokenRepo::create(&store, token.clone()),
-            Err(RepoError::Conflict(_))
+            ApiTokenRepository::create(&store, token.clone()),
+            Err(RepositoryError::Conflict(_))
         ));
         assert_eq!(
             store
@@ -1294,7 +1324,7 @@ mod tests {
             service_id: "ci".into(),
         };
         assert_eq!(
-            ApiTokenRepo::list_for_principal(&store, &principal)
+            ApiTokenRepository::list_for_principal(&store, &principal)
                 .unwrap()
                 .len(),
             1
@@ -1302,9 +1332,9 @@ mod tests {
 
         let mut revoked = token;
         revoked.revoked_at = Some(ts("2026-06-19T01:00:00Z"));
-        ApiTokenRepo::update(&store, revoked).unwrap();
+        ApiTokenRepository::update(&store, revoked).unwrap();
         assert!(
-            ApiTokenRepo::get(&store, &ApiTokenId("tok_1".into()))
+            ApiTokenRepository::get(&store, &ApiTokenId("tok_1".into()))
                 .unwrap()
                 .unwrap()
                 .revoked_at
@@ -1324,17 +1354,17 @@ mod tests {
             scope: ScopeRef::Global,
             effect: Effect::Allow,
         };
-        GrantRepo::put(&store, grant).unwrap();
+        GrantRepository::put(&store, grant).unwrap();
         assert!(
-            GrantRepo::get(&store, &GrantId("g1".into()))
+            GrantRepository::get(&store, &GrantId("g1".into()))
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(GrantRepo::list(&store).unwrap().len(), 1);
-        GrantRepo::remove(&store, &GrantId("g1".into())).unwrap();
+        assert_eq!(GrantRepository::list(&store).unwrap().len(), 1);
+        GrantRepository::remove(&store, &GrantId("g1".into())).unwrap();
         assert!(matches!(
-            GrantRepo::remove(&store, &GrantId("g1".into())),
-            Err(RepoError::NotFound(_))
+            GrantRepository::remove(&store, &GrantId("g1".into())),
+            Err(RepositoryError::NotFound(_))
         ));
     }
 
@@ -1352,42 +1382,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            RoleBindingRepo::list_for_principal(&store, &principal)
+            RoleBindingRepository::list_for_principal(&store, &principal)
                 .unwrap()
                 .len(),
             1
         );
-        assert_eq!(RoleBindingRepo::list(&store).unwrap().len(), 1);
+        assert_eq!(RoleBindingRepository::list(&store).unwrap().len(), 1);
 
         let binding = RoleBinding {
             principal: principal.clone(),
             role: RoleId("admin".into()),
             scope: ScopeRef::Global,
         };
-        RoleBindingRepo::remove(&store, &binding).unwrap();
-        assert_eq!(RoleBindingRepo::list(&store).unwrap().len(), 0);
+        RoleBindingRepository::remove(&store, &binding).unwrap();
+        assert_eq!(RoleBindingRepository::list(&store).unwrap().len(), 0);
         assert!(matches!(
-            RoleBindingRepo::remove(&store, &binding),
-            Err(RepoError::NotFound(_))
+            RoleBindingRepository::remove(&store, &binding),
+            Err(RepositoryError::NotFound(_))
         ));
     }
 
     #[test]
     fn oauth_clients_upsert_get_list_and_remove() {
         let store = InMemoryStore::new();
-        assert_eq!(OAuthClientRepo::get(&store, "web").unwrap(), None);
+        assert_eq!(OAuthClientRepository::get(&store, "web").unwrap(), None);
 
         let public = RegisteredClient::public(
             "web",
             vec!["https://web.example/cb".into()],
             ["openid", "email"],
         );
-        OAuthClientRepo::upsert(&store, public.clone()).unwrap();
+        OAuthClientRepository::upsert(&store, public.clone()).unwrap();
         assert_eq!(
-            OAuthClientRepo::get(&store, "web").unwrap(),
+            OAuthClientRepository::get(&store, "web").unwrap(),
             Some(public.clone())
         );
-        assert_eq!(OAuthClientRepo::list(&store).unwrap().len(), 1);
+        assert_eq!(OAuthClientRepository::list(&store).unwrap().len(), 1);
 
         // Upsert replaces in place by client id (a rotation rewrites the secret).
         let confidential = RegisteredClient::confidential(
@@ -1396,19 +1426,19 @@ mod tests {
             vec!["https://web.example/cb".into()],
             ["openid", "email"],
         );
-        OAuthClientRepo::upsert(&store, confidential.clone()).unwrap();
+        OAuthClientRepository::upsert(&store, confidential.clone()).unwrap();
         assert_eq!(
-            OAuthClientRepo::get(&store, "web").unwrap(),
+            OAuthClientRepository::get(&store, "web").unwrap(),
             Some(confidential)
         );
-        assert_eq!(OAuthClientRepo::list(&store).unwrap().len(), 1);
+        assert_eq!(OAuthClientRepository::list(&store).unwrap().len(), 1);
 
-        OAuthClientRepo::remove(&store, "web").unwrap();
+        OAuthClientRepository::remove(&store, "web").unwrap();
         assert!(matches!(
-            OAuthClientRepo::remove(&store, "web"),
-            Err(RepoError::NotFound(_))
+            OAuthClientRepository::remove(&store, "web"),
+            Err(RepositoryError::NotFound(_))
         ));
-        assert!(OAuthClientRepo::list(&store).unwrap().is_empty());
+        assert!(OAuthClientRepository::list(&store).unwrap().is_empty());
     }
 
     #[test]
@@ -1423,16 +1453,16 @@ mod tests {
             created_at: ts("2026-06-21T00:00:00Z"),
             updated_at: ts("2026-06-21T00:00:00Z"),
         };
-        OrgRepo::upsert(&store, org.clone()).unwrap();
+        OrgRepository::upsert(&store, org.clone()).unwrap();
         assert_eq!(
-            OrgRepo::get(&store, &OrgId("acme".into())).unwrap(),
+            OrgRepository::get(&store, &OrgId("acme".into())).unwrap(),
             Some(org)
         );
-        assert_eq!(OrgRepo::list(&store).unwrap().len(), 1);
-        OrgRepo::remove(&store, &OrgId("acme".into())).unwrap();
+        assert_eq!(OrgRepository::list(&store).unwrap().len(), 1);
+        OrgRepository::remove(&store, &OrgId("acme".into())).unwrap();
         assert!(matches!(
-            OrgRepo::remove(&store, &OrgId("acme".into())),
-            Err(RepoError::NotFound(_))
+            OrgRepository::remove(&store, &OrgId("acme".into())),
+            Err(RepositoryError::NotFound(_))
         ));
 
         let group = Group {
@@ -1445,9 +1475,12 @@ mod tests {
             created_at: ts("2026-06-21T00:00:00Z"),
             updated_at: ts("2026-06-21T00:00:00Z"),
         };
-        GroupRepo::upsert(&store, group.clone()).unwrap();
-        assert_eq!(GroupRepo::get(&store, &group.id).unwrap(), Some(group));
-        assert_eq!(GroupRepo::list(&store).unwrap().len(), 1);
+        GroupRepository::upsert(&store, group.clone()).unwrap();
+        assert_eq!(
+            GroupRepository::get(&store, &group.id).unwrap(),
+            Some(group)
+        );
+        assert_eq!(GroupRepository::list(&store).unwrap().len(), 1);
 
         let role = RoleDef {
             id: RoleId("publisher".into()),
@@ -1456,20 +1489,20 @@ mod tests {
             created_at: ts("2026-06-21T00:00:00Z"),
             updated_at: ts("2026-06-21T00:00:00Z"),
         };
-        RoleRepo::upsert(&store, role.clone()).unwrap();
-        assert_eq!(RoleRepo::get(&store, &role.id).unwrap(), Some(role));
-        assert_eq!(RoleRepo::list(&store).unwrap().len(), 1);
-        RoleRepo::remove(&store, &RoleId("publisher".into())).unwrap();
+        RoleRepository::upsert(&store, role.clone()).unwrap();
+        assert_eq!(RoleRepository::get(&store, &role.id).unwrap(), Some(role));
+        assert_eq!(RoleRepository::list(&store).unwrap().len(), 1);
+        RoleRepository::remove(&store, &RoleId("publisher".into())).unwrap();
         assert!(matches!(
-            RoleRepo::remove(&store, &RoleId("publisher".into())),
-            Err(RepoError::NotFound(_))
+            RoleRepository::remove(&store, &RoleId("publisher".into())),
+            Err(RepositoryError::NotFound(_))
         ));
     }
 
     #[test]
     fn plans_and_subscriptions_resolve_by_principal() {
         let store = InMemoryStore::new();
-        PlanRepo::put(
+        PlanRepository::put(
             &store,
             Plan::new(PlanId("pro".into()), PlanTier::Pro, ["pack.read"]),
         )
@@ -1485,7 +1518,7 @@ mod tests {
             store.subscription(&principal).unwrap(),
             Some(PlanId("pro".into()))
         );
-        assert_eq!(PlanRepo::list(&store).unwrap().len(), 1);
+        assert_eq!(PlanRepository::list(&store).unwrap().len(), 1);
     }
 
     #[test]
@@ -1494,7 +1527,7 @@ mod tests {
         // Updating claims for an unlinked identity fails closed.
         assert!(matches!(
             store.update_claims(external("e1", "a", "sub")),
-            Err(RepoError::NotFound(_))
+            Err(RepositoryError::NotFound(_))
         ));
         store.link(external("e1", "a", "sub")).unwrap();
         let mut refreshed = external("e1", "a", "sub");
@@ -1531,11 +1564,11 @@ mod tests {
             revoked_at: None,
         };
         assert!(matches!(
-            SessionRepo::update(&store, session),
-            Err(RepoError::NotFound(_))
+            SessionRepository::update(&store, session),
+            Err(RepositoryError::NotFound(_))
         ));
         assert_eq!(
-            SessionRepo::get(&store, &SessionId("ghost".into())).unwrap(),
+            SessionRepository::get(&store, &SessionId("ghost".into())).unwrap(),
             None
         );
 
@@ -1553,7 +1586,7 @@ mod tests {
         };
         store.start(flow).unwrap();
         assert!(
-            LoginFlowRepo::get(&store, &OAuthLoginStateId("l1".into()))
+            LoginFlowRepository::get(&store, &OAuthLoginStateId("l1".into()))
                 .unwrap()
                 .is_some()
         );
@@ -1563,7 +1596,7 @@ mod tests {
                 &OAuthLoginStateId("absent".into()),
                 ts("2026-06-19T00:05:00Z")
             ),
-            Err(RepoError::NotFound(_))
+            Err(RepositoryError::NotFound(_))
         ));
     }
 
@@ -1582,20 +1615,20 @@ mod tests {
             expires_at: None,
             revoked_at: None,
         };
-        ApiTokenRepo::create(&store, base.clone()).unwrap();
+        ApiTokenRepository::create(&store, base.clone()).unwrap();
         // A distinct id that reuses an existing prefix is a conflict on its own.
         let mut clashing = base.clone();
         clashing.id = ApiTokenId("tok_2".into());
         assert!(matches!(
-            ApiTokenRepo::create(&store, clashing),
-            Err(RepoError::Conflict(_))
+            ApiTokenRepository::create(&store, clashing),
+            Err(RepositoryError::Conflict(_))
         ));
         // Updating a token id that does not exist fails closed.
         let mut ghost = base;
         ghost.id = ApiTokenId("ghost".into());
         assert!(matches!(
-            ApiTokenRepo::update(&store, ghost),
-            Err(RepoError::NotFound(_))
+            ApiTokenRepository::update(&store, ghost),
+            Err(RepositoryError::NotFound(_))
         ));
     }
 
@@ -1613,20 +1646,23 @@ mod tests {
             },
         };
         store.put_edge(edge).unwrap();
-        assert_eq!(ResourceModelRepo::list_edges(&store).unwrap().len(), 1);
+        assert_eq!(
+            ResourceModelRepository::list_edges(&store).unwrap().len(),
+            1
+        );
 
-        PlanRepo::put(
+        PlanRepository::put(
             &store,
             Plan::new(PlanId("pro".into()), PlanTier::Pro, ["pack.read"]),
         )
         .unwrap();
         assert!(
-            PlanRepo::get(&store, &PlanId("pro".into()))
+            PlanRepository::get(&store, &PlanId("pro".into()))
                 .unwrap()
                 .is_some()
         );
         assert_eq!(
-            PlanRepo::get(&store, &PlanId("absent".into())).unwrap(),
+            PlanRepository::get(&store, &PlanId("absent".into())).unwrap(),
             None
         );
     }
@@ -1644,7 +1680,7 @@ mod tests {
             account_id: AccountId("owner".into()),
         };
         for id in ["org-a", "org-b"] {
-            OrgRepo::upsert(
+            OrgRepository::upsert(
                 &store,
                 Organization {
                     id: OrgId(id.into()),
@@ -1659,7 +1695,7 @@ mod tests {
         for suffix in ["a", "b"] {
             let org_id = OrgId(format!("org-{suffix}"));
             let node_id = DirectoryNodeId(format!("node-{suffix}"));
-            DirectoryRepo::create_directory_node(
+            DirectoryRepository::create_directory_node(
                 &store,
                 DirectoryNode {
                     id: node_id.clone(),
@@ -1672,7 +1708,7 @@ mod tests {
                     created_at: ts("2026-06-19T00:00:00Z"),
                     updated_at: ts("2026-06-19T00:00:00Z"),
                 },
-                Some(ProductSpaceBinding {
+                Some(ProductSpacePlacement {
                     product_space: ProductSpaceRef {
                         product: "agents".into(),
                         space_id: format!("space-{suffix}"),
@@ -1680,10 +1716,11 @@ mod tests {
                     org_id,
                     node_id,
                 }),
+                &owner,
             )
             .unwrap();
         }
-        GroupRepo::upsert(
+        GroupRepository::upsert(
             &store,
             Group {
                 id: GroupId("group-a".into()),
@@ -1696,7 +1733,7 @@ mod tests {
         )
         .unwrap();
         for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
-            ResourceModelRepo::put_workspace_org(
+            ResourceModelRepository::put_workspace_org(
                 &store,
                 WorkspaceOrgEdge {
                     workspace_id: WorkspaceId(workspace.into()),
@@ -1713,8 +1750,8 @@ mod tests {
                 project_id: awaken_iam_contract::ProjectId("project-a".into()),
             },
         };
-        ResourceModelRepo::put_edge(&store, owned_resource.clone()).unwrap();
-        GrantRepo::put(
+        ResourceModelRepository::put_edge(&store, owned_resource.clone()).unwrap();
+        GrantRepository::put(
             &store,
             Grant {
                 id: GrantId("owned-grant".into()),
@@ -1728,7 +1765,7 @@ mod tests {
             },
         )
         .unwrap();
-        RoleBindingRepo::add(
+        RoleBindingRepository::add(
             &store,
             RoleBinding {
                 principal: owner.clone(),
@@ -1740,7 +1777,7 @@ mod tests {
         )
         .unwrap();
         for (id, workspace) in [("token-a", "ws-a"), ("token-b", "ws-b")] {
-            ApiTokenRepo::create(
+            ApiTokenRepository::create(
                 &store,
                 ApiToken {
                     id: ApiTokenId(id.into()),
@@ -1759,22 +1796,22 @@ mod tests {
         assert!(store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
         assert!(!store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
         assert!(
-            OrgRepo::get(&store, &OrgId("org-a".into()))
+            OrgRepository::get(&store, &OrgId("org-a".into()))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            OrgRepo::get(&store, &OrgId("org-b".into()))
+            OrgRepository::get(&store, &OrgId("org-b".into()))
                 .unwrap()
                 .is_some()
         );
         assert!(
-            DirectoryRepo::directory_node(&store, &DirectoryNodeId("node-a".into()))
+            DirectoryRepository::directory_node(&store, &DirectoryNodeId("node-a".into()))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            DirectoryRepo::product_space_binding(
+            DirectoryRepository::product_space_binding(
                 &store,
                 &ProductSpaceRef {
                     product: "agents".into(),
@@ -1784,17 +1821,21 @@ mod tests {
             .unwrap()
             .is_some()
         );
-        assert!(GroupRepo::list(&store).unwrap().is_empty());
-        assert!(GrantRepo::list(&store).unwrap().is_empty());
-        assert!(RoleBindingRepo::list(&store).unwrap().is_empty());
-        assert!(ResourceModelRepo::list_edges(&store).unwrap().is_empty());
+        assert!(GroupRepository::list(&store).unwrap().is_empty());
+        assert!(GrantRepository::list(&store).unwrap().is_empty());
+        assert!(RoleBindingRepository::list(&store).unwrap().is_empty());
         assert!(
-            ApiTokenRepo::get(&store, &ApiTokenId("token-a".into()))
+            ResourceModelRepository::list_edges(&store)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ApiTokenRepository::get(&store, &ApiTokenId("token-a".into()))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            ApiTokenRepo::get(&store, &ApiTokenId("token-b".into()))
+            ApiTokenRepository::get(&store, &ApiTokenId("token-b".into()))
                 .unwrap()
                 .is_some()
         );
@@ -1829,10 +1870,10 @@ mod tests {
     fn clones_share_one_authoritative_store() {
         let writer = InMemoryStore::new();
         let reader = writer.clone();
-        AccountRepo::upsert(&writer, account("shared")).unwrap();
+        AccountRepository::upsert(&writer, account("shared")).unwrap();
 
         assert!(
-            AccountRepo::get(&reader, &AccountId("shared".into()))
+            AccountRepository::get(&reader, &AccountId("shared".into()))
                 .unwrap()
                 .is_some()
         );

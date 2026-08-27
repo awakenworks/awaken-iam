@@ -8,7 +8,7 @@
 //! round-trip through the real `Grant`/`ResourceEdge` aggregates without
 //! dropping a field.
 //!
-//! These tests use real `GrantRepo` / `ResourceModelRepo` ports from
+//! These tests use real `GrantRepository` / `ResourceModelRepository` repository contracts from
 //! `awaken_iam_core` (not mocks) so any divergence between the wire shape
 //! and the core aggregate is caught here.
 
@@ -16,11 +16,11 @@ use awaken_iam_contract::{
     AccountId, GrantEffect, GrantSubjectRef, PrincipalRef, ResourceId, ResourceParentEdge,
     ResourceProvision, ResourceType, ScopeRef,
 };
-use awaken_iam_core::{GrantRepo, ResourceModelRepo, apply_resource_provision};
+use awaken_iam_core::{GrantRepository, ResourceModelRepository, apply_resource_provision};
 use std::sync::Mutex;
 
-/// A real `GrantRepo` and `ResourceModelRepo` backed by in-memory vectors.
-/// Implements both ports so the provision can be applied through the same
+/// A real `GrantRepository` and `ResourceModelRepository` backed by in-memory vectors.
+/// Implements both repository contracts so the provision can be applied through the same
 /// seam the SqlStore / InMemoryStore adapters expose in production.
 #[derive(Default)]
 struct FakePort {
@@ -28,8 +28,8 @@ struct FakePort {
     edges: Mutex<Vec<awaken_iam_core::ResourceEdge>>,
 }
 
-impl awaken_iam_core::GrantRepo for FakePort {
-    fn put(&self, grant: awaken_iam_core::Grant) -> awaken_iam_core::RepoResult<()> {
+impl awaken_iam_core::GrantRepository for FakePort {
+    fn put(&self, grant: awaken_iam_core::Grant) -> awaken_iam_core::RepositoryResult<()> {
         let mut grants = self.grants.lock().unwrap();
         if let Some(existing) = grants.iter_mut().find(|g| g.id == grant.id) {
             *existing = grant;
@@ -41,7 +41,7 @@ impl awaken_iam_core::GrantRepo for FakePort {
     fn get(
         &self,
         id: &awaken_iam_core::GrantId,
-    ) -> awaken_iam_core::RepoResult<Option<awaken_iam_core::Grant>> {
+    ) -> awaken_iam_core::RepositoryResult<Option<awaken_iam_core::Grant>> {
         Ok(self
             .grants
             .lock()
@@ -50,15 +50,15 @@ impl awaken_iam_core::GrantRepo for FakePort {
             .find(|g| &g.id == id)
             .cloned())
     }
-    fn list(&self) -> awaken_iam_core::RepoResult<Vec<awaken_iam_core::Grant>> {
+    fn list(&self) -> awaken_iam_core::RepositoryResult<Vec<awaken_iam_core::Grant>> {
         Ok(self.grants.lock().unwrap().clone())
     }
-    fn remove(&self, id: &awaken_iam_core::GrantId) -> awaken_iam_core::RepoResult<()> {
+    fn remove(&self, id: &awaken_iam_core::GrantId) -> awaken_iam_core::RepositoryResult<()> {
         let mut grants = self.grants.lock().unwrap();
         let before = grants.len();
         grants.retain(|g| &g.id != id);
         if grants.len() == before {
-            return Err(awaken_iam_core::RepoError::NotFound(format!(
+            return Err(awaken_iam_core::RepositoryError::NotFound(format!(
                 "grant {}",
                 id.0
             )));
@@ -67,8 +67,11 @@ impl awaken_iam_core::GrantRepo for FakePort {
     }
 }
 
-impl awaken_iam_core::ResourceModelRepo for FakePort {
-    fn put_edge(&self, edge: awaken_iam_core::ResourceEdge) -> awaken_iam_core::RepoResult<()> {
+impl awaken_iam_core::ResourceModelRepository for FakePort {
+    fn put_edge(
+        &self,
+        edge: awaken_iam_core::ResourceEdge,
+    ) -> awaken_iam_core::RepositoryResult<()> {
         let mut edges = self.edges.lock().unwrap();
         if let Some(existing) = edges
             .iter_mut()
@@ -80,7 +83,7 @@ impl awaken_iam_core::ResourceModelRepo for FakePort {
         }
         Ok(())
     }
-    fn list_edges(&self) -> awaken_iam_core::RepoResult<Vec<awaken_iam_core::ResourceEdge>> {
+    fn list_edges(&self) -> awaken_iam_core::RepositoryResult<Vec<awaken_iam_core::ResourceEdge>> {
         Ok(self.edges.lock().unwrap().clone())
     }
 }
@@ -232,8 +235,8 @@ fn provision_writes_edges_before_grants_so_evaluation_resolves_immediately() {
         grants: StdMutex<Vec<awaken_iam_core::Grant>>,
         edges: StdMutex<Vec<awaken_iam_core::ResourceEdge>>,
     }
-    impl awaken_iam_core::GrantRepo for OrderedPort {
-        fn put(&self, g: awaken_iam_core::Grant) -> awaken_iam_core::RepoResult<()> {
+    impl awaken_iam_core::GrantRepository for OrderedPort {
+        fn put(&self, g: awaken_iam_core::Grant) -> awaken_iam_core::RepositoryResult<()> {
             self.order.lock().unwrap().push("grant");
             self.grants.lock().unwrap().push(g);
             Ok(())
@@ -241,23 +244,28 @@ fn provision_writes_edges_before_grants_so_evaluation_resolves_immediately() {
         fn get(
             &self,
             _: &awaken_iam_core::GrantId,
-        ) -> awaken_iam_core::RepoResult<Option<awaken_iam_core::Grant>> {
+        ) -> awaken_iam_core::RepositoryResult<Option<awaken_iam_core::Grant>> {
             Ok(None)
         }
-        fn list(&self) -> awaken_iam_core::RepoResult<Vec<awaken_iam_core::Grant>> {
+        fn list(&self) -> awaken_iam_core::RepositoryResult<Vec<awaken_iam_core::Grant>> {
             Ok(self.grants.lock().unwrap().clone())
         }
-        fn remove(&self, _: &awaken_iam_core::GrantId) -> awaken_iam_core::RepoResult<()> {
+        fn remove(&self, _: &awaken_iam_core::GrantId) -> awaken_iam_core::RepositoryResult<()> {
             Ok(())
         }
     }
-    impl awaken_iam_core::ResourceModelRepo for OrderedPort {
-        fn put_edge(&self, e: awaken_iam_core::ResourceEdge) -> awaken_iam_core::RepoResult<()> {
+    impl awaken_iam_core::ResourceModelRepository for OrderedPort {
+        fn put_edge(
+            &self,
+            e: awaken_iam_core::ResourceEdge,
+        ) -> awaken_iam_core::RepositoryResult<()> {
             self.order.lock().unwrap().push("edge");
             self.edges.lock().unwrap().push(e);
             Ok(())
         }
-        fn list_edges(&self) -> awaken_iam_core::RepoResult<Vec<awaken_iam_core::ResourceEdge>> {
+        fn list_edges(
+            &self,
+        ) -> awaken_iam_core::RepositoryResult<Vec<awaken_iam_core::ResourceEdge>> {
             Ok(self.edges.lock().unwrap().clone())
         }
     }

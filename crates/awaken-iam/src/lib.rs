@@ -12,13 +12,13 @@ pub use awaken_iam_client::{
 pub use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ActionKey, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    CreateDirectoryNode, DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeDto,
-    DirectoryNodeId, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    CreateDirectoryNode, DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeId,
+    DirectoryNodeView, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
     ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey,
     ExternalSubject, GrantEffect, GrantSnapshot, GrantSubjectRef, IdentityProviderConfig,
     IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind, MoveDirectoryNode,
     NamespaceId, NamespaceOwner, OAuthLoginState, OAuthLoginStateId, OrgId, PolicySnapshot,
-    PrincipalRef, ProductSpaceBinding, ProductSpaceRef, ProjectId, RefreshToken,
+    PrincipalRef, ProductSpacePlacement, ProductSpaceRef, ProjectId, RefreshToken,
     RefreshTokenChainId, RefreshTokenId, RefreshTokenView, ResourceId, ResourceModelRegistered,
     ResourceModelRegistration, ResourceParentEdge, ResourceProvision, ResourceType,
     ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot, ScopeRef, Session,
@@ -27,7 +27,7 @@ pub use awaken_iam_contract::{
 };
 pub use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditLedger, AuditSink, AuthorizedGrant, BeginLogin,
-    ConsumerNamespaces, DecisionTrace, DirectoryInvariant, DirectoryNode, DirectoryRepo,
+    ConsumerNamespaces, DecisionTrace, DirectoryInvariant, DirectoryNode, DirectoryRepository,
     DomainEvent, Effect, EntitlementCatalog, EntitlementEngine, EntitlementMode,
     EntitlementOutcome, EntitlementProvider, EntitlementReason, EntitlementResolver, EntropySource,
     EstablishSession, GenericOAuthProvider, GenericOAuthSecrets, Grant, GrantId, GrantSubject,
@@ -36,10 +36,10 @@ pub use awaken_iam_core::{
     NamespaceTrustDirectory, OAuthAuthorizationRequest, OAuthAuthorizationServer,
     OAuthChallengeService, OAuthClientRegistry, OAuthProviderError, OsEntropy, PkceChallenge,
     PkceMethod, Plan, PlanId, PlanTier, PolicySet, Quota, RateLimit, RateWindow, RegisteredClient,
-    RepoError, RepoResult, ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding, RoleDef,
-    RoleId, SessionDirectory, SessionMinter, ShadowAuthorizer, ShadowOutcome, ShadowReport,
-    TokenRedemption, TrustError, action_namespace, apply_resource_provision, hash_session_token,
-    seed_roles,
+    RepositoryError, RepositoryResult, ResourceEdge, ResourceModel, ResourceTypeDef, RoleBinding,
+    RoleDef, RoleId, SessionDirectory, SessionMinter, ShadowAuthorizer, ShadowOutcome,
+    ShadowReport, TokenRedemption, TrustError, action_namespace, apply_resource_provision,
+    hash_session_token, seed_roles,
 };
 pub use awaken_iam_preset::{
     ANTHROPIC_ROLE_IDS, AWAKEN_RUNTIME_NAMESPACES, AWAKEN_RUNTIME_ROLE_IDS,

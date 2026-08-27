@@ -40,7 +40,7 @@ pub struct ProductSpaceRef {
 
 /// Public projection of one arbitrary-depth directory node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectoryNodeDto {
+pub struct DirectoryNodeView {
     pub id: DirectoryNodeId,
     /// Immutable security, billing, and data-partition root.
     pub org_id: OrgId,
@@ -59,19 +59,44 @@ pub struct DirectoryNodeDto {
 
 /// Placement of a stable product space in the user-visible directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProductSpaceBinding {
+pub struct ProductSpacePlacement {
     pub product_space: ProductSpaceRef,
     /// Immutable tenant partition of the product space and target node.
     pub org_id: OrgId,
     pub node_id: DirectoryNodeId,
 }
 
-/// Atomic create command for a node and its optional product-space placement.
+/// Create one user-managed folder in an organization's Directory.
+///
+/// Product-owned spaces use [`EnsureProductSpacePlacement`] instead. Keeping
+/// those commands separate leaves IAM as the only authority that derives a
+/// product node id, canonical slug, timestamps, active state, and audit data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDirectoryNode {
-    pub node: DirectoryNodeDto,
+    pub org_id: OrgId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<ProductSpaceBinding>,
+    pub parent_id: Option<DirectoryNodeId>,
+    pub name: String,
+    pub preferred_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Idempotently place one product-owned space in the user-visible Directory.
+///
+/// The optional parent is another stable product-space identity rather than a
+/// Directory node id. This preserves the product relationship without giving
+/// a product authority over IAM-generated node identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnsureProductSpacePlacement {
+    pub product_space: ProductSpaceRef,
+    pub org_id: OrgId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_product_space: Option<ProductSpaceRef>,
+    pub name: String,
+    pub preferred_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Move one directory node without changing product-space or authorization ids.
@@ -79,7 +104,6 @@ pub struct CreateDirectoryNode {
 pub struct MoveDirectoryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<DirectoryNodeId>,
-    pub updated_at: Timestamp,
 }
 
 /// Replace user-visible metadata without changing placement or product identity.
@@ -89,7 +113,6 @@ pub struct UpdateDirectoryNode {
     pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub updated_at: Timestamp,
 }
 
 /// Query the direct children of one directory parent in an organization.
@@ -104,6 +127,24 @@ pub struct DirectoryChildrenQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryMutationAck {
     pub revision: u64,
+}
+
+/// Result of creating one user-managed Directory folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryNodeMutationResult {
+    pub revision: u64,
+    pub node: DirectoryNodeView,
+}
+
+/// Result of the canonical product-space placement command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductSpacePlacementResult {
+    pub revision: u64,
+    pub node: DirectoryNodeView,
+    pub placement: ProductSpacePlacement,
+    /// `true` only when this command created the node and placement. Exact
+    /// retries return the existing user-managed presentation unchanged.
+    pub created: bool,
 }
 
 /// Stable identifier of an organization invitation.
@@ -131,7 +172,7 @@ pub struct InvitationBinding {
 /// Public projection of IAM's invitation aggregate. The token hash is never
 /// exposed; a clear token appears only in create/resend responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvitationDto {
+pub struct InvitationView {
     pub id: InvitationId,
     pub org_id: OrgId,
     pub email: String,
@@ -159,7 +200,7 @@ pub struct CreateInvitation {
 /// Invitation plus the one-time token a delivery adapter must send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedInvitation {
-    pub invitation: InvitationDto,
+    pub invitation: InvitationView,
     pub token: String,
     pub version: u64,
 }
@@ -189,7 +230,7 @@ pub struct AcceptInvitation {
 /// Successful acceptance response and the PDP visibility fence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedInvitation {
-    pub invitation: InvitationDto,
+    pub invitation: InvitationView,
     pub version: u64,
 }
 
@@ -224,7 +265,7 @@ pub struct ReplaceScopedMemberships {
 
 /// Wire shape of an organization administered through `/v1/admin/orgs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrgDto {
+pub struct OrgView {
     /// Stable organization id, also usable as an org scope anchor.
     pub id: OrgId,
     /// Optional human-readable name.
@@ -240,7 +281,7 @@ pub struct OrgDto {
 
 /// Wire shape of a group administered through `/v1/admin/groups`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupDto {
+pub struct GroupView {
     /// Stable group id (a core id, carried as a string).
     pub id: String,
     /// Organization the group belongs to.
@@ -259,7 +300,7 @@ pub struct GroupDto {
 
 /// Wire shape of a role definition administered through `/v1/admin/roles`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleDto {
+pub struct RoleView {
     /// Stable role id (a core id, carried as a string).
     pub id: String,
     /// Optional human-readable name.
@@ -298,22 +339,22 @@ mod tests {
     }
 
     #[test]
-    fn org_dto_round_trips_and_omits_absent_name() {
-        let dto = OrgDto {
+    fn org_view_round_trips_and_omits_absent_name() {
+        let view = OrgView {
             id: OrgId("acme".into()),
             display_name: None,
             owner: account("ada"),
             created_at: Timestamp("2026-06-21T00:00:00Z".into()),
             updated_at: Timestamp("2026-06-21T00:00:00Z".into()),
         };
-        let json = serde_json::to_string(&dto).unwrap();
+        let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("display_name"));
-        assert_eq!(serde_json::from_str::<OrgDto>(&json).unwrap(), dto);
+        assert_eq!(serde_json::from_str::<OrgView>(&json).unwrap(), view);
     }
 
     #[test]
-    fn group_and_role_dtos_round_trip() {
-        let group = GroupDto {
+    fn group_and_role_views_round_trip() {
+        let group = GroupView {
             id: "eng".into(),
             org: OrgId("acme".into()),
             display_name: Some("Engineering".into()),
@@ -322,9 +363,9 @@ mod tests {
             updated_at: Timestamp("2026-06-21T00:00:00Z".into()),
         };
         let json = serde_json::to_string(&group).unwrap();
-        assert_eq!(serde_json::from_str::<GroupDto>(&json).unwrap(), group);
+        assert_eq!(serde_json::from_str::<GroupView>(&json).unwrap(), group);
 
-        let role = RoleDto {
+        let role = RoleView {
             id: "publisher".into(),
             display_name: None,
             action_patterns: vec!["pack.*".into()],
@@ -332,12 +373,12 @@ mod tests {
             updated_at: Timestamp("2026-06-21T00:00:00Z".into()),
         };
         let json = serde_json::to_string(&role).unwrap();
-        assert_eq!(serde_json::from_str::<RoleDto>(&json).unwrap(), role);
+        assert_eq!(serde_json::from_str::<RoleView>(&json).unwrap(), role);
     }
 
     #[test]
-    fn group_dto_defaults_empty_members() {
-        let parsed: GroupDto =
+    fn group_view_defaults_empty_members() {
+        let parsed: GroupView =
             serde_json::from_str(r#"{"id":"eng","org":"acme","created_at":"t","updated_at":"t"}"#)
                 .unwrap();
         assert!(parsed.members.is_empty());
@@ -355,36 +396,26 @@ mod tests {
 
     #[test]
     fn directory_wire_shape_keeps_placement_separate_from_product_identity() {
-        // Causes/effects: C1 optional parent/description/binding omitted -> E1
-        // backward-friendly defaults; C2 open product namespace supplied -> E2
-        // round-trip without a fixed product enum; C3 move omits parent -> E3
-        // represent a move to the directory root. Rules W1-W3 pin the public
-        // shape consumed identically by embedded and HTTP adapters.
+        // Cause/effect decision table: C1 optional parent/description omitted
+        // -> E1 root placement with no description; C2 open product namespace
+        // -> E2 lossless round-trip without an enum; C3 move omits parent -> E3
+        // move to root. W1-W3 pin the shared embedded/HTTP published language.
         let json = r#"{
-          "node": {
-            "id":"node-a", "org_id":"acme", "name":"Team", "slug":"team",
-            "created_at":"t0", "updated_at":"t0"
-          },
-          "binding": {
-            "product_space":{"product":"future-product","space_id":"space-a"},
-            "org_id":"acme", "node_id":"node-a"
-          }
+          "product_space":{"product":"future-product","space_id":"space-a"},
+          "org_id":"acme", "name":"Team", "preferred_slug":"Team"
         }"#;
-        let command: CreateDirectoryNode = serde_json::from_str(json).unwrap();
-        assert!(command.node.parent_id.is_none());
-        assert!(command.node.description.is_none());
-        assert!(!command.node.archived);
+        let command: EnsureProductSpacePlacement = serde_json::from_str(json).unwrap();
+        assert!(command.parent_product_space.is_none());
+        assert!(command.description.is_none());
+        assert_eq!(command.product_space.product, "future-product");
         assert_eq!(
-            command.binding.as_ref().unwrap().product_space.product,
-            "future-product"
-        );
-        assert_eq!(
-            serde_json::from_str::<CreateDirectoryNode>(&serde_json::to_string(&command).unwrap())
-                .unwrap(),
+            serde_json::from_str::<EnsureProductSpacePlacement>(
+                &serde_json::to_string(&command).unwrap()
+            )
+            .unwrap(),
             command
         );
-        let move_to_root: MoveDirectoryNode =
-            serde_json::from_str(r#"{"updated_at":"t1"}"#).unwrap();
+        let move_to_root: MoveDirectoryNode = serde_json::from_str("{}").unwrap();
         assert!(move_to_root.parent_id.is_none());
     }
 }

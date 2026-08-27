@@ -40,7 +40,9 @@
 
 use awaken_iam_contract::Timestamp;
 
-use awaken_iam_core::{ActionPattern, RepoResult, RoleDef, RoleId, RoleRepo, seed_roles};
+use awaken_iam_core::{
+    ActionPattern, RepositoryResult, RoleDef, RoleId, RoleRepository, seed_roles,
+};
 
 /// The two awaken-runtime preset role ids — seeded by [`seed_runtime_roles`]
 /// during awaken-1.0.0-dev startup provisioning.
@@ -191,7 +193,7 @@ const SEED_ROLES: &[SeedRole] = &[
 /// Build the seeded named role catalog, stamping every role with `now`.
 ///
 /// The result is pure data — ordered as [`ANTHROPIC_ROLE_IDS`] — that a
-/// deployment loads into its [`RoleRepo`] (see [`seed_named_roles`]). Every role
+/// deployment loads into its [`RoleRepository`] (see [`seed_named_roles`]). Every role
 /// satisfies [`RoleDef::validate`](awaken_iam_core::RoleDef): each carries at
 /// least one pattern and none carries the catch-all `*`.
 pub fn named_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
@@ -218,7 +220,7 @@ pub fn named_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
 /// deployment adds under other ids are untouched. The upsert loop itself is the
 /// kernel's product-neutral [`seed_roles`] mechanism; this function only chooses
 /// the Anthropic catalog as its policy input.
-pub fn seed_named_roles(repo: &dyn RoleRepo, now: &Timestamp) -> RepoResult<()> {
+pub fn seed_named_roles(repo: &dyn RoleRepository, now: &Timestamp) -> RepositoryResult<()> {
     seed_roles(repo, named_role_catalog(now))
 }
 
@@ -245,7 +247,7 @@ const RUNTIME_SEED_ROLES: &[SeedRole] = &[
 /// Build the awaken-runtime preset role catalog, stamping every role with `now`.
 ///
 /// The result is pure data — ordered as [`AWAKEN_RUNTIME_ROLE_IDS`] — that
-/// awaken-1.0.0-dev startup provisioning loads into its [`RoleRepo`] (see
+/// awaken-1.0.0-dev startup provisioning loads into its [`RoleRepository`] (see
 /// [`seed_runtime_roles`]). Every role satisfies [`RoleDef::validate`].
 pub fn runtime_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
     RUNTIME_SEED_ROLES
@@ -271,7 +273,7 @@ pub fn runtime_role_catalog(now: &Timestamp) -> Vec<RoleDef> {
 /// Custom roles a deployment adds under other ids are untouched. The upsert loop
 /// itself is the kernel's product-neutral [`seed_roles`] mechanism; this function
 /// only chooses the runtime catalog as its policy input.
-pub fn seed_runtime_roles(repo: &dyn RoleRepo, now: &Timestamp) -> RepoResult<()> {
+pub fn seed_runtime_roles(repo: &dyn RoleRepository, now: &Timestamp) -> RepositoryResult<()> {
     seed_roles(repo, runtime_role_catalog(now))
 }
 
@@ -443,18 +445,18 @@ mod tests {
 
         #[derive(Default)]
         struct MemRoles(Mutex<BTreeMap<String, RoleDef>>);
-        impl RoleRepo for MemRoles {
-            fn get(&self, id: &Id) -> RepoResult<Option<RoleDef>> {
+        impl RoleRepository for MemRoles {
+            fn get(&self, id: &Id) -> RepositoryResult<Option<RoleDef>> {
                 Ok(self.0.lock().unwrap().get(&id.0).cloned())
             }
-            fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+            fn upsert(&self, role: RoleDef) -> RepositoryResult<()> {
                 self.0.lock().unwrap().insert(role.id.0.clone(), role);
                 Ok(())
             }
-            fn list(&self) -> RepoResult<Vec<RoleDef>> {
+            fn list(&self) -> RepositoryResult<Vec<RoleDef>> {
                 Ok(self.0.lock().unwrap().values().cloned().collect())
             }
-            fn remove(&self, id: &Id) -> RepoResult<()> {
+            fn remove(&self, id: &Id) -> RepositoryResult<()> {
                 self.0.lock().unwrap().remove(&id.0);
                 Ok(())
             }
@@ -474,24 +476,24 @@ mod tests {
 
     #[test]
     fn seeding_a_repo_is_idempotent_and_loads_every_role() {
-        // A minimal in-memory RoleRepo to exercise the loader without the server.
+        // A minimal in-memory RoleRepository to exercise the loader without the server.
         use std::collections::BTreeMap;
         use std::sync::Mutex;
 
         #[derive(Default)]
         struct MemRoles(Mutex<BTreeMap<String, RoleDef>>);
-        impl RoleRepo for MemRoles {
-            fn get(&self, id: &RoleId) -> RepoResult<Option<RoleDef>> {
+        impl RoleRepository for MemRoles {
+            fn get(&self, id: &RoleId) -> RepositoryResult<Option<RoleDef>> {
                 Ok(self.0.lock().unwrap().get(&id.0).cloned())
             }
-            fn upsert(&self, role: RoleDef) -> RepoResult<()> {
+            fn upsert(&self, role: RoleDef) -> RepositoryResult<()> {
                 self.0.lock().unwrap().insert(role.id.0.clone(), role);
                 Ok(())
             }
-            fn list(&self) -> RepoResult<Vec<RoleDef>> {
+            fn list(&self) -> RepositoryResult<Vec<RoleDef>> {
                 Ok(self.0.lock().unwrap().values().cloned().collect())
             }
-            fn remove(&self, id: &RoleId) -> RepoResult<()> {
+            fn remove(&self, id: &RoleId) -> RepositoryResult<()> {
                 self.0.lock().unwrap().remove(&id.0);
                 Ok(())
             }

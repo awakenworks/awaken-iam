@@ -8,7 +8,7 @@
 //! and the browser; they are never stored.
 //!
 //! On callback the service consumes the challenge exactly once through the
-//! authoritative [`LoginFlowRepo`] and verifies the presented
+//! authoritative [`LoginFlowRepository`] and verifies the presented
 //! values against the stored hashes in constant time. Any mismatch, expiry, or
 //! replay fails closed, and the challenge is burned regardless of the outcome so
 //! a failed attempt cannot be retried.
@@ -20,7 +20,7 @@ use subtle::ConstantTimeEq;
 
 use awaken_iam_contract::{IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, Timestamp};
 
-use crate::{IamError, LoginBinding, LoginFlowRepo, RepoError};
+use crate::{IamError, LoginBinding, LoginFlowRepository, RepositoryError};
 
 /// Number of random bytes drawn for each minted login secret (256 bits).
 const SECRET_BYTES: usize = 32;
@@ -140,7 +140,7 @@ impl<E: EntropySource> OAuthChallengeService<E> {
     /// forward-going, or [`IamError::DuplicateLoginState`] when the id is reused.
     pub fn begin_login(
         &mut self,
-        repository: &dyn LoginFlowRepo,
+        repository: &dyn LoginFlowRepository,
         request: BeginLogin,
     ) -> Result<IssuedLogin, IamError> {
         if request.expires_at.0 <= request.created_at.0 {
@@ -178,10 +178,10 @@ impl<E: EntropySource> OAuthChallengeService<E> {
         repository
             .start(login_state.clone())
             .map_err(|error| match error {
-                RepoError::Conflict(_) => IamError::DuplicateLoginState {
+                RepositoryError::Conflict(_) => IamError::DuplicateLoginState {
                     id: login_state.id.clone(),
                 },
-                RepoError::NotFound(_) | RepoError::Backend(_) => {
+                RepositoryError::NotFound(_) | RepositoryError::Backend(_) => {
                     IamError::LoginFlowStorageUnavailable
                 }
             })?;
@@ -200,14 +200,14 @@ impl<E: EntropySource> OAuthChallengeService<E> {
     /// Consume a login challenge and verify the presented bindings.
     ///
     /// The challenge is consumed first — so expiry, replay, and unknown-id all
-    /// fail closed through [`LoginFlowRepo`] and a single
+    /// fail closed through [`LoginFlowRepository`] and a single
     /// attempt is burned even when a binding later mismatches. Then `state`,
     /// `nonce`, and the PKCE verifier are each verified in constant time against
     /// the stored hashes, including presence parity. Returns the consumed
     /// challenge on success.
     pub fn complete_login(
         &self,
-        repository: &dyn LoginFlowRepo,
+        repository: &dyn LoginFlowRepository,
         attempt: &LoginAttempt,
         now: Timestamp,
     ) -> Result<OAuthLoginState, IamError> {
@@ -230,13 +230,13 @@ impl<E: EntropySource> OAuthChallengeService<E> {
         repository
             .mark_consumed(&attempt.id, now.clone())
             .map_err(|error| match error {
-                RepoError::Conflict(_) => IamError::LoginStateAlreadyConsumed {
+                RepositoryError::Conflict(_) => IamError::LoginStateAlreadyConsumed {
                     id: attempt.id.clone(),
                 },
-                RepoError::NotFound(_) => IamError::LoginStateNotFound {
+                RepositoryError::NotFound(_) => IamError::LoginStateNotFound {
                     id: attempt.id.clone(),
                 },
-                RepoError::Backend(_) => IamError::LoginFlowStorageUnavailable,
+                RepositoryError::Backend(_) => IamError::LoginFlowStorageUnavailable,
             })?;
         consumed.consumed_at = Some(now);
 
@@ -309,29 +309,33 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct TestLoginRepo(Mutex<HashMap<OAuthLoginStateId, OAuthLoginState>>);
+    struct TestLoginRepository(Mutex<HashMap<OAuthLoginStateId, OAuthLoginState>>);
 
-    impl LoginFlowRepo for TestLoginRepo {
-        fn start(&self, state: OAuthLoginState) -> crate::RepoResult<()> {
+    impl LoginFlowRepository for TestLoginRepository {
+        fn start(&self, state: OAuthLoginState) -> crate::RepositoryResult<()> {
             let mut states = self.0.lock().unwrap();
             if states.contains_key(&state.id) {
-                return Err(RepoError::Conflict("duplicate login flow".into()));
+                return Err(RepositoryError::Conflict("duplicate login flow".into()));
             }
             states.insert(state.id.clone(), state);
             Ok(())
         }
 
-        fn get(&self, id: &OAuthLoginStateId) -> crate::RepoResult<Option<OAuthLoginState>> {
+        fn get(&self, id: &OAuthLoginStateId) -> crate::RepositoryResult<Option<OAuthLoginState>> {
             Ok(self.0.lock().unwrap().get(id).cloned())
         }
 
-        fn mark_consumed(&self, id: &OAuthLoginStateId, at: Timestamp) -> crate::RepoResult<()> {
+        fn mark_consumed(
+            &self,
+            id: &OAuthLoginStateId,
+            at: Timestamp,
+        ) -> crate::RepositoryResult<()> {
             let mut states = self.0.lock().unwrap();
             let state = states
                 .get_mut(id)
-                .ok_or_else(|| RepoError::NotFound("login flow".into()))?;
+                .ok_or_else(|| RepositoryError::NotFound("login flow".into()))?;
             if state.consumed_at.is_some() {
-                return Err(RepoError::Conflict("login flow consumed".into()));
+                return Err(RepositoryError::Conflict("login flow consumed".into()));
             }
             state.consumed_at = Some(at);
             Ok(())
@@ -369,7 +373,7 @@ mod tests {
     #[test]
     fn begin_login_mints_distinct_secrets_and_stores_only_hashes() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
 
         let issued = service
             .begin_login(&repository, begin_request("login_1", true, true))
@@ -408,7 +412,7 @@ mod tests {
     #[test]
     fn begin_login_omits_optional_secrets_when_not_requested() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
 
         let issued = service
             .begin_login(&repository, begin_request("login_1", false, false))
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn begin_login_rejects_non_forward_window() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let mut request = begin_request("login_1", true, true);
         request.expires_at = request.created_at.clone();
 
@@ -453,7 +457,7 @@ mod tests {
         // closed. This case selects success plus the not-C2 replay row; sibling
         // cases select expiry and each binding mismatch.
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let issued = service
             .begin_login(&repository, begin_request("login_1", true, true))
             .unwrap();
@@ -493,7 +497,7 @@ mod tests {
     #[test]
     fn complete_login_fails_closed_on_state_mismatch_and_burns_challenge() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let issued = service
             .begin_login(&repository, begin_request("login_1", false, false))
             .unwrap();
@@ -546,7 +550,7 @@ mod tests {
     #[test]
     fn complete_login_requires_presented_nonce_and_pkce() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let issued = service
             .begin_login(&repository, begin_request("login_1", true, true))
             .unwrap();
@@ -577,7 +581,7 @@ mod tests {
     #[test]
     fn complete_login_rejects_wrong_pkce_verifier() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let issued = service
             .begin_login(&repository, begin_request("login_1", false, true))
             .unwrap();
@@ -607,7 +611,7 @@ mod tests {
     #[test]
     fn complete_login_rejects_expired_challenge() {
         let mut service = OAuthChallengeService::new(SequentialEntropy::default());
-        let repository = TestLoginRepo::default();
+        let repository = TestLoginRepository::default();
         let issued = service
             .begin_login(&repository, begin_request("login_1", false, false))
             .unwrap();

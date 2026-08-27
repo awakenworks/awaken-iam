@@ -4,7 +4,7 @@
 //! model, this is the Policy Administration Point for the *product clients* that
 //! integrate against IAM as an OAuth authorization server (the provider posture
 //! in [auth server](../../../docs/design/auth-server.md)). It persists each
-//! [`RegisteredClient`] through the [`OAuthClientRepo`] port so the registry the
+//! [`RegisteredClient`] through the [`OAuthClientRepository`] port so the registry the
 //! authorization server enforces is durable rather than an in-memory seed. The
 //! authorization server reads the same repository on every request, so an admin
 //! mutation is immediately visible to every replica without snapshot hydration.
@@ -24,7 +24,9 @@
 //! version, matching the discipline of the policy PAP.
 
 use awaken_iam_contract::Timestamp;
-use awaken_iam_core::{AuditEvent, AuditSink, EntropySource, OAuthClientRepo, RegisteredClient};
+use awaken_iam_core::{
+    AuditEvent, AuditSink, EntropySource, OAuthClientRepository, RegisteredClient,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -84,7 +86,7 @@ pub struct IssuedClientSecret {
 
 /// Policy Administration Point over the downstream OAuth client registry.
 ///
-/// `S` is any store implementing [`OAuthClientRepo`] and [`AuditSink`]; the
+/// `S` is any store implementing [`OAuthClientRepository`] and [`AuditSink`]; the
 /// in-memory [`InMemoryStore`](crate::InMemoryStore) backs tests and local mode,
 /// and a database adapter backs the service. Mutating methods append an
 /// [`OAuthClientEvent`] and advance the [snapshot version](OAuthClientAdminApi::version);
@@ -98,7 +100,7 @@ pub struct OAuthClientAdminApi<S> {
 
 impl<S> OAuthClientAdminApi<S>
 where
-    S: OAuthClientRepo + AuditSink,
+    S: OAuthClientRepository + AuditSink,
 {
     /// Build the PAP over `store` at initial snapshot version 1.
     pub fn new(store: S) -> Self {
@@ -148,14 +150,14 @@ where
     /// confidential); a confidential client's secret is already hashed into it
     /// by [`RegisteredClient::confidential`].
     pub fn register(&mut self, client: RegisteredClient, at: Timestamp) -> AdminResult<u64> {
-        if OAuthClientRepo::get(&self.store, &client.client_id)?.is_some() {
+        if OAuthClientRepository::get(&self.store, &client.client_id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!(
                 "oauth client {}",
                 client.client_id
             )));
         }
         let id = client.client_id.clone();
-        OAuthClientRepo::upsert(&self.store, client)?;
+        OAuthClientRepository::upsert(&self.store, client)?;
         self.commit(OAuthClientEvent::Registered(id), at)
     }
 
@@ -172,7 +174,7 @@ where
         entropy: &mut impl EntropySource,
         at: Timestamp,
     ) -> AdminResult<IssuedClientSecret> {
-        let existing = OAuthClientRepo::get(&self.store, client_id)?
+        let existing = OAuthClientRepository::get(&self.store, client_id)?
             .ok_or_else(|| AdminError::NotFound(format!("oauth client {client_id}")))?;
         if existing.secret_hash.is_none() {
             return Err(AdminError::Invalid(format!(
@@ -187,7 +189,7 @@ where
             existing.redirect_uris.clone(),
             existing.allowed_scopes.clone(),
         );
-        OAuthClientRepo::upsert(&self.store, rotated)?;
+        OAuthClientRepository::upsert(&self.store, rotated)?;
         self.commit(OAuthClientEvent::SecretRotated(client_id.to_owned()), at)?;
         Ok(IssuedClientSecret {
             client_id: client_id.to_owned(),
@@ -197,18 +199,18 @@ where
 
     /// Deregister a client, failing closed when it is absent.
     pub fn deregister(&mut self, client_id: &str, at: Timestamp) -> AdminResult<u64> {
-        OAuthClientRepo::remove(&self.store, client_id)?;
+        OAuthClientRepository::remove(&self.store, client_id)?;
         self.commit(OAuthClientEvent::Deregistered(client_id.to_owned()), at)
     }
 
     /// Resolve a registered client by id.
     pub fn get_client(&self, client_id: &str) -> AdminResult<Option<RegisteredClient>> {
-        Ok(OAuthClientRepo::get(&self.store, client_id)?)
+        Ok(OAuthClientRepository::get(&self.store, client_id)?)
     }
 
     /// List every registered client.
     pub fn list_clients(&self) -> AdminResult<Vec<RegisteredClient>> {
-        Ok(OAuthClientRepo::list(&self.store)?)
+        Ok(OAuthClientRepository::list(&self.store)?)
     }
 }
 

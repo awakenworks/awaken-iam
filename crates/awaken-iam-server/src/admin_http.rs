@@ -47,16 +47,16 @@ use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryNodeId, EntitlementCheckResponse, EntitlementRequest,
-    GrantSnapshot, GrantSubjectRef, GroupDto, InvitationId, InvitationQuery, IssuedInvitation,
-    MembershipQuery, MoveDirectoryNode, NamespaceId, OrgDto, OrgId, PolicySnapshot,
-    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
-    RoleBindingSnapshot, RoleDto, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode,
-    WorkspaceOrgEdge,
+    DirectoryChildrenQuery, DirectoryNodeId, EnsureProductSpacePlacement, EntitlementCheckResponse,
+    EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView, InvitationId, InvitationQuery,
+    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgView,
+    PolicySnapshot, ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation,
+    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
+    UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    ActionPattern, AuthorizationProfileRepo, Effect, Grant, GrantId, GrantSubject, Group, GroupId,
-    Organization, PolicySet, RoleBinding, RoleDef, RoleId,
+    ActionPattern, AuthorizationProfileRepository, Effect, Grant, GrantId, GrantSubject, Group,
+    GroupId, Organization, PolicySet, RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -66,11 +66,14 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::InMemoryStore;
 use crate::{
     AccessTokenAuthority, AdminCredential, AdminError, AuthorizationProfileAdmin, CapabilityCheck,
-    InMemoryStore, LeaseEpoch, MintCapability, PolicyAdminApi, PolicyStore, ProfileAdminError,
-    mint_capability, verify_capability,
+    LeaseEpoch, MintCapability, PolicyAdminApi, PolicyStore, ProfileAdminError, mint_capability,
+    verify_capability,
 };
 use awaken_iam_contract::GrantEffect;
 
@@ -111,7 +114,7 @@ impl AdminAuthPolicy {
 
 /// The daemon's shared, mutable `/v1` state: the read engines plus the
 /// policy-administration point over one store, behind a single applier lock.
-pub struct DaemonState<S = InMemoryStore> {
+pub struct DaemonState<S> {
     authz: crate::AuthzApi,
     admin: PolicyAdminApi<S>,
     directory: crate::DirectoryApi<S>,
@@ -126,6 +129,7 @@ impl<S> std::fmt::Debug for DaemonState<S> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl DaemonState<InMemoryStore> {
     /// Assemble the daemon state over the daemon's authorization engine, a fresh
     /// policy-administration store, and the admin auth policy.
@@ -138,7 +142,7 @@ impl DaemonState<InMemoryStore> {
     pub fn with_profile_repository(
         authz: crate::AuthzApi,
         auth: AdminAuthPolicy,
-        profiles: Arc<dyn AuthorizationProfileRepo>,
+        profiles: Arc<dyn AuthorizationProfileRepository>,
         authority: AccessTokenAuthority,
     ) -> Self {
         Self::with_policy_store(authz, auth, profiles, InMemoryStore::new(), authority)
@@ -146,7 +150,7 @@ impl DaemonState<InMemoryStore> {
     }
 }
 
-impl<S: PolicyStore + awaken_iam_core::DirectoryRepo + Clone> DaemonState<S> {
+impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + Clone> DaemonState<S> {
     /// Assemble the daemon over one explicit policy store.
     ///
     /// Production passes the same migrated SQL store used for profiles. Tests
@@ -155,7 +159,7 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepo + Clone> DaemonState<S> {
     pub fn with_policy_store(
         mut authz: crate::AuthzApi,
         auth: AdminAuthPolicy,
-        profiles: Arc<dyn AuthorizationProfileRepo>,
+        profiles: Arc<dyn AuthorizationProfileRepository>,
         store: S,
         capability_tokens: AccessTokenAuthority,
     ) -> Result<Self, AdminError> {
@@ -192,7 +196,7 @@ impl<S: PolicyStore> DaemonState<S> {
 }
 
 /// Shared handle to the daemon's `/v1` state every request is dispatched to.
-pub type SharedDaemonState<S = InMemoryStore> = Arc<Mutex<DaemonState<S>>>;
+pub type SharedDaemonState<S> = Arc<Mutex<DaemonState<S>>>;
 
 /// Build the [`axum::Router`] the standalone daemon serves: the authorization
 /// half of `/v1`, the operational `GET /healthz` probe, and the guarded
@@ -200,7 +204,7 @@ pub type SharedDaemonState<S = InMemoryStore> = Arc<Mutex<DaemonState<S>>>;
 /// [`DaemonState`].
 pub fn daemon_router<S>(state: SharedDaemonState<S>) -> Router
 where
-    S: PolicyStore + awaken_iam_core::DirectoryRepo + Clone + 'static,
+    S: PolicyStore + awaken_iam_core::DirectoryRepository + Clone + 'static,
 {
     Router::new()
         .route("/healthz", get(healthz))
@@ -225,6 +229,14 @@ where
         .route(
             "/v1/admin/directory/product-spaces/query",
             post(get_product_space_binding),
+        )
+        .route(
+            "/v1/admin/directory/product-spaces/ensure",
+            post(ensure_product_space_placement),
+        )
+        .route(
+            "/v1/admin/directory/nodes/{id}/restore",
+            post(restore_directory_node),
         )
         .route("/v1/admin/groups", post(create_group))
         .route(
@@ -602,7 +614,7 @@ async fn snapshot(
 async fn create_org(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
-    Json(dto): Json<OrgDto>,
+    Json(dto): Json<OrgView>,
 ) -> Response {
     apply(&state, &headers, move |admin, at| {
         admin.create_org(org_from_dto(dto), at)
@@ -613,7 +625,7 @@ async fn update_org(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(mut dto): Json<OrgDto>,
+    Json(mut dto): Json<OrgView>,
 ) -> Response {
     dto.id = OrgId(id);
     apply(&state, &headers, move |admin, at| {
@@ -643,17 +655,27 @@ async fn list_orgs(
 }
 
 async fn create_directory_node(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Json(request): Json<CreateDirectoryNode>,
 ) -> Response {
-    directory_read(&state, &headers, move |directory| {
-        directory.create_node(request)
+    directory_command(&state, &headers, move |directory, context| {
+        directory.create_node(request, context)
+    })
+}
+
+async fn ensure_product_space_placement(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
+    headers: HeaderMap,
+    Json(request): Json<EnsureProductSpacePlacement>,
+) -> Response {
+    directory_command(&state, &headers, move |directory, context| {
+        directory.ensure_product_space_placement(request, context)
     })
 }
 
 async fn get_directory_node(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -669,7 +691,7 @@ async fn get_directory_node(
 }
 
 async fn list_directory_children(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Query(query): Query<DirectoryChildrenQuery>,
 ) -> Response {
@@ -679,39 +701,49 @@ async fn list_directory_children(
 }
 
 async fn move_directory_node(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<MoveDirectoryNode>,
 ) -> Response {
-    directory_read(&state, &headers, move |directory| {
-        directory.move_node(&DirectoryNodeId(id), request)
+    directory_command(&state, &headers, move |directory, context| {
+        directory.move_node(&DirectoryNodeId(id), request, context)
     })
 }
 
 async fn update_directory_node(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<UpdateDirectoryNode>,
 ) -> Response {
-    directory_read(&state, &headers, move |directory| {
-        directory.update_node(&DirectoryNodeId(id), request)
+    directory_command(&state, &headers, move |directory, context| {
+        directory.update_node(&DirectoryNodeId(id), request, context)
     })
 }
 
 async fn archive_directory_node(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    directory_read(&state, &headers, move |directory| {
-        directory.archive_node(&DirectoryNodeId(id), &now_timestamp())
+    directory_command(&state, &headers, move |directory, context| {
+        directory.archive_node(&DirectoryNodeId(id), context)
+    })
+}
+
+async fn restore_directory_node(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    directory_command(&state, &headers, move |directory, context| {
+        directory.restore_node(&DirectoryNodeId(id), context)
     })
 }
 
 async fn get_product_space_binding(
-    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepo>>,
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
     Json(product_space): Json<ProductSpaceRef>,
 ) -> Response {
@@ -729,7 +761,7 @@ async fn get_product_space_binding(
 async fn create_group(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
-    Json(dto): Json<GroupDto>,
+    Json(dto): Json<GroupView>,
 ) -> Response {
     apply(&state, &headers, move |admin, at| {
         admin.create_group(group_from_dto(dto), at)
@@ -740,7 +772,7 @@ async fn update_group(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(mut dto): Json<GroupDto>,
+    Json(mut dto): Json<GroupView>,
 ) -> Response {
     dto.id = id;
     apply(&state, &headers, move |admin, at| {
@@ -761,7 +793,7 @@ async fn delete_group(
 async fn define_role(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
-    Json(dto): Json<RoleDto>,
+    Json(dto): Json<RoleView>,
 ) -> Response {
     apply(&state, &headers, move |admin, at| {
         admin.define_role(role_from_dto(dto), at)
@@ -772,7 +804,7 @@ async fn update_role(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(mut dto): Json<RoleDto>,
+    Json(mut dto): Json<RoleView>,
 ) -> Response {
     dto.id = id;
     apply(&state, &headers, move |admin, at| {
@@ -1026,7 +1058,7 @@ where
 
 fn directory_read<S, T, F>(state: &SharedDaemonState<S>, headers: &HeaderMap, op: F) -> Response
 where
-    S: awaken_iam_core::DirectoryRepo,
+    S: awaken_iam_core::DirectoryRepository,
     T: serde::Serialize,
     F: FnOnce(&crate::DirectoryApi<S>) -> Result<T, AdminError>,
 {
@@ -1037,6 +1069,40 @@ where
     match op(&guard.directory) {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => admin_error_response(&error),
+    }
+}
+
+fn directory_command<S, T, F>(state: &SharedDaemonState<S>, headers: &HeaderMap, op: F) -> Response
+where
+    S: awaken_iam_core::DirectoryRepository,
+    T: serde::Serialize,
+    F: FnOnce(&crate::DirectoryApi<S>, crate::DirectoryCommandContext) -> Result<T, AdminError>,
+{
+    let guard = lock(state);
+    if let Some(rejection) = authorize_admin(&guard.auth, headers) {
+        return rejection;
+    }
+    let context = crate::DirectoryCommandContext::new(admin_actor(headers), now_timestamp());
+    match op(&guard.directory, context) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+fn admin_actor(headers: &HeaderMap) -> awaken_iam_contract::PrincipalRef {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let credential = AdminCredential::from_headers(header("x-api-key"), header("authorization"))
+        .expect("directory command is authenticated before actor derivation");
+    let token = match credential {
+        AdminCredential::ApiKey(token) | AdminCredential::Bearer(token) => token,
+    };
+    let digest = Sha256::digest(token.as_bytes());
+    let fingerprint = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    awaken_iam_contract::PrincipalRef::Service {
+        service_id: format!("iam-admin:{fingerprint}"),
     }
 }
 
@@ -1103,7 +1169,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 
 // -- DTO <-> core aggregate conversions ---------------------------------------
 
-fn org_from_dto(dto: OrgDto) -> Organization {
+fn org_from_dto(dto: OrgView) -> Organization {
     Organization {
         id: dto.id,
         display_name: dto.display_name,
@@ -1113,8 +1179,8 @@ fn org_from_dto(dto: OrgDto) -> Organization {
     }
 }
 
-fn org_to_dto(org: Organization) -> OrgDto {
-    OrgDto {
+fn org_to_dto(org: Organization) -> OrgView {
+    OrgView {
         id: org.id,
         display_name: org.display_name,
         owner: org.owner,
@@ -1123,7 +1189,7 @@ fn org_to_dto(org: Organization) -> OrgDto {
     }
 }
 
-fn group_from_dto(dto: GroupDto) -> Group {
+fn group_from_dto(dto: GroupView) -> Group {
     Group {
         id: GroupId(dto.id),
         org: dto.org,
@@ -1134,7 +1200,7 @@ fn group_from_dto(dto: GroupDto) -> Group {
     }
 }
 
-fn role_from_dto(dto: RoleDto) -> RoleDef {
+fn role_from_dto(dto: RoleView) -> RoleDef {
     RoleDef {
         id: RoleId(dto.id),
         display_name: dto.display_name,
@@ -1216,7 +1282,7 @@ mod tests {
 
     #[test]
     fn org_dto_round_trips_through_the_core_aggregate() {
-        let dto = OrgDto {
+        let dto = OrgView {
             id: OrgId("acme".into()),
             display_name: Some("ACME".into()),
             owner: account("ada"),
