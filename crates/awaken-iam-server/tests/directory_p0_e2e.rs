@@ -8,7 +8,9 @@ use awaken_iam_contract::{
     ProductId, ProductSpaceRef, Timestamp,
 };
 use awaken_iam_core::{AuditSink, OrgRepository, Organization};
-use awaken_iam_server::{DirectoryApi, DirectoryCommandContext, sqlite_in_memory_store};
+use awaken_iam_server::{
+    DirectoryApi, DirectoryCommandContext, PolicyAdminApi, sqlite_in_memory_store,
+};
 
 fn at(second: u8) -> Timestamp {
     Timestamp(format!("2026-08-27T00:00:{second:02}Z"))
@@ -58,6 +60,13 @@ fn ensure(org_id: &str) -> EnsureProductSpacePlacement {
 
 fn context(second: u8) -> DirectoryCommandContext {
     DirectoryCommandContext::product_service(product("agents"), "agents", at(second))
+}
+
+fn product_space(product_id: &str, kind: &str, id: &str) -> ProductSpaceRef {
+    ProductSpaceRef {
+        product_id: product(product_id),
+        space_id: format!("{kind}/{id}"),
+    }
 }
 
 #[test]
@@ -183,6 +192,85 @@ fn parent_resolution_is_org_scoped_and_requires_an_active_parent() {
         2,
         "only create and archive produce effects"
     );
+}
+
+#[test]
+fn agents_objects_and_workforce_share_placement_without_sharing_policy() {
+    // Cause/effect decision table:
+    // R1 three open product ids in one Org, each parented beneath another
+    // product -> one arbitrary cross-product Directory tree; R2 move the middle
+    // Objects node beneath a user folder -> only Directory parentage/revision
+    // changes while every ProductSpaceRef binding stays stable; R3 all Directory
+    // mutations -> IAM policy version remains unchanged. Constraints: Org is the
+    // immutable partition, product ids are not an enum, and no product business
+    // parent or permission edge is inferred from Directory parent_id.
+    let store = sqlite_in_memory_store("directory_three_products").unwrap();
+    create_org(&store, "acme");
+    let directory = DirectoryApi::new(store.clone());
+    let policy = PolicyAdminApi::new(store);
+    let policy_version = policy.store_version().unwrap();
+
+    let agents = product_space("agents", "workspace", "agent-ws");
+    let objects = product_space("objects", "object-space", "customer-data");
+    let workforce = product_space("workforce", "project", "delivery");
+    let ensure = |space: ProductSpaceRef,
+                  parent_product_space: Option<ProductSpaceRef>,
+                  name: &str,
+                  second: u8| {
+        directory
+            .ensure_product_space_placement(
+                EnsureProductSpacePlacement {
+                    product_space: space,
+                    org_id: OrgId("acme".into()),
+                    parent_product_space,
+                    name: name.into(),
+                    preferred_slug: name.into(),
+                    description: None,
+                },
+                DirectoryCommandContext::product_service(product(name), name, at(second)),
+            )
+            .unwrap()
+    };
+
+    let agents_node = ensure(agents.clone(), None, "agents", 1).node;
+    let objects_node = ensure(objects.clone(), Some(agents.clone()), "objects", 2).node;
+    let workforce_node = ensure(workforce.clone(), Some(objects.clone()), "workforce", 3).node;
+    assert_eq!(objects_node.parent_id, Some(agents_node.id));
+    assert_eq!(workforce_node.parent_id, Some(objects_node.id.clone()));
+
+    let folder = directory
+        .create_node(
+            CreateDirectoryNode {
+                org_id: OrgId("acme".into()),
+                parent_id: None,
+                name: "Customer Success".into(),
+                preferred_slug: "customer-success".into(),
+                description: None,
+            },
+            DirectoryCommandContext::service("directory-admin", at(4)),
+        )
+        .unwrap()
+        .node;
+    directory
+        .move_node(
+            &objects_node.id,
+            MoveDirectoryNode {
+                parent_id: Some(folder.id),
+            },
+            DirectoryCommandContext::service("directory-admin", at(5)),
+        )
+        .unwrap();
+
+    for space in [&agents, &objects, &workforce] {
+        assert!(
+            directory
+                .product_space_placement(&OrgId("acme".into()), space)
+                .unwrap()
+                .is_some(),
+            "R2: moving presentation preserves stable product binding"
+        );
+    }
+    assert_eq!(policy.store_version().unwrap(), policy_version, "R3");
 }
 
 #[test]

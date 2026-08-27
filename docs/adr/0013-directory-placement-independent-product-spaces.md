@@ -1,6 +1,6 @@
 # ADR-0013: Directory placement is independent from product-space identity
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Implementation:** done
 - **Date:** 2026-08-27
 - **Deciders:** Awaken IAM maintainers
@@ -25,7 +25,7 @@ meet that requirement.
 1. The existing IAM Directory supporting subdomain gains arbitrary-depth
    `DirectoryNode` placement below an immutable `OrgId` tenant partition. It
    does not add a new crate, client, server, host, database, or transport.
-2. `ProductSpaceRef { product, space_id }` is an open, opaque product identity.
+2. `ProductSpaceRef { product_id, space_id }` is an open, opaque product identity.
    `ProductSpacePlacement` places that stable identity at one Directory node.
    Products own the space and its business rules; IAM owns only placement.
 3. A node has an optional direct parent, not a tier. Parent changes stay inside
