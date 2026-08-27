@@ -1,15 +1,15 @@
-//! Policy-administration wire DTOs.
+//! Policy-administration wire contracts.
 //!
 //! These are the request/response shapes the standalone daemon serves under
 //! `/v1/admin/*`, the console <-> remote-daemon management seam a remote control
 //! plane administers the authorization model through (organizations, groups,
-//! roles, grants, and memberships). Like the rest of this crate they are DTOs
+//! roles, grants, and memberships). Like the rest of this crate they are data
 //! only: the policy-administration logic lives in `awaken-iam-server`'s Policy
 //! Administration Point, which maps these onto the `awaken-iam-core` aggregates.
 //!
 //! Ids that live in `awaken-iam-core` (group, role) are carried as plain strings
 //! here so the contract stays free of any dependency on the core crate, matching
-//! the convention the snapshot DTOs already use (a grant's `role_id` /
+//! the convention the snapshot contracts already use (a grant's `role_id` /
 //! `group_id`). Grant issue and membership reuse the snapshot grant/role-binding
 //! shapes ([`GrantSnapshot`](crate::GrantSnapshot) and
 //! [`RoleBindingSnapshot`](crate::RoleBindingSnapshot)) rather than duplicating

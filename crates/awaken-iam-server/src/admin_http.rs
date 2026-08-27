@@ -1167,7 +1167,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-// -- DTO <-> core aggregate conversions ---------------------------------------
+// -- Wire contract <-> core aggregate conversions -----------------------------
 
 fn org_from_dto(dto: OrgView) -> Organization {
     Organization {

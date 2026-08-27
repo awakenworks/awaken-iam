@@ -45,7 +45,7 @@ use crate::provider::{
 };
 
 /// Deployment-supplied material for a generic provider that does not belong in
-/// the shared [`IdentityProviderConfig`] DTO.
+/// the shared [`IdentityProviderConfig`] contract.
 ///
 /// The client secret is a deployment secret; the userinfo endpoint and default
 /// scopes are operational details kept out of the contract (mirroring how

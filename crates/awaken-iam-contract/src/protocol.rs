@@ -1,10 +1,10 @@
-//! Remote authorization protocol DTOs.
+//! Remote authorization protocol contracts.
 //!
 //! These are the wire shapes exchanged by the remote IAM protocol described in
 //! `docs/design/remote-protocol.md`: the request/response bodies for
 //! `POST /v1/authorize`, `POST /v1/authorize/batch`, `POST /v1/entitlements/check`,
 //! and the policy snapshot served for local-mode synchronisation. Like the rest
-//! of this crate they are DTOs only — evaluation lives in `awaken-iam-core` and
+//! of this crate they are data only — evaluation lives in `awaken-iam-core` and
 //! the protocol assembly lives in `awaken-iam-server`.
 //!
 //! Every authorization response carries enough explanation for an audit/debug

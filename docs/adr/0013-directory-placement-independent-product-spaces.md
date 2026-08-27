@@ -1,7 +1,7 @@
 # ADR-0013: Directory placement is independent from product-space identity
 
 - **Status:** Proposed
-- **Implementation:** in-progress
+- **Implementation:** done
 - **Date:** 2026-08-27
 - **Deciders:** Awaken IAM maintainers
 - **Amends:** ADR-0001 and ADR-0002

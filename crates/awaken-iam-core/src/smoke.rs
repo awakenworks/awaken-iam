@@ -11,7 +11,7 @@
 //! documented in the provider setup runbook; opting a smoke run in is then just
 //! adding the matching `IAM_E2E_REAL_*` flag. Secrets stay in the environment —
 //! the client secret is read only to confirm availability and is never copied
-//! onto the public [`IdentityProviderConfig`] DTO (guardrail G5).
+//! onto the public [`IdentityProviderConfig`] contract (guardrail G5).
 //!
 //! The decision logic is pure and takes an environment lookup closure, which
 //! keeps it deterministic and unit-testable without mutating process state.
@@ -208,13 +208,13 @@ pub fn evaluate_gate_from_env(provider: RealProvider) -> SmokeGate {
 
 /// A real provider's configuration assembled from the environment.
 ///
-/// Carries the public [`IdentityProviderConfig`] DTO plus the redirect URI and
+/// Carries the public [`IdentityProviderConfig`] contract plus the redirect URI and
 /// resolved scopes needed to build an authorization redirect. The client secret
 /// is deliberately absent: the gate confirms it is present, but it stays in the
 /// environment for the deployment's transport to read (guardrail G5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmokeProviderConfig {
-    /// Public provider configuration DTO (no secret material).
+    /// Public provider configuration contract (no secret material).
     pub config: IdentityProviderConfig,
     /// Absolute callback URL registered with the upstream provider.
     pub redirect_uri: String,

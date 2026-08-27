@@ -213,7 +213,7 @@ pub struct AuthorizationTrace {
 }
 
 impl AuthorizationTrace {
-    /// Project the trace onto the [`AuthorizationOutcome`] wire DTO, flattening
+    /// Project the trace onto the [`AuthorizationOutcome`] wire contract, flattening
     /// the reason to its stable code and the matched ids to plain strings. The
     /// approval obligation, when present, is carried through unchanged.
     pub fn to_outcome(&self) -> AuthorizationOutcome {
@@ -1040,7 +1040,7 @@ fn obligation_id(
     id
 }
 
-/// Serialize a contract DTO to its canonical JSON string for hashing.
+/// Serialize a contract value to its canonical JSON string for hashing.
 ///
 /// Serde emits struct and enum fields in declaration order, so this is stable
 /// across processes; the rare serialization failure degrades to an empty string

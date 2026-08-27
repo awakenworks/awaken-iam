@@ -73,7 +73,7 @@ pub enum IdentityProviderKind {
 /// Identity provider configuration safe to expose in shared contracts.
 ///
 /// Client secrets and signing keys are deployment secrets and do not belong in
-/// this DTO.
+/// this public contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityProviderConfig {
     /// Stable config identifier.

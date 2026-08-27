@@ -404,7 +404,7 @@ async fn scoped_role_change_reaches_the_live_pdp_as_one_http_command() {
     // subset replacement -> 200 + one version fence + exact new binding;
     // R2 replacement outside the managed family -> 400 and old binding stays;
     // R3 unrelated role at the same scope -> preserved. The query proves the
-    // mutation reached the authoritative PAP rather than a response-only DTO.
+    // mutation reached the authoritative PAP rather than a response-only shape.
     let app = daemon();
     let principal = serde_json::json!({"kind":"account","account_id":"member"});
     let scope = serde_json::json!({"kind":"workspace","workspace_id":"workspace-a"});

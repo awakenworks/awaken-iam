@@ -1,7 +1,7 @@
 //! Shared IAM contract types.
 //!
-//! This crate is the stable seam used by product services. It contains DTOs and
-//! identifiers, plus the pure, offline verification of the self-describing wire
+//! This crate is the stable seam used by product services. It contains wire
+//! contracts and identifiers, plus pure, offline verification of the self-describing wire
 //! shapes they carry (for example a license-claim signature check against a
 //! pinned JWKS); policy evaluation, persistence, and server code live elsewhere.
 

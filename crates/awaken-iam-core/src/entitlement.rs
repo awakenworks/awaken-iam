@@ -288,7 +288,7 @@ impl EntitlementOutcome {
         }
     }
 
-    /// Project the outcome onto the [`EntitlementCheckResponse`] wire DTO,
+    /// Project the outcome onto the [`EntitlementCheckResponse`] wire contract,
     /// flattening the reason to its stable code.
     pub fn to_response(&self) -> awaken_iam_contract::EntitlementCheckResponse {
         awaken_iam_contract::EntitlementCheckResponse {
