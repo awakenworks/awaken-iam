@@ -69,7 +69,7 @@ pub use local_setup::{
     LocalSetupId,
 };
 pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
-pub use op_http::{SharedAuthApi, op_router};
+pub use op_http::{SharedAuthApi, jwks_router, op_router};
 pub use op_id_token::{
     ID_TOKEN_TYP, IdTokenError, MintIdToken, OidcIdTokenClaims, mint_id_token, verify_id_token,
 };

@@ -9,11 +9,12 @@
 //! the ADR promises. Selecting the backend is configuration, not a code fork.
 
 use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, DirectoryNodeId,
-    EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
-    ExternalIdentityKey, ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId,
-    OrgId, PrincipalRef, ProductId, ProductSpacePlacement, ProductSpaceRef, ResourceId,
-    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, CreateDirectoryNode,
+    DirectoryNodeId, EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims,
+    ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderKey,
+    MoveDirectoryNode, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId,
+    ProductSpacePlacement, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
+    Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
@@ -33,6 +34,57 @@ use std::thread;
 
 fn ts(value: &str) -> Timestamp {
     Timestamp(value.into())
+}
+
+struct IsolatedPostgresSchema {
+    base_url: String,
+    schema: String,
+    url: String,
+}
+
+impl IsolatedPostgresSchema {
+    fn create(base_url: &str, prefix: &str) -> Self {
+        let schema = format!(
+            "{}_{}_{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("wall clock")
+                .as_nanos()
+        );
+        let create_url = base_url.to_owned();
+        let create_schema = schema.clone();
+        std::thread::spawn(move || {
+            let mut client = postgres::Client::connect(&create_url, postgres::NoTls)
+                .expect("connect PostgreSQL");
+            client
+                .batch_execute(&format!("CREATE SCHEMA {create_schema}"))
+                .expect("create isolated IAM schema");
+        })
+        .join()
+        .expect("isolated IAM schema thread");
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        let url = format!("{base_url}{separator}options=-csearch_path%3D{schema}");
+        Self {
+            base_url: base_url.into(),
+            schema,
+            url,
+        }
+    }
+}
+
+impl Drop for IsolatedPostgresSchema {
+    fn drop(&mut self) {
+        let base_url = self.base_url.clone();
+        let schema = self.schema.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(mut client) = postgres::Client::connect(&base_url, postgres::NoTls) {
+                let _ = client.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"));
+            }
+        })
+        .join();
+    }
 }
 
 fn account(id: &str) -> Account {
@@ -707,34 +759,11 @@ async fn postgres_backend_serves_every_repository_when_configured() {
         eprintln!("skipping: set IAM_TEST_POSTGRES_URL to run the Postgres backend e2e");
         return;
     };
-    // Start from a clean slate so the shared harness's count assertions hold.
-    let backend = PostgresBackend::connect(&url).expect("connect");
-    for table in [
-        "accounts",
-        "external_identities",
-        "sessions",
-        "login_flows",
-        "api_tokens",
-        "orgs",
-        "product_space_bindings",
-        "directory_nodes",
-        "directory_fence",
-        "groups",
-        "roles",
-        "grants",
-        "role_bindings",
-        "resource_edges",
-        "workspace_org_edges",
-        "plans",
-        "subscriptions",
-        "audit_events",
-        "schema_migrations",
-    ] {
-        backend
-            .execute(&format!("DROP TABLE IF EXISTS iam_{table} CASCADE"), &[])
-            .expect("drop");
-    }
-    let store = postgres_migrated_store(&url, "iam").expect("migrate postgres");
+    // The migration bundle remains the only table inventory. An isolated schema
+    // gives this harness a repeatable empty authority without duplicating that
+    // inventory in test cleanup or colliding with another PostgreSQL test.
+    let schema = IsolatedPostgresSchema::create(&url, "iam_store_e2e");
+    let store = postgres_migrated_store(&schema.url, "iam").expect("migrate postgres");
     exercise_every_repository(&store);
 
     // Cause/effect graph: C1=multiple processes may issue the same canonical
@@ -803,11 +832,100 @@ async fn postgres_backend_serves_every_repository_when_configured() {
             .all(|result| result.node.id == results[0].node.id),
         "E2"
     );
-    let roots = DirectoryApi::new(store)
+    let roots = DirectoryApi::new(store.clone())
         .children(&OrgId("postgres-directory-race".into()), None)
         .unwrap();
     assert_eq!(roots.nodes.len(), 1, "E3");
     assert_eq!(roots.revision, 2, "E3");
+
+    // Cause/effect graph: C1 two cloned PostgreSQL store handles load the same
+    // two roots, C2 inverse moves start together, C3 the backend serializes each
+    // transaction through the Org revision fence before ancestry validation.
+    // E1 exactly one move commits, E2 the other observes the new ancestry and
+    // rejects a cycle, E3 one revision/audit mutation is durable.
+    //
+    // Decision table:
+    // | A parent | B parent | concurrent commands | effect |
+    // | root | root | A->B and B->A | one success, one cycle refusal |
+    // | B | root | replay A->B | no second cycle-producing mutation |
+    // Constraint: this is the production PostgreSQL adapter; the SQLite P0
+    // test covers the same domain rule but cannot prove row-lock serialization.
+    let cycle_org = OrgId("postgres-directory-cycle".into());
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: cycle_org.clone(),
+            display_name: Some("Postgres directory cycle".into()),
+            owner: service("postgres-directory-test"),
+            created_at: ts("2026-08-27T00:01:00Z"),
+            updated_at: ts("2026-08-27T00:01:00Z"),
+        },
+    )
+    .unwrap();
+    let directory = DirectoryApi::new(store.clone());
+    let create = |name: &str| {
+        directory
+            .create_node(
+                CreateDirectoryNode {
+                    org_id: cycle_org.clone(),
+                    parent_id: None,
+                    name: name.into(),
+                    preferred_slug: name.to_ascii_lowercase(),
+                    description: None,
+                },
+                DirectoryCommandContext::service(
+                    "postgres-directory-test",
+                    ts("2026-08-27T00:01:01Z"),
+                ),
+            )
+            .unwrap()
+            .node
+    };
+    let a = create("A");
+    let b = create("B");
+    let barrier = Arc::new(Barrier::new(2));
+    let attempts = [(a.id.clone(), b.id.clone()), (b.id.clone(), a.id.clone())]
+        .into_iter()
+        .map(|(node_id, parent_id)| {
+            let directory = DirectoryApi::new(store.clone());
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                directory.move_node(
+                    &node_id,
+                    MoveDirectoryNode {
+                        parent_id: Some(parent_id),
+                    },
+                    DirectoryCommandContext::service(
+                        "postgres-directory-test",
+                        ts("2026-08-27T00:01:02Z"),
+                    ),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = attempts
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "E1"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_err()).count(),
+        1,
+        "E2"
+    );
+    let stored_a = directory.node(&a.id).unwrap().unwrap();
+    let stored_b = directory.node(&b.id).unwrap().unwrap();
+    assert!(
+        (stored_a.parent_id.as_ref() == Some(&b.id) && stored_b.parent_id.is_none())
+            || (stored_b.parent_id.as_ref() == Some(&a.id) && stored_a.parent_id.is_none()),
+        "E2: the committed PostgreSQL graph remains acyclic"
+    );
+    assert_eq!(directory.revision(&cycle_org).unwrap(), 4, "E3");
 }
 
 #[test]

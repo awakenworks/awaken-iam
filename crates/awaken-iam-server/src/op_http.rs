@@ -32,9 +32,10 @@ struct OpHttpState {
 
 /// Bind the canonical public OP endpoints over `auth`.
 ///
-/// JWKS is deliberately not mounted here: an embedding product may publish
-/// additional token families under the same platform JWKS. The supplied
-/// `AuthApi` must use that deployment's shared [`AccessTokenAuthority`](crate::AccessTokenAuthority).
+/// JWKS is deliberately composed separately through [`jwks_router`]: an
+/// embedding product may publish additional token families under the same
+/// platform JWKS. The supplied `AuthApi` must use that deployment's shared
+/// [`AccessTokenAuthority`](crate::AccessTokenAuthority).
 pub fn op_router(auth: SharedAuthApi, issuer: impl Into<String>) -> Router {
     let state = OpHttpState {
         auth,
@@ -52,6 +53,21 @@ pub fn op_router(auth: SharedAuthApi, issuer: impl Into<String>) -> Router {
         .route("/v1/oauth/revoke", post(revoke))
         .route("/v1/oauth/userinfo", get(userinfo))
         .with_state(state)
+}
+
+/// Publish the standalone IAM process's access-token trust anchor.
+///
+/// Product embeddings that aggregate additional signing families keep their
+/// own combined JWKS route and use [`op_router`] alone. `iam-daemon` composes
+/// this router exactly once beside the OP and administration routes.
+pub fn jwks_router(auth: SharedAuthApi) -> Router {
+    Router::new()
+        .route("/.well-known/jwks.json", get(jwks))
+        .with_state(auth)
+}
+
+async fn jwks(State(auth): State<SharedAuthApi>) -> Response {
+    Json(auth.lock().await.jwks()).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,6 +594,35 @@ mod tests {
             .to_owned();
         let shared = Arc::new(Mutex::new(auth));
         (op_router(shared, issuer), session_cookie)
+    }
+
+    #[tokio::test]
+    async fn standalone_jwks_router_publishes_the_auth_api_trust_anchor() {
+        // Cause/effect decision table:
+        // | composition | requested route | effect |
+        // | standalone JWKS router | /.well-known/jwks.json | exact AuthApi keys |
+        // | product OP router only | same route | absent; product may aggregate keys |
+        // Constraint: there is one access-token authority; this route projects
+        // it and never creates or caches another signing-key source.
+        let auth = AuthApi::new();
+        let expected = auth.jwks();
+        let response = jwks_router(Arc::new(Mutex::new(auth)))
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<awaken_iam_contract::Jwks>(&body).unwrap(),
+            expected
+        );
     }
 
     /// Causal table for the shared browser bootstrap:
