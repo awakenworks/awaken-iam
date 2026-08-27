@@ -6,10 +6,10 @@
 //! timestamps, active state, and movable presentation placement.
 
 use awaken_iam_contract::{
-    CreateDirectoryNode, DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult,
-    DirectoryNodeView, EnsureProductSpacePlacement, MoveDirectoryNode, OrgId, PrincipalRef,
-    ProductSpacePlacement, ProductSpacePlacementResult, ProductSpaceRef, Timestamp,
-    UpdateDirectoryNode,
+    CreateDirectoryNode, DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId,
+    DirectoryNodeMutationResult, DirectoryNodeView, EnsureProductSpacePlacement, MoveDirectoryNode,
+    OrgId, PrincipalRef, ProductId, ProductSpacePlacement, ProductSpacePlacementResult,
+    ProductSpaceRef, Timestamp, UpdateDirectoryNode,
 };
 use awaken_iam_core::{DirectoryNode, DirectoryRepository, RepositoryError};
 use base64::Engine as _;
@@ -26,11 +26,16 @@ use crate::admin_api::{AdminError, AdminResult};
 pub struct DirectoryCommandContext {
     pub actor: PrincipalRef,
     pub at: Timestamp,
+    product_id: Option<ProductId>,
 }
 
 impl DirectoryCommandContext {
     pub fn new(actor: PrincipalRef, at: Timestamp) -> Self {
-        Self { actor, at }
+        Self {
+            actor,
+            at,
+            product_id: None,
+        }
     }
 
     pub fn service(service_id: impl Into<String>, at: Timestamp) -> Self {
@@ -40,6 +45,30 @@ impl DirectoryCommandContext {
             },
             at,
         )
+    }
+
+    /// Bind an embedded or authenticated product caller to its own namespace.
+    pub fn product_service(
+        product_id: ProductId,
+        service_id: impl Into<String>,
+        at: Timestamp,
+    ) -> Self {
+        let mut context = Self::service(service_id, at);
+        context.product_id = Some(product_id);
+        context
+    }
+
+    fn authorize(&self, product_id: &ProductId) -> AdminResult<()> {
+        if self
+            .product_id
+            .as_ref()
+            .is_some_and(|allowed| allowed != product_id)
+        {
+            return Err(AdminError::Invalid(format!(
+                "product caller may not place product {product_id}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -55,7 +84,7 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
     }
 
     /// Create a user-managed folder. Product spaces must use
-    /// [`Self::ensure_product_space_placement`], the single placement compiler.
+    /// [`Self::ensure_product_space_placement`], the canonical placement command.
     pub fn create_node(
         &self,
         request: CreateDirectoryNode,
@@ -92,12 +121,16 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
         context: DirectoryCommandContext,
     ) -> AdminResult<ProductSpacePlacementResult> {
         validate_product_space(&request.product_space)?;
+        context.authorize(&request.product_space.product_id)?;
         if request.name.trim().is_empty() {
             return Err(AdminError::Invalid(
                 "directory node name must not be empty".into(),
             ));
         }
-        if let Some(existing) = self.store.product_space_binding(&request.product_space)? {
+        if let Some(existing) = self
+            .store
+            .product_space_placement(&request.org_id, &request.product_space)?
+        {
             return self.existing_placement(existing, &request.org_id, context);
         }
 
@@ -107,11 +140,14 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
             .map(|parent| self.resolve_live_parent(parent, &request.org_id))
             .transpose()?;
         let node = DirectoryNode {
-            id: product_space_node_id(&request.product_space),
+            id: product_space_node_id(&request.org_id, &request.product_space),
             org_id: request.org_id.clone(),
             parent_id,
             name: request.name,
-            slug: canonical_slug(&request.preferred_slug, Some(&request.product_space)),
+            slug: canonical_slug(
+                &request.preferred_slug,
+                Some((&request.org_id, &request.product_space)),
+            ),
             description: request.description,
             archived: false,
             created_at: context.at.clone(),
@@ -142,7 +178,10 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
                 // Cause: a concurrent exact ensure may win the unique
                 // product-space key. Effect: converge on that authoritative
                 // placement rather than exposing a spurious conflict.
-                if let Some(existing) = self.store.product_space_binding(&request.product_space)? {
+                if let Some(existing) = self
+                    .store
+                    .product_space_placement(&request.org_id, &request.product_space)?
+                {
                     self.existing_placement(existing, &request.org_id, context)
                 } else {
                     Err(error.into())
@@ -177,7 +216,7 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
             node.updated_at = context.at;
             revision
         } else {
-            self.store.directory_revision()?
+            self.store.directory_revision(expected_org)?
         };
         Ok(ProductSpacePlacementResult {
             revision,
@@ -195,7 +234,7 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
         validate_product_space(product_space)?;
         let placement = self
             .store
-            .product_space_binding(product_space)?
+            .product_space_placement(org_id, product_space)?
             .ok_or_else(|| AdminError::NotFound("parent product space has no placement".into()))?;
         if &placement.org_id != org_id {
             return Err(AdminError::Invalid(
@@ -218,13 +257,13 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
         &self,
         org_id: &OrgId,
         parent_id: Option<&DirectoryNodeId>,
-    ) -> AdminResult<Vec<DirectoryNodeView>> {
-        Ok(self
-            .store
-            .directory_children(org_id, parent_id)?
-            .into_iter()
-            .map(DirectoryNodeView::from)
-            .collect())
+    ) -> AdminResult<DirectoryChildrenView> {
+        let (revision, nodes) = self.store.directory_children(org_id, parent_id)?;
+        Ok(DirectoryChildrenView {
+            org_id: org_id.clone(),
+            revision,
+            nodes: nodes.into_iter().map(DirectoryNodeView::from).collect(),
+        })
     }
 
     pub fn move_node(
@@ -285,22 +324,25 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
         })
     }
 
-    pub fn product_space_binding(
+    pub fn product_space_placement(
         &self,
+        org_id: &OrgId,
         product_space: &ProductSpaceRef,
     ) -> AdminResult<Option<ProductSpacePlacement>> {
-        Ok(self.store.product_space_binding(product_space)?)
+        Ok(self.store.product_space_placement(org_id, product_space)?)
     }
 
-    pub fn revision(&self) -> AdminResult<u64> {
-        Ok(self.store.directory_revision()?)
+    pub fn revision(&self, org_id: &OrgId) -> AdminResult<u64> {
+        Ok(self.store.directory_revision(org_id)?)
     }
 }
 
 fn validate_product_space(product_space: &ProductSpaceRef) -> AdminResult<()> {
-    if product_space.product.trim().is_empty() || product_space.space_id.trim().is_empty() {
+    if product_space.space_id.trim().is_empty()
+        || product_space.space_id.trim() != product_space.space_id
+    {
         return Err(AdminError::Invalid(
-            "product namespace and space id must not be empty".into(),
+            "product space id must not be empty or contain surrounding whitespace".into(),
         ));
     }
     Ok(())
@@ -317,20 +359,26 @@ fn random_node_id() -> AdminResult<DirectoryNodeId> {
     )))
 }
 
-fn product_space_node_id(product_space: &ProductSpaceRef) -> DirectoryNodeId {
-    let digest = product_space_digest(product_space);
+fn product_space_node_id(org_id: &OrgId, product_space: &ProductSpaceRef) -> DirectoryNodeId {
+    let digest = product_space_digest(org_id, product_space);
     DirectoryNodeId(format!(
         "space_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..18])
     ))
 }
 
-fn product_space_digest(product_space: &ProductSpaceRef) -> [u8; 32] {
-    Sha256::digest(format!("{}\u{1f}{}", product_space.product, product_space.space_id).as_bytes())
-        .into()
+fn product_space_digest(org_id: &OrgId, product_space: &ProductSpaceRef) -> [u8; 32] {
+    Sha256::digest(
+        format!(
+            "{}\u{1f}{}\u{1f}{}",
+            org_id.0, product_space.product_id, product_space.space_id
+        )
+        .as_bytes(),
+    )
+    .into()
 }
 
-fn canonical_slug(raw: &str, product_space: Option<&ProductSpaceRef>) -> String {
+fn canonical_slug(raw: &str, product_space: Option<(&OrgId, &ProductSpaceRef)>) -> String {
     let mut base = String::with_capacity(raw.len());
     let mut previous_hyphen = false;
     for byte in raw.bytes().map(|byte| byte.to_ascii_lowercase()) {
@@ -348,11 +396,11 @@ fn canonical_slug(raw: &str, product_space: Option<&ProductSpaceRef>) -> String 
     if base.is_empty() {
         base.push_str("space");
     }
-    let Some(product_space) = product_space else {
+    let Some((org_id, product_space)) = product_space else {
         base.truncate(50);
         return base.trim_end_matches('-').to_owned();
     };
-    let digest = product_space_digest(product_space);
+    let digest = product_space_digest(org_id, product_space);
     let suffix = digest[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -374,25 +422,33 @@ mod tests {
         // and slug for idempotent replay; R2(C2) -> different id and suffix so
         // sibling labels cannot create a second product-side collision policy.
         let first = ProductSpaceRef {
-            product: "workforce".into(),
+            product_id: ProductId::new("workforce").unwrap(),
             space_id: "workspace/one".into(),
         };
         let second = ProductSpaceRef {
-            product: "workforce".into(),
+            product_id: ProductId::new("workforce").unwrap(),
             space_id: "workspace/two".into(),
         };
-        assert_eq!(product_space_node_id(&first), product_space_node_id(&first));
+        let org = OrgId("acme".into());
         assert_eq!(
-            canonical_slug("My Workspace", Some(&first)),
-            canonical_slug("My Workspace", Some(&first))
+            product_space_node_id(&org, &first),
+            product_space_node_id(&org, &first)
+        );
+        assert_eq!(
+            canonical_slug("My Workspace", Some((&org, &first))),
+            canonical_slug("My Workspace", Some((&org, &first)))
         );
         assert_ne!(
-            product_space_node_id(&first),
-            product_space_node_id(&second)
+            product_space_node_id(&org, &first),
+            product_space_node_id(&org, &second)
         );
         assert_ne!(
-            canonical_slug("My Workspace", Some(&first)),
-            canonical_slug("My Workspace", Some(&second))
+            product_space_node_id(&org, &first),
+            product_space_node_id(&OrgId("other".into()), &first)
+        );
+        assert_ne!(
+            canonical_slug("My Workspace", Some((&org, &first))),
+            canonical_slug("My Workspace", Some((&org, &second)))
         );
     }
 }

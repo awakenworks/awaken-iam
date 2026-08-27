@@ -1,5 +1,5 @@
 //! End-to-end coverage of the SQL store's repository contracts not exercised by
-//! `sql_store_e2e::exercise_every_port`: list endpoints, role deletion, the
+//! `sql_store_e2e::exercise_every_repository`: list endpoints, role deletion, the
 //! api-token absent-update NotFound branch, and the unknown tier / effect
 //! string-error branches.
 

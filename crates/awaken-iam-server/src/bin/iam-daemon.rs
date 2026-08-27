@@ -19,9 +19,12 @@
 //!   `Authorization: Bearer` value the remote console presents). Unset means the
 //!   admin seam is still served but fails closed — every admin call is rejected —
 //!   so the daemon never exposes an unauthenticated control plane by default.
+//! - `IAM_DIRECTORY_PRODUCT_TOKENS` — comma-separated `product_id=token`
+//!   credentials allowed to ensure/query only that product's Directory spaces.
 
 use std::sync::{Arc, Mutex};
 
+use awaken_iam_contract::ProductId;
 use awaken_iam_core::{
     AuthCodeRepository, OAuthClientRepository, RegisteredClient, SessionRepository,
 };
@@ -79,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
-    let admin_auth = admin_auth_from_env();
+    let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
     let state = Arc::new(Mutex::new(DaemonState::with_policy_store(
         authz,
         admin_auth,
@@ -114,8 +117,35 @@ fn resolve_admin_auth(raw: Option<&str>) -> AdminAuthPolicy {
 }
 
 /// Read `IAM_ADMIN_TOKEN` from the environment and resolve the auth policy.
-fn admin_auth_from_env() -> AdminAuthPolicy {
-    resolve_admin_auth(std::env::var("IAM_ADMIN_TOKEN").ok().as_deref())
+fn resolve_product_auth(
+    mut policy: AdminAuthPolicy,
+    raw: Option<&str>,
+) -> Result<AdminAuthPolicy, String> {
+    for entry in raw.into_iter().flat_map(|value| value.split(',')) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (product_id, token) = entry.split_once('=').ok_or_else(|| {
+            "IAM_DIRECTORY_PRODUCT_TOKENS entries must be product_id=token".to_owned()
+        })?;
+        let product_id = ProductId::new(product_id.trim()).map_err(|error| error.to_string())?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("IAM_DIRECTORY_PRODUCT_TOKENS token must not be empty".into());
+        }
+        policy = policy.with_product_token(product_id, token);
+    }
+    Ok(policy)
+}
+
+fn admin_auth_from_env() -> Result<AdminAuthPolicy, String> {
+    resolve_product_auth(
+        resolve_admin_auth(std::env::var("IAM_ADMIN_TOKEN").ok().as_deref()),
+        std::env::var("IAM_DIRECTORY_PRODUCT_TOKENS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -160,6 +190,26 @@ mod tests {
     #[test]
     fn empty_entries_between_commas_do_not_panic() {
         let _ = resolve_admin_auth(Some("alpha,,beta,"));
+    }
+
+    #[test]
+    fn product_token_parser_accepts_canonical_entries_and_rejects_ambiguous_ones() {
+        // Cause-effect decision table: canonical product=token entries -> scoped
+        // credentials; missing separator, empty token or noncanonical ProductId
+        // -> startup error. Invalid security configuration never degrades to an
+        // unrestricted or silently ignored credential.
+        let policy = resolve_product_auth(
+            AdminAuthPolicy::deny_all(),
+            Some("agents=agents-secret, workforce=workforce-secret"),
+        )
+        .unwrap();
+        let _ = policy;
+        for invalid in ["agents", "agents=", "Agents=secret"] {
+            assert!(
+                resolve_product_auth(AdminAuthPolicy::deny_all(), Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

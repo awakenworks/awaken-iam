@@ -1,10 +1,8 @@
 //! In-memory adapter implementing the core's repository contracts.
 //!
-//! This backs tests and the `local` client deployment. It enforces the same
-//! uniqueness and lifecycle invariants the database adapter does, so code
-//! exercised against it behaves identically once a real pool is mounted. State
-//! lives behind a single [`Mutex`] keyed by subdomain, mirroring the
-//! scope-partitioned bundles without ever coupling them by a foreign key.
+//! This backs focused tests for IAM contexts that do not require durable
+//! adapters. Directory deliberately has no in-memory implementation: embedded
+//! and hosted Directory tests exercise the one migrated SQL authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -12,17 +10,13 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpacePlacement,
-    ProfileLifecycle, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ScopeRef, Session,
+    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
-#[cfg(any(test, feature = "test-support"))]
-use awaken_iam_contract::{DirectoryNodeId, ProductSpaceRef};
-#[cfg(any(test, feature = "test-support"))]
-use awaken_iam_core::DirectoryRepository;
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ApiTokenRepository, AuditEvent, AuditSink,
-    AuthCodeRepository, AuthorizationProfileRepository, DirectoryNode, ExternalIdentityRepository,
-    Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId, GroupRepository, Invitation,
+    AuthCodeRepository, AuthorizationProfileRepository, ExternalIdentityRepository, Grant, GrantId,
+    GrantRepository, GrantSubject, Group, GroupId, GroupRepository, Invitation,
     InvitationRepository, LoginFlowRepository, OAuthClientRepository, OrgPrivacyRepository,
     OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepository,
     RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge, ResourceModelRepository,
@@ -31,9 +25,6 @@ use awaken_iam_core::{
 };
 
 use super::fence::{Fence, FenceStore};
-
-#[cfg(any(test, feature = "test-support"))]
-mod directory;
 
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
@@ -67,10 +58,6 @@ struct Authz {
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
-    directory_nodes: BTreeMap<String, DirectoryNode>,
-    product_space_bindings: BTreeMap<String, ProductSpacePlacement>,
-    #[cfg(any(test, feature = "test-support"))]
-    directory_revision: u64,
 }
 
 #[derive(Default)]
@@ -79,7 +66,7 @@ struct Entitlement {
     subscriptions: BTreeMap<String, PlanId>,
 }
 
-/// In-memory implementation of every IAM repository port.
+/// In-memory implementation of selected IAM repository contracts for tests.
 #[derive(Clone, Default)]
 pub struct InMemoryStore {
     identity: Arc<Mutex<Identity>>,
@@ -500,9 +487,7 @@ impl OrgPrivacyRepository for InMemoryStore {
             + authz.role_bindings.len()
             + authz.invitations.len()
             + authz.resource_edges.len()
-            + authz.workspace_orgs.len()
-            + authz.directory_nodes.len()
-            + authz.product_space_bindings.len();
+            + authz.workspace_orgs.len();
 
         authz.orgs.remove(&id.0);
         authz.groups.retain(|_, group| &group.org != id);
@@ -510,10 +495,6 @@ impl OrgPrivacyRepository for InMemoryStore {
             .invitations
             .retain(|_, invitation| &invitation.org_id != id);
         authz.workspace_orgs.retain(|_, edge| &edge.org_id != id);
-        authz
-            .product_space_bindings
-            .retain(|_, binding| &binding.org_id != id);
-        authz.directory_nodes.retain(|_, node| &node.org_id != id);
         authz
             .role_bindings
             .retain(|_, binding| !privacy.contains(&binding.scope));
@@ -537,9 +518,7 @@ impl OrgPrivacyRepository for InMemoryStore {
             + authz.role_bindings.len()
             + authz.invitations.len()
             + authz.resource_edges.len()
-            + authz.workspace_orgs.len()
-            + authz.directory_nodes.len()
-            + authz.product_space_bindings.len();
+            + authz.workspace_orgs.len();
         drop(authz);
 
         let mut identity = self
@@ -1692,34 +1671,6 @@ mod tests {
             )
             .unwrap();
         }
-        for suffix in ["a", "b"] {
-            let org_id = OrgId(format!("org-{suffix}"));
-            let node_id = DirectoryNodeId(format!("node-{suffix}"));
-            DirectoryRepository::create_directory_node(
-                &store,
-                DirectoryNode {
-                    id: node_id.clone(),
-                    org_id: org_id.clone(),
-                    parent_id: None,
-                    name: format!("Root {suffix}"),
-                    slug: format!("root-{suffix}"),
-                    description: None,
-                    archived: false,
-                    created_at: ts("2026-06-19T00:00:00Z"),
-                    updated_at: ts("2026-06-19T00:00:00Z"),
-                },
-                Some(ProductSpacePlacement {
-                    product_space: ProductSpaceRef {
-                        product: "agents".into(),
-                        space_id: format!("space-{suffix}"),
-                    },
-                    org_id,
-                    node_id,
-                }),
-                &owner,
-            )
-            .unwrap();
-        }
         GroupRepository::upsert(
             &store,
             Group {
@@ -1804,22 +1755,6 @@ mod tests {
             OrgRepository::get(&store, &OrgId("org-b".into()))
                 .unwrap()
                 .is_some()
-        );
-        assert!(
-            DirectoryRepository::directory_node(&store, &DirectoryNodeId("node-a".into()))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            DirectoryRepository::product_space_binding(
-                &store,
-                &ProductSpaceRef {
-                    product: "agents".into(),
-                    space_id: "space-b".into(),
-                },
-            )
-            .unwrap()
-            .is_some()
         );
         assert!(GroupRepository::list(&store).unwrap().is_empty());
         assert!(GrantRepository::list(&store).unwrap().is_empty());

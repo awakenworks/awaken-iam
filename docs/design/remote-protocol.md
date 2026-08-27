@@ -12,7 +12,7 @@ served over HTTP — `authorize()` is unreachable for a separate service. A
 standalone consumer runs as its own process and must obtain decisions remotely,
 while an embedded consumer wants the same trait in-process with no network hop.
 
-## One trait, two modes
+## Capability-specific clients, two modes
 
 ```rust
 trait IamClient {
@@ -21,10 +21,12 @@ trait IamClient {
 }
 ```
 
-The remote transport layer is broken out as the `AuthzTransport` trait so that
-`RemoteIamClient<T>` can delegate each endpoint call to a swappable implementation
-(`HttpAuthzTransport` in production, stubs in tests). Methods on `AuthzTransport`
-correspond one-to-one with the HTTP endpoints below:
+The remote layer separates authorization and Directory capabilities.
+`AuthzTransport` owns authorization, entitlement, snapshot, and token methods;
+`DirectoryClient` owns the complete Directory surface. `RemoteIamClient<T>` can
+delegate either capability to `HttpAuthzTransport` in production or a focused
+test implementation without forcing an authorization-only consumer to implement
+Directory methods.
 
 | Transport method | HTTP endpoint |
 |---|---|
@@ -34,11 +36,16 @@ correspond one-to-one with the HTTP endpoints below:
 | `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
 | `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
 | `introspect_token` | `POST /v1/tokens/introspect` |
+The independent `DirectoryClient` maps one-to-one to:
+
+| Directory method | HTTP endpoint |
+|---|---|
 | `create_directory_node` | `POST /v1/admin/directory/nodes` |
 | `ensure_product_space_placement` | `POST /v1/admin/directory/product-spaces/ensure` |
 | `get_directory_node` / `directory_children` | `GET /v1/admin/directory/nodes...` |
+| `directory_revision` | `GET /v1/admin/directory/revision` |
 | `move_directory_node` / `update_directory_node` / `archive_directory_node` / `restore_directory_node` | `PUT` / `PATCH` / `DELETE` / `POST /v1/admin/directory/nodes/{id}/restore` |
-| `product_space_binding` | `POST /v1/admin/directory/product-spaces/query` |
+| `product_space_placement` | `POST /v1/admin/directory/product-spaces/query` |
 
 `introspect_token` has a default implementation that returns an unsupported error,
 so existing `AuthzTransport` implementations remain valid without change. The
@@ -77,6 +84,7 @@ POST /v1/admin/directory/nodes
 POST /v1/admin/directory/product-spaces/ensure
 GET  /v1/admin/directory/nodes/{id}
 GET  /v1/admin/directory/nodes?org_id={org}&parent_id={optional_parent}
+GET  /v1/admin/directory/revision?org_id={org}
 PUT  /v1/admin/directory/nodes/{id}
 PATCH /v1/admin/directory/nodes/{id}
 DELETE /v1/admin/directory/nodes/{id}

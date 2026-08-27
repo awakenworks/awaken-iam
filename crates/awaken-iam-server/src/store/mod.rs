@@ -1,5 +1,5 @@
-//! Storage edge for IAM: the in-memory adapter and the scope-partitioned
-//! migration bundles the database adapter applies.
+//! Storage edge for IAM: selected test repositories and the scope-partitioned
+//! migration bundles used by the production database adapters.
 //!
 //! The core declares the [repository contracts](awaken_iam_core); this module is
 //! the server-owned edge that provides adapters for them, keeping `contract`,

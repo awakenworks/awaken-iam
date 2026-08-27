@@ -54,7 +54,7 @@ pub type AuthzState = Arc<AuthzApi>;
 ///
 /// The returned router is framework-complete: hand it to [`serve`] (or any
 /// `axum::serve`) to answer `/v1` over hyper. Bodies are the
-/// [`awaken_iam_contract`] DTOs as JSON; a malformed body is rejected by the
+/// [`awaken_iam_contract`] wire contracts as JSON; a malformed body is rejected by the
 /// `Json` extractor as `400 Bad Request` before reaching the engine.
 pub fn authz_router(state: AuthzState) -> Router {
     Router::new()

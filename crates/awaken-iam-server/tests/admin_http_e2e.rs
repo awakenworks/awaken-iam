@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AdminMutationAck, AuthorizationOutcome, BatchAuthorizationResponse, EntitlementCheckResponse,
-    OrgView, PolicySnapshot,
+    OrgView, PolicySnapshot, ProductId,
 };
 use awaken_iam_core::AuthorizationProfileRepository;
 use awaken_iam_server::{
@@ -25,6 +25,7 @@ use axum::http::{Request, Response, StatusCode};
 use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-secret";
+const AGENTS_TOKEN: &str = "agents-directory-secret";
 
 fn test_daemon_state(
     authz: AuthzApi,
@@ -43,10 +44,11 @@ fn test_daemon_state(
 }
 
 fn daemon() -> Router {
-    let state = Arc::new(Mutex::new(test_daemon_state(
-        AuthzApi::new(),
-        AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
-    )));
+    daemon_with_auth(AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]))
+}
+
+fn daemon_with_auth(auth: AdminAuthPolicy) -> Router {
+    let state = Arc::new(Mutex::new(test_daemon_state(AuthzApi::new(), auth)));
     daemon_router(state)
 }
 
@@ -67,6 +69,16 @@ fn authed(method: &str, path: &str, body: Option<&str>) -> Request<Body> {
 
 fn authed_json(method: &str, path: &str, body: serde_json::Value) -> Request<Body> {
     authed(method, path, Some(&body.to_string()))
+}
+
+fn product_json(method: &str, path: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {AGENTS_TOKEN}"))
+        .body(Body::from(body.to_string()))
+        .expect("build product request")
 }
 
 fn org_body(id: &str) -> serde_json::Value {
@@ -146,7 +158,7 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
             "POST",
             "/v1/admin/directory/product-spaces/ensure",
             serde_json::json!({
-                "product_space":{"product":"agents", "space_id":"space-a"},
+                "product_space":{"product_id":"agents", "space_id":"space-a"},
                 "org_id":"acme",
                 "parent_product_space":null,
                 "name":"Team",
@@ -214,14 +226,20 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
         .await
         .unwrap();
     assert_eq!(roots.status(), StatusCode::OK);
-    assert_eq!(body_json(roots).await.as_array().unwrap().len(), 2, "E4");
+    let roots = body_json(roots).await;
+    assert_eq!(roots["org_id"], "acme", "E4");
+    assert_eq!(roots["nodes"].as_array().unwrap().len(), 2, "E4");
+    assert!(roots["revision"].as_u64().unwrap() > updated_revision, "E4");
 
     let binding = app
         .clone()
         .oneshot(authed_json(
             "POST",
             "/v1/admin/directory/product-spaces/query",
-            serde_json::json!({"product":"agents", "space_id":"space-a"}),
+            serde_json::json!({
+                "org_id":"acme",
+                "product_space":{"product_id":"agents", "space_id":"space-a"}
+            }),
         ))
         .await
         .unwrap();
@@ -238,6 +256,118 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "H5");
+}
+
+#[tokio::test]
+async fn product_credential_is_scoped_and_directory_route_matrix_is_complete() {
+    // Cause-effect decision table over the remote security/read surface:
+    // R1 product credential + matching ProductId ensure/query -> 200; R2 same
+    // credential + another ProductId -> 403 and no effect; R3 product credential
+    // + administrator-only node command -> 403; R4 admin archive/restore/revision
+    // -> each route succeeds and the Org revision advances exactly once.
+    let app = daemon_with_auth(
+        AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()])
+            .with_product_token(ProductId::new("agents").unwrap(), AGENTS_TOKEN),
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("acme")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let matching = serde_json::json!({
+        "product_space":{"product_id":"agents", "space_id":"workspace/a"},
+        "org_id":"acme",
+        "name":"Agents workspace",
+        "preferred_slug":"agents-workspace"
+    });
+    let created = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/ensure",
+            matching,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK, "R1");
+    let created = body_json(created).await;
+    let node_id = created["node"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["revision"], 2, "R1");
+
+    let foreign = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/ensure",
+            serde_json::json!({
+                "product_space":{"product_id":"objects", "space_id":"space/a"},
+                "org_id":"acme",
+                "name":"Objects space",
+                "preferred_slug":"objects-space"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN, "R2");
+
+    let generic = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/nodes",
+            serde_json::json!({
+                "org_id":"acme", "name":"Folder", "preferred_slug":"folder"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(generic.status(), StatusCode::FORBIDDEN, "R3");
+
+    let own_query = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/query",
+            serde_json::json!({
+                "org_id":"acme",
+                "product_space":{"product_id":"agents", "space_id":"workspace/a"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(own_query.status(), StatusCode::OK, "R1");
+
+    let archived = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/v1/admin/directory/nodes/{node_id}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::OK, "R4");
+    assert_eq!(body_json(archived).await["revision"], 3, "R4");
+    let restored = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/admin/directory/nodes/{node_id}/restore"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK, "R4");
+    assert_eq!(body_json(restored).await["revision"], 4, "R4");
+    let revision = app
+        .oneshot(authed_get("/v1/admin/directory/revision?org_id=acme"))
+        .await
+        .unwrap();
+    assert_eq!(revision.status(), StatusCode::OK, "R4");
+    assert_eq!(body_json(revision).await, 4, "R4");
 }
 
 #[tokio::test]

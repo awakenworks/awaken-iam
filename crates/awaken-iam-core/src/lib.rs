@@ -183,7 +183,7 @@ pub enum IamError {
     },
     /// The authoritative login-flow repository could not complete an operation.
     ///
-    /// Backend detail stays behind the repository port. HTTP hosts may expose
+    /// Backend detail stays behind the repository contract. HTTP hosts may expose
     /// this as temporary unavailability, but must never fall back to a
     /// process-local challenge directory.
     #[error("login flow storage is unavailable")]

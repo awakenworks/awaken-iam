@@ -23,7 +23,7 @@ pub use outbox::{
     DrainReport, InMemoryOutbox, OutboxError, OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore,
     ProvisionTransport,
 };
-pub use remote::{AuthzTransport, IamClientMode, RemoteError, RemoteIamClient};
+pub use remote::{AuthzTransport, DirectoryClient, IamClientMode, RemoteError, RemoteIamClient};
 pub use snapshot::{REASON_UNSYNCED, SnapshotCache, SyncStatus};
 
 use awaken_iam_contract::{

@@ -27,7 +27,7 @@ use crate::{
     RegisteredClient, ResourceEdge, RoleBinding, RoleDef, RoleId,
 };
 
-/// Error surface shared by every repository port.
+/// Error surface shared by every repository contract.
 ///
 /// Adapters map their backend failures onto these variants so the domain and
 /// application services handle persistence outcomes uniformly regardless of
@@ -203,7 +203,7 @@ pub trait DirectoryRepository: Send + Sync {
         &self,
         org_id: &OrgId,
         parent_id: Option<&DirectoryNodeId>,
-    ) -> RepositoryResult<Vec<DirectoryNode>>;
+    ) -> RepositoryResult<(u64, Vec<DirectoryNode>)>;
     /// Move a live node inside its immutable organization, rejecting cycles.
     fn move_directory_node(
         &self,
@@ -238,12 +238,13 @@ pub trait DirectoryRepository: Send + Sync {
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64>;
     /// Resolve the current placement of one stable product space.
-    fn product_space_binding(
+    fn product_space_placement(
         &self,
+        org_id: &OrgId,
         product_space: &ProductSpaceRef,
     ) -> RepositoryResult<Option<ProductSpacePlacement>>;
-    /// Read the authoritative directory freshness fence.
-    fn directory_revision(&self) -> RepositoryResult<u64>;
+    /// Read the authoritative freshness fence for one organization Directory.
+    fn directory_revision(&self, org_id: &OrgId) -> RepositoryResult<u64>;
 }
 
 /// One idempotent IAM-owned organization privacy lifecycle command.

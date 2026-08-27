@@ -23,12 +23,13 @@ pub use profile::{
 
 pub use admin::{
     AcceptInvitation, AcceptedInvitation, AdminMutationAck, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult,
-    DirectoryNodeView, EnsureProductSpacePlacement, GroupView, InvitationBinding, InvitationId,
+    DirectoryChildrenQuery, DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId,
+    DirectoryNodeMutationResult, DirectoryNodeView, DirectoryRevisionQuery,
+    EnsureProductSpacePlacement, GroupView, InvalidProductId, InvitationBinding, InvitationId,
     InvitationQuery, InvitationStatus, InvitationView, IssuedInvitation, MembershipQuery,
-    MoveDirectoryNode, OrgView, ProductSpacePlacement, ProductSpacePlacementResult,
-    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RoleView, ScopeMembershipQuery,
-    UpdateDirectoryNode,
+    MoveDirectoryNode, OrgView, ProductId, ProductSpacePlacement, ProductSpacePlacementQuery,
+    ProductSpacePlacementResult, ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation,
+    RoleView, ScopeMembershipQuery, UpdateDirectoryNode,
 };
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

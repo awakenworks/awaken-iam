@@ -1,7 +1,7 @@
 //! End-to-end proof that the real database adapters are switchable behind the
 //! repository contracts (ADR-0003).
 //!
-//! One harness, [`exercise_every_port`], drives every IAM repository port through
+//! One harness, [`exercise_every_repository`], drives every IAM repository contract through
 //! its success, failure, and guardrail paths against an [`SqlStore`] without
 //! naming a backend. It runs unconditionally against SQLite (a migrated
 //! in-memory database) and, when `IAM_TEST_POSTGRES_URL` is set, against a real
@@ -10,10 +10,10 @@
 
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, DirectoryNodeId,
-    ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId, ExternalIdentityKey,
-    ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProductSpacePlacement, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
-    Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
+    ExternalIdentityKey, ExternalSubject, IdentityProviderKey, OAuthLoginState, OAuthLoginStateId,
+    OrgId, PrincipalRef, ProductId, ProductSpacePlacement, ProductSpaceRef, ResourceId,
+    ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
@@ -25,8 +25,11 @@ use awaken_iam_core::{
     RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
 };
 use awaken_iam_server::{
-    PostgresBackend, SqlConn, SqlStore, postgres_migrated_store, sqlite_in_memory_store,
+    DirectoryApi, DirectoryCommandContext, PostgresBackend, SqlConn, SqlStore,
+    postgres_migrated_store, sqlite_in_memory_store,
 };
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 fn ts(value: &str) -> Timestamp {
     Timestamp(value.into())
@@ -67,8 +70,8 @@ fn service(name: &str) -> PrincipalRef {
     }
 }
 
-/// Drive every repository port through its success, failure, and guardrail paths.
-fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
+/// Drive every repository through its success, failure, and guardrail paths.
+fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
     // --- accounts: upsert is idempotent replace; list is ordered ---
     assert_eq!(
         AccountRepository::get(store, &AccountId("a".into())).unwrap(),
@@ -444,7 +447,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
             directory_node("root", None),
             Some(ProductSpacePlacement {
                 product_space: ProductSpaceRef {
-                    product: "agents".into(),
+                    product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
                     space_id: "space-a".into(),
                 },
                 org_id: OrgId("acme".into()),
@@ -463,10 +466,11 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
     )
     .unwrap();
     assert_eq!(
-        DirectoryRepository::product_space_binding(
+        DirectoryRepository::product_space_placement(
             store,
+            &OrgId("acme".into()),
             &ProductSpaceRef {
-                product: "agents".into(),
+                product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
                 space_id: "space-a".into(),
             }
         )
@@ -475,7 +479,8 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         .node_id,
         DirectoryNodeId("root".into())
     );
-    let before_rejection = DirectoryRepository::directory_revision(store).unwrap();
+    let before_rejection =
+        DirectoryRepository::directory_revision(store, &OrgId("acme".into())).unwrap();
     assert!(matches!(
         DirectoryRepository::move_directory_node(
             store,
@@ -487,7 +492,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
         Err(RepositoryError::Conflict(_))
     ));
     assert_eq!(
-        DirectoryRepository::directory_revision(store).unwrap(),
+        DirectoryRepository::directory_revision(store, &OrgId("acme".into())).unwrap(),
         before_rejection
     );
     DirectoryRepository::update_directory_node(
@@ -528,6 +533,7 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
             Some(&DirectoryNodeId("root".into()))
         )
         .unwrap()
+        .1
         .is_empty()
     );
 
@@ -668,9 +674,9 @@ fn exercise_every_port<B: SqlConn>(store: &SqlStore<B>) {
 }
 
 #[test]
-fn sqlite_backend_serves_every_port() {
+fn sqlite_backend_serves_every_repository() {
     let store = sqlite_in_memory_store("iam").expect("migrate sqlite");
-    exercise_every_port(&store);
+    exercise_every_repository(&store);
 }
 
 #[test]
@@ -686,7 +692,7 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
 }
 
 #[tokio::test]
-async fn postgres_backend_serves_every_port_when_configured() {
+async fn postgres_backend_serves_every_repository_when_configured() {
     // Cause/effect graph: C1=the complete Postgres port suite runs inside an
     // entered Tokio host, C2=connect/query/transaction/migration use the
     // synchronous driver. E1=every call crosses the adapter-owned plain-thread
@@ -710,6 +716,9 @@ async fn postgres_backend_serves_every_port_when_configured() {
         "login_flows",
         "api_tokens",
         "orgs",
+        "product_space_bindings",
+        "directory_nodes",
+        "directory_fence",
         "groups",
         "roles",
         "grants",
@@ -726,7 +735,79 @@ async fn postgres_backend_serves_every_port_when_configured() {
             .expect("drop");
     }
     let store = postgres_migrated_store(&url, "iam").expect("migrate postgres");
-    exercise_every_port(&store);
+    exercise_every_repository(&store);
+
+    // Cause/effect graph: C1=multiple processes may issue the same canonical
+    // ensure against PostgreSQL, C2=the Org fence and unique key serialize the
+    // race. E1=one placement wins, E2=all callers observe one node/revision,
+    // E3=only one root is durable. Decision rule C1+C2 -> E1+E2+E3 proves the
+    // production backend, not only SQLite, enforces idempotency.
+    let org_id = OrgId("postgres-directory-race".into());
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: org_id.clone(),
+            display_name: Some("Postgres directory race".into()),
+            owner: service("postgres-directory-test"),
+            created_at: ts("2026-08-27T00:00:00Z"),
+            updated_at: ts("2026-08-27T00:00:00Z"),
+        },
+    )
+    .unwrap();
+    let product_id = ProductId::new("agents").unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let directory = DirectoryApi::new(store.clone());
+            let barrier = barrier.clone();
+            let org_id = org_id.clone();
+            let product_id = product_id.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                directory
+                    .ensure_product_space_placement(
+                        EnsureProductSpacePlacement {
+                            product_space: ProductSpaceRef {
+                                product_id: product_id.clone(),
+                                space_id: "workspace/shared-race".into(),
+                            },
+                            org_id,
+                            parent_product_space: None,
+                            name: "Shared race".into(),
+                            preferred_slug: "shared-race".into(),
+                            description: None,
+                        },
+                        DirectoryCommandContext::product_service(
+                            product_id,
+                            "postgres-directory-test",
+                            ts("2026-08-27T00:00:01Z"),
+                        ),
+                    )
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results.iter().filter(|result| result.created).count(),
+        1,
+        "E1"
+    );
+    assert!(results.iter().all(|result| result.revision == 2), "E2");
+    assert!(
+        results
+            .iter()
+            .all(|result| result.node.id == results[0].node.id),
+        "E2"
+    );
+    let roots = DirectoryApi::new(store)
+        .children(&OrgId("postgres-directory-race".into()), None)
+        .unwrap();
+    assert_eq!(roots.nodes.len(), 1, "E3");
+    assert_eq!(roots.revision, 2, "E3");
 }
 
 #[test]

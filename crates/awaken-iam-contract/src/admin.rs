@@ -16,6 +16,7 @@
 //! them.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::{AccountId, OrgId, PrincipalRef, ScopeRef, Timestamp};
 
@@ -27,14 +28,74 @@ use crate::{AccountId, OrgId, PrincipalRef, ScopeRef, Timestamp};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DirectoryNodeId(pub String);
 
+/// Open, canonical identity of a product that publishes Directory placements.
+///
+/// This is deliberately not an enum: adding a product must not require an IAM
+/// release. Lowercase canonical syntax prevents visually equivalent products
+/// from creating different persistence identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProductId(String);
+
+impl ProductId {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidProductId> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid = (1..=64).contains(&value.len())
+            && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+            && bytes.all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            });
+        if !valid {
+            return Err(InvalidProductId);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ProductId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ProductId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Product identifiers must already be in canonical lowercase form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidProductId;
+
+impl fmt::Display for InvalidProductId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "product id must be 1-64 lowercase ASCII letters, digits, '.', '_' or '-', starting with a letter",
+        )
+    }
+}
+
+impl std::error::Error for InvalidProductId {}
+
 /// Stable, product-qualified identity of a product-owned space.
 ///
-/// `product` is an open namespace (`"agents"`, `"workforce"`, ...), not an IAM
-/// enum. `space_id` is opaque to IAM and remains stable when its directory node
-/// moves or is renamed.
+/// `space_id` is opaque to IAM and remains stable when its directory node moves
+/// or is renamed. Its persistence identity is completed by the owning `OrgId`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProductSpaceRef {
-    pub product: String,
+    pub product_id: ProductId,
     pub space_id: String,
 }
 
@@ -121,6 +182,27 @@ pub struct DirectoryChildrenQuery {
     pub org_id: OrgId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<DirectoryNodeId>,
+}
+
+/// Read the current revision of one organization Directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryRevisionQuery {
+    pub org_id: OrgId,
+}
+
+/// Org-scoped Directory read projection fenced in the same storage read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryChildrenView {
+    pub org_id: OrgId,
+    pub revision: u64,
+    pub nodes: Vec<DirectoryNodeView>,
+}
+
+/// Resolve one product-space placement inside its immutable organization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductSpacePlacementQuery {
+    pub org_id: OrgId,
+    pub product_space: ProductSpaceRef,
 }
 
 /// Directory mutation acknowledgement, fenced independently from IAM policy.
@@ -397,17 +479,17 @@ mod tests {
     #[test]
     fn directory_wire_shape_keeps_placement_separate_from_product_identity() {
         // Cause/effect decision table: C1 optional parent/description omitted
-        // -> E1 root placement with no description; C2 open product namespace
+        // -> E1 root placement with no description; C2 open canonical product id
         // -> E2 lossless round-trip without an enum; C3 move omits parent -> E3
         // move to root. W1-W3 pin the shared embedded/HTTP published language.
         let json = r#"{
-          "product_space":{"product":"future-product","space_id":"space-a"},
+          "product_space":{"product_id":"future-product","space_id":"space-a"},
           "org_id":"acme", "name":"Team", "preferred_slug":"Team"
         }"#;
         let command: EnsureProductSpacePlacement = serde_json::from_str(json).unwrap();
         assert!(command.parent_product_space.is_none());
         assert!(command.description.is_none());
-        assert_eq!(command.product_space.product, "future-product");
+        assert_eq!(command.product_space.product_id.as_str(), "future-product");
         assert_eq!(
             serde_json::from_str::<EnsureProductSpacePlacement>(
                 &serde_json::to_string(&command).unwrap()
@@ -417,5 +499,18 @@ mod tests {
         );
         let move_to_root: MoveDirectoryNode = serde_json::from_str("{}").unwrap();
         assert!(move_to_root.parent_id.is_none());
+    }
+
+    #[test]
+    fn product_id_rejects_noncanonical_or_ambiguous_identity() {
+        // Cause/effect decision table: R1 lowercase canonical id -> construct and
+        // deserialize; R2 uppercase, surrounding whitespace, leading digit or
+        // unsupported separator -> reject before hashing or persistence. These
+        // rules prevent two spellings from becoming parallel product identities.
+        assert_eq!(ProductId::new("agents").unwrap().as_str(), "agents");
+        for invalid in ["Agents", " agents", "agents ", "1agents", "agents/team"] {
+            assert!(ProductId::new(invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_str::<ProductId>(&format!("\"{invalid}\"")).is_err());
+        }
     }
 }

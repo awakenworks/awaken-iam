@@ -37,10 +37,10 @@ impl<B: SqlConn> OrgPrivacyRepository for SqlStore<B> {
                 // command mutex. Privacy deletion must serialize with those
                 // commands or a node could outlive its tenant partition.
                 sql: format!(
-                    "UPDATE {} SET revision = revision WHERE id = 1",
+                    "UPDATE {} SET revision = revision WHERE org_id = ?",
                     self.table("directory_fence")
                 ),
-                params: Vec::new(),
+                params: vec![p(id.0.clone())],
             },
             SqlWrite {
                 // Advance the independent Directory fence only when this Org
@@ -48,11 +48,11 @@ impl<B: SqlConn> OrgPrivacyRepository for SqlStore<B> {
                 // revision-idempotent.
                 sql: format!(
                     "UPDATE {} SET revision = revision + 1 \
-                     WHERE id = 1 AND EXISTS (SELECT 1 FROM {} WHERE org_id = ?)",
+                     WHERE org_id = ? AND EXISTS (SELECT 1 FROM {} WHERE org_id = ?)",
                     self.table("directory_fence"),
                     self.table("directory_nodes")
                 ),
-                params: vec![p(id.0.clone())],
+                params: vec![p(id.0.clone()), p(id.0.clone())],
             },
         ];
         for row in token_rows {
@@ -110,6 +110,7 @@ impl<B: SqlConn> OrgPrivacyRepository for SqlStore<B> {
         for (table, column) in [
             ("product_space_bindings", "org_id"),
             ("directory_nodes", "org_id"),
+            ("directory_fence", "org_id"),
             ("invitations", "org_id"),
             ("groups", "org_id"),
             ("workspace_org_edges", "org_id"),

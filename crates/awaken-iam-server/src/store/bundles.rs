@@ -143,6 +143,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "enforce one product-space placement per Directory node",
                     DIRECTORY_0002,
                 ),
+                (
+                    3,
+                    "partition product-space identity and revision by organization",
+                    DIRECTORY_0003,
+                ),
             ],
         ),
         bundle(
@@ -433,6 +438,37 @@ const DIRECTORY_0002: &str = "\
 CREATE UNIQUE INDEX {prefix}_product_space_bindings_node_key \
  ON {prefix}_product_space_bindings (node_id);";
 
+// reviewed: migration-allow-destructive — the third Directory step atomically rebuilds two
+// authority tables because SQLite cannot alter their primary keys in place.
+// The Directory aggregate is one organization partition, not one global tree.
+// Rebuild the two small authority tables portably because SQLite cannot alter a
+// primary key in place. Existing organizations with Directory nodes inherit the
+// previous global revision; an empty organization initializes revision 1 on its
+// first Directory command.
+const DIRECTORY_0003: &str = "\
+CREATE TABLE {prefix}_product_space_bindings_v2 (\
+ product TEXT NOT NULL, \
+ space_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ node_id TEXT NOT NULL, \
+ PRIMARY KEY (org_id, product, space_id));\n\
+INSERT INTO {prefix}_product_space_bindings_v2 (product, space_id, org_id, node_id) \
+ SELECT product, space_id, org_id, node_id FROM {prefix}_product_space_bindings;\n\
+DROP TABLE {prefix}_product_space_bindings;\n\
+ALTER TABLE {prefix}_product_space_bindings_v2 RENAME TO {prefix}_product_space_bindings;\n\
+CREATE INDEX {prefix}_product_space_bindings_node_idx \
+ ON {prefix}_product_space_bindings (org_id, node_id);\n\
+CREATE UNIQUE INDEX {prefix}_product_space_bindings_node_key \
+ ON {prefix}_product_space_bindings (node_id);\n\
+CREATE TABLE {prefix}_directory_fence_v2 (\
+ org_id TEXT PRIMARY KEY, \
+ revision BIGINT NOT NULL);\n\
+INSERT INTO {prefix}_directory_fence_v2 (org_id, revision) \
+ SELECT DISTINCT node.org_id, fence.revision \
+ FROM {prefix}_directory_nodes node CROSS JOIN {prefix}_directory_fence fence;\n\
+DROP TABLE {prefix}_directory_fence;\n\
+ALTER TABLE {prefix}_directory_fence_v2 RENAME TO {prefix}_directory_fence;";
+
 // --- iam.entitlement DDL ---------------------------------------------------
 //
 // Plans and the per-principal subscription assignment. A subscription names a
@@ -466,6 +502,89 @@ CREATE TABLE {prefix}_audit_events (\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{SqlConn, SqliteBackend};
+
+    #[test]
+    fn directory_v3_preserves_rows_and_scopes_identity_and_revision_by_org() {
+        // Cause/effect graph: C1=the first two versions contain one placement and
+        // one global revision, C2=the third rebuilds both authority tables. E1=the existing row
+        // remains queryable, E2=its Org receives the old revision, E3=another
+        // Org may reuse the same product-space identity. Decision rule
+        // C1+C2 -> E1+E2+E3 guards the only supported upgrade path.
+        let backend = SqliteBackend::open_in_memory().expect("open sqlite");
+        for statement in [
+            "CREATE TABLE iam_directory_nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, parent_id TEXT NOT NULL, name TEXT NOT NULL, slug TEXT NOT NULL, description TEXT, archived BIGINT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (org_id, parent_id, slug))",
+            "CREATE TABLE iam_product_space_bindings (product TEXT NOT NULL, space_id TEXT NOT NULL, org_id TEXT NOT NULL, node_id TEXT NOT NULL, PRIMARY KEY (product, space_id))",
+            "CREATE UNIQUE INDEX iam_product_space_bindings_node_key ON iam_product_space_bindings (node_id)",
+            "CREATE TABLE iam_directory_fence (id INTEGER PRIMARY KEY, revision BIGINT NOT NULL)",
+            "INSERT INTO iam_directory_nodes (id, org_id, parent_id, name, slug, description, archived, created_at, updated_at) VALUES ('node-a', 'org-a', '', 'A', 'a', NULL, 0, 't', 't')",
+            "INSERT INTO iam_product_space_bindings (product, space_id, org_id, node_id) VALUES ('agents', 'workspace/shared', 'org-a', 'node-a')",
+            "INSERT INTO iam_directory_fence (id, revision) VALUES (1, 7)",
+        ] {
+            backend
+                .execute(statement, &[])
+                .expect("seed version-two schema");
+        }
+
+        for statement in DIRECTORY_0003.replace("{prefix}", "iam").split(';') {
+            let statement = statement.trim();
+            if !statement.is_empty() {
+                backend
+                    .execute(statement, &[])
+                    .expect("apply third-version statement");
+            }
+        }
+
+        let placement = backend
+            .query(
+                "SELECT org_id, node_id FROM iam_product_space_bindings WHERE product = ? AND space_id = ?",
+                &[Some("agents".into()), Some("workspace/shared".into())],
+            )
+            .expect("read migrated placement");
+        assert_eq!(
+            placement,
+            vec![vec![Some("org-a".into()), Some("node-a".into())]],
+            "E1"
+        );
+        assert_eq!(
+            backend
+                .query(
+                    "SELECT CAST(revision AS TEXT) FROM iam_directory_fence WHERE org_id = ?",
+                    &[Some("org-a".into())],
+                )
+                .expect("read migrated revision"),
+            vec![vec![Some("7".into())]],
+            "E2"
+        );
+
+        backend
+            .execute(
+                "INSERT INTO iam_directory_nodes (id, org_id, parent_id, name, slug, description, archived, created_at, updated_at) VALUES ('node-b', 'org-b', '', 'B', 'b', NULL, 0, 't', 't')",
+                &[],
+            )
+            .expect("seed second Org node");
+        backend
+            .execute(
+                "INSERT INTO iam_product_space_bindings (product, space_id, org_id, node_id) VALUES (?, ?, ?, ?)",
+                &[
+                    Some("agents".into()),
+                    Some("workspace/shared".into()),
+                    Some("org-b".into()),
+                    Some("node-b".into()),
+                ],
+            )
+            .expect("same product space is valid in another Org");
+        assert_eq!(
+            backend
+                .query(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM iam_product_space_bindings",
+                    &[],
+                )
+                .expect("count placements"),
+            vec![vec![Some("2".into())]],
+            "E3"
+        );
+    }
 
     #[test]
     fn bundles_partition_by_the_subdomain_scopes() {

@@ -3,7 +3,7 @@
 //! This is the production byte-transport for remote mode: it shapes each
 //! authorization/entitlement request into the JSON bodies of the remote
 //! protocol (`docs/design/remote-protocol.md`), calls the IAM daemon's
-//! `/v1` endpoints, and decodes the reasoned response DTOs. The surrounding
+//! `/v1` endpoints, and decodes the reasoned response contracts. The surrounding
 //! [`RemoteIamClient`](crate::RemoteIamClient) owns the fail-closed contract —
 //! it maps any [`RemoteError`] this transport returns to a deny — so this layer
 //! concentrates on the parts every consumer would otherwise re-implement:
@@ -24,11 +24,12 @@ use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationProfile, AuthorizationProfileActivated,
     AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryMutationAck,
-    DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView, EnsureProductSpacePlacement,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery,
-    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView,
-    PolicySnapshot, ProductSpacePlacement, ProductSpacePlacementResult, ProductSpaceRef,
+    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryChildrenView,
+    DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
+    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
+    EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery, InvitationView,
+    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
+    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
     ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
     RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
@@ -37,7 +38,7 @@ use awaken_iam_contract::{
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 
-use crate::{AuthzTransport, RemoteError};
+use crate::{AuthzTransport, DirectoryClient, RemoteError};
 
 /// Default per-request timeout when the caller does not specify one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -341,108 +342,6 @@ impl AuthzTransport for HttpAuthzTransport {
         let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
         Self::decode(response)
     }
-
-    fn create_directory_node(
-        &self,
-        request: &CreateDirectoryNode,
-    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
-        let response = self.send_with_retry(|| {
-            self.client
-                .post(self.url("/v1/admin/directory/nodes"))
-                .json(request)
-        })?;
-        Self::decode(response)
-    }
-
-    fn ensure_product_space_placement(
-        &self,
-        request: &EnsureProductSpacePlacement,
-    ) -> Result<ProductSpacePlacementResult, RemoteError> {
-        let response = self.send_with_retry(|| {
-            self.client
-                .post(self.url("/v1/admin/directory/product-spaces/ensure"))
-                .json(request)
-        })?;
-        Self::decode(response)
-    }
-
-    fn get_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
-        let path = format!("/v1/admin/directory/nodes/{}", id.0);
-        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        Self::decode(response).map(Some)
-    }
-
-    fn directory_children(
-        &self,
-        query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
-        let response = self.send_with_retry(|| {
-            self.client
-                .get(self.url("/v1/admin/directory/nodes"))
-                .query(query)
-        })?;
-        Self::decode(response)
-    }
-
-    fn move_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-        request: &MoveDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        let path = format!("/v1/admin/directory/nodes/{}", id.0);
-        let response = self.send_with_retry(|| self.client.put(self.url(&path)).json(request))?;
-        Self::decode(response)
-    }
-
-    fn update_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-        request: &UpdateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        let path = format!("/v1/admin/directory/nodes/{}", id.0);
-        let response = self.send_with_retry(|| self.client.patch(self.url(&path)).json(request))?;
-        Self::decode(response)
-    }
-
-    fn archive_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        let path = format!("/v1/admin/directory/nodes/{}", id.0);
-        let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
-        Self::decode(response)
-    }
-
-    fn restore_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        let path = format!("/v1/admin/directory/nodes/{}/restore", id.0);
-        let response = self.send_with_retry(|| self.client.post(self.url(&path)))?;
-        Self::decode(response)
-    }
-
-    fn product_space_binding(
-        &self,
-        space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
-        let response = self.send_with_retry(|| {
-            self.client
-                .post(self.url("/v1/admin/directory/product-spaces/query"))
-                .json(space)
-        })?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        Self::decode(response).map(Some)
-    }
-
     fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
@@ -675,11 +574,124 @@ impl AuthzTransport for HttpAuthzTransport {
     }
 }
 
+impl DirectoryClient for HttpAuthzTransport {
+    fn create_directory_node(
+        &self,
+        request: &CreateDirectoryNode,
+    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/nodes"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
+    fn ensure_product_space_placement(
+        &self,
+        request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/product-spaces/ensure"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
+    fn get_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+
+    fn directory_children(
+        &self,
+        query: &DirectoryChildrenQuery,
+    ) -> Result<DirectoryChildrenView, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .get(self.url("/v1/admin/directory/nodes"))
+                .query(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn directory_revision(&self, query: &DirectoryRevisionQuery) -> Result<u64, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .get(self.url("/v1/admin/directory/revision"))
+                .query(query)
+        })?;
+        Self::decode(response)
+    }
+
+    fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.put(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.patch(self.url(&path)).json(request))?;
+        Self::decode(response)
+    }
+
+    fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}", id.0);
+        let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        let path = format!("/v1/admin/directory/nodes/{}/restore", id.0);
+        let response = self.send_with_retry(|| self.client.post(self.url(&path)))?;
+        Self::decode(response)
+    }
+
+    fn product_space_placement(
+        &self,
+        query: &ProductSpacePlacementQuery,
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/product-spaces/query"))
+                .json(query)
+        })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::decode(response).map(Some)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use awaken_iam_contract::{
-        AccountId, ActionKey, AuthorizationDecision, EntitlementDecision, PrincipalRef, ScopeRef,
+        AccountId, ActionKey, AuthorizationDecision, EntitlementDecision, PrincipalRef, ProductId,
+        ScopeRef,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -872,30 +884,113 @@ mod tests {
     }
 
     #[test]
-    fn directory_metadata_update_uses_one_canonical_patch() {
-        // Cause/effect transport table: R1 valid typed metadata command + 2xx
-        // ack -> exactly one PATCH to the Directory node path and decoded
-        // revision; R2 non-2xx -> shared decoder returns RemoteError (covered by
-        // `non_success_status_is_an_error`). No read-before-write or product
-        // metadata fallback is allowed.
-        let server = StubServer::start(vec![Reply::Ok(r#"{"revision":7}"#.into())]);
-        let request = UpdateDirectoryNode {
-            name: "Platform Team".into(),
-            slug: "platform".into(),
-            description: Some("Shared platform".into()),
+    fn directory_client_uses_every_canonical_remote_route() {
+        // Cause-effect route table: one call for create/ensure/get/children/
+        // revision/move/update/archive/restore/placement -> exactly one request
+        // with the canonical HTTP verb/path and one decoded typed result. A
+        // missing implementation cannot compile because DirectoryClient has no
+        // default unsupported methods.
+        let node = r#"{"id":"node-a","org_id":"acme","name":"Team","slug":"team","created_at":"t","updated_at":"t"}"#;
+        let server = StubServer::start(vec![
+            Reply::Ok(format!(r#"{{"revision":2,"node":{node}}}"#)),
+            Reply::Ok(format!(r#"{{"revision":2,"node":{node},"placement":{{"product_space":{{"product_id":"agents","space_id":"workspace/a"}},"org_id":"acme","node_id":"node-a"}},"created":false}}"#)),
+            Reply::Ok(node.into()),
+            Reply::Ok(format!(r#"{{"org_id":"acme","revision":2,"nodes":[{node}]}}"#)),
+            Reply::Ok("2".into()),
+            Reply::Ok(r#"{"revision":3}"#.into()),
+            Reply::Ok(r#"{"revision":4}"#.into()),
+            Reply::Ok(r#"{"revision":5}"#.into()),
+            Reply::Ok(r#"{"revision":6}"#.into()),
+            Reply::Ok(r#"{"product_space":{"product_id":"agents","space_id":"workspace/a"},"org_id":"acme","node_id":"node-a"}"#.into()),
+        ]);
+        let transport = transport(&server);
+        let org_id = awaken_iam_contract::OrgId("acme".into());
+        let product_space = awaken_iam_contract::ProductSpaceRef {
+            product_id: ProductId::new("agents").unwrap(),
+            space_id: "workspace/a".into(),
         };
-
+        transport
+            .create_directory_node(&CreateDirectoryNode {
+                org_id: org_id.clone(),
+                parent_id: None,
+                name: "Team".into(),
+                preferred_slug: "team".into(),
+                description: None,
+            })
+            .unwrap();
+        transport
+            .ensure_product_space_placement(&EnsureProductSpacePlacement {
+                product_space: product_space.clone(),
+                org_id: org_id.clone(),
+                parent_product_space: None,
+                name: "Team".into(),
+                preferred_slug: "team".into(),
+                description: None,
+            })
+            .unwrap();
+        transport
+            .get_directory_node(&DirectoryNodeId("node-a".into()))
+            .unwrap();
+        transport
+            .directory_children(&DirectoryChildrenQuery {
+                org_id: org_id.clone(),
+                parent_id: None,
+            })
+            .unwrap();
         assert_eq!(
-            transport(&server)
-                .update_directory_node(&DirectoryNodeId("team".into()), &request)
-                .unwrap()
-                .revision,
-            7
+            transport
+                .directory_revision(&DirectoryRevisionQuery {
+                    org_id: org_id.clone(),
+                })
+                .unwrap(),
+            2
         );
+        transport
+            .move_directory_node(
+                &DirectoryNodeId("node-a".into()),
+                &MoveDirectoryNode { parent_id: None },
+            )
+            .unwrap();
+        transport
+            .update_directory_node(
+                &DirectoryNodeId("node-a".into()),
+                &UpdateDirectoryNode {
+                    name: "Platform Team".into(),
+                    slug: "platform".into(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        transport
+            .archive_directory_node(&DirectoryNodeId("node-a".into()))
+            .unwrap();
+        transport
+            .restore_directory_node(&DirectoryNodeId("node-a".into()))
+            .unwrap();
+        transport
+            .product_space_placement(&ProductSpacePlacementQuery {
+                org_id,
+                product_space,
+            })
+            .unwrap();
+
         let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("PATCH /v1/admin/directory/nodes/team "));
-        assert!(requests[0].contains("Platform Team"));
+        let routes = [
+            "POST /v1/admin/directory/nodes ",
+            "POST /v1/admin/directory/product-spaces/ensure ",
+            "GET /v1/admin/directory/nodes/node-a ",
+            "GET /v1/admin/directory/nodes?org_id=acme ",
+            "GET /v1/admin/directory/revision?org_id=acme ",
+            "PUT /v1/admin/directory/nodes/node-a ",
+            "PATCH /v1/admin/directory/nodes/node-a ",
+            "DELETE /v1/admin/directory/nodes/node-a ",
+            "POST /v1/admin/directory/nodes/node-a/restore ",
+            "POST /v1/admin/directory/product-spaces/query ",
+        ];
+        assert_eq!(requests.len(), routes.len());
+        for (request, route) in requests.iter().zip(routes) {
+            assert!(request.starts_with(route), "{request}");
+        }
     }
 
     #[test]

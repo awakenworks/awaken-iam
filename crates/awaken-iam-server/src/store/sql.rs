@@ -1,4 +1,4 @@
-//! Backend-neutral SQL adapter implementing every IAM repository port.
+//! Backend-neutral SQL adapter implementing every IAM repository contract.
 //!
 //! The two real database backends — Postgres and SQLite — differ only in the
 //! driver edge: how a parameterized statement is rendered (placeholder syntax,
@@ -20,7 +20,7 @@ use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     AuthorizationProfileDocument, DirectoryNodeId, ExternalIdentity, ExternalIdentityKey,
     GrantSubjectRef, InvitationBinding, InvitationId, InvitationStatus, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpacePlacement,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId, ProductSpacePlacement,
     ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType, Session, SessionId, Timestamp,
     WorkspaceId, WorkspaceOrgEdge,
 };
@@ -88,7 +88,7 @@ pub trait SqlConn: Send + Sync {
     ) -> RepositoryResult<Vec<u64>>;
 }
 
-/// A storage adapter that serves every IAM repository port from a real database.
+/// A storage adapter that serves every IAM repository from a real database.
 ///
 /// Generic over the [`SqlConn`] backend so the same logic backs Postgres and
 /// SQLite. The table `prefix` matches the one the migration plan rendered, so the

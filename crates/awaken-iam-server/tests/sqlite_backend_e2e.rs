@@ -274,7 +274,7 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
             .ensure_product_space_placement(
                 EnsureProductSpacePlacement {
                     product_space: ProductSpaceRef {
-                        product: "agents".into(),
+                        product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
                         space_id: format!("workspace/space-{suffix}"),
                     },
                     org_id,
@@ -365,10 +365,13 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
     );
     assert!(
         directory
-            .product_space_binding(&ProductSpaceRef {
-                product: "agents".into(),
-                space_id: "workspace/space-b".into(),
-            })
+            .product_space_placement(
+                &OrgId("org-b".into()),
+                &ProductSpaceRef {
+                    product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
+                    space_id: "workspace/space-b".into(),
+                }
+            )
             .unwrap()
             .is_some()
     );

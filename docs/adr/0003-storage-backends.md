@@ -127,7 +127,7 @@ guard**, and the **prose in the docs**.
 The Postgres adapter owns the complete synchronous-driver boundary, not only
 the final `Client` destructor. The `postgres` client enters its private Tokio
 runtime during ordinary queries and transactions as well as shutdown. When an
-embedded or standalone Axum handler calls a synchronous repository port from
+embedded or standalone Axum handler calls a synchronous repository contract from
 an already-entered Tokio runtime, `PostgresBackend` executes that driver call
 on a scoped plain OS thread and synchronously returns its result. Callers that
 already run outside Tokio retain the direct path.
@@ -137,7 +137,7 @@ routers, `AuthApi`, and embedding products must not grow parallel database
 executors or Postgres-specific session repositories.
 
 ```text
-Axum/AuthApi -> repository port -> PostgresBackend
+Axum/AuthApi -> repository contract -> PostgresBackend
                                 -> direct call (plain caller)
                                 -> scoped plain thread (Tokio caller)
                                 -> one shared Client/transaction
@@ -149,4 +149,3 @@ Axum/AuthApi -> repository port -> PostgresBackend
 | entered Tokio runtime | query/transaction | scoped plain thread | original result |
 | entered Tokio runtime | direct driver call | forbidden | nested-runtime panic |
 | either | backend error | same selected boundary | unchanged fail-closed error |
-

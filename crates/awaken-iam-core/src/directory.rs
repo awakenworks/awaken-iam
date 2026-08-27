@@ -72,7 +72,7 @@ impl From<DirectoryNode> for DirectoryNodeView {
     }
 }
 
-/// Why a directory node or binding is invalid before persistence.
+/// Why a directory node or placement is invalid before persistence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DirectoryInvariant {
     #[error("directory node id must not be empty")]
@@ -83,7 +83,7 @@ pub enum DirectoryInvariant {
     InvalidSlug,
     #[error("a directory node cannot be its own parent")]
     SelfParent,
-    #[error("product namespace and space id must not be empty")]
+    #[error("product space id must not be empty or contain surrounding whitespace")]
     EmptyProductSpace,
     #[error("product-space binding must target the same organization as its node")]
     CrossTenantBinding,
@@ -112,8 +112,8 @@ impl DirectoryNode {
         &self,
         placement: &ProductSpacePlacement,
     ) -> Result<(), DirectoryInvariant> {
-        if placement.product_space.product.trim().is_empty()
-            || placement.product_space.space_id.trim().is_empty()
+        if placement.product_space.space_id.trim().is_empty()
+            || placement.product_space.space_id.trim() != placement.product_space.space_id
         {
             return Err(DirectoryInvariant::EmptyProductSpace);
         }
@@ -279,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn directory_node_and_binding_validate_without_fixed_levels() {
-        // Cause/effect graph: C1 valid metadata, C2 parent is self, C3 binding
-        // product identity is empty, C4 binding tenant/node disagrees. Effects:
+    fn directory_node_and_placement_validate_without_fixed_levels() {
+        // Cause/effect graph: C1 valid metadata, C2 parent is self, C3 placement
+        // space identity is empty, C4 placement tenant/node disagrees. Effects:
         // E1 accept any non-self parent (no Org/Workspace/Project tier enum),
         // E2 reject a one-node cycle, E3 reject an unqualified product space,
         // E4 reject cross-tenant or wrong-node placement. Rules R1-R4 exercise
@@ -292,22 +292,22 @@ mod tests {
         let self_parent = node(Some("node-a"));
         assert_eq!(self_parent.validate(), Err(DirectoryInvariant::SelfParent));
 
-        let mut binding = ProductSpacePlacement {
+        let mut placement = ProductSpacePlacement {
             product_space: awaken_iam_contract::ProductSpaceRef {
-                product: String::new(),
-                space_id: "space-a".into(),
+                product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
+                space_id: String::new(),
             },
             org_id: valid.org_id.clone(),
             node_id: valid.id.clone(),
         };
         assert_eq!(
-            valid.validate_placement(&binding),
+            valid.validate_placement(&placement),
             Err(DirectoryInvariant::EmptyProductSpace)
         );
-        binding.product_space.product = "agents".into();
-        binding.org_id = OrgId("org-b".into());
+        placement.product_space.space_id = "space-a".into();
+        placement.org_id = OrgId("org-b".into());
         assert_eq!(
-            valid.validate_placement(&binding),
+            valid.validate_placement(&placement),
             Err(DirectoryInvariant::CrossTenantBinding)
         );
     }

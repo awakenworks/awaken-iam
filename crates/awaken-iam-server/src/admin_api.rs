@@ -1578,7 +1578,9 @@ mod tests {
         // non-leaf archive and accept a leaf archive; E5 replay preserves user
         // metadata and restores an archived placement. Decision rules D1-D6
         // cover the success path and each structural failure without a fixed tier.
-        let mut pap = pap();
+        let store = crate::sqlite_in_memory_store("directory_admin_test")
+            .expect("migrate Directory test store");
+        let mut pap = PolicyAdminApi::new(store);
         pap.create_org(org("acme"), at()).unwrap();
         let directory = crate::DirectoryApi::new(pap.store().clone());
         let policy_version = pap.store_version().unwrap();
@@ -1600,7 +1602,7 @@ mod tests {
             .unwrap();
         assert_eq!(team.revision, 3);
         let product_space = ProductSpaceRef {
-            product: "agents".into(),
+            product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
             space_id: "workspace/space-a".into(),
         };
         let ensured = directory
@@ -1639,7 +1641,7 @@ mod tests {
         assert_eq!(pap.store_version().unwrap(), policy_version);
         assert_eq!(
             directory
-                .product_space_binding(&product_space)
+                .product_space_placement(&OrgId("acme".into()), &product_space)
                 .unwrap()
                 .unwrap()
                 .node_id,

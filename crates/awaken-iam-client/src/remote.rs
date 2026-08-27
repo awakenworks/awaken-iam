@@ -19,15 +19,16 @@ use awaken_iam_contract::{
     AuthorizationProfileActivated, AuthorizationProfileRetired, AuthorizationProfileValidation,
     AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
     CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery,
-    DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
-    EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
-    GrantSnapshot, InvitationId, InvitationQuery, InvitationView, IssuedInvitation,
-    MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
-    ProductSpacePlacement, ProductSpacePlacementResult, ProductSpaceRef, ReplaceScopedMemberships,
-    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
-    UserInfo, WorkspaceOrgEdge,
+    DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult,
+    DirectoryNodeView, DirectoryRevisionQuery, EnsureProductSpacePlacement,
+    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId,
+    InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
+    NamespaceId, OrgView, PolicySnapshot, ProductSpacePlacement, ProductSpacePlacementQuery,
+    ProductSpacePlacementResult, ReplaceScopedMemberships, ResendInvitation,
+    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
+    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
+    WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -36,7 +37,7 @@ use crate::IamClient;
 ///
 /// Covers transport-level problems (connection, status, decode) uniformly; the
 /// authorization/entitlement *decisions* themselves are carried in the response
-/// DTOs, not in this error.
+/// response contracts, not in this error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("iam remote transport failed: {0}")]
 pub struct RemoteError(pub String);
@@ -123,71 +124,6 @@ pub trait AuthzTransport {
 
     fn delete_org(&self, _org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
-    }
-
-    fn create_directory_node(
-        &self,
-        _request: &CreateDirectoryNode,
-    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn ensure_product_space_placement(
-        &self,
-        _request: &EnsureProductSpacePlacement,
-    ) -> Result<ProductSpacePlacementResult, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn get_directory_node(
-        &self,
-        _id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn directory_children(
-        &self,
-        _query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn move_directory_node(
-        &self,
-        _id: &DirectoryNodeId,
-        _request: &MoveDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn update_directory_node(
-        &self,
-        _id: &DirectoryNodeId,
-        _request: &UpdateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn archive_directory_node(
-        &self,
-        _id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn restore_directory_node(
-        &self,
-        _id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
-    }
-
-    fn product_space_binding(
-        &self,
-        _space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
-        Err(RemoteError("directory API is not supported".into()))
     }
 
     fn create_role(&self, _role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
@@ -348,6 +284,52 @@ pub trait AuthzTransport {
     }
 }
 
+/// Published client boundary for the independent Directory context.
+///
+/// Implementations must provide the complete surface; there are no runtime
+/// "unsupported" defaults that hide an incomplete deployment composition.
+pub trait DirectoryClient {
+    fn create_directory_node(
+        &self,
+        request: &CreateDirectoryNode,
+    ) -> Result<DirectoryNodeMutationResult, RemoteError>;
+    fn ensure_product_space_placement(
+        &self,
+        request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError>;
+    fn get_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeView>, RemoteError>;
+    fn directory_children(
+        &self,
+        query: &DirectoryChildrenQuery,
+    ) -> Result<DirectoryChildrenView, RemoteError>;
+    fn directory_revision(&self, query: &DirectoryRevisionQuery) -> Result<u64, RemoteError>;
+    fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError>;
+    fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError>;
+    fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError>;
+    fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError>;
+    fn product_space_placement(
+        &self,
+        query: &ProductSpacePlacementQuery,
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError>;
+}
+
 /// IAM client that resolves decisions over the remote protocol.
 ///
 /// Generic over the [`AuthzTransport`] seam so a deployment injects its HTTP
@@ -453,71 +435,6 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     /// Delete organization metadata through IAM's canonical policy-admin path.
     pub fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         self.transport.delete_org(org_id)
-    }
-
-    pub fn create_directory_node(
-        &self,
-        request: &CreateDirectoryNode,
-    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
-        self.transport.create_directory_node(request)
-    }
-
-    pub fn ensure_product_space_placement(
-        &self,
-        request: &EnsureProductSpacePlacement,
-    ) -> Result<ProductSpacePlacementResult, RemoteError> {
-        self.transport.ensure_product_space_placement(request)
-    }
-
-    pub fn get_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
-        self.transport.get_directory_node(id)
-    }
-
-    pub fn directory_children(
-        &self,
-        query: &DirectoryChildrenQuery,
-    ) -> Result<Vec<DirectoryNodeView>, RemoteError> {
-        self.transport.directory_children(query)
-    }
-
-    pub fn move_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-        request: &MoveDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        self.transport.move_directory_node(id, request)
-    }
-
-    pub fn update_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-        request: &UpdateDirectoryNode,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        self.transport.update_directory_node(id, request)
-    }
-
-    pub fn archive_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        self.transport.archive_directory_node(id)
-    }
-
-    pub fn restore_directory_node(
-        &self,
-        id: &DirectoryNodeId,
-    ) -> Result<DirectoryMutationAck, RemoteError> {
-        self.transport.restore_directory_node(id)
-    }
-
-    pub fn product_space_binding(
-        &self,
-        space: &ProductSpaceRef,
-    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
-        self.transport.product_space_binding(space)
     }
 
     pub fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
@@ -664,6 +581,77 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         namespace: &NamespaceId,
     ) -> Result<AuthorizationProfile, RemoteError> {
         self.transport.active_profile(namespace)
+    }
+}
+
+impl<T: DirectoryClient> RemoteIamClient<T> {
+    pub fn create_directory_node(
+        &self,
+        request: &CreateDirectoryNode,
+    ) -> Result<DirectoryNodeMutationResult, RemoteError> {
+        self.transport.create_directory_node(request)
+    }
+
+    pub fn ensure_product_space_placement(
+        &self,
+        request: &EnsureProductSpacePlacement,
+    ) -> Result<ProductSpacePlacementResult, RemoteError> {
+        self.transport.ensure_product_space_placement(request)
+    }
+
+    pub fn get_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<Option<DirectoryNodeView>, RemoteError> {
+        self.transport.get_directory_node(id)
+    }
+
+    pub fn directory_children(
+        &self,
+        query: &DirectoryChildrenQuery,
+    ) -> Result<DirectoryChildrenView, RemoteError> {
+        self.transport.directory_children(query)
+    }
+
+    pub fn directory_revision(&self, query: &DirectoryRevisionQuery) -> Result<u64, RemoteError> {
+        self.transport.directory_revision(query)
+    }
+
+    pub fn move_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &MoveDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.move_directory_node(id, request)
+    }
+
+    pub fn update_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+        request: &UpdateDirectoryNode,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.update_directory_node(id, request)
+    }
+
+    pub fn archive_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.archive_directory_node(id)
+    }
+
+    pub fn restore_directory_node(
+        &self,
+        id: &DirectoryNodeId,
+    ) -> Result<DirectoryMutationAck, RemoteError> {
+        self.transport.restore_directory_node(id)
+    }
+
+    pub fn product_space_placement(
+        &self,
+        query: &ProductSpacePlacementQuery,
+    ) -> Result<Option<ProductSpacePlacement>, RemoteError> {
+        self.transport.product_space_placement(query)
     }
 }
 

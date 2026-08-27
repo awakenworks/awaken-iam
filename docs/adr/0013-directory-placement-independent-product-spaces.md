@@ -117,3 +117,25 @@ remote unavailable / invalid hierarchy / persistence failure
   business ownership and authorization.
 - Synchronize Cloud, Flow, and IAM stores: preserves multiple writers and makes
   temporary disagreement an expected state.
+
+## Amendment: organization-scoped authority and product credentials
+
+The implementation review found that the accepted decision still left a global
+placement key and freshness fence, an unvalidated product string, Directory
+methods mixed into the authorization transport, and a second process-memory
+Directory repository. Those details contradicted the stated Org aggregate and
+single-authority decisions. The implementation therefore tightens them as
+follows:
+
+- The wire field is `product_id`; `ProductId` validates canonical open product
+  identities, and product credentials are bound to exactly one such identity.
+- Placement identity and the independent Directory revision are scoped by Org.
+  A children read returns its Org revision and nodes from one database statement.
+- `EnsureProductSpacePlacement` is the canonical product-space command.
+  Remote callers use a complete `DirectoryClient` separate from
+  `AuthzTransport`.
+- Directory has no process-memory repository. Tests exercise the production SQL
+  repository over migrated in-memory SQLite; local production persists SQLite
+  and hosted production persists PostgreSQL.
+- Migration V0003 preserves existing placements while rebuilding the placement
+  key and freshness fence as Org-scoped authority.

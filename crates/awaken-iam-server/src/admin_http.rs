@@ -40,19 +40,19 @@
 //! host never mounts this router — it administers the model in-process — so the
 //! seam is exposed over HTTP only by the standalone daemon.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryNodeId, EnsureProductSpacePlacement, EntitlementCheckResponse,
-    EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView, InvitationId, InvitationQuery,
-    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgView,
-    PolicySnapshot, ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
-    UpdateDirectoryNode, WorkspaceOrgEdge,
+    DirectoryChildrenQuery, DirectoryNodeId, DirectoryRevisionQuery, EnsureProductSpacePlacement,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
+    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
+    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
+    ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile, RoleBindingSnapshot,
+    RoleView, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepository, Effect, Grant, GrantId, GrantSubject, Group,
@@ -68,8 +68,6 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::InMemoryStore;
 use crate::{
     AccessTokenAuthority, AdminCredential, AdminError, AuthorizationProfileAdmin, CapabilityCheck,
     LeaseEpoch, MintCapability, PolicyAdminApi, PolicyStore, ProfileAdminError, mint_capability,
@@ -85,7 +83,13 @@ use awaken_iam_contract::GrantEffect;
 /// never silently exposes an unauthenticated control plane.
 #[derive(Debug, Clone, Default)]
 pub struct AdminAuthPolicy {
-    accepted: HashSet<String>,
+    accepted: HashMap<String, DirectoryCredentialAccess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectoryCredentialAccess {
+    Administrator,
+    Product(ProductId),
 }
 
 impl AdminAuthPolicy {
@@ -93,8 +97,22 @@ impl AdminAuthPolicy {
     /// `Authorization: Bearer` value). No token means deny-all.
     pub fn new(tokens: impl IntoIterator<Item = String>) -> Self {
         Self {
-            accepted: tokens.into_iter().filter(|t| !t.is_empty()).collect(),
+            accepted: tokens
+                .into_iter()
+                .filter(|token| !token.is_empty())
+                .map(|token| (token, DirectoryCredentialAccess::Administrator))
+                .collect(),
         }
+    }
+
+    /// Add one credential that may ensure and query only its own product spaces.
+    pub fn with_product_token(mut self, product_id: ProductId, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.is_empty() {
+            self.accepted
+                .insert(token, DirectoryCredentialAccess::Product(product_id));
+        }
+        self
     }
 
     /// A policy that rejects every admin caller (the secure default before an
@@ -103,12 +121,17 @@ impl AdminAuthPolicy {
         Self::default()
     }
 
-    /// Whether `credential` is permitted to administer policy.
-    fn accepts(&self, credential: &AdminCredential) -> bool {
+    fn access(&self, credential: &AdminCredential) -> Option<&DirectoryCredentialAccess> {
         let token = match credential {
             AdminCredential::ApiKey(token) | AdminCredential::Bearer(token) => token,
         };
-        self.accepted.contains(token)
+        self.accepted.get(token)
+    }
+
+    /// Whether `credential` carries unrestricted administration authority.
+    #[cfg(test)]
+    fn accepts(&self, credential: &AdminCredential) -> bool {
+        self.access(credential) == Some(&DirectoryCredentialAccess::Administrator)
     }
 }
 
@@ -129,33 +152,12 @@ impl<S> std::fmt::Debug for DaemonState<S> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl DaemonState<InMemoryStore> {
-    /// Assemble the daemon state over the daemon's authorization engine, a fresh
-    /// policy-administration store, and the admin auth policy.
-    pub fn new(authz: crate::AuthzApi, auth: AdminAuthPolicy) -> Self {
-        let authority = crate::AuthApi::new().token_authority();
-        Self::with_profile_repository(authz, auth, Arc::new(InMemoryStore::new()), authority)
-    }
-
-    /// Assemble the daemon with an explicit durable profile repository.
-    pub fn with_profile_repository(
-        authz: crate::AuthzApi,
-        auth: AdminAuthPolicy,
-        profiles: Arc<dyn AuthorizationProfileRepository>,
-        authority: AccessTokenAuthority,
-    ) -> Self {
-        Self::with_policy_store(authz, auth, profiles, InMemoryStore::new(), authority)
-            .expect("a fresh in-memory IAM policy store must hydrate")
-    }
-}
-
 impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + Clone> DaemonState<S> {
     /// Assemble the daemon over one explicit policy store.
     ///
-    /// Production passes the same migrated SQL store used for profiles. Tests
-    /// may pass [`InMemoryStore`]. In both cases the PAP, restart hydration, and
-    /// live PDP consume one source of truth.
+    /// Production and tests pass one migrated SQL store for policy, profiles,
+    /// and Directory state. The PAP, restart hydration, and live PDP therefore
+    /// consume one source of truth; Directory has no parallel memory repository.
     pub fn with_policy_store(
         mut authz: crate::AuthzApi,
         auth: AdminAuthPolicy,
@@ -228,8 +230,9 @@ where
         )
         .route(
             "/v1/admin/directory/product-spaces/query",
-            post(get_product_space_binding),
+            post(get_product_space_placement),
         )
+        .route("/v1/admin/directory/revision", get(get_directory_revision))
         .route(
             "/v1/admin/directory/product-spaces/ensure",
             post(ensure_product_space_placement),
@@ -669,7 +672,8 @@ async fn ensure_product_space_placement(
     headers: HeaderMap,
     Json(request): Json<EnsureProductSpacePlacement>,
 ) -> Response {
-    directory_command(&state, &headers, move |directory, context| {
+    let product_id = request.product_space.product_id.clone();
+    product_directory_command(&state, &headers, &product_id, move |directory, context| {
         directory.ensure_product_space_placement(request, context)
     })
 }
@@ -742,20 +746,43 @@ async fn restore_directory_node(
     })
 }
 
-async fn get_product_space_binding(
+async fn get_product_space_placement(
     State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
     headers: HeaderMap,
-    Json(product_space): Json<ProductSpaceRef>,
+    Json(query): Json<ProductSpacePlacementQuery>,
 ) -> Response {
     let guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
+    let access = match directory_credential_access(&guard.auth, &headers) {
+        Ok(access) => access,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let DirectoryCredentialAccess::Product(product_id) = &access
+        && product_id != &query.product_space.product_id
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_product",
+            "the presented credential may access only its own product spaces",
+        );
     }
-    match guard.directory.product_space_binding(&product_space) {
-        Ok(Some(binding)) => Json(binding).into_response(),
+    match guard
+        .directory
+        .product_space_placement(&query.org_id, &query.product_space)
+    {
+        Ok(Some(placement)) => Json(placement).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => admin_error_response(&error),
     }
+}
+
+async fn get_directory_revision(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
+    headers: HeaderMap,
+    Query(query): Query<DirectoryRevisionQuery>,
+) -> Response {
+    directory_read(&state, &headers, move |directory| {
+        directory.revision(&query.org_id)
+    })
 }
 
 async fn create_group(
@@ -1089,6 +1116,57 @@ where
     }
 }
 
+fn product_directory_command<S, T, F>(
+    state: &SharedDaemonState<S>,
+    headers: &HeaderMap,
+    requested_product_id: &ProductId,
+    op: F,
+) -> Response
+where
+    S: awaken_iam_core::DirectoryRepository,
+    T: serde::Serialize,
+    F: FnOnce(&crate::DirectoryApi<S>, crate::DirectoryCommandContext) -> Result<T, AdminError>,
+{
+    let guard = lock(state);
+    let access = match directory_credential_access(&guard.auth, headers) {
+        Ok(access) => access,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let DirectoryCredentialAccess::Product(product_id) = &access
+        && product_id != requested_product_id
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_product",
+            "the presented credential may access only its own product spaces",
+        );
+    }
+    let actor = admin_actor(headers);
+    let context = match access {
+        DirectoryCredentialAccess::Administrator => {
+            crate::DirectoryCommandContext::new(actor, now_timestamp())
+        }
+        DirectoryCredentialAccess::Product(product_id) => {
+            crate::DirectoryCommandContext::product_service(
+                product_id,
+                actor_id(actor),
+                now_timestamp(),
+            )
+        }
+    };
+    match op(&guard.directory, context) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+fn actor_id(actor: awaken_iam_contract::PrincipalRef) -> String {
+    match actor {
+        awaken_iam_contract::PrincipalRef::Service { service_id } => service_id,
+        _ => unreachable!("admin_actor always creates a service principal"),
+    }
+}
+
 fn admin_actor(headers: &HeaderMap) -> awaken_iam_contract::PrincipalRef {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let credential = AdminCredential::from_headers(header("x-api-key"), header("authorization"))
@@ -1110,25 +1188,53 @@ fn admin_actor(headers: &HeaderMap) -> awaken_iam_contract::PrincipalRef {
 /// administer policy: a missing credential is `401`, an unaccepted one `403`,
 /// decided before any state is read or written. `None` means the call proceeds.
 fn authorize_admin(auth: &AdminAuthPolicy, headers: &HeaderMap) -> Option<Response> {
+    match directory_credential_access(auth, headers) {
+        Ok(DirectoryCredentialAccess::Administrator) => None,
+        Ok(DirectoryCredentialAccess::Product(_)) => Some(error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the presented product credential may not administer IAM",
+        )),
+        Err(rejection) => Some(rejection.into_response()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DirectoryCredentialRejection {
+    Missing,
+    Forbidden,
+}
+
+impl DirectoryCredentialRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Missing => error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_admin_credential",
+                "an admin credential is required to administer policy",
+            ),
+            Self::Forbidden => error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "the presented credential may not administer policy",
+            ),
+        }
+    }
+}
+
+fn directory_credential_access(
+    auth: &AdminAuthPolicy,
+    headers: &HeaderMap,
+) -> Result<DirectoryCredentialAccess, DirectoryCredentialRejection> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let Some(credential) =
         AdminCredential::from_headers(header("x-api-key"), header("authorization"))
     else {
-        return Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "missing_admin_credential",
-            "an admin credential is required to administer policy",
-        ));
+        return Err(DirectoryCredentialRejection::Missing);
     };
-    if auth.accepts(&credential) {
-        None
-    } else {
-        Some(error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "the presented credential may not administer policy",
-        ))
-    }
+    auth.access(&credential)
+        .cloned()
+        .ok_or(DirectoryCredentialRejection::Forbidden)
 }
 
 /// Map an [`AdminError`] onto its HTTP status and a stable error body.

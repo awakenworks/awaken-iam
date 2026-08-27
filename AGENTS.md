@@ -17,7 +17,7 @@ Shared instructions for AI agents working in this repository.
 
 ## Architecture guardrails
 
-- **G1 — Contract boundary.** `awaken-iam-contract` contains shared DTOs only and must not depend on `awaken-iam-core`, `awaken-iam-client`, or `awaken-iam-server`. _Enforcer:_ `xtask guardrail-lints`.
+- **G1 — Contract boundary.** `awaken-iam-contract` contains published wire contracts only and must not depend on `awaken-iam-core`, `awaken-iam-client`, or `awaken-iam-server`. _Enforcer:_ `xtask guardrail-lints`.
 - **G2 — Core/server boundary.** `awaken-iam-core` may depend on `awaken-iam-contract`, but not on `awaken-iam-server`. _Enforcer:_ `xtask guardrail-lints`.
 - **G3 — Client/server boundary.** `awaken-iam-client` may depend on contract types, but not on server implementation. _Enforcer:_ `xtask guardrail-lints`.
 - **G4 — No product runtime ownership.** IAM crates must not depend on product runtime crates (`oversight-*`, `awaken-next-*`, `oversight-pack-hub-*`) unless an explicit future ADR introduces a contract-only dependency. _Enforcer:_ `xtask guardrail-lints`.

@@ -30,7 +30,9 @@ fn decode_directory_node(row: &SqlRow) -> RepositoryResult<DirectoryNode> {
 fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpacePlacement> {
     Ok(ProductSpacePlacement {
         product_space: ProductSpaceRef {
-            product: req(row, 0, "product_space.product")?,
+            product_id: ProductId::new(req(row, 0, "product_space.product")?).map_err(|error| {
+                RepositoryError::Backend(format!("invalid stored product id: {error}"))
+            })?,
             space_id: req(row, 1, "product_space.space_id")?,
         },
         org_id: OrgId(req(row, 2, "product_space.org_id")?),
@@ -39,6 +41,7 @@ fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpace
 }
 
 const DIRECTORY_NODE_COLUMNS: &str = "id, org_id, parent_id, name, slug, description, CAST(archived AS TEXT), created_at, updated_at";
+const JOINED_DIRECTORY_NODE_COLUMNS: &str = "node.id, node.org_id, node.parent_id, node.name, node.slug, node.description, CAST(node.archived AS TEXT), node.created_at, node.updated_at";
 
 impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
     fn create_directory_node(
@@ -79,24 +82,18 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                 ));
             }
         }
-        if self
-            .directory_children(&node.org_id, node.parent_id.as_ref())?
-            .iter()
-            .any(|sibling| sibling.slug == node.slug)
-        {
-            return Err(RepositoryError::Conflict(format!(
-                "directory slug {} already exists under this parent",
-                node.slug
-            )));
-        }
+        // The transaction's unique key is the authoritative sibling-slug
+        // check. Avoid a pre-read here: a new organization has no revision row
+        // until this first command initializes it, and a pre-read would still
+        // race another writer before the command mutex is acquired.
         if let Some(placement) = &placement
             && self
-                .product_space_binding(&placement.product_space)?
+                .product_space_placement(&placement.org_id, &placement.product_space)?
                 .is_some()
         {
             return Err(RepositoryError::Conflict(format!(
                 "product space {}/{} is already placed",
-                placement.product_space.product, placement.product_space.space_id
+                placement.product_space.product_id, placement.product_space.space_id
             )));
         }
 
@@ -108,12 +105,22 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             .parent_id
             .as_ref()
             .map_or_else(String::new, |id| id.0.clone());
-        let mut writes = vec![SqlWrite {
-            // This no-op update is the portable Directory command mutex. Every
-            // structural mutation acquires it before rechecking its condition.
-            sql: format!("UPDATE {fence} SET revision = revision WHERE id = 1"),
-            params: Vec::new(),
-        }];
+        let mut writes = vec![
+            SqlWrite {
+                sql: format!(
+                    "INSERT INTO {fence} (org_id, revision) VALUES (?, 1) \
+                     ON CONFLICT (org_id) DO NOTHING"
+                ),
+                params: vec![p(node.org_id.0.clone())],
+            },
+            SqlWrite {
+                // This no-op update is the portable Directory command mutex. Every
+                // structural mutation in one organization acquires it before
+                // rechecking its condition.
+                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                params: vec![p(node.org_id.0.clone())],
+            },
+        ];
         let (insert_sql, insert_params) = if node.parent_id.is_some() {
             (
                 format!(
@@ -168,7 +175,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                     "INSERT INTO {bindings} (product, space_id, org_id, node_id) VALUES (?, ?, ?, ?)"
                 ),
                 params: vec![
-                    p(placement.product_space.product),
+                    p(placement.product_space.product_id.as_str().to_owned()),
                     p(placement.product_space.space_id),
                     p(placement.org_id.0),
                     p(placement.node_id.0),
@@ -185,15 +192,15 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             ],
         });
         writes.push(SqlWrite {
-            sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE id = 1"),
-            params: Vec::new(),
+            sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
+            params: vec![p(node.org_id.0.clone())],
         });
-        let required = (0..writes.len())
+        let required = (1..writes.len())
             .map(|index| (index, 1))
             .collect::<Vec<_>>();
         self.backend
             .execute_transaction_checked(&writes, &required)?;
-        self.directory_revision()
+        self.directory_revision(&node.org_id)
     }
 
     fn directory_node(&self, id: &DirectoryNodeId) -> RepositoryResult<Option<DirectoryNode>> {
@@ -212,21 +219,38 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         &self,
         org_id: &OrgId,
         parent_id: Option<&DirectoryNodeId>,
-    ) -> RepositoryResult<Vec<DirectoryNode>> {
-        let params = vec![
+    ) -> RepositoryResult<(u64, Vec<DirectoryNode>)> {
+        let params = [
             p(org_id.0.clone()),
             p(parent_id.map_or_else(String::new, |parent| parent.0.clone())),
         ];
         let sql = format!(
-            "SELECT {DIRECTORY_NODE_COLUMNS} FROM {} \
-             WHERE org_id = ? AND parent_id = ? AND archived = 0 ORDER BY slug",
+            "SELECT {JOINED_DIRECTORY_NODE_COLUMNS}, CAST(fence.revision AS TEXT) \
+             FROM {} fence LEFT JOIN {} node \
+               ON node.org_id = fence.org_id AND node.parent_id = ? AND node.archived = 0 \
+             WHERE fence.org_id = ? ORDER BY node.slug",
+            self.table("directory_fence"),
             self.table("directory_nodes")
         );
-        self.backend
-            .query(&sql, &params)?
+        let rows = self
+            .backend
+            .query(&sql, &[params[1].clone(), params[0].clone()])?;
+        let revision = rows
+            .first()
+            .and_then(|row| row.get(9))
+            .and_then(Option::as_deref)
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| {
+                RepositoryError::Backend(format!("invalid directory revision: {error}"))
+            })?
+            .unwrap_or(1);
+        let nodes = rows
             .iter()
+            .filter(|row| row.first().and_then(Option::as_deref).is_some())
             .map(decode_directory_node)
-            .collect()
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        Ok((revision, nodes))
     }
 
     fn move_directory_node(
@@ -246,7 +270,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             .filter(|node| !node.archived)
             .ok_or_else(|| RepositoryError::NotFound(format!("live directory node {}", id.0)))?;
         if current.parent_id.as_ref() == parent_id {
-            return self.directory_revision();
+            return self.directory_revision(&current.org_id);
         }
         if let Some(parent_id) = parent_id {
             let parent = self
@@ -277,6 +301,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         }
         if self
             .directory_children(&current.org_id, parent_id)?
+            .1
             .iter()
             .any(|sibling| sibling.id != current.id && sibling.slug == current.slug)
         {
@@ -290,8 +315,8 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         let parent_key = parent_id.map_or_else(String::new, |parent| parent.0.clone());
         let writes = [
             SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE id = 1"),
-                params: Vec::new(),
+                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                params: vec![p(current.org_id.0.clone())],
             },
             SqlWrite {
                 sql: format!(
@@ -320,7 +345,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                     p(parent_key.clone()),
                     p(current.org_id.0.clone()),
                     p(id.0.clone()),
-                    p(current.org_id.0),
+                    p(current.org_id.0.clone()),
                     p(parent_key),
                     p(current.slug),
                     p(id.0.clone()),
@@ -340,15 +365,15 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             },
             SqlWrite {
                 sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE id = 1",
+                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
                     self.table("directory_fence")
                 ),
-                params: Vec::new(),
+                params: vec![p(current.org_id.0.clone())],
             },
         ];
         self.backend
             .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision()
+        self.directory_revision(&current.org_id)
     }
 
     fn archive_directory_node(
@@ -361,9 +386,9 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             .directory_node(id)?
             .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
         if node.archived {
-            return self.directory_revision();
+            return self.directory_revision(&node.org_id);
         }
-        let live_children = self.directory_children(&node.org_id, Some(id))?;
+        let live_children = self.directory_children(&node.org_id, Some(id))?.1;
         if !live_children.is_empty() {
             return Err(RepositoryError::Conflict(
                 "a directory node with live children cannot be archived".into(),
@@ -373,8 +398,8 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         let fence = self.table("directory_fence");
         let writes = [
             SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE id = 1"),
-                params: Vec::new(),
+                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                params: vec![p(node.org_id.0.clone())],
             },
             SqlWrite {
                 sql: format!(
@@ -399,15 +424,15 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             },
             SqlWrite {
                 sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE id = 1",
+                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
                     self.table("directory_fence")
                 ),
-                params: Vec::new(),
+                params: vec![p(node.org_id.0.clone())],
             },
         ];
         self.backend
             .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision()
+        self.directory_revision(&node.org_id)
     }
 
     fn restore_directory_node(
@@ -420,14 +445,14 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             .directory_node(id)?
             .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
         if !node.archived {
-            return self.directory_revision();
+            return self.directory_revision(&node.org_id);
         }
         let nodes = self.table("directory_nodes");
         let fence = self.table("directory_fence");
         let writes = [
             SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE id = 1"),
-                params: Vec::new(),
+                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                params: vec![p(node.org_id.0.clone())],
             },
             SqlWrite {
                 sql: format!(
@@ -437,7 +462,11 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                          WHERE parent.id = {nodes}.parent_id \
                            AND parent.org_id = ? AND parent.archived = 0))"
                 ),
-                params: vec![p(updated_at.0.clone()), p(id.0.clone()), p(node.org_id.0)],
+                params: vec![
+                    p(updated_at.0.clone()),
+                    p(id.0.clone()),
+                    p(node.org_id.0.clone()),
+                ],
             },
             SqlWrite {
                 sql: format!(
@@ -452,13 +481,13 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                 ],
             },
             SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE id = 1"),
-                params: Vec::new(),
+                sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
+                params: vec![p(node.org_id.0.clone())],
             },
         ];
         self.backend
             .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision()
+        self.directory_revision(&node.org_id)
     }
 
     fn update_directory_node(
@@ -486,17 +515,17 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             && updated.slug == current.slug
             && updated.description == current.description
         {
-            return self.directory_revision();
+            return self.directory_revision(&current.org_id);
         }
 
         let nodes = self.table("directory_nodes");
         let writes = [
             SqlWrite {
                 sql: format!(
-                    "UPDATE {} SET revision = revision WHERE id = 1",
+                    "UPDATE {} SET revision = revision WHERE org_id = ?",
                     self.table("directory_fence")
                 ),
-                params: Vec::new(),
+                params: vec![p(current.org_id.0.clone())],
             },
             SqlWrite {
                 sql: format!(
@@ -512,7 +541,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                     description.map(str::to_owned),
                     p(updated_at.0.clone()),
                     p(id.0.clone()),
-                    p(current.org_id.0),
+                    p(current.org_id.0.clone()),
                     p(current
                         .parent_id
                         .map_or_else(String::new, |parent| parent.0)),
@@ -534,30 +563,33 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             },
             SqlWrite {
                 sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE id = 1",
+                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
                     self.table("directory_fence")
                 ),
-                params: Vec::new(),
+                params: vec![p(current.org_id.0.clone())],
             },
         ];
         self.backend
             .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision()
+        self.directory_revision(&current.org_id)
     }
 
-    fn product_space_binding(
+    fn product_space_placement(
         &self,
+        org_id: &OrgId,
         product_space: &ProductSpaceRef,
     ) -> RepositoryResult<Option<ProductSpacePlacement>> {
         let sql = format!(
-            "SELECT product, space_id, org_id, node_id FROM {} WHERE product = ? AND space_id = ?",
+            "SELECT product, space_id, org_id, node_id FROM {} \
+             WHERE org_id = ? AND product = ? AND space_id = ?",
             self.table("product_space_bindings")
         );
         self.backend
             .query(
                 &sql,
                 &[
-                    p(product_space.product.clone()),
+                    p(org_id.0.clone()),
+                    p(product_space.product_id.as_str().to_owned()),
                     p(product_space.space_id.clone()),
                 ],
             )?
@@ -566,21 +598,155 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
             .transpose()
     }
 
-    fn directory_revision(&self) -> RepositoryResult<u64> {
+    fn directory_revision(&self, org_id: &OrgId) -> RepositoryResult<u64> {
         let sql = format!(
-            "SELECT CAST(revision AS TEXT) FROM {} WHERE id = 1",
+            "SELECT CAST(revision AS TEXT) FROM {} WHERE org_id = ?",
             self.table("directory_fence")
         );
-        let rows = self.backend.query(&sql, &[])?;
+        let rows = self.backend.query(&sql, &[p(org_id.0.clone())])?;
         let revision = rows
             .first()
             .and_then(|row| row.first())
-            .and_then(Option::as_deref)
-            .ok_or_else(|| {
-                RepositoryError::Backend("directory freshness fence is missing".into())
-            })?;
-        revision.parse().map_err(|error| {
-            RepositoryError::Backend(format!("invalid directory revision: {error}"))
+            .and_then(Option::as_deref);
+        revision.map_or(Ok(1), |revision| {
+            revision.parse().map_err(|error| {
+                RepositoryError::Backend(format!("invalid directory revision: {error}"))
+            })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awaken_iam_core::{AuditSink, OrgRepository, Organization};
+
+    #[derive(Debug, Clone)]
+    struct FailingTransaction {
+        inner: crate::SqliteBackend,
+        fail_at: usize,
+    }
+
+    impl SqlConn for FailingTransaction {
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+
+        fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
+            self.inner.execute(sql, params)
+        }
+
+        fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
+            self.inner.query(sql, params)
+        }
+
+        fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
+            self.inner.execute_transaction(writes)
+        }
+
+        fn execute_transaction_checked(
+            &self,
+            writes: &[SqlWrite],
+            required: &[(usize, u64)],
+        ) -> RepositoryResult<Vec<u64>> {
+            let mut writes = writes.to_vec();
+            writes[self.fail_at].sql = "invalid SQL injected by Directory rollback test".into();
+            self.inner.execute_transaction_checked(&writes, required)
+        }
+    }
+
+    fn timestamp() -> Timestamp {
+        Timestamp("2026-08-27T00:00:00Z".into())
+    }
+
+    fn actor() -> PrincipalRef {
+        PrincipalRef::Service {
+            service_id: "directory-rollback-test".into(),
+        }
+    }
+
+    #[test]
+    fn every_create_write_failure_rolls_back_all_directory_effects() {
+        // Cause-effect decision table: for each transaction write W1 fence init,
+        // W2 Org mutex, W3 node, W4 placement, W5 audit, W6 revision, inject one
+        // backend failure -> no node, placement or Directory audit survives.
+        // This traces the repository's all-or-nothing effect at every boundary.
+        for fail_at in 0..6 {
+            let backend = crate::SqliteBackend::open_in_memory().unwrap();
+            let authoritative =
+                crate::sqlite_migrated_store(backend.clone(), "directory_rollback").unwrap();
+            let org_id = OrgId("acme".into());
+            OrgRepository::upsert(
+                &authoritative,
+                Organization {
+                    id: org_id.clone(),
+                    display_name: None,
+                    owner: actor(),
+                    created_at: timestamp(),
+                    updated_at: timestamp(),
+                },
+            )
+            .unwrap();
+            let node_id = DirectoryNodeId("node-a".into());
+            let product_space = ProductSpaceRef {
+                product_id: ProductId::new("agents").unwrap(),
+                space_id: "workspace/a".into(),
+            };
+            let failing = SqlStore::with_prefix(
+                FailingTransaction {
+                    inner: backend,
+                    fail_at,
+                },
+                "directory_rollback",
+            )
+            .unwrap();
+            let result = DirectoryRepository::create_directory_node(
+                &failing,
+                DirectoryNode {
+                    id: node_id.clone(),
+                    org_id: org_id.clone(),
+                    parent_id: None,
+                    name: "Agents".into(),
+                    slug: "agents".into(),
+                    description: None,
+                    archived: false,
+                    created_at: timestamp(),
+                    updated_at: timestamp(),
+                },
+                Some(ProductSpacePlacement {
+                    product_space: product_space.clone(),
+                    org_id: org_id.clone(),
+                    node_id: node_id.clone(),
+                }),
+                &actor(),
+            );
+            assert!(
+                matches!(result, Err(RepositoryError::Backend(_))),
+                "W{fail_at}"
+            );
+            assert!(
+                DirectoryRepository::directory_node(&authoritative, &node_id)
+                    .unwrap()
+                    .is_none(),
+                "W{fail_at}"
+            );
+            assert!(
+                DirectoryRepository::product_space_placement(
+                    &authoritative,
+                    &org_id,
+                    &product_space
+                )
+                .unwrap()
+                .is_none(),
+                "W{fail_at}"
+            );
+            assert!(
+                AuditSink::events(&authoritative)
+                    .unwrap()
+                    .iter()
+                    .all(|event| !event.action.starts_with("directory.")),
+                "W{fail_at}"
+            );
+        }
     }
 }
