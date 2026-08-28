@@ -4,11 +4,14 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use awaken_iam_contract::{
-    CreateDirectoryNode, EnsureProductSpacePlacement, MoveDirectoryNode, OrgId, PrincipalRef,
-    ProductId, ProductSpacePlacementStatus, ProductSpaceRef, RetireProductSpacePlacement,
-    Timestamp, UpdateDirectoryNode,
+    ActionKey, AuthorizationRequest, CreateDirectoryNode, EnsureProductSpacePlacement,
+    MoveDirectoryNode, OrgId, PrincipalRef, ProductId, ProductSpacePlacementStatus,
+    ProductSpaceRef, ResourceId, ResourceType, RetireProductSpacePlacement, ScopeRef, Timestamp,
+    UpdateDirectoryNode,
 };
-use awaken_iam_core::{AuditSink, OrgRepository, Organization};
+use awaken_iam_core::{
+    ActionPattern, AuditSink, Effect, Grant, GrantId, GrantSubject, OrgRepository, Organization,
+};
 use awaken_iam_server::{
     DirectoryApi, DirectoryCommandContext, PolicyAdminApi, sqlite_in_memory_store,
 };
@@ -196,20 +199,22 @@ fn parent_resolution_is_org_scoped_and_requires_an_active_parent() {
 }
 
 #[test]
-fn agents_objects_and_workforce_share_placement_without_sharing_policy() {
+fn cross_product_move_preserves_product_bindings_and_authorization_and_rejects_cross_org() {
     // Cause/effect decision table:
-    // R1 three open product ids in one Org, each parented beneath another
-    // product -> one arbitrary cross-product Directory tree; R2 move the middle
-    // Objects node beneath a user folder -> only Directory parentage/revision
-    // changes while every ProductSpaceRef binding stays stable; R3 all Directory
-    // mutations -> IAM policy version remains unchanged. Constraints: Org is the
-    // immutable partition, product ids are not an enum, and no product business
-    // parent or permission edge is inferred from Directory parent_id.
+    // R1 three open product ids in one Org, each parented beneath another product
+    // -> one arbitrary cross-product Directory tree. R2 move the middle Objects
+    // node beneath a user folder -> only Directory parentage/revision changes;
+    // every complete ProductSpacePlacement and allow/deny authorization outcome
+    // remains byte-for-byte equal. R3 target parent belongs to another Org ->
+    // reject without changing the source node, placement, policy version, or
+    // authorization outcome. Constraints: Org is the immutable partition,
+    // product ids are open, and Directory parent_id is never a business or
+    // authorization edge.
     let store = sqlite_in_memory_store("directory_three_products").unwrap();
     create_org(&store, "acme");
+    create_org(&store, "other");
     let directory = DirectoryApi::new(store.clone());
-    let policy = PolicyAdminApi::new(store);
-    let policy_version = policy.store_version().unwrap();
+    let mut policy = PolicyAdminApi::new(store.clone());
 
     let agents = product_space("agents", "workspace", "agent-ws");
     let objects = product_space("objects", "object-space", "customer-data");
@@ -239,6 +244,63 @@ fn agents_objects_and_workforce_share_placement_without_sharing_policy() {
     assert_eq!(objects_node.parent_id, Some(agents_node.id));
     assert_eq!(workforce_node.parent_id, Some(objects_node.id.clone()));
 
+    let principal = PrincipalRef::Service {
+        service_id: "cross-product-reader".into(),
+    };
+    let spaces = [&agents, &objects, &workforce];
+    let scopes = spaces
+        .iter()
+        .map(|space| ScopeRef::Resource {
+            resource_type: ResourceType(format!("{}.space", space.product_id)),
+            resource_id: ResourceId(space.space_id.clone()),
+        })
+        .collect::<Vec<_>>();
+    for (index, (space, scope)) in spaces.iter().zip(&scopes).enumerate() {
+        policy
+            .issue_grant(
+                Grant {
+                    id: GrantId(format!("grant-{}", space.product_id)),
+                    subject: GrantSubject::Principal(principal.clone()),
+                    action_pattern: ActionPattern(format!("{}.read", space.product_id)),
+                    scope: scope.clone(),
+                    effect: Effect::Allow,
+                },
+                at(4 + index as u8),
+            )
+            .unwrap();
+    }
+    let requests = spaces
+        .iter()
+        .zip(&scopes)
+        .flat_map(|(space, scope)| {
+            ["read", "delete"].map(|action| {
+                AuthorizationRequest::direct(
+                    principal.clone(),
+                    ActionKey(format!("{}.{action}", space.product_id)),
+                    scope.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let decisions = || {
+        let hydrated = policy.policy().unwrap();
+        requests
+            .iter()
+            .map(|request| hydrated.evaluate(request).to_outcome())
+            .collect::<Vec<_>>()
+    };
+    let policy_version = policy.store_version().unwrap();
+    let decisions_before = decisions();
+    let placements_before = spaces
+        .iter()
+        .map(|space| {
+            directory
+                .product_space_placement(&OrgId("acme".into()), space)
+                .unwrap()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
     let folder = directory
         .create_node(
             CreateDirectoryNode {
@@ -256,22 +318,91 @@ fn agents_objects_and_workforce_share_placement_without_sharing_policy() {
         .move_node(
             &objects_node.id,
             MoveDirectoryNode {
-                parent_id: Some(folder.id),
+                parent_id: Some(folder.id.clone()),
             },
             DirectoryCommandContext::service("directory-admin", at(5)),
         )
         .unwrap();
 
-    for space in [&agents, &objects, &workforce] {
-        assert!(
+    let placements_after_move = spaces
+        .iter()
+        .map(|space| {
             directory
                 .product_space_placement(&OrgId("acme".into()), space)
                 .unwrap()
-                .is_some(),
-            "R2: moving presentation preserves stable product binding"
-        );
-    }
-    assert_eq!(policy.store_version().unwrap(), policy_version, "R3");
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        placements_after_move, placements_before,
+        "R2 product identity"
+    );
+    assert_eq!(decisions(), decisions_before, "R2 authorization");
+    assert_eq!(
+        policy.store_version().unwrap(),
+        policy_version,
+        "R2 policy fence"
+    );
+
+    let other_folder = directory
+        .create_node(
+            CreateDirectoryNode {
+                org_id: OrgId("other".into()),
+                parent_id: None,
+                name: "Other tenant".into(),
+                preferred_slug: "other-tenant".into(),
+                description: None,
+            },
+            DirectoryCommandContext::service("directory-admin", at(6)),
+        )
+        .unwrap()
+        .node;
+    let revision_before_cross_org = directory.revision(&OrgId("acme".into())).unwrap();
+    let audit_before_cross_org = AuditSink::events(&store).unwrap();
+    assert!(
+        directory
+            .move_node(
+                &objects_node.id,
+                MoveDirectoryNode {
+                    parent_id: Some(other_folder.id),
+                },
+                DirectoryCommandContext::service("directory-admin", at(7)),
+            )
+            .is_err(),
+        "R3 cross-Org move must fail"
+    );
+    assert_eq!(
+        directory.node(&objects_node.id).unwrap().unwrap().parent_id,
+        Some(folder.id),
+        "R3 source parent"
+    );
+    assert_eq!(
+        directory.revision(&OrgId("acme".into())).unwrap(),
+        revision_before_cross_org,
+        "R3 directory fence"
+    );
+    assert_eq!(
+        spaces
+            .iter()
+            .map(|space| directory
+                .product_space_placement(&OrgId("acme".into()), space)
+                .unwrap()
+                .unwrap())
+            .collect::<Vec<_>>(),
+        placements_before,
+        "R3 product identity"
+    );
+    assert_eq!(decisions(), decisions_before, "R3 authorization");
+    assert_eq!(
+        policy.store_version().unwrap(),
+        policy_version,
+        "R3 policy fence"
+    );
+    assert_eq!(
+        AuditSink::events(&store).unwrap(),
+        audit_before_cross_org,
+        "R3 audit"
+    );
 }
 
 #[test]

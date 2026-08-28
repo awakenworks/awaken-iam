@@ -163,3 +163,23 @@ archive user structure. The placement therefore owns an independent
 Migration V0004 adds the placement lifecycle with existing rows defaulting to
 `active`. Products reconcile active parents before children and retire children
 before parents; temporary failures retry the same canonical commands.
+
+## Amendment: normative move invariants
+
+Every Directory move, whether embedded or remote, must preserve these three
+independent authorities:
+
+1. **Product identity is unchanged.** The complete `ProductSpacePlacement`,
+   including product id, opaque space id, Org, node id, and lifecycle, remains
+   unchanged; only `DirectoryNode.parent_id` and presentation revision may move.
+2. **Authorization is unchanged.** The IAM policy fence, scope graph, grants,
+   and exact allow/deny outcomes remain unchanged. Directory ancestry is never
+   consulted as an authorization edge.
+3. **Org is immutable.** A target parent in another Org is rejected with no
+   source-node, placement, Directory-revision, policy, or audit effect.
+
+The production SQL repository and remote HTTP surface share this one move
+command. P0 acceptance compares complete cross-product placements and real
+authorization outcomes before and after a successful move, then proves an
+attempted cross-Org move has no effects. A product or Cloud adapter must not
+weaken these invariants or add a fallback move path.
