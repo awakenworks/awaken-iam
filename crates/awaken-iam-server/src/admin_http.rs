@@ -51,8 +51,9 @@ use awaken_iam_contract::{
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
     NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
-    ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile, RoleBindingSnapshot,
-    RoleView, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode, WorkspaceOrgEdge,
+    ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
+    UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuthorizationProfileRepository, Effect, Grant, GrantId, GrantSubject, Group,
@@ -236,6 +237,10 @@ where
         .route(
             "/v1/admin/directory/product-spaces/ensure",
             post(ensure_product_space_placement),
+        )
+        .route(
+            "/v1/admin/directory/product-spaces/retire",
+            post(retire_product_space_placement),
         )
         .route(
             "/v1/admin/directory/nodes/{id}/restore",
@@ -675,6 +680,17 @@ async fn ensure_product_space_placement(
     let product_id = request.product_space.product_id.clone();
     product_directory_command(&state, &headers, &product_id, move |directory, context| {
         directory.ensure_product_space_placement(request, context)
+    })
+}
+
+async fn retire_product_space_placement(
+    State(state): State<SharedDaemonState<impl PolicyStore + awaken_iam_core::DirectoryRepository>>,
+    headers: HeaderMap,
+    Json(request): Json<RetireProductSpacePlacement>,
+) -> Response {
+    let product_id = request.product_space.product_id.clone();
+    product_directory_command(&state, &headers, &product_id, move |directory, context| {
+        directory.retire_product_space_placement(request, context)
     })
 }
 

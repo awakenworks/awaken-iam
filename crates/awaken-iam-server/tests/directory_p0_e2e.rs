@@ -5,7 +5,8 @@ use std::thread;
 
 use awaken_iam_contract::{
     CreateDirectoryNode, EnsureProductSpacePlacement, MoveDirectoryNode, OrgId, PrincipalRef,
-    ProductId, ProductSpaceRef, Timestamp,
+    ProductId, ProductSpacePlacementStatus, ProductSpaceRef, RetireProductSpacePlacement,
+    Timestamp, UpdateDirectoryNode,
 };
 use awaken_iam_core::{AuditSink, OrgRepository, Organization};
 use awaken_iam_server::{
@@ -404,4 +405,314 @@ fn concurrent_inverse_moves_cannot_commit_a_cycle() {
         "R3"
     );
     assert_eq!(directory.revision(&OrgId("acme".into())).unwrap(), 4, "R3");
+}
+
+#[test]
+fn product_retirement_is_independent_from_user_node_lifecycle() {
+    // Cause/effect decision table:
+    // | placement | node/children | command | effect |
+    // | active | live with a live child | retire | binding becomes retired once; node and child stay live |
+    // | retired | unchanged | retire retry | no revision or audit advance |
+    // | retired parent | any | create a new child | reject because product parent is unavailable |
+    // | retired | user metadata unchanged | ensure | reactivate the same node once |
+    // Constraints: retirement never deletes/moves/archives user structure and
+    // never advances authorization policy; ProductSpaceRef remains stable.
+    let store = sqlite_in_memory_store("directory_product_lifecycle").unwrap();
+    create_org(&store, "acme");
+    let directory = DirectoryApi::new(store.clone());
+    let policy = PolicyAdminApi::new(store);
+    let policy_version = policy.store_version().unwrap();
+    let parent_space = product_space("workforce", "workspace", "parent");
+    let child_space = product_space("workforce", "project", "child");
+    let parent = directory
+        .ensure_product_space_placement(
+            EnsureProductSpacePlacement {
+                product_space: parent_space.clone(),
+                org_id: OrgId("acme".into()),
+                parent_product_space: None,
+                name: "Parent".into(),
+                preferred_slug: "parent".into(),
+                description: Some("preserved".into()),
+            },
+            DirectoryCommandContext::product_service(product("workforce"), "workforce", at(1)),
+        )
+        .unwrap();
+    let child = directory
+        .ensure_product_space_placement(
+            EnsureProductSpacePlacement {
+                product_space: child_space,
+                org_id: OrgId("acme".into()),
+                parent_product_space: Some(parent_space.clone()),
+                name: "Child".into(),
+                preferred_slug: "child".into(),
+                description: None,
+            },
+            DirectoryCommandContext::product_service(product("workforce"), "workforce", at(2)),
+        )
+        .unwrap();
+    let retired = directory
+        .retire_product_space_placement(
+            RetireProductSpacePlacement {
+                product_space: parent_space.clone(),
+                org_id: OrgId("acme".into()),
+            },
+            DirectoryCommandContext::product_service(product("workforce"), "workforce", at(3)),
+        )
+        .unwrap();
+    assert!(retired.changed);
+    assert_eq!(
+        retired.placement.status,
+        ProductSpacePlacementStatus::Retired
+    );
+    assert!(!retired.node.archived);
+    assert_eq!(
+        directory.node(&child.node.id).unwrap().unwrap().parent_id,
+        Some(parent.node.id.clone())
+    );
+    let retired_revision = retired.revision;
+    let retry = directory
+        .retire_product_space_placement(
+            RetireProductSpacePlacement {
+                product_space: parent_space.clone(),
+                org_id: OrgId("acme".into()),
+            },
+            DirectoryCommandContext::product_service(product("workforce"), "workforce", at(4)),
+        )
+        .unwrap();
+    assert!(!retry.changed);
+    assert_eq!(retry.revision, retired_revision);
+    assert!(
+        directory
+            .ensure_product_space_placement(
+                EnsureProductSpacePlacement {
+                    product_space: product_space("workforce", "project", "new-child"),
+                    org_id: OrgId("acme".into()),
+                    parent_product_space: Some(parent_space.clone()),
+                    name: "New child".into(),
+                    preferred_slug: "new-child".into(),
+                    description: None,
+                },
+                DirectoryCommandContext::product_service(product("workforce"), "workforce", at(5),),
+            )
+            .is_err()
+    );
+    let reactivated = directory
+        .ensure_product_space_placement(
+            EnsureProductSpacePlacement {
+                product_space: parent_space,
+                org_id: OrgId("acme".into()),
+                parent_product_space: None,
+                name: "Ignored replacement".into(),
+                preferred_slug: "ignored-replacement".into(),
+                description: None,
+            },
+            DirectoryCommandContext::product_service(product("workforce"), "workforce", at(6)),
+        )
+        .unwrap();
+    assert!(!reactivated.created);
+    assert_eq!(
+        reactivated.placement.status,
+        ProductSpacePlacementStatus::Active
+    );
+    assert_eq!(reactivated.node.id, parent.node.id);
+    assert_eq!(reactivated.node.name, "Parent");
+    assert_eq!(reactivated.node.description.as_deref(), Some("preserved"));
+    assert_eq!(policy.store_version().unwrap(), policy_version);
+}
+
+#[test]
+fn concurrent_exact_retirement_converges_without_duplicate_effects() {
+    // Cause-effect decision table: C1 one active placement, C2 eight exact
+    // retire commands race behind one start barrier. C1+C2 -> every call
+    // succeeds with retired durable truth, exactly one revision/audit effect,
+    // and the user node remains live. This covers the checked-row loser path,
+    // not merely sequential idempotent replay.
+    let store = sqlite_in_memory_store("directory_concurrent_retire").unwrap();
+    create_org(&store, "acme");
+    let created = DirectoryApi::new(store.clone())
+        .ensure_product_space_placement(ensure("acme"), context(1))
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|index| {
+            let directory = DirectoryApi::new(store.clone());
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                directory.retire_product_space_placement(
+                    RetireProductSpacePlacement {
+                        product_space: space(),
+                        org_id: OrgId("acme".into()),
+                    },
+                    context(index as u8 + 2),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(|result| {
+        result.placement.status == ProductSpacePlacementStatus::Retired && result.revision == 3
+    }));
+    assert!(!directory_node(&store, &created.node.id).archived);
+    assert_eq!(
+        AuditSink::events(&store)
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "directory.product-space.retire")
+            .count(),
+        1
+    );
+}
+
+fn directory_node(
+    store: &impl awaken_iam_core::DirectoryRepository,
+    id: &awaken_iam_contract::DirectoryNodeId,
+) -> awaken_iam_core::DirectoryNode {
+    awaken_iam_core::DirectoryRepository::directory_node(store, id)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn rejected_directory_boundaries_have_no_partial_effects() {
+    // Cause/effect decision table for repository-dependent invariants:
+    // | cause | command | effect |
+    // | target parent belongs to another Org | move | reject, both Org revisions and audit unchanged |
+    // | target parent is archived | move | reject, revision and audit unchanged |
+    // | parent remains archived | restore child | reject, child remains archived |
+    // | live sibling already owns slug | update | reject, metadata unchanged |
+    // These are the P1 negative combinations that pure aggregate validation
+    // cannot decide. Every rejection must occur before an audit/fence effect.
+    let store = sqlite_in_memory_store("directory_rejected_boundaries").unwrap();
+    create_org(&store, "org-a");
+    create_org(&store, "org-b");
+    let directory = DirectoryApi::new(store.clone());
+    let create = |org: &str, parent_id, name: &str, slug: &str, second| {
+        directory
+            .create_node(
+                CreateDirectoryNode {
+                    org_id: OrgId(org.into()),
+                    parent_id,
+                    name: name.into(),
+                    preferred_slug: slug.into(),
+                    description: None,
+                },
+                DirectoryCommandContext::service("directory-boundary-test", at(second)),
+            )
+            .unwrap()
+            .node
+    };
+    let a_root = create("org-a", None, "A root", "a-root", 1);
+    let a_child = create("org-a", Some(a_root.id.clone()), "A child", "child", 2);
+    let b_root = create("org-b", None, "B root", "b-root", 3);
+
+    let a_revision = directory.revision(&OrgId("org-a".into())).unwrap();
+    let b_revision = directory.revision(&OrgId("org-b".into())).unwrap();
+    let audit_count = AuditSink::events(&store).unwrap().len();
+    assert!(
+        directory
+            .move_node(
+                &a_child.id,
+                MoveDirectoryNode {
+                    parent_id: Some(b_root.id),
+                },
+                DirectoryCommandContext::service("directory-boundary-test", at(4)),
+            )
+            .is_err(),
+        "cross-Org move"
+    );
+    assert_eq!(
+        directory.revision(&OrgId("org-a".into())).unwrap(),
+        a_revision
+    );
+    assert_eq!(
+        directory.revision(&OrgId("org-b".into())).unwrap(),
+        b_revision
+    );
+    assert_eq!(AuditSink::events(&store).unwrap().len(), audit_count);
+
+    let archived_target = create("org-a", None, "Archived target", "archived", 5);
+    directory
+        .archive_node(
+            &archived_target.id,
+            DirectoryCommandContext::service("directory-boundary-test", at(6)),
+        )
+        .unwrap();
+    let revision = directory.revision(&OrgId("org-a".into())).unwrap();
+    let audit_count = AuditSink::events(&store).unwrap().len();
+    assert!(
+        directory
+            .move_node(
+                &a_child.id,
+                MoveDirectoryNode {
+                    parent_id: Some(archived_target.id),
+                },
+                DirectoryCommandContext::service("directory-boundary-test", at(7)),
+            )
+            .is_err(),
+        "archived parent move"
+    );
+    assert_eq!(
+        directory.revision(&OrgId("org-a".into())).unwrap(),
+        revision
+    );
+    assert_eq!(AuditSink::events(&store).unwrap().len(), audit_count);
+
+    directory
+        .archive_node(
+            &a_child.id,
+            DirectoryCommandContext::service("directory-boundary-test", at(8)),
+        )
+        .unwrap();
+    directory
+        .archive_node(
+            &a_root.id,
+            DirectoryCommandContext::service("directory-boundary-test", at(9)),
+        )
+        .unwrap();
+    let revision = directory.revision(&OrgId("org-a".into())).unwrap();
+    let audit_count = AuditSink::events(&store).unwrap().len();
+    assert!(
+        directory
+            .restore_node(
+                &a_child.id,
+                DirectoryCommandContext::service("directory-boundary-test", at(10)),
+            )
+            .is_err(),
+        "archived parent restore"
+    );
+    assert!(directory.node(&a_child.id).unwrap().unwrap().archived);
+    assert_eq!(
+        directory.revision(&OrgId("org-a".into())).unwrap(),
+        revision
+    );
+    assert_eq!(AuditSink::events(&store).unwrap().len(), audit_count);
+
+    let first = create("org-a", None, "First", "first", 11);
+    let second = create("org-a", None, "Second", "second", 12);
+    let revision = directory.revision(&OrgId("org-a".into())).unwrap();
+    let audit_count = AuditSink::events(&store).unwrap().len();
+    assert!(
+        directory
+            .update_node(
+                &second.id,
+                UpdateDirectoryNode {
+                    name: "Conflicting".into(),
+                    slug: first.slug.clone(),
+                    description: Some("must not persist".into()),
+                },
+                DirectoryCommandContext::service("directory-boundary-test", at(13)),
+            )
+            .is_err(),
+        "sibling slug conflict"
+    );
+    assert_eq!(directory.node(&second.id).unwrap().unwrap().name, "Second");
+    assert_eq!(
+        directory.revision(&OrgId("org-a".into())).unwrap(),
+        revision
+    );
+    assert_eq!(AuditSink::events(&store).unwrap().len(), audit_count);
 }

@@ -125,6 +125,19 @@ pub struct ProductSpacePlacement {
     /// Immutable tenant partition of the product space and target node.
     pub org_id: OrgId,
     pub node_id: DirectoryNodeId,
+    /// Product-owned availability, independent from the user-managed node's
+    /// archived presentation state.
+    #[serde(default)]
+    pub status: ProductSpacePlacementStatus,
+}
+
+/// Product-owned lifecycle of one stable Directory placement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductSpacePlacementStatus {
+    #[default]
+    Active,
+    Retired,
 }
 
 /// Create one user-managed folder in an organization's Directory.
@@ -158,6 +171,15 @@ pub struct EnsureProductSpacePlacement {
     pub preferred_slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// Retire one product-owned space without deleting or moving its Directory
+/// node. Exact retries are successful no-ops and later ensure reactivates the
+/// same placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireProductSpacePlacement {
+    pub product_space: ProductSpaceRef,
+    pub org_id: OrgId,
 }
 
 /// Move one directory node without changing product-space or authorization ids.
@@ -227,6 +249,16 @@ pub struct ProductSpacePlacementResult {
     /// `true` only when this command created the node and placement. Exact
     /// retries return the existing user-managed presentation unchanged.
     pub created: bool,
+}
+
+/// Result of an idempotent product-space lifecycle transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductSpaceLifecycleResult {
+    pub revision: u64,
+    pub node: DirectoryNodeView,
+    pub placement: ProductSpacePlacement,
+    /// Whether this invocation changed placement or node lifecycle state.
+    pub changed: bool,
 }
 
 /// Stable identifier of an organization invitation.
@@ -499,6 +531,26 @@ mod tests {
         );
         let move_to_root: MoveDirectoryNode = serde_json::from_str("{}").unwrap();
         assert!(move_to_root.parent_id.is_none());
+
+        // W4 an older placement without lifecycle state remains wire-compatible
+        // and means active; W5 an explicit retired state round-trips exactly.
+        let legacy: ProductSpacePlacement = serde_json::from_str(
+            r#"{"product_space":{"product_id":"agents","space_id":"workspace/a"},"org_id":"acme","node_id":"node-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.status, ProductSpacePlacementStatus::Active, "W4");
+        let retired = ProductSpacePlacement {
+            status: ProductSpacePlacementStatus::Retired,
+            ..legacy
+        };
+        assert_eq!(
+            serde_json::from_str::<ProductSpacePlacement>(
+                &serde_json::to_string(&retired).unwrap()
+            )
+            .unwrap(),
+            retired,
+            "W5"
+        );
     }
 
     #[test]

@@ -148,6 +148,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "partition product-space identity and revision by organization",
                     DIRECTORY_0003,
                 ),
+                (
+                    4,
+                    "separate product-space lifecycle from node presentation",
+                    DIRECTORY_0004,
+                ),
             ],
         ),
         bundle(
@@ -469,6 +474,13 @@ INSERT INTO {prefix}_directory_fence_v2 (org_id, revision) \
 DROP TABLE {prefix}_directory_fence;\n\
 ALTER TABLE {prefix}_directory_fence_v2 RENAME TO {prefix}_directory_fence;";
 
+// Existing placements were active by definition. Product retirement is stored
+// on the binding rather than overloading the user-managed node archive flag.
+const DIRECTORY_0004: &str = "\
+ALTER TABLE {prefix}_product_space_bindings \
+ ADD COLUMN status TEXT NOT NULL DEFAULT 'active' \
+ CHECK (status IN ('active', 'retired'));";
+
 // --- iam.entitlement DDL ---------------------------------------------------
 //
 // Plans and the per-principal subscription assignment. A subscription names a
@@ -583,6 +595,60 @@ mod tests {
                 .expect("count placements"),
             vec![vec![Some("2".into())]],
             "E3"
+        );
+    }
+
+    #[test]
+    fn directory_v4_preserves_existing_placements_as_active() {
+        // Cause/effect decision table: R1 a version-three placement plus the
+        // version-four migration ->
+        // the row remains active; R2 active -> retired update round-trips; R3 an
+        // unknown lifecycle value -> database constraint refusal. This guards
+        // the only supported lifecycle upgrade without rebuilding node state.
+        let backend = SqliteBackend::open_in_memory().expect("open sqlite");
+        backend
+            .execute(
+                "CREATE TABLE iam_product_space_bindings (product TEXT NOT NULL, space_id TEXT NOT NULL, org_id TEXT NOT NULL, node_id TEXT NOT NULL, PRIMARY KEY (org_id, product, space_id))",
+                &[],
+            )
+            .expect("seed version-three schema");
+        backend
+            .execute(
+                "INSERT INTO iam_product_space_bindings (product, space_id, org_id, node_id) VALUES ('agents', 'workspace/a', 'org-a', 'node-a')",
+                &[],
+            )
+            .expect("seed version-three placement");
+        backend
+            .execute(&DIRECTORY_0004.replace("{prefix}", "iam"), &[])
+            .expect("apply version four");
+        assert_eq!(
+            backend
+                .query(
+                    "SELECT status FROM iam_product_space_bindings WHERE org_id = ? AND product = ? AND space_id = ?",
+                    &[
+                        Some("org-a".into()),
+                        Some("agents".into()),
+                        Some("workspace/a".into()),
+                    ],
+                )
+                .expect("read migrated lifecycle"),
+            vec![vec![Some("active".into())]],
+            "R1"
+        );
+        backend
+            .execute(
+                "UPDATE iam_product_space_bindings SET status = 'retired' WHERE org_id = 'org-a'",
+                &[],
+            )
+            .expect("retire placement");
+        assert!(
+            backend
+                .execute(
+                    "UPDATE iam_product_space_bindings SET status = 'unknown' WHERE org_id = 'org-a'",
+                    &[],
+                )
+                .is_err(),
+            "R3"
         );
     }
 

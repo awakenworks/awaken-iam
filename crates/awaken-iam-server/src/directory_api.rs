@@ -8,8 +8,9 @@
 use awaken_iam_contract::{
     CreateDirectoryNode, DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId,
     DirectoryNodeMutationResult, DirectoryNodeView, EnsureProductSpacePlacement, MoveDirectoryNode,
-    OrgId, PrincipalRef, ProductId, ProductSpacePlacement, ProductSpacePlacementResult,
-    ProductSpaceRef, Timestamp, UpdateDirectoryNode,
+    OrgId, PrincipalRef, ProductId, ProductSpaceLifecycleResult, ProductSpacePlacement,
+    ProductSpacePlacementResult, ProductSpacePlacementStatus, ProductSpaceRef,
+    RetireProductSpacePlacement, Timestamp, UpdateDirectoryNode,
 };
 use awaken_iam_core::{DirectoryNode, DirectoryRepository, RepositoryError};
 use base64::Engine as _;
@@ -157,6 +158,7 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
             product_space: request.product_space.clone(),
             org_id: request.org_id.clone(),
             node_id: node.id.clone(),
+            status: ProductSpacePlacementStatus::Active,
         };
         node.validate()
             .map_err(|error| AdminError::Invalid(error.to_string()))?;
@@ -202,27 +204,78 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
                 "product space is already placed in another organization".into(),
             ));
         }
-        let mut node = self
+        let node = self
             .store
             .directory_node(&placement.node_id)?
             .ok_or_else(|| {
                 AdminError::Backend("product placement points to a missing node".into())
             })?;
-        let revision = if node.archived {
-            let revision =
-                self.store
-                    .restore_directory_node(&node.id, &context.at, &context.actor)?;
-            node.archived = false;
-            node.updated_at = context.at;
-            revision
+        let revision = if placement.status == ProductSpacePlacementStatus::Retired || node.archived
+        {
+            self.store.set_product_space_placement_status(
+                expected_org,
+                &placement.product_space,
+                ProductSpacePlacementStatus::Active,
+                &context.at,
+                &context.actor,
+            )?
         } else {
             self.store.directory_revision(expected_org)?
+        };
+        let placement = ProductSpacePlacement {
+            status: ProductSpacePlacementStatus::Active,
+            ..placement
+        };
+        let node = if node.archived {
+            self.store
+                .directory_node(&placement.node_id)?
+                .ok_or_else(|| {
+                    AdminError::Backend("activated placement points to a missing node".into())
+                })?
+        } else {
+            node
         };
         Ok(ProductSpacePlacementResult {
             revision,
             node: node.into(),
             placement,
             created: false,
+        })
+    }
+
+    /// Idempotently retire one product space while preserving its stable
+    /// binding and user-managed Directory node.
+    pub fn retire_product_space_placement(
+        &self,
+        request: RetireProductSpacePlacement,
+        context: DirectoryCommandContext,
+    ) -> AdminResult<ProductSpaceLifecycleResult> {
+        validate_product_space(&request.product_space)?;
+        context.authorize(&request.product_space.product_id)?;
+        let placement = self
+            .store
+            .product_space_placement(&request.org_id, &request.product_space)?
+            .ok_or_else(|| AdminError::NotFound("product space has no placement".into()))?;
+        let changed = placement.status != ProductSpacePlacementStatus::Retired;
+        let revision = self.store.set_product_space_placement_status(
+            &request.org_id,
+            &request.product_space,
+            ProductSpacePlacementStatus::Retired,
+            &context.at,
+            &context.actor,
+        )?;
+        let node = self
+            .store
+            .directory_node(&placement.node_id)?
+            .ok_or_else(|| AdminError::Backend("placement points to a missing node".into()))?;
+        Ok(ProductSpaceLifecycleResult {
+            revision,
+            node: node.into(),
+            placement: ProductSpacePlacement {
+                status: ProductSpacePlacementStatus::Retired,
+                ..placement
+            },
+            changed,
         })
     }
 
@@ -239,6 +292,11 @@ impl<S: DirectoryRepository> DirectoryApi<S> {
         if &placement.org_id != org_id {
             return Err(AdminError::Invalid(
                 "parent product space belongs to another organization".into(),
+            ));
+        }
+        if placement.status != ProductSpacePlacementStatus::Active {
+            return Err(AdminError::NotFound(
+                "parent product-space placement is retired".into(),
             ));
         }
         let parent = self

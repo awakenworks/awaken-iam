@@ -79,10 +79,12 @@ of X" is a cheap query. `ResourceModel` is how a product teaches IAM its scope
 hierarchy and action catalog **as data**, so IAM authorizes deep product scopes
 (e.g. issue → project → workspace) without depending on the product.
 
-`DirectoryNode` is user-visible placement, not an authorization Scope or a
-product aggregate. A `ProductSpacePlacement` places one stable,
-product-qualified opaque id at a node. Moving the node never changes product
-identity, tenant partition, or permissions; see
+`DirectoryNode` is presentation, not an authorization Scope or a product
+aggregate. A `ProductSpacePlacement` places one stable, product-qualified
+opaque id at a node and independently records whether that product space is
+active or retired. Retiring a product space never deletes, moves, or archives
+the user-managed node. Moving the node never changes product identity, tenant
+partition, lifecycle, or permissions; see
 [ADR-0013](../adr/0013-directory-placement-independent-product-spaces.md).
 
 ## Domain services
@@ -176,4 +178,3 @@ on product runtime.
 - Aggregates stay small; no aggregate loads another's internals.
 - Providers limited to Google, GitHub, fake. Adding one is enum + config, but we
   ship only what is needed.
-

@@ -280,14 +280,26 @@ mod tests {
 
     #[test]
     fn directory_node_and_placement_validate_without_fixed_levels() {
-        // Cause/effect graph: C1 valid metadata, C2 parent is self, C3 placement
-        // space identity is empty, C4 placement tenant/node disagrees. Effects:
-        // E1 accept any non-self parent (no Org/Workspace/Project tier enum),
-        // E2 reject a one-node cycle, E3 reject an unqualified product space,
-        // E4 reject cross-tenant or wrong-node placement. Rules R1-R4 exercise
-        // every representation invariant before a repository transaction.
+        // Cause/effect graph: C1 valid metadata; C2 empty id; C3 empty name;
+        // C4 invalid slug; C5 parent is self; C6 placement space is empty or
+        // padded; C7 placement tenant or node disagrees. Effects: E1 accepts any
+        // non-self parent without fixed tiers; E2-E7 reject the exact invalid
+        // representation before persistence. Rules R1-R7 exhaust every
+        // DirectoryInvariant variant.
         let valid = node(Some("arbitrary-parent"));
         assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = valid.clone();
+        invalid.id = DirectoryNodeId(" ".into());
+        assert_eq!(invalid.validate(), Err(DirectoryInvariant::EmptyNodeId));
+        let mut invalid = valid.clone();
+        invalid.name = " ".into();
+        assert_eq!(invalid.validate(), Err(DirectoryInvariant::EmptyName));
+        for slug in ["", "Uppercase", "-leading", "trailing-", "has space"] {
+            let mut invalid = valid.clone();
+            invalid.slug = slug.into();
+            assert_eq!(invalid.validate(), Err(DirectoryInvariant::InvalidSlug));
+        }
 
         let self_parent = node(Some("node-a"));
         assert_eq!(self_parent.validate(), Err(DirectoryInvariant::SelfParent));
@@ -299,13 +311,25 @@ mod tests {
             },
             org_id: valid.org_id.clone(),
             node_id: valid.id.clone(),
+            status: awaken_iam_contract::ProductSpacePlacementStatus::Active,
         };
+        assert_eq!(
+            valid.validate_placement(&placement),
+            Err(DirectoryInvariant::EmptyProductSpace)
+        );
+        placement.product_space.space_id = " padded ".into();
         assert_eq!(
             valid.validate_placement(&placement),
             Err(DirectoryInvariant::EmptyProductSpace)
         );
         placement.product_space.space_id = "space-a".into();
         placement.org_id = OrgId("org-b".into());
+        assert_eq!(
+            valid.validate_placement(&placement),
+            Err(DirectoryInvariant::CrossTenantBinding)
+        );
+        placement.org_id = valid.org_id.clone();
+        placement.node_id = DirectoryNodeId("node-b".into());
         assert_eq!(
             valid.validate_placement(&placement),
             Err(DirectoryInvariant::CrossTenantBinding)

@@ -475,10 +475,12 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
     // Cause-effect decision table for the cross-backend Directory authority:
     // R1 valid root + qualified product space -> node, binding, audit and one
     // revision advance commit together; R2 arbitrary live child -> accepted;
-    // R3 ancestor moved below its descendant -> conflict with no revision
-    // advance; R4 parent with live child -> archive conflict; R5 leaf -> archive
-    // commits and disappears from live children. The same rules execute through
-    // this harness for SQLite and optional Postgres, proving one SQL path.
+    // R3 retire/activate binding -> status and revision commit while the live
+    // node remains unchanged; R4 ancestor moved below its descendant -> conflict
+    // with no revision advance; R5 parent with live child -> archive conflict;
+    // R6 leaf -> archive commits and disappears from live children. The same
+    // rules execute through this harness for SQLite and required Postgres,
+    // proving one SQL path.
     let directory_node = |id: &str, parent: Option<&str>| DirectoryNode {
         id: DirectoryNodeId(id.into()),
         org_id: OrgId("acme".into()),
@@ -504,6 +506,7 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
                 },
                 org_id: OrgId("acme".into()),
                 node_id: DirectoryNodeId("root".into()),
+                status: awaken_iam_contract::ProductSpacePlacementStatus::Active,
             }),
             &directory_actor,
         )
@@ -531,6 +534,48 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
         .node_id,
         DirectoryNodeId("root".into())
     );
+    let product_space = ProductSpaceRef {
+        product_id: awaken_iam_contract::ProductId::new("agents").unwrap(),
+        space_id: "space-a".into(),
+    };
+    let before_retire =
+        DirectoryRepository::directory_revision(store, &OrgId("acme".into())).unwrap();
+    assert_eq!(
+        DirectoryRepository::set_product_space_placement_status(
+            store,
+            &OrgId("acme".into()),
+            &product_space,
+            awaken_iam_contract::ProductSpacePlacementStatus::Retired,
+            &ts("2026-06-21T00:30:00Z"),
+            &directory_actor,
+        )
+        .unwrap(),
+        before_retire + 1,
+        "R3"
+    );
+    assert_eq!(
+        DirectoryRepository::product_space_placement(store, &OrgId("acme".into()), &product_space)
+            .unwrap()
+            .unwrap()
+            .status,
+        awaken_iam_contract::ProductSpacePlacementStatus::Retired,
+        "R3"
+    );
+    assert!(
+        !DirectoryRepository::directory_node(store, &DirectoryNodeId("root".into()))
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    DirectoryRepository::set_product_space_placement_status(
+        store,
+        &OrgId("acme".into()),
+        &product_space,
+        awaken_iam_contract::ProductSpacePlacementStatus::Active,
+        &ts("2026-06-21T00:31:00Z"),
+        &directory_actor,
+    )
+    .unwrap();
     let before_rejection =
         DirectoryRepository::directory_revision(store, &OrgId("acme".into())).unwrap();
     assert!(matches!(
@@ -715,8 +760,8 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
             .iter()
             .filter(|event| event.action.starts_with("directory."))
             .count(),
-        4,
-        "create root, create child, update child, and archive child are audited"
+        6,
+        "node create/update/archive plus product retire/activate are audited"
     );
     let tail = &events[events.len() - 2..];
     assert_eq!(tail[0].detail, "first");

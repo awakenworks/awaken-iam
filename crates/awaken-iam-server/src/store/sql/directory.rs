@@ -28,6 +28,15 @@ fn decode_directory_node(row: &SqlRow) -> RepositoryResult<DirectoryNode> {
 }
 
 fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpacePlacement> {
+    let status = match req(row, 4, "product_space.status")?.as_str() {
+        "active" => ProductSpacePlacementStatus::Active,
+        "retired" => ProductSpacePlacementStatus::Retired,
+        other => {
+            return Err(RepositoryError::Backend(format!(
+                "invalid product-space status {other}"
+            )));
+        }
+    };
     Ok(ProductSpacePlacement {
         product_space: ProductSpaceRef {
             product_id: ProductId::new(req(row, 0, "product_space.product")?).map_err(|error| {
@@ -37,6 +46,7 @@ fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpace
         },
         org_id: OrgId(req(row, 2, "product_space.org_id")?),
         node_id: DirectoryNodeId(req(row, 3, "product_space.node_id")?),
+        status,
     })
 }
 
@@ -172,13 +182,18 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         if let Some(placement) = placement {
             writes.push(SqlWrite {
                 sql: format!(
-                    "INSERT INTO {bindings} (product, space_id, org_id, node_id) VALUES (?, ?, ?, ?)"
+                    "INSERT INTO {bindings} (product, space_id, org_id, node_id, status) \
+                     VALUES (?, ?, ?, ?, ?)"
                 ),
                 params: vec![
                     p(placement.product_space.product_id.as_str().to_owned()),
                     p(placement.product_space.space_id),
                     p(placement.org_id.0),
                     p(placement.node_id.0),
+                    p(match placement.status {
+                        ProductSpacePlacementStatus::Active => "active".to_owned(),
+                        ProductSpacePlacementStatus::Retired => "retired".to_owned(),
+                    }),
                 ],
             });
         }
@@ -574,13 +589,128 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         self.directory_revision(&current.org_id)
     }
 
+    fn set_product_space_placement_status(
+        &self,
+        org_id: &OrgId,
+        product_space: &ProductSpaceRef,
+        status: ProductSpacePlacementStatus,
+        updated_at: &Timestamp,
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64> {
+        let placement = self
+            .product_space_placement(org_id, product_space)?
+            .ok_or_else(|| RepositoryError::NotFound("product-space placement".into()))?;
+        let node = self
+            .directory_node(&placement.node_id)?
+            .ok_or_else(|| RepositoryError::Backend("placement points to a missing node".into()))?;
+        let restore_node = status == ProductSpacePlacementStatus::Active && node.archived;
+        if placement.status == status && !restore_node {
+            return self.directory_revision(org_id);
+        }
+
+        let desired = match status {
+            ProductSpacePlacementStatus::Active => "active",
+            ProductSpacePlacementStatus::Retired => "retired",
+        };
+        let current = match placement.status {
+            ProductSpacePlacementStatus::Active => "active",
+            ProductSpacePlacementStatus::Retired => "retired",
+        };
+        let bindings = self.table("product_space_bindings");
+        let nodes = self.table("directory_nodes");
+        let fence = self.table("directory_fence");
+        let mut writes = vec![SqlWrite {
+            sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+            params: vec![p(org_id.0.clone())],
+        }];
+        if placement.status != status {
+            writes.push(SqlWrite {
+                sql: format!(
+                    "UPDATE {bindings} SET status = ? \
+                     WHERE org_id = ? AND product = ? AND space_id = ? AND status = ?"
+                ),
+                params: vec![
+                    p(desired.to_owned()),
+                    p(org_id.0.clone()),
+                    p(product_space.product_id.as_str().to_owned()),
+                    p(product_space.space_id.clone()),
+                    p(current.to_owned()),
+                ],
+            });
+        }
+        if restore_node {
+            writes.push(SqlWrite {
+                sql: format!(
+                    "UPDATE {nodes} SET archived = 0, updated_at = ? \
+                     WHERE id = ? AND org_id = ? AND archived = 1 \
+                       AND (parent_id = '' OR EXISTS (SELECT 1 FROM {nodes} parent \
+                         WHERE parent.id = {nodes}.parent_id \
+                           AND parent.org_id = ? AND parent.archived = 0))"
+                ),
+                params: vec![
+                    p(updated_at.0.clone()),
+                    p(node.id.0.clone()),
+                    p(org_id.0.clone()),
+                    p(org_id.0.clone()),
+                ],
+            });
+        }
+        writes.push(SqlWrite {
+            sql: format!(
+                "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                self.table("audit_events")
+            ),
+            params: vec![
+                p(updated_at.0.clone()),
+                p(json_encode(actor, "directory actor")?),
+                p(match status {
+                    ProductSpacePlacementStatus::Active => "directory.product-space.activate",
+                    ProductSpacePlacementStatus::Retired => "directory.product-space.retire",
+                }),
+                p(format!(
+                    "product space {}/{}",
+                    product_space.product_id, product_space.space_id
+                )),
+            ],
+        });
+        writes.push(SqlWrite {
+            sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
+            params: vec![p(org_id.0.clone())],
+        });
+        let required = (0..writes.len())
+            .map(|index| (index, 1))
+            .collect::<Vec<_>>();
+        match self.backend.execute_transaction_checked(&writes, &required) {
+            Ok(_) => self.directory_revision(org_id),
+            Err(error @ RepositoryError::Conflict(_)) => {
+                // Another process may have won the identical lifecycle
+                // transition after our read but before the Org-fenced write.
+                // Re-read durable truth and converge only when every requested
+                // effect is already present; unrelated conflicts still fail.
+                let converged = self
+                    .product_space_placement(org_id, product_space)?
+                    .is_some_and(|current| current.status == status)
+                    && (status == ProductSpacePlacementStatus::Retired
+                        || self
+                            .directory_node(&placement.node_id)?
+                            .is_some_and(|current| !current.archived));
+                if converged {
+                    self.directory_revision(org_id)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn product_space_placement(
         &self,
         org_id: &OrgId,
         product_space: &ProductSpaceRef,
     ) -> RepositoryResult<Option<ProductSpacePlacement>> {
         let sql = format!(
-            "SELECT product, space_id, org_id, node_id FROM {} \
+            "SELECT product, space_id, org_id, node_id, status FROM {} \
              WHERE org_id = ? AND product = ? AND space_id = ?",
             self.table("product_space_bindings")
         );
@@ -717,6 +847,7 @@ mod tests {
                     product_space: product_space.clone(),
                     org_id: org_id.clone(),
                     node_id: node_id.clone(),
+                    status: ProductSpacePlacementStatus::Active,
                 }),
                 &actor(),
             );
@@ -746,6 +877,11 @@ mod tests {
                     .iter()
                     .all(|event| !event.action.starts_with("directory.")),
                 "W{fail_at}"
+            );
+            assert_eq!(
+                DirectoryRepository::directory_revision(&authoritative, &org_id).unwrap(),
+                1,
+                "W{fail_at}: rollback must include the independent Directory fence"
             );
         }
     }

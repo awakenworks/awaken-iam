@@ -261,7 +261,7 @@ async fn directory_http_preserves_stable_space_identity_across_move() {
 #[tokio::test]
 async fn product_credential_is_scoped_and_directory_route_matrix_is_complete() {
     // Cause-effect decision table over the remote security/read surface:
-    // R1 product credential + matching ProductId ensure/query -> 200; R2 same
+    // R1 product credential + matching ProductId ensure/query/retire -> 200; R2 same
     // credential + another ProductId -> 403 and no effect; R3 product credential
     // + administrator-only node command -> 403; R4 admin archive/restore/revision
     // -> each route succeeds and the Org revision advances exactly once.
@@ -340,6 +340,37 @@ async fn product_credential_is_scoped_and_directory_route_matrix_is_complete() {
         .unwrap();
     assert_eq!(own_query.status(), StatusCode::OK, "R1");
 
+    let retired = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/retire",
+            serde_json::json!({
+                "org_id":"acme",
+                "product_space":{"product_id":"agents", "space_id":"workspace/a"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::OK, "R1");
+    let retired = body_json(retired).await;
+    assert_eq!(retired["placement"]["status"], "retired", "R1");
+    assert_eq!(retired["revision"], 3, "R1");
+
+    let foreign_retire = app
+        .clone()
+        .oneshot(product_json(
+            "POST",
+            "/v1/admin/directory/product-spaces/retire",
+            serde_json::json!({
+                "org_id":"acme",
+                "product_space":{"product_id":"objects", "space_id":"space/a"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_retire.status(), StatusCode::FORBIDDEN, "R2");
+
     let archived = app
         .clone()
         .oneshot(authed(
@@ -350,7 +381,7 @@ async fn product_credential_is_scoped_and_directory_route_matrix_is_complete() {
         .await
         .unwrap();
     assert_eq!(archived.status(), StatusCode::OK, "R4");
-    assert_eq!(body_json(archived).await["revision"], 3, "R4");
+    assert_eq!(body_json(archived).await["revision"], 4, "R4");
     let restored = app
         .clone()
         .oneshot(authed(
@@ -361,13 +392,13 @@ async fn product_credential_is_scoped_and_directory_route_matrix_is_complete() {
         .await
         .unwrap();
     assert_eq!(restored.status(), StatusCode::OK, "R4");
-    assert_eq!(body_json(restored).await["revision"], 4, "R4");
+    assert_eq!(body_json(restored).await["revision"], 5, "R4");
     let revision = app
         .oneshot(authed_get("/v1/admin/directory/revision?org_id=acme"))
         .await
         .unwrap();
     assert_eq!(revision.status(), StatusCode::OK, "R4");
-    assert_eq!(body_json(revision).await, 4, "R4");
+    assert_eq!(body_json(revision).await, 5, "R4");
 }
 
 #[tokio::test]

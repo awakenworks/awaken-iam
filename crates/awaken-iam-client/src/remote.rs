@@ -23,12 +23,12 @@ use awaken_iam_contract::{
     DirectoryNodeView, DirectoryRevisionQuery, EnsureProductSpacePlacement,
     EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId,
     InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
-    NamespaceId, OrgView, PolicySnapshot, ProductSpacePlacement, ProductSpacePlacementQuery,
-    ProductSpacePlacementResult, ReplaceScopedMemberships, ResendInvitation,
-    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
-    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
-    WorkspaceOrgEdge,
+    NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement,
+    ProductSpacePlacementQuery, ProductSpacePlacementResult, ReplaceScopedMemberships,
+    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
+    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::IamClient;
@@ -297,6 +297,10 @@ pub trait DirectoryClient {
         &self,
         request: &EnsureProductSpacePlacement,
     ) -> Result<ProductSpacePlacementResult, RemoteError>;
+    fn retire_product_space_placement(
+        &self,
+        request: &RetireProductSpacePlacement,
+    ) -> Result<ProductSpaceLifecycleResult, RemoteError>;
     fn get_directory_node(
         &self,
         id: &DirectoryNodeId,
@@ -597,6 +601,13 @@ impl<T: DirectoryClient> RemoteIamClient<T> {
         request: &EnsureProductSpacePlacement,
     ) -> Result<ProductSpacePlacementResult, RemoteError> {
         self.transport.ensure_product_space_placement(request)
+    }
+
+    pub fn retire_product_space_placement(
+        &self,
+        request: &RetireProductSpacePlacement,
+    ) -> Result<ProductSpaceLifecycleResult, RemoteError> {
+        self.transport.retire_product_space_placement(request)
     }
 
     pub fn get_directory_node(

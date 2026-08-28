@@ -139,3 +139,27 @@ follows:
   and hosted production persists PostgreSQL.
 - Migration V0003 preserves existing placements while rebuilding the placement
   key and freshness fence as Org-scoped authority.
+
+## Amendment: product-space lifecycle and operator observation
+
+Product lifecycle cannot be represented by `DirectoryNode.archived`. A node is
+user-managed presentation and may contain other live nodes; a product retiring
+its space must neither fail because the node has children nor silently move or
+archive user structure. The placement therefore owns an independent
+`active`/`retired` lifecycle:
+
+- `EnsureProductSpacePlacement` creates or activates the one stable placement.
+  It still restores an archived node when the product is active, preserving the
+  existing node identity, parent, and metadata.
+- `RetireProductSpacePlacement` idempotently retires the binding without
+  deleting or moving its node. Reactivation reuses the same binding and node.
+- Both transitions are one Directory repository transaction with one audit
+  record and one revision advance. Exact retries are no-ops.
+- Product credentials may ensure, retire, and query only their own ProductId.
+- Operator observation is a read projection over authoritative placement and
+  product facts. It owns no writable state and is not a customer-facing
+  Directory surface.
+
+Migration V0004 adds the placement lifecycle with existing rows defaulting to
+`active`. Products reconcile active parents before children and retire children
+before parents; temporary failures retry the same canonical commands.

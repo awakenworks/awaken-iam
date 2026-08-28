@@ -17,8 +17,8 @@ use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     DirectoryNodeId, ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId,
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpacePlacement,
-    ProductSpaceRef, ProfileLifecycle, Session, SessionId, Timestamp, WorkspaceId,
-    WorkspaceOrgEdge,
+    ProductSpacePlacementStatus, ProductSpaceRef, ProfileLifecycle, Session, SessionId, Timestamp,
+    WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::oauth_provider::StoredAuthorizationCode;
@@ -234,6 +234,17 @@ pub trait DirectoryRepository: Send + Sync {
     fn restore_directory_node(
         &self,
         id: &DirectoryNodeId,
+        updated_at: &Timestamp,
+        actor: &PrincipalRef,
+    ) -> RepositoryResult<u64>;
+    /// Atomically activate or retire one existing product-space placement.
+    /// Activation also restores its node when necessary; retirement never
+    /// mutates the user-managed node hierarchy or archive state.
+    fn set_product_space_placement_status(
+        &self,
+        org_id: &OrgId,
+        product_space: &ProductSpaceRef,
+        status: ProductSpacePlacementStatus,
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64>;

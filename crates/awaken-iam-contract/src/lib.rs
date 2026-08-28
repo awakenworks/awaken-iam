@@ -27,8 +27,9 @@ pub use admin::{
     DirectoryNodeMutationResult, DirectoryNodeView, DirectoryRevisionQuery,
     EnsureProductSpacePlacement, GroupView, InvalidProductId, InvitationBinding, InvitationId,
     InvitationQuery, InvitationStatus, InvitationView, IssuedInvitation, MembershipQuery,
-    MoveDirectoryNode, OrgView, ProductId, ProductSpacePlacement, ProductSpacePlacementQuery,
-    ProductSpacePlacementResult, ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation,
+    MoveDirectoryNode, OrgView, ProductId, ProductSpaceLifecycleResult, ProductSpacePlacement,
+    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProductSpacePlacementStatus,
+    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RetireProductSpacePlacement,
     RoleView, ScopeMembershipQuery, UpdateDirectoryNode,
 };
 pub use identity::{

@@ -29,9 +29,10 @@ use awaken_iam_contract::{
     DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
     EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery, InvitationView,
     IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
-    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
-    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
+    ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
+    ProductSpacePlacementResult, ReplaceScopedMemberships, ResendInvitation,
+    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
     UserInfo, WorkspaceOrgEdge,
 };
@@ -599,6 +600,18 @@ impl DirectoryClient for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn retire_product_space_placement(
+        &self,
+        request: &RetireProductSpacePlacement,
+    ) -> Result<ProductSpaceLifecycleResult, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/directory/product-spaces/retire"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
+
     fn get_directory_node(
         &self,
         id: &DirectoryNodeId,
@@ -885,7 +898,7 @@ mod tests {
 
     #[test]
     fn directory_client_uses_every_canonical_remote_route() {
-        // Cause-effect route table: one call for create/ensure/get/children/
+        // Cause-effect route table: one call for create/ensure/retire/get/children/
         // revision/move/update/archive/restore/placement -> exactly one request
         // with the canonical HTTP verb/path and one decoded typed result. A
         // missing implementation cannot compile because DirectoryClient has no
@@ -894,6 +907,7 @@ mod tests {
         let server = StubServer::start(vec![
             Reply::Ok(format!(r#"{{"revision":2,"node":{node}}}"#)),
             Reply::Ok(format!(r#"{{"revision":2,"node":{node},"placement":{{"product_space":{{"product_id":"agents","space_id":"workspace/a"}},"org_id":"acme","node_id":"node-a"}},"created":false}}"#)),
+            Reply::Ok(format!(r#"{{"revision":3,"node":{node},"placement":{{"product_space":{{"product_id":"agents","space_id":"workspace/a"}},"org_id":"acme","node_id":"node-a","status":"retired"}},"changed":true}}"#)),
             Reply::Ok(node.into()),
             Reply::Ok(format!(r#"{{"org_id":"acme","revision":2,"nodes":[{node}]}}"#)),
             Reply::Ok("2".into()),
@@ -926,6 +940,12 @@ mod tests {
                 name: "Team".into(),
                 preferred_slug: "team".into(),
                 description: None,
+            })
+            .unwrap();
+        transport
+            .retire_product_space_placement(&RetireProductSpacePlacement {
+                product_space: product_space.clone(),
+                org_id: org_id.clone(),
             })
             .unwrap();
         transport
@@ -978,6 +998,7 @@ mod tests {
         let routes = [
             "POST /v1/admin/directory/nodes ",
             "POST /v1/admin/directory/product-spaces/ensure ",
+            "POST /v1/admin/directory/product-spaces/retire ",
             "GET /v1/admin/directory/nodes/node-a ",
             "GET /v1/admin/directory/nodes?org_id=acme ",
             "GET /v1/admin/directory/revision?org_id=acme ",

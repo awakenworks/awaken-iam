@@ -21,8 +21,8 @@ use awaken_iam_contract::{
     AuthorizationProfileDocument, DirectoryNodeId, ExternalIdentity, ExternalIdentityKey,
     GrantSubjectRef, InvitationBinding, InvitationId, InvitationStatus, NamespaceId,
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId, ProductSpacePlacement,
-    ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType, Session, SessionId, Timestamp,
-    WorkspaceId, WorkspaceOrgEdge,
+    ProductSpacePlacementStatus, ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType,
+    Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
