@@ -22,6 +22,7 @@
 //! | `PUT /v1/admin/roles/{id}` | [`PolicyAdminApi::update_role`] |
 //! | `DELETE /v1/admin/roles/{id}` | [`PolicyAdminApi::delete_role`] |
 //! | `POST /v1/admin/grants` | [`PolicyAdminApi::issue_grant`] |
+//! | `GET /v1/admin/grants/{id}` | [`PolicyAdminApi::get_grant`] |
 //! | `DELETE /v1/admin/grants/{id}` | [`PolicyAdminApi::revoke_grant`] |
 //! | `POST /v1/admin/memberships` | [`PolicyAdminApi::grant_membership`] |
 //! | `DELETE /v1/admin/memberships` | [`PolicyAdminApi::revoke_membership`] |

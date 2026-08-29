@@ -1059,6 +1059,67 @@ async fn get_role_matches_the_remote_client_contract_and_fails_closed() {
 }
 
 #[tokio::test]
+async fn get_grant_matches_the_remote_client_contract_and_fails_closed() {
+    // Cause/effect table for the exact grant read used by remote Cloud:
+    // C1=valid admin credential + existing Grant -> E1=200 and exact fields;
+    // C2=valid credential + absent Grant -> E2=404/None; C3=missing credential
+    // -> E3=401 before repository access. The PAP repository is authoritative;
+    // a potentially stale PDP snapshot must never substitute for this read.
+    let router = daemon();
+    let grant = serde_json::json!({
+        "id": "publisher-read",
+        "subject": { "kind": "role", "role_id": "publisher" },
+        "action_pattern": "pack.read",
+        "scope": { "kind": "global" },
+        "effect": "allow"
+    });
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/grants", grant))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::OK
+    );
+
+    let found = router
+        .clone()
+        .oneshot(authed_get("/v1/admin/grants/publisher-read"))
+        .await
+        .expect("dispatch");
+    assert_eq!(found.status(), StatusCode::OK);
+    let found: awaken_iam_contract::GrantSnapshot =
+        serde_json::from_value(body_json(found).await).expect("Grant");
+    assert_eq!(found.id, "publisher-read");
+    assert_eq!(found.action_pattern, "pack.read");
+
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_get("/v1/admin/grants/missing"))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/grants/publisher-read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn update_org_replaces_an_existing_organization() {
     let router = daemon();
 

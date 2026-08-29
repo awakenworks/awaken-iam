@@ -31,6 +31,7 @@
 //! | `PUT /v1/admin/roles/{id}` | [`PolicyAdminApi::update_role`] |
 //! | `DELETE /v1/admin/roles/{id}` | [`PolicyAdminApi::delete_role`] |
 //! | `POST /v1/admin/grants` | [`PolicyAdminApi::issue_grant`] |
+//! | `GET /v1/admin/grants/{id}` | [`PolicyAdminApi::get_grant`] |
 //! | `DELETE /v1/admin/grants/{id}` | [`PolicyAdminApi::revoke_grant`] |
 //! | `POST /v1/admin/memberships` | [`PolicyAdminApi::grant_membership`] |
 //! | `DELETE /v1/admin/memberships` | [`PolicyAdminApi::revoke_membership`] |
@@ -262,7 +263,7 @@ where
             get(get_role).put(update_role).delete(delete_role),
         )
         .route("/v1/admin/grants", post(issue_grant))
-        .route("/v1/admin/grants/{id}", delete(revoke_grant))
+        .route("/v1/admin/grants/{id}", get(get_grant).delete(revoke_grant))
         .route("/v1/admin/capabilities", post(issue_capability))
         .route(
             "/v1/admin/memberships",
@@ -915,6 +916,22 @@ async fn issue_grant(
     })
 }
 
+async fn get_grant(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.admin.get_grant(&GrantId(id)) {
+        Ok(Some(grant)) => (StatusCode::OK, Json(grant_to_dto(grant))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
 async fn revoke_grant(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
@@ -1400,6 +1417,26 @@ fn grant_from_dto(dto: GrantSnapshot) -> Grant {
             GrantEffect::Allow => Effect::Allow,
             GrantEffect::RequireApproval => Effect::RequireApproval,
             GrantEffect::Deny => Effect::Deny,
+        },
+    }
+}
+
+fn grant_to_dto(grant: Grant) -> GrantSnapshot {
+    GrantSnapshot {
+        id: grant.id.0,
+        subject: match grant.subject {
+            GrantSubject::Principal(principal) => GrantSubjectRef::Principal { principal },
+            GrantSubject::Role(role_id) => GrantSubjectRef::Role { role_id: role_id.0 },
+            GrantSubject::Group(group_id) => GrantSubjectRef::Group {
+                group_id: group_id.0,
+            },
+        },
+        action_pattern: grant.action_pattern.0,
+        scope: grant.scope,
+        effect: match grant.effect {
+            Effect::Allow => GrantEffect::Allow,
+            Effect::RequireApproval => GrantEffect::RequireApproval,
+            Effect::Deny => GrantEffect::Deny,
         },
     }
 }
