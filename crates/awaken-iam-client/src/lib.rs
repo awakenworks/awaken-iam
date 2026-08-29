@@ -30,13 +30,42 @@ use awaken_iam_contract::{
     AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,
 };
 
+/// Availability failure at the IAM decision boundary.
+///
+/// Policy denials remain ordinary decision values. This error exists so an
+/// online PEP can distinguish a reachable PDP denial from an unreachable PDP
+/// without ever treating the latter as an allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IamDecisionError {
+    #[error("IAM decision service is unavailable")]
+    Unavailable,
+}
+
 /// Shared client interface for services that delegate IAM decisions.
 pub trait IamClient {
     /// Check authorization for an action and scope.
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision;
 
+    /// Check authorization while preserving decision-service availability.
+    /// Existing in-process clients inherit the infallible adapter; transports
+    /// override it so an outage remains distinct from an explicit deny.
+    fn authorize_result(
+        &self,
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizationDecision, IamDecisionError> {
+        Ok(self.authorize(request))
+    }
+
     /// Check account/product entitlement.
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision;
+
+    /// Check entitlement while preserving decision-service availability.
+    fn check_entitlement_result(
+        &self,
+        request: EntitlementRequest,
+    ) -> Result<EntitlementDecision, IamDecisionError> {
+        Ok(self.check_entitlement(request))
+    }
 }
 
 /// A shared reference to a client is itself a client.
@@ -49,8 +78,22 @@ impl<C: IamClient + ?Sized> IamClient for &C {
         (**self).authorize(request)
     }
 
+    fn authorize_result(
+        &self,
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizationDecision, IamDecisionError> {
+        (**self).authorize_result(request)
+    }
+
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
         (**self).check_entitlement(request)
+    }
+
+    fn check_entitlement_result(
+        &self,
+        request: EntitlementRequest,
+    ) -> Result<EntitlementDecision, IamDecisionError> {
+        (**self).check_entitlement_result(request)
     }
 }
 

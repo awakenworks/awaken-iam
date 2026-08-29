@@ -1,9 +1,9 @@
 //! Convenience facade for Awaken IAM library users.
 
 pub use awaken_iam_client::{
-    AuthzTransport, DrainReport, IamClient, IamClientMode, InMemoryOutbox, OutboxError,
-    OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore, ProvisionTransport, RemoteError,
-    RemoteIamClient,
+    AuthzTransport, DrainReport, IamClient, IamClientMode, IamDecisionError, InMemoryOutbox,
+    OutboxError, OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore, ProvisionTransport,
+    RemoteError, RemoteIamClient,
 };
 #[cfg(feature = "http")]
 pub use awaken_iam_client::{

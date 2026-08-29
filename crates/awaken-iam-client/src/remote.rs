@@ -31,7 +31,7 @@ use awaken_iam_contract::{
     UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
 };
 
-use crate::IamClient;
+use crate::{IamClient, IamDecisionError};
 
 /// Failure reported by an [`AuthzTransport`] implementation.
 ///
@@ -674,11 +674,31 @@ impl<T: AuthzTransport> IamClient for RemoteIamClient<T> {
             .unwrap_or(AuthorizationDecision::Deny)
     }
 
+    fn authorize_result(
+        &self,
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizationDecision, IamDecisionError> {
+        self.transport
+            .authorize(&request)
+            .map(|outcome| outcome.decision)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
+
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
         self.transport
             .check_entitlement(&request)
             .map(|response| response.decision)
             .unwrap_or(EntitlementDecision::Deny)
+    }
+
+    fn check_entitlement_result(
+        &self,
+        request: EntitlementRequest,
+    ) -> Result<EntitlementDecision, IamDecisionError> {
+        self.transport
+            .check_entitlement(&request)
+            .map(|response| response.decision)
+            .map_err(|_| IamDecisionError::Unavailable)
     }
 }
 
@@ -717,10 +737,30 @@ impl<L: IamClient, R: IamClient> IamClient for IamClientMode<L, R> {
         }
     }
 
+    fn authorize_result(
+        &self,
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizationDecision, IamDecisionError> {
+        match self {
+            IamClientMode::Local(client) => client.authorize_result(request),
+            IamClientMode::Remote(client) => client.authorize_result(request),
+        }
+    }
+
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
         match self {
             IamClientMode::Local(client) => client.check_entitlement(request),
             IamClientMode::Remote(client) => client.check_entitlement(request),
+        }
+    }
+
+    fn check_entitlement_result(
+        &self,
+        request: EntitlementRequest,
+    ) -> Result<EntitlementDecision, IamDecisionError> {
+        match self {
+            IamClientMode::Local(client) => client.check_entitlement_result(request),
+            IamClientMode::Remote(client) => client.check_entitlement_result(request),
         }
     }
 }
@@ -911,6 +951,14 @@ mod tests {
         assert_eq!(
             client.check_entitlement(ent_request()),
             EntitlementDecision::Deny
+        );
+        assert_eq!(
+            client.authorize_result(auth_request("pack.read")),
+            Err(IamDecisionError::Unavailable)
+        );
+        assert_eq!(
+            client.check_entitlement_result(ent_request()),
+            Err(IamDecisionError::Unavailable)
         );
         // The reasoned accessor still surfaces the error for callers that care.
         assert_eq!(
