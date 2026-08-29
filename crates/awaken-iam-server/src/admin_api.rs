@@ -10,6 +10,7 @@
 //! | Route | Method on [`PolicyAdminApi`] |
 //! |---|---|
 //! | `POST /v1/admin/orgs` | [`PolicyAdminApi::create_org`] |
+//! | `GET /v1/admin/orgs/{id}` | [`PolicyAdminApi::get_org`] |
 //! | `PUT /v1/admin/orgs/{id}` | [`PolicyAdminApi::update_org`] |
 //! | `DELETE /v1/admin/orgs/{id}` | [`PolicyAdminApi::delete_org`] |
 //! | `GET /v1/admin/orgs` | [`PolicyAdminApi::list_orgs`] |

@@ -946,6 +946,58 @@ async fn healthz_does_not_require_an_admin_credential() {
 }
 
 #[tokio::test]
+async fn get_org_matches_the_remote_client_contract_and_fails_closed() {
+    // Cause/effect table for the exact resource read used by remote Cloud:
+    // C1=valid admin credential + existing Org -> E1=200 and the exact Org;
+    // C2=valid credential + absent Org -> E2=404 (the client maps this to
+    // None); C3=missing credential -> E3=401 before repository access. This
+    // route must not be approximated by an O(number-of-orgs) list scan.
+    let router = daemon();
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("acme")))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::OK
+    );
+
+    let found = router
+        .clone()
+        .oneshot(authed_get("/v1/admin/orgs/acme"))
+        .await
+        .expect("dispatch");
+    assert_eq!(found.status(), StatusCode::OK);
+    let found: OrgView = serde_json::from_value(body_json(found).await).expect("Org");
+    assert_eq!(found.id.0, "acme");
+
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_get("/v1/admin/orgs/missing"))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/orgs/acme")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn update_org_replaces_an_existing_organization() {
     let router = daemon();
 

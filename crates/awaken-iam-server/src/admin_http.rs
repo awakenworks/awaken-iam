@@ -19,6 +19,7 @@
 //! | Route | Method on [`PolicyAdminApi`] |
 //! |---|---|
 //! | `POST /v1/admin/orgs` | [`PolicyAdminApi::create_org`] |
+//! | `GET /v1/admin/orgs/{id}` | [`PolicyAdminApi::get_org`] |
 //! | `PUT /v1/admin/orgs/{id}` | [`PolicyAdminApi::update_org`] |
 //! | `DELETE /v1/admin/orgs/{id}` | [`PolicyAdminApi::delete_org`] |
 //! | `GET /v1/admin/orgs` | [`PolicyAdminApi::list_orgs`] |
@@ -217,7 +218,10 @@ where
         .route("/v1/authz/snapshot", get(snapshot))
         .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
-        .route("/v1/admin/orgs/{id}", put(update_org).delete(delete_org))
+        .route(
+            "/v1/admin/orgs/{id}",
+            get(get_org).put(update_org).delete(delete_org),
+        )
         .route(
             "/v1/admin/directory/nodes",
             post(create_directory_node).get(list_directory_children),
@@ -627,6 +631,22 @@ async fn create_org(
     apply(&state, &headers, move |admin, at| {
         admin.create_org(org_from_dto(dto), at)
     })
+}
+
+async fn get_org(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.admin.get_org(&OrgId(id)) {
+        Ok(Some(org)) => (StatusCode::OK, Json(org_to_dto(org))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => admin_error_response(&error),
+    }
 }
 
 async fn update_org(

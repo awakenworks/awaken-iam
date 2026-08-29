@@ -170,6 +170,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
 /// [`Standalone`](Deployment::Standalone) deployment.
 const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/admin/orgs"),
+    RouteSpec::get("/v1/admin/orgs/{id}"),
     RouteSpec::put("/v1/admin/orgs/{id}"),
     RouteSpec::delete("/v1/admin/orgs/{id}"),
     RouteSpec::get("/v1/admin/orgs"),
