@@ -27,6 +27,7 @@
 //! | `PUT /v1/admin/groups/{id}` | [`PolicyAdminApi::update_group`] |
 //! | `DELETE /v1/admin/groups/{id}` | [`PolicyAdminApi::delete_group`] |
 //! | `POST /v1/admin/roles` | [`PolicyAdminApi::define_role`] |
+//! | `GET /v1/admin/roles/{id}` | [`PolicyAdminApi::get_role`] |
 //! | `PUT /v1/admin/roles/{id}` | [`PolicyAdminApi::update_role`] |
 //! | `DELETE /v1/admin/roles/{id}` | [`PolicyAdminApi::delete_role`] |
 //! | `POST /v1/admin/grants` | [`PolicyAdminApi::issue_grant`] |
@@ -256,7 +257,10 @@ where
             put(update_group).delete(delete_group),
         )
         .route("/v1/admin/roles", post(define_role))
-        .route("/v1/admin/roles/{id}", put(update_role).delete(delete_role))
+        .route(
+            "/v1/admin/roles/{id}",
+            get(get_role).put(update_role).delete(delete_role),
+        )
         .route("/v1/admin/grants", post(issue_grant))
         .route("/v1/admin/grants/{id}", delete(revoke_grant))
         .route("/v1/admin/capabilities", post(issue_capability))
@@ -863,6 +867,22 @@ async fn define_role(
     })
 }
 
+async fn get_role(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
+        return rejection;
+    }
+    match guard.admin.get_role(&RoleId(id)) {
+        Ok(Some(role)) => (StatusCode::OK, Json(role_to_dto(role))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
 async fn update_role(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
@@ -1349,6 +1369,20 @@ fn role_from_dto(dto: RoleView) -> RoleDef {
         action_patterns: dto.action_patterns.into_iter().map(ActionPattern).collect(),
         created_at: dto.created_at,
         updated_at: dto.updated_at,
+    }
+}
+
+fn role_to_dto(role: RoleDef) -> RoleView {
+    RoleView {
+        id: role.id.0,
+        display_name: role.display_name,
+        action_patterns: role
+            .action_patterns
+            .into_iter()
+            .map(|pattern| pattern.0)
+            .collect(),
+        created_at: role.created_at,
+        updated_at: role.updated_at,
     }
 }
 

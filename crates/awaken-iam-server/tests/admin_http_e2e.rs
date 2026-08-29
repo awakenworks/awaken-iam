@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AdminMutationAck, AuthorizationOutcome, BatchAuthorizationResponse, EntitlementCheckResponse,
-    OrgView, PolicySnapshot, ProductId,
+    OrgView, PolicySnapshot, ProductId, RoleView,
 };
 use awaken_iam_core::AuthorizationProfileRepository;
 use awaken_iam_server::{
@@ -987,6 +987,67 @@ async fn get_org_matches_the_remote_client_contract_and_fails_closed() {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/admin/orgs/acme")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn get_role_matches_the_remote_client_contract_and_fails_closed() {
+    // Cause/effect table for the exact role read used by remote Cloud:
+    // C1=valid admin credential + existing Role -> E1=200 and the exact Role;
+    // C2=valid credential + absent Role -> E2=404 (the client maps this to
+    // None); C3=missing credential -> E3=401 before repository access. This
+    // route is the read half of ensure-role and must not be inferred from a
+    // cached policy snapshot or approximated by a full collection scan.
+    let router = daemon();
+    let role = serde_json::json!({
+        "id": "publisher",
+        "display_name": "Publisher",
+        "action_patterns": ["pack.read", "pack.publish"],
+        "created_at": "2026-06-21T00:00:00Z",
+        "updated_at": "2026-06-21T00:00:00Z"
+    });
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_json("POST", "/v1/admin/roles", role))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::OK
+    );
+
+    let found = router
+        .clone()
+        .oneshot(authed_get("/v1/admin/roles/publisher"))
+        .await
+        .expect("dispatch");
+    assert_eq!(found.status(), StatusCode::OK);
+    let found: RoleView = serde_json::from_value(body_json(found).await).expect("Role");
+    assert_eq!(found.id, "publisher");
+    assert_eq!(found.action_patterns, ["pack.read", "pack.publish"]);
+
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(authed_get("/v1/admin/roles/missing"))
+            .await
+            .expect("dispatch")
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/roles/publisher")
                     .body(Body::empty())
                     .unwrap(),
             )

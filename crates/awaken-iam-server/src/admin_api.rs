@@ -18,6 +18,7 @@
 //! | `PUT /v1/admin/groups/{id}` | [`PolicyAdminApi::update_group`] |
 //! | `DELETE /v1/admin/groups/{id}` | [`PolicyAdminApi::delete_group`] |
 //! | `POST /v1/admin/roles` | [`PolicyAdminApi::define_role`] |
+//! | `GET /v1/admin/roles/{id}` | [`PolicyAdminApi::get_role`] |
 //! | `PUT /v1/admin/roles/{id}` | [`PolicyAdminApi::update_role`] |
 //! | `DELETE /v1/admin/roles/{id}` | [`PolicyAdminApi::delete_role`] |
 //! | `POST /v1/admin/grants` | [`PolicyAdminApi::issue_grant`] |

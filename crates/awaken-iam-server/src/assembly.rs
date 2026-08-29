@@ -178,6 +178,7 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::put("/v1/admin/groups/{id}"),
     RouteSpec::delete("/v1/admin/groups/{id}"),
     RouteSpec::post("/v1/admin/roles"),
+    RouteSpec::get("/v1/admin/roles/{id}"),
     RouteSpec::put("/v1/admin/roles/{id}"),
     RouteSpec::delete("/v1/admin/roles/{id}"),
     RouteSpec::post("/v1/admin/grants"),
@@ -665,6 +666,7 @@ mod tests {
         assert!(standalone.contains(&RouteSpec::put("/v1/admin/groups/{id}")));
         assert!(standalone.contains(&RouteSpec::delete("/v1/admin/groups/{id}")));
         assert!(standalone.contains(&RouteSpec::post("/v1/admin/roles")));
+        assert!(standalone.contains(&RouteSpec::get("/v1/admin/roles/{id}")));
         assert!(standalone.contains(&RouteSpec::put("/v1/admin/roles/{id}")));
         assert!(standalone.contains(&RouteSpec::delete("/v1/admin/roles/{id}")));
         assert!(standalone.contains(&RouteSpec::post("/v1/admin/grants")));
