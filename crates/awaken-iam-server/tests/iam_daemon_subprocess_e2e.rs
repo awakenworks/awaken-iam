@@ -10,8 +10,28 @@
 //! binary promises.
 
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+async fn wait_until_ready(child: &mut Child, client: &reqwest::Client, base: &str) {
+    // Causal test design: readiness is proved by the production liveness
+    // endpoint, not by elapsed startup time. A bounded deadline tolerates a
+    // contended CI host while an early child exit still fails immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("inspect iam-daemon") {
+            panic!("iam-daemon exited before readiness: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "iam-daemon must accept connections within 15s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 fn test_database(label: &str) -> std::path::PathBuf {
     let nonce = std::time::SystemTime::now()
@@ -107,15 +127,7 @@ async fn iam_daemon_binary_boots_and_serves_healthz_and_snapshot() {
         .timeout(Duration::from_secs(5))
         .build()
         .expect("client");
-    let mut ready = false;
-    for _ in 0..100 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(ready, "iam-daemon must accept connections within 5s");
+    wait_until_ready(&mut child, &client, &base).await;
 
     // Liveness probe — proves main() bound the router.
     let liveness: serde_json::Value = client
@@ -209,12 +221,7 @@ async fn iam_daemon_binary_rejects_unknown_admin_token_with_403() {
         .timeout(Duration::from_secs(5))
         .build()
         .expect("client");
-    for _ in 0..100 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until_ready(&mut child, &client, &base).await;
 
     let status = client
         .post(format!("{base}/v1/admin/orgs"))
