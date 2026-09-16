@@ -419,6 +419,18 @@ pub struct ResourceProvision {
     pub grants: Vec<GrantSnapshot>,
     /// Scope-graph parent edges anchoring the new resource in the hierarchy.
     pub scope_edges: Vec<ResourceParentEdge>,
+    /// Resources retired by this epoch, with the exact grants to revoke.
+    #[serde(default)]
+    pub retirements: Vec<ResourceRetirement>,
+}
+
+/// Product-authored retirement of one resource authorization projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRetirement {
+    pub resource_type: ResourceType,
+    pub resource_id: ResourceId,
+    #[serde(default)]
+    pub grant_ids: Vec<String>,
 }
 
 /// Whether IAM applied a new resource provision or recognized an exact retry.
@@ -675,6 +687,7 @@ mod tests {
                     namespace_id: NamespaceId("acme".into()),
                 },
             }],
+            retirements: vec![],
         };
         let json = serde_json::to_string(&provision).unwrap();
         let parsed: ResourceProvision = serde_json::from_str(&json).unwrap();

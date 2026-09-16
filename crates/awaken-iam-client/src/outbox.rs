@@ -282,6 +282,7 @@ mod tests {
                 resource_id: ResourceId(key.into()),
                 parent: ScopeRef::Global,
             }],
+            retirements: vec![],
         }
     }
 

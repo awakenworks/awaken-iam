@@ -113,7 +113,8 @@ async fn organization_business_resource_agent_and_revocation_journeys_are_one_mo
     // R4 same resource/epoch under a new key or an edge outside Org -> reject
     // without changing the live policy.
     // R5 user Allow + delegated agent RequireApproval -> RequireApproval.
-    // R6 revoke the agent grant -> the same delegated request becomes Deny.
+    // R6 retire the resource at a higher epoch -> edge and exact grants vanish;
+    // exact retirement replay is stable and the delegated request becomes Deny.
     let app = app();
     let role = json!({
         "id":"organization-admin",
@@ -225,18 +226,35 @@ async fn organization_business_resource_agent_and_revocation_journeys_are_one_mo
     .await;
     assert_eq!(outcome["decision"], "require_approval", "R5");
 
+    let retirement = json!({
+        "product_id":"cross-industry",
+        "org_id":"acme",
+        "idempotency_key":"tutor.campus:nanshan:retire",
+        "epoch":2,
+        "grants":[],
+        "scope_edges":[],
+        "retirements":[{
+            "resource_type":"tutor.campus",
+            "resource_id":"nanshan",
+            "grant_ids":["g_nanshan_user","g_nanshan_agent"]
+        }]
+    });
+    let retired = app
+        .clone()
+        .oneshot(product_request(retirement.clone()))
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::OK);
+    assert_eq!(json_body(retired).await["disposition"], "applied");
     assert_eq!(
-        app.clone()
-            .oneshot(request(
-                "DELETE",
-                "/v1/admin/grants/g_nanshan_agent",
-                json!({}),
-                true,
-            ))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
+        json_body(
+            app.clone()
+                .oneshot(product_request(retirement))
+                .await
+                .unwrap()
+        )
+        .await["disposition"],
+        "replayed"
     );
     let denied = json_body(
         app.oneshot(request("POST", "/v1/authorize", authorization(), false))

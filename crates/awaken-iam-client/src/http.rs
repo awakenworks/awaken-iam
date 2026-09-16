@@ -1352,6 +1352,7 @@ mod tests {
                     org_id: OrgId("acme".into()),
                 },
             }],
+            retirements: vec![],
         };
         ProvisionTransport::provision(&transport, &provision).unwrap();
         assert!(ProvisionTransport::provision(&transport, &provision).is_err());
