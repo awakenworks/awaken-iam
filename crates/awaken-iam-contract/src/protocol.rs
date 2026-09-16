@@ -419,8 +419,12 @@ pub struct SignerSetSnapshot {
 /// Eventual consistency is safe because authorization fails closed: until this
 /// payload lands, a request against the new resource simply matches no grant and
 /// is denied — it never over-permits.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceProvision {
+    /// Product namespace that owns the resource semantics and outbox record.
+    pub product_id: ProductId,
+    /// Tenant root every provisioned edge and grant must resolve beneath.
+    pub org_id: OrgId,
     /// Deterministic dedup key for the resource-create event (e.g. the resource
     /// id), so an at-least-once redelivery collapses to a no-op.
     pub idempotency_key: String,
@@ -476,6 +480,24 @@ pub struct ResourceProjectionReceipt {
     pub epoch: u64,
     pub version: u64,
     pub disposition: ResourceProjectionDisposition,
+}
+
+/// Whether IAM applied a new resource provision or recognized an exact retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProvisionDisposition {
+    Applied,
+    Replayed,
+}
+
+/// Durable acknowledgement returned only after edges, grants, audit and the
+/// policy-version fence have committed together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceProvisionReceipt {
+    pub idempotency_key: String,
+    pub epoch: u64,
+    pub version: u64,
+    pub disposition: ResourceProvisionDisposition,
 }
 
 #[cfg(test)]
@@ -690,6 +712,8 @@ mod tests {
     #[test]
     fn resource_provision_round_trips_through_json() {
         let provision = ResourceProvision {
+            product_id: ProductId::new("tutor").unwrap(),
+            org_id: OrgId("acme".into()),
             idempotency_key: "issue:42".into(),
             epoch: 9,
             grants: vec![GrantSnapshot {

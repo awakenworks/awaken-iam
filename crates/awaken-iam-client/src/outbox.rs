@@ -259,6 +259,8 @@ mod tests {
 
     fn provision(key: &str, epoch: u64) -> ResourceProvision {
         ResourceProvision {
+            product_id: awaken_iam_contract::ProductId::new("test").unwrap(),
+            org_id: awaken_iam_contract::OrgId("acme".into()),
             idempotency_key: key.into(),
             epoch,
             grants: vec![GrantSnapshot {

@@ -133,6 +133,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "product projection ownership and resource tombstones",
                     AUTHZ_0008,
                 ),
+                (9, "resource provision receipts and epoch fences", AUTHZ_0009),
             ],
         ),
         bundle(
@@ -460,6 +461,19 @@ CREATE TABLE {prefix}_product_actions (\
  product_id TEXT NOT NULL, \
  action_key TEXT NOT NULL, \
  PRIMARY KEY (product_id, action_key));";
+
+const AUTHZ_0009: &str = "\
+CREATE TABLE {prefix}_resource_provisions (\
+ idempotency_key TEXT PRIMARY KEY, \
+ epoch BIGINT NOT NULL, \
+ fingerprint TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ applied_at TEXT NOT NULL);\n\
+CREATE TABLE {prefix}_resource_epochs (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));";
 
 // User-visible placement is independent from both the fixed compatibility
 // ScopeRef shapes and product business tables. An empty `parent_id` is the

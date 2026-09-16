@@ -34,10 +34,12 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
+mod provisioning;
+
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, CreateInvitation, InvitationId, InvitationStatus,
-    IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp,
-    WorkspaceId, WorkspaceOrgEdge,
+    IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ResourceProvision,
+    ResourceProvisionReceipt, ScopeRef, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 #[cfg(test)]
 use awaken_iam_contract::{
@@ -63,6 +65,7 @@ use crate::FenceStore;
 pub trait PolicyStore:
     OrgRepository
     + OrganizationProvisioningStore
+    + ResourceProvisioningStore
     + OrgPrivacyRepository
     + GroupRepository
     + RoleRepository
@@ -78,6 +81,7 @@ pub trait PolicyStore:
 impl<T> PolicyStore for T where
     T: OrgRepository
         + OrganizationProvisioningStore
+        + ResourceProvisioningStore
         + OrgPrivacyRepository
         + GroupRepository
         + RoleRepository
@@ -100,6 +104,16 @@ pub trait OrganizationProvisioningStore: Send + Sync {
     ) -> Result<u64, RepositoryError>;
 }
 
+/// Atomic persistence boundary for one consumer resource/outbox delivery.
+pub trait ResourceProvisioningStore: Send + Sync {
+    fn provision_resource(
+        &self,
+        provision: &ResourceProvision,
+        fingerprint: &str,
+        audit: AuditEvent,
+    ) -> Result<ResourceProvisionReceipt, RepositoryError>;
+}
+
 /// A policy-administration domain event.
 ///
 /// Each variant records one state change applied through the
@@ -114,6 +128,8 @@ pub enum DomainEvent {
     OrganizationUpdated(OrgId),
     /// An organization was deleted.
     OrganizationDeleted(OrgId),
+    /// A consumer's resource outbox record committed into the policy graph.
+    ResourceProvisioned(String),
     /// A new group was created.
     GroupCreated(GroupId),
     /// An existing group changed (membership or metadata).
@@ -181,6 +197,7 @@ impl DomainEvent {
             DomainEvent::OrganizationCreated(_) => "org.create",
             DomainEvent::OrganizationUpdated(_) => "org.update",
             DomainEvent::OrganizationDeleted(_) => "org.delete",
+            DomainEvent::ResourceProvisioned(_) => "resource.provision",
             DomainEvent::GroupCreated(_) => "group.create",
             DomainEvent::GroupUpdated(_) => "group.update",
             DomainEvent::GroupDeleted(_) => "group.delete",
@@ -208,6 +225,7 @@ impl DomainEvent {
             DomainEvent::OrganizationCreated(id)
             | DomainEvent::OrganizationUpdated(id)
             | DomainEvent::OrganizationDeleted(id) => format!("org {}", id.0),
+            DomainEvent::ResourceProvisioned(key) => format!("resource provision {key}"),
             DomainEvent::GroupCreated(id)
             | DomainEvent::GroupUpdated(id)
             | DomainEvent::GroupDeleted(id) => format!("group {}", id.0),

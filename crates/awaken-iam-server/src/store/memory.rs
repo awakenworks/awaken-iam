@@ -9,23 +9,31 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
-    ExternalIdentity, ExternalIdentityKey, InvitationId, InvitationStatus, NamespaceId,
-    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProfileLifecycle, ScopeRef, Session,
-    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    ExternalIdentity, ExternalIdentityKey, GrantEffect, GrantSubjectRef, InvitationId,
+    InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
+    ProfileLifecycle, ResourceProvision, ResourceProvisionDisposition, ResourceProvisionReceipt,
+    ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountIdentityRepository, AccountRepository, ApiTokenRepository, AuditEvent, AuditSink,
-    AuthCodeRepository, AuthorizationProfileRepository, ExternalIdentityRepository, Grant, GrantId,
-    GrantRepository, GrantSubject, Group, GroupId, GroupRepository, Invitation,
-    InvitationRepository, LoginFlowRepository, OAuthClientRepository, OrgPrivacyRepository,
-    OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepository,
-    RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge, ResourceModelRepository,
-    RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository, SessionRepository,
-    StoredAuthorizationCode,
+    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
+    AuditSink, AuthCodeRepository, AuthorizationProfileRepository, Effect,
+    ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
+    GroupRepository, Invitation, InvitationRepository, LoginFlowRepository, OAuthClientRepository,
+    OrgPrivacyRepository, OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId,
+    PlanRepository, RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge,
+    ResourceModelRepository, RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository,
+    SessionRepository, StoredAuthorizationCode,
 };
 
 use super::fence::{Fence, FenceStore};
-use crate::admin_api::OrganizationProvisioningStore;
+use crate::admin_api::{OrganizationProvisioningStore, ResourceProvisioningStore};
+
+#[derive(Clone)]
+struct StoredResourceProvision {
+    fingerprint: String,
+    epoch: u64,
+    version: u64,
+}
 
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
@@ -56,6 +64,8 @@ struct Authz {
     role_bindings: BTreeMap<String, RoleBinding>,
     invitations: BTreeMap<String, Invitation>,
     resource_edges: BTreeMap<String, ResourceEdge>,
+    resource_epochs: BTreeMap<String, u64>,
+    resource_provisions: BTreeMap<String, StoredResourceProvision>,
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
@@ -505,6 +515,98 @@ impl OrganizationProvisioningStore for InMemoryStore {
         audits.push(audit);
         fence.version += 1;
         Ok(fence.version)
+    }
+}
+
+impl ResourceProvisioningStore for InMemoryStore {
+    fn provision_resource(
+        &self,
+        provision: &ResourceProvision,
+        fingerprint: &str,
+        audit: AuditEvent,
+    ) -> RepositoryResult<ResourceProvisionReceipt> {
+        let mut authz = self.authz.lock().unwrap();
+        if let Some(existing) = authz.resource_provisions.get(&provision.idempotency_key) {
+            if existing.fingerprint != fingerprint || existing.epoch != provision.epoch {
+                return Err(RepositoryError::Conflict(
+                    "idempotency key belongs to another resource provision".into(),
+                ));
+            }
+            return Ok(ResourceProvisionReceipt {
+                idempotency_key: provision.idempotency_key.clone(),
+                epoch: existing.epoch,
+                version: existing.version,
+                disposition: ResourceProvisionDisposition::Replayed,
+            });
+        }
+        for edge in &provision.scope_edges {
+            let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
+            if authz
+                .resource_epochs
+                .get(&key)
+                .is_some_and(|epoch| *epoch >= provision.epoch)
+            {
+                return Err(RepositoryError::Conflict(format!(
+                    "resource epoch is stale for {}:{}",
+                    edge.resource_type.0, edge.resource_id.0
+                )));
+            }
+        }
+        let mut audits = self.audit.lock().unwrap();
+        let mut fence = self.fence.lock().unwrap();
+        for edge in &provision.scope_edges {
+            let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
+            authz.resource_edges.insert(
+                key.clone(),
+                ResourceEdge {
+                    resource_type: edge.resource_type.clone(),
+                    resource_id: edge.resource_id.clone(),
+                    parent: edge.parent.clone(),
+                },
+            );
+            authz.resource_epochs.insert(key, provision.epoch);
+        }
+        for snapshot in &provision.grants {
+            let grant = Grant {
+                id: GrantId(snapshot.id.clone()),
+                subject: match &snapshot.subject {
+                    GrantSubjectRef::Principal { principal } => {
+                        GrantSubject::Principal(principal.clone())
+                    }
+                    GrantSubjectRef::Role { role_id } => {
+                        GrantSubject::Role(RoleId(role_id.clone()))
+                    }
+                    GrantSubjectRef::Group { group_id } => {
+                        GrantSubject::Group(GroupId(group_id.clone()))
+                    }
+                },
+                action_pattern: ActionPattern(snapshot.action_pattern.clone()),
+                scope: snapshot.scope.clone(),
+                effect: match snapshot.effect {
+                    GrantEffect::Allow => Effect::Allow,
+                    GrantEffect::RequireApproval => Effect::RequireApproval,
+                    GrantEffect::Deny => Effect::Deny,
+                },
+            };
+            authz.grants.insert(grant.id.0.clone(), grant);
+        }
+        audits.push(audit);
+        fence.version += 1;
+        let receipt = ResourceProvisionReceipt {
+            idempotency_key: provision.idempotency_key.clone(),
+            epoch: provision.epoch,
+            version: fence.version,
+            disposition: ResourceProvisionDisposition::Applied,
+        };
+        authz.resource_provisions.insert(
+            provision.idempotency_key.clone(),
+            StoredResourceProvision {
+                fingerprint: fingerprint.into(),
+                epoch: provision.epoch,
+                version: receipt.version,
+            },
+        );
+        Ok(receipt)
     }
 }
 

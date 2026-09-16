@@ -54,10 +54,21 @@ use awaken_iam_contract::{
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
     NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
-    ProductResourceModelRequest, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
-    ResourceProjectionBatch, RetireAuthorizationProfile,
-    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
-    UpdateDirectoryNode, WorkspaceOrgEdge,
+    ProductResourceModelRequest,
+    ProvisionOrganization,
+    ReplaceScopedMemberships,
+    ResendInvitation,
+    ResourceProjectionBatch,
+    ResourceProvision,
+    ResourceProvisionReceipt,
+    RetireAuthorizationProfile,
+    RetireProductSpacePlacement,
+    RoleBindingSnapshot,
+    RoleView,
+    ScopeMembershipQuery,
+    Timestamp,
+    UpdateDirectoryNode,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
@@ -248,6 +259,7 @@ where
         .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
         .route("/v1/admin/orgs/provision", post(provision_org))
+        .route("/v1/authz/resource-provisions", post(provision_resource))
         .route(
             "/v1/admin/orgs/{id}",
             get(get_org).put(update_org).delete(delete_org),
@@ -877,6 +889,33 @@ async fn provision_org(
             at,
         )
     })
+}
+
+async fn provision_resource(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(command): Json<ResourceProvision>,
+) -> Response {
+    let mut guard = lock(&state);
+    match directory_credential_access(&guard.auth, &headers) {
+        Ok(DirectoryCredentialAccess::Administrator) => {}
+        Ok(DirectoryCredentialAccess::Product(product)) if product == command.product_id => {}
+        Ok(DirectoryCredentialAccess::Product(_)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "product credential does not own this resource provision",
+            );
+        }
+        Err(rejection) => return rejection.into_response(),
+    }
+    match guard.admin.provision_resource(command, now_timestamp()) {
+        Ok(receipt) => match guard.refresh_authorization(receipt.version) {
+            Ok(()) => (StatusCode::OK, Json::<ResourceProvisionReceipt>(receipt)).into_response(),
+            Err(error) => admin_error_response(&error),
+        },
+        Err(error) => admin_error_response(&error),
+    }
 }
 
 async fn get_org(
