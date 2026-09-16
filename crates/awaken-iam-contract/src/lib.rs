@@ -29,8 +29,8 @@ pub use admin::{
     InvitationQuery, InvitationStatus, InvitationView, IssuedInvitation, MembershipQuery,
     MoveDirectoryNode, OrgView, ProductId, ProductSpaceLifecycleResult, ProductSpacePlacement,
     ProductSpacePlacementQuery, ProductSpacePlacementResult, ProductSpacePlacementStatus,
-    ProductSpaceRef, ReplaceScopedMemberships, ResendInvitation, RetireProductSpacePlacement,
-    RoleView, ScopeMembershipQuery, UpdateDirectoryNode,
+    ProductSpaceRef, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
+    RetireProductSpacePlacement, RoleView, ScopeMembershipQuery, UpdateDirectoryNode,
 };
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

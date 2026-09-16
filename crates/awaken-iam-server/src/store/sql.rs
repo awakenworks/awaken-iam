@@ -42,6 +42,7 @@ use super::{Fence, FenceStore};
 mod directory;
 mod identity_rows;
 mod privacy;
+mod provisioning;
 
 use identity_rows::*;
 

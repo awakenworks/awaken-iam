@@ -25,6 +25,7 @@ use awaken_iam_core::{
 };
 
 use super::fence::{Fence, FenceStore};
+use crate::admin_api::OrganizationProvisioningStore;
 
 /// JSON-serializable key used to index rows whose natural key is a contract
 /// value object (principal, scope, resource coordinate).
@@ -466,6 +467,44 @@ impl OrgRepository for InMemoryStore {
             .remove(&id.0)
             .map(|_| ())
             .ok_or_else(|| RepositoryError::NotFound(format!("organization {} not found", id.0)))
+    }
+}
+
+impl OrganizationProvisioningStore for InMemoryStore {
+    fn provision_organization(
+        &self,
+        organization: Organization,
+        owner_binding: RoleBinding,
+        audit: AuditEvent,
+    ) -> RepositoryResult<u64> {
+        let binding_key = json_key(
+            &(
+                &owner_binding.principal,
+                &owner_binding.role.0,
+                &owner_binding.scope,
+            ),
+            "role binding",
+        )?;
+        let mut authz = self.authz.lock().unwrap();
+        if authz.orgs.contains_key(&organization.id.0) {
+            return Err(RepositoryError::Conflict(format!(
+                "organization {} already exists",
+                organization.id.0
+            )));
+        }
+        if !authz.roles.contains_key(&owner_binding.role.0) {
+            return Err(RepositoryError::NotFound(format!(
+                "role {} not found",
+                owner_binding.role.0
+            )));
+        }
+        let mut audits = self.audit.lock().unwrap();
+        let mut fence = self.fence.lock().unwrap();
+        authz.orgs.insert(organization.id.0.clone(), organization);
+        authz.role_bindings.insert(binding_key, owner_binding);
+        audits.push(audit);
+        fence.version += 1;
+        Ok(fence.version)
     }
 }
 

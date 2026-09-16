@@ -393,6 +393,17 @@ pub struct OrgView {
     pub updated_at: Timestamp,
 }
 
+/// Atomically creates an organization and binds its owner to an existing role.
+///
+/// Trusted control planes use this command instead of a create-then-grant
+/// sequence, which could expose a tenant without an administrator or advance
+/// only one half after a retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionOrganization {
+    pub organization: OrgView,
+    pub owner_role_id: String,
+}
+
 /// Wire shape of a group administered through `/v1/admin/groups`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupView {
