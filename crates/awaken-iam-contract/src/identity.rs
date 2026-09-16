@@ -68,6 +68,34 @@ pub enum IdentityProviderKind {
     OAuth2,
     /// OpenID Connect provider.
     Oidc,
+    /// WeChat Mini Program server-side `code2Session` provider.
+    WechatMiniProgram,
+}
+
+/// Exchange a one-time WeChat Mini Program login code for an IAM token grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WechatMiniProgramTokenRequest {
+    /// Customer-specific provider configuration key registered in IAM.
+    pub provider_key: IdentityProviderKey,
+    /// One-time code returned by `wx.login`; never persisted by IAM.
+    pub code: String,
+    /// Product API audience for the resulting access token.
+    pub audience: String,
+}
+
+/// OAuth-compatible grant returned to the customer Mini Program backend/client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WechatMiniProgramTokenResponse {
+    /// Signed IAM bearer access token.
+    pub access_token: String,
+    /// OAuth token type; always `Bearer`.
+    pub token_type: String,
+    /// Access-token lifetime in seconds.
+    pub expires_in: u64,
+    /// Rotating refresh token returned once.
+    pub refresh_token: String,
+    /// Granted scopes separated by spaces.
+    pub scope: String,
 }
 
 /// Identity provider configuration safe to expose in shared contracts.
@@ -632,5 +660,38 @@ impl RefreshTokenView {
 impl From<&RefreshToken> for RefreshTokenView {
     fn from(token: &RefreshToken) -> Self {
         Self::from_token(token)
+    }
+}
+
+#[cfg(test)]
+mod mini_program_contract_tests {
+    use super::*;
+
+    // Cause/effect contract table:
+    // M1 provider/code/audience present -> stable snake_case request wire shape.
+    // M2 response -> OAuth-compatible bearer fields without provider session secrets.
+    #[test]
+    fn mini_program_token_contract_is_provider_scoped_and_oauth_compatible() {
+        let request = WechatMiniProgramTokenRequest {
+            provider_key: IdentityProviderKey("wechat-customer-a".into()),
+            code: "one-time-code".into(),
+            audience: "tutor-api".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "provider_key": "wechat-customer-a", "code": "one-time-code", "audience": "tutor-api"
+            })
+        );
+        let response = WechatMiniProgramTokenResponse {
+            access_token: "access".into(),
+            token_type: "Bearer".into(),
+            expires_in: 3600,
+            refresh_token: "refresh".into(),
+            scope: "openid profile".into(),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["token_type"], "Bearer");
+        assert!(value.get("session_key").is_none());
     }
 }

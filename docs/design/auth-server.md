@@ -91,6 +91,13 @@ The product never calls a provider-specific login URL as its normal entrypoint.
 That keeps GitHub, Google, enterprise SSO, account chooser, and future factors
 inside IAM's bounded context.
 
+WeChat Mini Programs are the deliberate non-browser exception: `wx.login`
+produces a provider code rather than a redirect. The Mini Program sends that
+code to IAM's customer-scoped `/v1/auth/wechat-miniapp/token` endpoint. IAM
+performs `code2Session` and then rejoins the same ExternalIdentity, Account and
+token-grant authorities used here; the product still neither owns provider
+credentials nor creates another identity/session path.
+
 Native desktop products use the same discovery and authorization endpoint
 through `awaken-iam-client`'s loopback PKCE adapter. When the browser has no IAM
 session, the authorization endpoint renders IAM's configured provider choices;
@@ -372,5 +379,4 @@ issuers set `subject_kind: service`. A verifier reconstructs the exact
   tools — those stay product-side (ADR-0001 guardrail).
 - It does not own product session *semantics* (what a workspace session means);
   it issues and validates the identity, products attach meaning.
-
 

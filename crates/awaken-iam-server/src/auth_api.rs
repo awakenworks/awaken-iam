@@ -57,6 +57,9 @@ use crate::access_token::{
     LocalSeedSigner,
 };
 use crate::auth_redirect::build_authorize_redirect;
+use crate::auth_types::{
+    AuthFailureReason, ExternalLoginResolution, PrincipalResolutionFailure, ProviderSummary,
+};
 use crate::op_id_token::{IdTokenError, MintIdToken, mint_id_token};
 use crate::token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, TokenExchangeError, TokenExchangeRequest,
@@ -65,10 +68,9 @@ use crate::token_exchange::{
 use crate::{SessionCookieConfig, SessionGateway};
 use awaken_iam_contract::{
     Account, AccountId, AccountStatus, ExternalIdentity, ExternalIdentityClaims,
-    ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey,
-    IdentityProviderKind, Jwks, OAuthLoginStateId, OpenIdProviderMetadata, PrincipalRef,
-    RefreshTokenChainId, RefreshTokenId, RefreshTokenView, SessionId, SessionView, Timestamp,
-    UserInfo,
+    ExternalIdentityId, ExternalSubject, IdentityProviderConfig, IdentityProviderKey, Jwks,
+    OAuthLoginStateId, OpenIdProviderMetadata, PrincipalRef, RefreshTokenChainId, RefreshTokenId,
+    RefreshTokenView, SessionId, SessionView, Timestamp, UserInfo,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, AuthCodeRepository, AuthorizationUrlRequest,
@@ -208,6 +210,20 @@ pub enum AuthAuditEvent {
         /// Whether a new account was provisioned on this login.
         registered: bool,
         /// When the session was established.
+        at: Timestamp,
+    },
+    /// A customer Mini Program code resolved through a configured provider and
+    /// reused the canonical external-identity/account authority.
+    MiniProgramLoginSucceeded {
+        /// Customer-specific provider key.
+        provider_key: IdentityProviderKey,
+        /// Resolved platform account.
+        account_id: AccountId,
+        /// External identity used for the login.
+        external_identity_id: ExternalIdentityId,
+        /// Whether the account was provisioned during this exchange.
+        registered: bool,
+        /// Observation timestamp.
         at: Timestamp,
     },
     /// A login attempt failed before a session could be established.
@@ -366,41 +382,6 @@ pub enum AuthAuditEvent {
         /// When the code was redeemed.
         at: Timestamp,
     },
-}
-
-/// Stable machine-readable reason a session could not be resolved to an active
-/// account principal at the product authentication seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrincipalResolutionFailure {
-    /// No live session backed the presented cookie (missing, unknown, revoked,
-    /// or expired).
-    Unauthenticated,
-    /// The session resolved to an account that is disabled or unknown.
-    AccountDisabled,
-}
-
-/// Stable machine-readable reason a login attempt failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthFailureReason {
-    /// The login correlation cookie was absent or unparseable.
-    MissingCorrelation,
-    /// The presented OAuth `state` did not match the minted challenge.
-    StateMismatch,
-    /// The challenge was expired, replayed, or otherwise unusable.
-    ChallengeRejected,
-    /// The provider exchange rejected the callback.
-    ProviderRejected,
-}
-
-/// Compact provider descriptor returned by `GET /v1/auth/providers`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderSummary {
-    /// Stable provider key used in login routes.
-    pub provider_key: IdentityProviderKey,
-    /// Provider implementation family.
-    pub kind: IdentityProviderKind,
-    /// Human-readable provider name.
-    pub display_name: String,
 }
 
 /// Inputs to register a provider with the auth API.
@@ -1107,6 +1088,30 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         Ok(self
             .sessions
             .current_session_from_cookie(cookie_header, now)?)
+    }
+
+    /// Resolve verified provider claims through the same account/link owner as
+    /// browser callbacks, without inventing a second Mini Program user store.
+    pub fn resolve_verified_external_identity(
+        &mut self,
+        provider_key: IdentityProviderKey,
+        claims: ExternalIdentityClaims,
+        now: Timestamp,
+    ) -> Result<ExternalLoginResolution, AuthApiError> {
+        let (account_id, external_identity_id, registered) =
+            self.resolve_account(&provider_key, claims, &now)?;
+        self.audit.push(AuthAuditEvent::MiniProgramLoginSucceeded {
+            provider_key,
+            account_id: account_id.clone(),
+            external_identity_id: external_identity_id.clone(),
+            registered,
+            at: now,
+        });
+        Ok(ExternalLoginResolution {
+            account_id,
+            external_identity_id,
+            registered,
+        })
     }
 
     /// Resolve the account principal backing the presented IAM session.

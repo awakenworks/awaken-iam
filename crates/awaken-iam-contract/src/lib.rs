@@ -38,7 +38,7 @@ pub use identity::{
     IdentityProviderConfig, IdentityProviderConfigId, IdentityProviderKey, IdentityProviderKind,
     JsonWebKey, Jwks, OAuthLoginState, OAuthLoginStateId, OpenIdProviderMetadata, RefreshToken,
     RefreshTokenChainId, RefreshTokenId, RefreshTokenView, Session, SessionId, SessionView,
-    Timestamp, UserInfo,
+    Timestamp, UserInfo, WechatMiniProgramTokenRequest, WechatMiniProgramTokenResponse,
 };
 pub use license::{
     LICENSE_CLAIM_SCHEMA_VERSION, LicenseClaim, LicenseSignature, LicenseVerifyError,
