@@ -24,18 +24,39 @@
 //!   and register/project its own authorization resource model.
 //! - `IAM_DATABASE_URL` — PostgreSQL DSN for the standalone store. When absent,
 //!   `IAM_DATABASE_PATH` selects the single-node SQLite file (default `iam.sqlite`).
+//! - `IAM_WECHAT_MINI_PROGRAMS_JSON` — JSON array of customer-specific
+//!   `provider_key`, `app_id`, `app_secret`, `audience`, optional `scopes`, and
+//!   optional `endpoint` registrations for `/v1/auth/wechat-miniapp/token`.
 
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_contract::ProductId;
+use awaken_iam_contract::{IdentityProviderKey, ProductId};
 use awaken_iam_core::{
     AuthCodeRepository, OAuthClientRepository, RegisteredClient, SessionRepository,
 };
 use awaken_iam_server::{
-    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi,
-    SqlConn, SqlStore, SqliteBackend, daemon_router, http, jwks_router, op_router,
-    postgres_migrated_store, projection_router, sqlite_migrated_store,
+    AdminAuthPolicy,
+    AuthApi,
+    AuthzApi,
+    DaemonState,
+    IamDaemon,
+    RecordingExecutor,
+    ReqwestWechatMiniProgramExchange,
+    SharedAuthApi,
+    SqlConn,
+    SqlStore,
+    SqliteBackend,
+    WechatMiniProgramRegistration,
+    daemon_router,
+    http,
+    jwks_router,
+    op_router,
+    postgres_migrated_store,
+    projection_router,
+    sqlite_migrated_store,
+    wechat_mini_program_router,
 };
+use serde::Deserialize;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,6 +120,12 @@ async fn serve<B: SqlConn + Clone + 'static>(
     }
     let capability_tokens = auth.token_authority();
     let auth: SharedAuthApi = Arc::new(tokio::sync::Mutex::new(auth));
+    let wechat_registrations = wechat_registrations(
+        std::env::var("IAM_WECHAT_MINI_PROGRAMS_JSON")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
 
     // Profiles are durable even though the legacy MVP policy-admin aggregates
     // still use their existing adapters. The active heads are hydrated before
@@ -116,12 +143,76 @@ async fn serve<B: SqlConn + Clone + 'static>(
     let router = daemon_router(state.clone())
         .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))
-        .merge(op_router(auth, issuer));
+        .merge(op_router(auth.clone(), issuer.clone()))
+        .merge(wechat_mini_program_router(
+            auth,
+            issuer,
+            wechat_registrations,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     eprintln!("iam-daemon: serving /v1 (incl. /v1/admin/*) on http://{bind_addr}");
     http::serve(listener, router).await?;
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatRegistrationEnv {
+    provider_key: String,
+    app_id: String,
+    app_secret: String,
+    audience: String,
+    #[serde(default = "default_wechat_scopes")]
+    scopes: Vec<String>,
+    #[serde(default = "default_code2session_endpoint")]
+    endpoint: String,
+}
+
+fn default_wechat_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into()]
+}
+
+fn default_code2session_endpoint() -> String {
+    "https://api.weixin.qq.com/sns/jscode2session".into()
+}
+
+fn wechat_registrations(raw: Option<&str>) -> Result<Vec<WechatMiniProgramRegistration>, String> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<WechatRegistrationEnv> = serde_json::from_str(raw)
+        .map_err(|error| format!("IAM_WECHAT_MINI_PROGRAMS_JSON is invalid: {error}"))?;
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .map(|value| {
+            if value.provider_key.trim().is_empty() || !seen.insert(value.provider_key.clone()) {
+                return Err("WeChat provider_key must be non-empty and unique".into());
+            }
+            if value.app_id.trim().is_empty()
+                || value.app_secret.trim().is_empty()
+                || value.audience.trim().is_empty()
+                || value.scopes.is_empty()
+            {
+                return Err("WeChat app_id, app_secret, audience and scopes are required".into());
+            }
+            if !value.endpoint.starts_with("https://")
+                && !value.endpoint.starts_with("http://127.0.0.1")
+            {
+                return Err("WeChat code2Session endpoint must use HTTPS".into());
+            }
+            Ok(WechatMiniProgramRegistration {
+                provider_key: IdentityProviderKey(value.provider_key),
+                audience: value.audience,
+                scopes: value.scopes,
+                exchange: Arc::new(ReqwestWechatMiniProgramExchange::new(
+                    value.endpoint,
+                    value.app_id,
+                    value.app_secret,
+                )),
+            })
+        })
+        .collect()
 }
 
 /// Resolve the admin auth allow-list from `IAM_ADMIN_TOKEN`; an unset or empty
@@ -245,5 +336,25 @@ mod tests {
         // DaemonState assembly is covered by daemon_boot_e2e over migrated
         // SQLite rather than a process-memory policy store.
         let _policy = admin_auth_from_env();
+    }
+
+    #[test]
+    fn wechat_registration_parser_is_multi_customer_and_fails_closed() {
+        // Cause/effect table: absent -> no providers; two unique complete entries
+        // -> two isolated registrations; duplicate/missing secret/insecure remote
+        // endpoint -> startup failure rather than a partially enabled provider.
+        assert!(wechat_registrations(None).unwrap().is_empty());
+        let valid = r#"[
+          {"provider_key":"customer-a","app_id":"a","app_secret":"sa","audience":"tutor-a"},
+          {"provider_key":"customer-b","app_id":"b","app_secret":"sb","audience":"tutor-b","scopes":["openid"]}
+        ]"#;
+        assert_eq!(wechat_registrations(Some(valid)).unwrap().len(), 2);
+        for invalid in [
+            r#"[{"provider_key":"a","app_id":"x","app_secret":"s","audience":"api"},{"provider_key":"a","app_id":"y","app_secret":"s","audience":"api"}]"#,
+            r#"[{"provider_key":"a","app_id":"x","app_secret":"","audience":"api"}]"#,
+            r#"[{"provider_key":"a","app_id":"x","app_secret":"s","audience":"api","endpoint":"http://example.com"}]"#,
+        ] {
+            assert!(wechat_registrations(Some(invalid)).is_err(), "{invalid}");
+        }
     }
 }

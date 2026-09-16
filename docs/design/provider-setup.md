@@ -252,6 +252,37 @@ For login flows that need no upstream provider at all — local smoke tests, CI 
 use the deterministic [fake provider](auth-server.md#provider-adapter-genericity)
 keyed `fake`, which requires no secrets.
 
+## Customer WeChat Mini Programs
+
+Mini Programs do not use a browser redirect callback. The client calls
+`wx.login`, then sends the one-time code to IAM's
+`POST /v1/auth/wechat-miniapp/token`. IAM alone calls WeChat `code2Session`,
+normalizes `openid` into the existing external-identity authority, and returns a
+normal IAM access/refresh grant. Tutor and other products never receive the
+WeChat `session_key` and do not maintain a parallel openid/session table.
+
+Register one isolated provider key per customer Mini Program with
+`IAM_WECHAT_MINI_PROGRAMS_JSON`:
+
+```json
+[
+  {
+    "provider_key": "wechat-school-a",
+    "app_id": "<secret-manager-value>",
+    "app_secret": "<secret-manager-value>",
+    "audience": "tutor-api",
+    "scopes": ["openid", "profile"]
+  }
+]
+```
+
+`provider_key`, app credentials and audience are mandatory and provider keys
+must be unique. The optional endpoint defaults to WeChat's HTTPS
+`/sns/jscode2session`; non-HTTPS remote endpoints fail startup. Store the JSON
+as a Kubernetes Secret or cloud-secret value, never in source control. Different
+customer Mini Programs may authenticate differently, but all successful
+exchanges resolve to the same platform Account/ExternalIdentity model.
+
 ## Real provider smoke tests
 
 CI exercises the fake provider by default and never depends on a live Google or

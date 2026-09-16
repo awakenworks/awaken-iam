@@ -8,6 +8,7 @@ mod approval_discharge;
 mod assembly;
 mod auth_api;
 mod auth_redirect;
+mod auth_types;
 mod authz_api;
 mod capability_token;
 mod clock;
@@ -23,6 +24,7 @@ mod session;
 mod store;
 mod token_exchange;
 mod upstream_http;
+mod wechat_miniapp;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
@@ -47,13 +49,15 @@ pub use approval_discharge::{
 };
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
-    AuthApi, AuthApiError, AuthAuditEvent, AuthFailureReason, CallbackOutcome, CallbackRequest,
+    AuthApi, AuthApiError, AuthAuditEvent, CallbackOutcome, CallbackRequest,
     DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_LOGIN_PROOF_COOKIE_NAME, DownstreamAuthorizeOutcome,
     DownstreamAuthorizeRequest, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
-    OpCodeRedemption, OpTokenGrant, PrincipalResolutionFailure, ProviderRegistration,
-    ProviderSummary, RedeemAuthorizationCode, RefreshGrant, ReturnToDecision, ReturnToPolicy,
-    RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant,
-    UnlinkIdentity,
+    OpCodeRedemption, OpTokenGrant, ProviderRegistration, RedeemAuthorizationCode, RefreshGrant,
+    ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin,
+    StartLoginOutcome, TokenGrant, UnlinkIdentity,
+};
+pub use auth_types::{
+    AuthFailureReason, ExternalLoginResolution, PrincipalResolutionFailure, ProviderSummary,
 };
 pub use authz_api::{AuthzApi, IntrospectionError};
 pub use capability_token::{
@@ -94,6 +98,10 @@ pub use token_exchange::{
 pub use upstream_http::{
     DEFAULT_GITHUB_API_BASE, DEFAULT_GITHUB_USER_AGENT, DEFAULT_TIMEOUT, ReqwestGithubTransport,
     ReqwestHttpTransport,
+};
+pub use wechat_miniapp::{
+    ReqwestWechatMiniProgramExchange, WechatExchangeError, WechatIdentity,
+    WechatMiniProgramExchange, WechatMiniProgramRegistration, wechat_mini_program_router,
 };
 
 use awaken_iam_client::IamClient;
