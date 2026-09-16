@@ -78,6 +78,95 @@ async fn boot_daemon() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn organization_onboarding_has_one_real_http_commit_boundary() {
+    // Cause/effect decision table:
+    // R1 authenticated named Org + existing role -> one command makes both
+    // Org and owner binding queryable over real TCP.
+    // R2 missing owner role -> 404 and no partially created Org.
+    let (addr, handle) = boot_daemon().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    let role = serde_json::json!({
+        "id": "organization-admin",
+        "action_patterns": ["org.*", "workspace.*"],
+        "created_at": "2026-09-17T00:00:00Z",
+        "updated_at": "2026-09-17T00:00:00Z"
+    });
+    assert!(
+        client
+            .post(format!("{base}/v1/admin/roles"))
+            .header("authorization", &auth)
+            .json(&role)
+            .send()
+            .await
+            .expect("create role")
+            .status()
+            .is_success()
+    );
+    let organization = |id: &str, role: &str| {
+        serde_json::json!({
+            "organization": {
+                "id": id,
+                "display_name": "Acme Industries",
+                "owner": {"kind":"account","account_id":"ada"},
+                "created_at": "2026-09-17T00:00:00Z",
+                "updated_at": "2026-09-17T00:00:00Z"
+            },
+            "owner_role_id": role
+        })
+    };
+    assert!(
+        client
+            .post(format!("{base}/v1/admin/orgs/provision"))
+            .header("authorization", &auth)
+            .json(&organization("acme", "organization-admin"))
+            .send()
+            .await
+            .expect("provision organization")
+            .status()
+            .is_success()
+    );
+    let bindings: Vec<serde_json::Value> = client
+        .post(format!("{base}/v1/admin/memberships/query"))
+        .header("authorization", &auth)
+        .json(&serde_json::json!({"principal":{"kind":"account","account_id":"ada"}}))
+        .send()
+        .await
+        .expect("query memberships")
+        .json()
+        .await
+        .expect("decode memberships");
+    assert_eq!(bindings.len(), 1);
+
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/admin/orgs/provision"))
+            .header("authorization", &auth)
+            .json(&organization("partial", "missing"))
+            .send()
+            .await
+            .expect("reject missing role")
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let orgs: Vec<OrgView> = client
+        .get(format!("{base}/v1/admin/orgs"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .expect("list organizations")
+        .json()
+        .await
+        .expect("decode organizations");
+    assert!(orgs.iter().all(|org| org.id.0 != "partial"));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_boots_and_serves_the_canonical_v1_surface() {
     let (addr, handle) = boot_daemon().await;
     let base = format!("http://{addr}");

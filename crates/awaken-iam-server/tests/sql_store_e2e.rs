@@ -28,7 +28,7 @@ use awaken_iam_core::{
     StoredAuthorizationCode,
 };
 use awaken_iam_server::{
-    DirectoryApi, DirectoryCommandContext, FenceStore, PostgresBackend, SqlConn, SqlStore,
+    DirectoryApi, DirectoryCommandContext, FenceStore, PolicyAdminApi, PostgresBackend, SqlConn, SqlStore,
     postgres_migrated_store, sqlite_in_memory_store,
 };
 use std::sync::{Arc, Barrier};
@@ -122,6 +122,65 @@ fn service(name: &str) -> PrincipalRef {
     PrincipalRef::Service {
         service_id: name.into(),
     }
+}
+
+#[test]
+fn sqlite_organization_onboarding_is_one_durable_transaction() {
+    // Cause/effect decision table on the production SQL seam:
+    // R1 named new Org + durable owner role -> Org, binding, audit, and fence
+    // commit together. R2 missing role -> checked transaction rolls back every
+    // write, leaving the fence and all queryable state unchanged.
+    let store = sqlite_in_memory_store("iam_onboarding").expect("migrate SQLite IAM store");
+    let mut admin = PolicyAdminApi::new(store.clone());
+    let at = ts("2026-09-17T00:00:00Z");
+    admin
+        .define_role(
+            RoleDef {
+                id: RoleId("organization-admin".into()),
+                display_name: Some("Organization admin".into()),
+                action_patterns: vec![ActionPattern("org.*".into())],
+                created_at: at.clone(),
+                updated_at: at.clone(),
+            },
+            at.clone(),
+        )
+        .expect("seed owner role");
+    let organization = |id: &str| Organization {
+        id: OrgId(id.into()),
+        display_name: Some(format!("{id} organization")),
+        owner: PrincipalRef::Account {
+            account_id: AccountId("owner".into()),
+        },
+        created_at: at.clone(),
+        updated_at: at.clone(),
+    };
+
+    let committed = admin
+        .provision_organization(
+            organization("acme"),
+            RoleId("organization-admin".into()),
+            at.clone(),
+        )
+        .expect("provision organization");
+    assert_eq!(admin.version(), committed);
+    assert_eq!(OrgRepository::list(&store).unwrap().len(), 1);
+    assert_eq!(RoleBindingRepository::list(&store).unwrap().len(), 1);
+    assert_eq!(AuditSink::events(&store).unwrap().len(), 2);
+
+    let before = admin.version();
+    assert!(
+        admin
+            .provision_organization(organization("partial"), RoleId("missing".into()), at,)
+            .is_err()
+    );
+    assert_eq!(admin.version(), before);
+    assert!(
+        OrgRepository::get(&store, &OrgId("partial".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(RoleBindingRepository::list(&store).unwrap().len(), 1);
+    assert_eq!(AuditSink::events(&store).unwrap().len(), 2);
 }
 
 /// Drive every repository through its success, failure, and guardrail paths.

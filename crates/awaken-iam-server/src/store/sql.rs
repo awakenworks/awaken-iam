@@ -43,6 +43,7 @@ mod directory;
 mod identity_rows;
 mod privacy;
 mod projections;
+mod provisioning;
 
 use identity_rows::*;
 

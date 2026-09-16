@@ -24,8 +24,8 @@ use awaken_iam_contract::{
     EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId,
     InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
     NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement,
-    ProductSpacePlacementQuery, ProductSpacePlacementResult, ReplaceScopedMemberships,
-    ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
+    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
+    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
     RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
     ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
     UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
@@ -112,6 +112,15 @@ pub trait AuthzTransport {
 
     fn create_org(&self, _org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
+    }
+
+    fn provision_organization(
+        &self,
+        _command: &ProvisionOrganization,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError(
+            "organization provisioning is not supported".into(),
+        ))
     }
 
     fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {
@@ -426,6 +435,13 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
 
     pub fn create_org(&self, org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         self.transport.create_org(org)
+    }
+
+    pub fn provision_organization(
+        &self,
+        command: &ProvisionOrganization,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.provision_organization(command)
     }
 
     pub fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {

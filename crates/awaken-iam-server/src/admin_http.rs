@@ -48,15 +48,16 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
-    AuthorizationRequest, BatchAuthorizationRequest, CreateAuthorizationProfile,
-    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryNodeId,
-    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
-    EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView, InvitationId, InvitationQuery,
-    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgView,
-    PolicySnapshot, ProductId, ProductResourceModelRequest, ProductSpacePlacementQuery,
-    ReplaceScopedMemberships, ResendInvitation, ResourceProjectionBatch,
-    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
-    ScopeMembershipQuery, Timestamp, UpdateDirectoryNode, WorkspaceOrgEdge,
+    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
+    DirectoryChildrenQuery, DirectoryNodeId, DirectoryRevisionQuery, EnsureProductSpacePlacement,
+    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
+    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
+    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
+    ProductResourceModelRequest, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
+    ResourceProjectionBatch, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
+    UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
@@ -246,6 +247,7 @@ where
         .route("/v1/authz/snapshot", get(snapshot))
         .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
+        .route("/v1/admin/orgs/provision", post(provision_org))
         .route(
             "/v1/admin/orgs/{id}",
             get(get_org).put(update_org).delete(delete_org),
@@ -860,6 +862,20 @@ async fn create_org(
 ) -> Response {
     apply(&state, &headers, move |admin, at| {
         admin.create_org(org_from_dto(dto), at)
+    })
+}
+
+async fn provision_org(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(command): Json<ProvisionOrganization>,
+) -> Response {
+    apply(&state, &headers, move |admin, at| {
+        admin.provision_organization(
+            org_from_dto(command.organization),
+            RoleId(command.owner_role_id),
+            at,
+        )
     })
 }
 

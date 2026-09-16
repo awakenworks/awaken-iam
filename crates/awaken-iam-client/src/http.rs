@@ -30,7 +30,7 @@ use awaken_iam_contract::{
     EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery, InvitationView,
     IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
     ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
-    ProductSpacePlacementResult, ReplaceScopedMemberships, ResendInvitation,
+    ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
     ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
     RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
     SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
@@ -321,6 +321,18 @@ impl AuthzTransport for HttpAuthzTransport {
     fn create_org(&self, org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/orgs")).json(org))?;
+        Self::decode(response)
+    }
+
+    fn provision_organization(
+        &self,
+        command: &ProvisionOrganization,
+    ) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/orgs/provision"))
+                .json(command)
+        })?;
         Self::decode(response)
     }
 

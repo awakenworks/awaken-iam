@@ -62,6 +62,7 @@ use crate::FenceStore;
 /// operation in a second forwarding interface.
 pub trait PolicyStore:
     OrgRepository
+    + OrganizationProvisioningStore
     + OrgPrivacyRepository
     + GroupRepository
     + RoleRepository
@@ -76,6 +77,7 @@ pub trait PolicyStore:
 
 impl<T> PolicyStore for T where
     T: OrgRepository
+        + OrganizationProvisioningStore
         + OrgPrivacyRepository
         + GroupRepository
         + RoleRepository
@@ -86,6 +88,16 @@ impl<T> PolicyStore for T where
         + AuditSink
         + FenceStore
 {
+}
+
+/// Atomic persistence boundary for tenant creation and its owner authority.
+pub trait OrganizationProvisioningStore: Send + Sync {
+    fn provision_organization(
+        &self,
+        organization: Organization,
+        owner_binding: RoleBinding,
+        audit: AuditEvent,
+    ) -> Result<u64, RepositoryError>;
 }
 
 /// A policy-administration domain event.
@@ -430,6 +442,51 @@ where
         let id = org.id.clone();
         OrgRepository::upsert(&self.store, org)?;
         self.commit(DomainEvent::OrganizationCreated(id), at)
+    }
+
+    /// Create a named organization and its owner role binding in one commit.
+    pub fn provision_organization(
+        &mut self,
+        org: Organization,
+        owner_role: RoleId,
+        at: Timestamp,
+    ) -> AdminResult<u64> {
+        let name = org
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if name.is_empty() || name.len() > 120 {
+            return Err(AdminError::Invalid(
+                "organization display name must contain 1..=120 bytes".into(),
+            ));
+        }
+        if OrgRepository::get(&self.store, &org.id)?.is_some() {
+            return Err(AdminError::AlreadyExists(format!(
+                "organization {}",
+                org.id.0
+            )));
+        }
+        if RoleRepository::get(&self.store, &owner_role)?.is_none() {
+            return Err(AdminError::NotFound(format!("role {}", owner_role.0)));
+        }
+        let event = DomainEvent::OrganizationCreated(org.id.clone());
+        let binding = RoleBinding {
+            principal: org.owner.clone(),
+            role: owner_role,
+            scope: ScopeRef::Org {
+                org_id: org.id.clone(),
+            },
+        };
+        let audit = AuditEvent {
+            at,
+            actor: Some(org.owner.clone()),
+            action: event.action().to_owned(),
+            detail: event.detail(),
+        };
+        self.version = self.store.provision_organization(org, binding, audit)?;
+        self.events.push(event);
+        Ok(self.version)
     }
 
     /// Replace an existing organization, failing closed when it is absent.
@@ -1414,6 +1471,54 @@ mod tests {
         let audit = AuditSink::events(pap.store()).unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, "org.create");
+    }
+
+    #[test]
+    fn organization_provisioning_commits_owner_authority_atomically() {
+        // Cause/effect decision table:
+        // R1 named new Org + existing owner role -> Org, exact Org binding,
+        // audit row, event, and one version advance appear together.
+        // R2 missing role -> no Org/binding/audit/version effect.
+        // R3 absent/blank name -> reject before persistence.
+        let mut pap = pap();
+        pap.define_role(role("organization-admin"), at()).unwrap();
+        let before = pap.version();
+        let committed = pap
+            .provision_organization(org("acme"), RoleId("organization-admin".into()), at())
+            .unwrap();
+        assert_eq!(committed, before + 1);
+        assert!(pap.get_org(&OrgId("acme".into())).unwrap().is_some());
+        assert_eq!(
+            pap.list_memberships().unwrap(),
+            vec![RoleBinding {
+                principal: account("ada"),
+                role: RoleId("organization-admin".into()),
+                scope: ScopeRef::Org {
+                    org_id: OrgId("acme".into())
+                },
+            }]
+        );
+
+        let version = pap.version();
+        let audits = AuditSink::events(pap.store()).unwrap().len();
+        assert!(matches!(
+            pap.provision_organization(org("missing-role"), RoleId("absent".into()), at(),),
+            Err(AdminError::NotFound(_))
+        ));
+        assert_eq!(pap.version(), version);
+        assert_eq!(AuditSink::events(pap.store()).unwrap().len(), audits);
+        assert!(
+            pap.get_org(&OrgId("missing-role".into()))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut unnamed = org("unnamed");
+        unnamed.display_name = Some("   ".into());
+        assert!(matches!(
+            pap.provision_organization(unnamed, RoleId("organization-admin".into()), at(),),
+            Err(AdminError::Invalid(_))
+        ));
     }
 
     #[test]
