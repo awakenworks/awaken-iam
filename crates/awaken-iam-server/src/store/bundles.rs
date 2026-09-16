@@ -128,6 +128,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 (5, "initialize the singleton freshness fence", AUTHZ_0005),
                 (6, "persist Workspace to Org scope projections", AUTHZ_0006),
                 (7, "organization invitation lifecycle", AUTHZ_0007),
+                (
+                    8,
+                    "resource provision receipts and epoch fences",
+                    AUTHZ_0008,
+                ),
             ],
         ),
         bundle(
@@ -400,6 +405,19 @@ CREATE TABLE {prefix}_invitations (\
  UNIQUE (org_id, idempotency_key));\n\
 CREATE INDEX {prefix}_invitations_org_idx \
  ON {prefix}_invitations (org_id, created_at);";
+
+const AUTHZ_0008: &str = "\
+CREATE TABLE {prefix}_resource_provisions (\
+ idempotency_key TEXT PRIMARY KEY, \
+ epoch BIGINT NOT NULL, \
+ fingerprint TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ applied_at TEXT NOT NULL);\n\
+CREATE TABLE {prefix}_resource_epochs (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));";
 
 // User-visible placement is independent from both the fixed compatibility
 // ScopeRef shapes and product business tables. An empty `parent_id` is the

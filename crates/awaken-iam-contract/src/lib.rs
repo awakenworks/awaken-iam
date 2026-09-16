@@ -48,9 +48,9 @@ pub use protocol::{
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect,
     GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
     NamespaceOrgEdge, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    ResourceParentEdge, ResourceProvision, ResourceTypeRegistration, RoleBindingSnapshot,
-    ScopeGraphSnapshot, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
-    WorkspaceOrgEdge,
+    ResourceParentEdge, ResourceProvision, ResourceProvisionDisposition, ResourceProvisionReceipt,
+    ResourceTypeRegistration, RoleBindingSnapshot, ScopeGraphSnapshot, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceOrgEdge,
 };
 pub use trust::{
     NamespaceOwner, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId,

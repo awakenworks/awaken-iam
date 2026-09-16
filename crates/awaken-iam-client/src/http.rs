@@ -31,15 +31,16 @@ use awaken_iam_contract::{
     IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
     ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
     ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
-    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
-    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
-    UserInfo, WorkspaceOrgEdge,
+    ResourceModelRegistered, ResourceModelRegistration, ResourceProvision,
+    ResourceProvisionReceipt, RetireAuthorizationProfile, RetireProductSpacePlacement,
+    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
+    WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 
-use crate::{AuthzTransport, DirectoryClient, RemoteError};
+use crate::{AuthzTransport, DirectoryClient, ProvisionTransport, RemoteError};
 
 /// Default per-request timeout when the caller does not specify one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -584,6 +585,18 @@ impl AuthzTransport for HttpAuthzTransport {
         let path = format!("/v1/admin/authz/profiles/{}/active", namespace.0);
         let response = self.send_with_retry(|| self.client.get(self.url(&path)))?;
         Self::decode(response)
+    }
+}
+
+impl ProvisionTransport for HttpAuthzTransport {
+    fn provision(&self, provision: &ResourceProvision) -> Result<(), RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authz/resource-provisions"))
+                .json(provision)
+        })?;
+        let _: ResourceProvisionReceipt = Self::decode(response)?;
+        Ok(())
     }
 }
 
@@ -1315,5 +1328,34 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.0.contains("401"), "unexpected error: {}", err.0);
+    }
+
+    #[test]
+    fn outbox_transport_posts_resource_provision_and_requires_a_receipt() {
+        // Cause/effect rules: a 200 receipt confirms the relay delivery and
+        // uses the sole provisioning path; a non-success response remains a
+        // transport failure so the local outbox record stays pending.
+        use awaken_iam_contract::{OrgId, ResourceId, ResourceParentEdge, ResourceType, ScopeRef};
+        let body = r#"{"idempotency_key":"tutor.campus:nanshan","epoch":1,"version":7,"disposition":"applied"}"#;
+        let server = StubServer::start(vec![Reply::Ok(body.into()), Reply::Status(409)]);
+        let transport = transport(&server);
+        let provision = ResourceProvision {
+            product_id: awaken_iam_contract::ProductId::new("tutor").unwrap(),
+            org_id: OrgId("acme".into()),
+            idempotency_key: "tutor.campus:nanshan".into(),
+            epoch: 1,
+            grants: vec![],
+            scope_edges: vec![ResourceParentEdge {
+                resource_type: ResourceType("tutor.campus".into()),
+                resource_id: ResourceId("nanshan".into()),
+                parent: ScopeRef::Org {
+                    org_id: OrgId("acme".into()),
+                },
+            }],
+        };
+        ProvisionTransport::provision(&transport, &provision).unwrap();
+        assert!(ProvisionTransport::provision(&transport, &provision).is_err());
+        drop(transport);
+        assert!(server.requests()[0].starts_with("POST /v1/authz/resource-provisions "));
     }
 }

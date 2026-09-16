@@ -90,6 +90,8 @@ impl awaken_iam_core::ResourceModelRepository for FakePort {
 
 fn provision_with_subject(subject: GrantSubjectRef) -> ResourceProvision {
     ResourceProvision {
+        product_id: awaken_iam_contract::ProductId::new("test").unwrap(),
+        org_id: awaken_iam_contract::OrgId("acme".into()),
         idempotency_key: "issue:42".into(),
         epoch: 3,
         grants: vec![awaken_iam_contract::GrantSnapshot {
@@ -287,6 +289,8 @@ fn provision_with_multiple_grants_writes_each_one() {
     // owner, the team gets read, etc.). Each grant round-trips independently.
     let port = FakePort::default();
     let provision = ResourceProvision {
+        product_id: awaken_iam_contract::ProductId::new("test").unwrap(),
+        org_id: awaken_iam_contract::OrgId("acme".into()),
         idempotency_key: "issue:99".into(),
         epoch: 7,
         grants: vec![

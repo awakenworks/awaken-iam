@@ -610,6 +610,8 @@ impl ProvisionTransport for PolicyTransport {
 /// - a creator grant giving ada full issue.* authority over the new issue
 fn issue_77_provision() -> ResourceProvision {
     ResourceProvision {
+        product_id: awaken_iam_contract::ProductId::new("oversight").unwrap(),
+        org_id: awaken_iam_contract::OrgId("acme".into()),
         idempotency_key: "issue:issue_77".into(),
         epoch: 1,
         grants: vec![GrantSnapshot {
