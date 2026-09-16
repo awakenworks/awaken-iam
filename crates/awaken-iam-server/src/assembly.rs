@@ -155,6 +155,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/entitlements/check"),
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::post("/v1/authz/resource-model"),
+    RouteSpec::post("/v1/authz/resource-provisions"),
     RouteSpec::get("/v1/authz/snapshot"),
     RouteSpec::post("/v1/capabilities/introspect"),
 ];
@@ -171,7 +172,6 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
 const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/admin/orgs"),
     RouteSpec::post("/v1/admin/orgs/provision"),
-    RouteSpec::post("/v1/authz/resource-provisions"),
     RouteSpec::get("/v1/admin/orgs/{id}"),
     RouteSpec::put("/v1/admin/orgs/{id}"),
     RouteSpec::delete("/v1/admin/orgs/{id}"),
