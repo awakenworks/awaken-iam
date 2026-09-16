@@ -41,6 +41,15 @@ pub fn apply_resource_provision(
     grants: &dyn GrantRepository,
     edges: &dyn ResourceModelRepository,
 ) -> RepositoryResult<()> {
+    for retirement in &provision.retirements {
+        edges.remove_edge(&retirement.resource_type, &retirement.resource_id)?;
+        for grant_id in &retirement.grant_ids {
+            match grants.remove(&GrantId(grant_id.clone())) {
+                Ok(()) | Err(crate::RepositoryError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     for edge in &provision.scope_edges {
         edges.put_edge(ResourceEdge {
             resource_type: edge.resource_type.clone(),
@@ -133,6 +142,16 @@ mod tests {
             }
             Ok(())
         }
+        fn remove_edge(
+            &self,
+            resource_type: &awaken_iam_contract::ResourceType,
+            resource_id: &awaken_iam_contract::ResourceId,
+        ) -> RepositoryResult<()> {
+            self.edges.lock().unwrap().retain(|edge| {
+                &edge.resource_type != resource_type || &edge.resource_id != resource_id
+            });
+            Ok(())
+        }
         fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>> {
             Ok(self.edges.lock().unwrap().clone())
         }
@@ -163,6 +182,7 @@ mod tests {
                 resource_id: ResourceId("42".into()),
                 parent: ScopeRef::Global,
             }],
+            retirements: vec![],
         }
     }
 
@@ -188,6 +208,29 @@ mod tests {
         apply_resource_provision(&provision(), &authz, &authz).unwrap();
         assert_eq!(authz.list().unwrap().len(), 1);
         assert_eq!(authz.list_edges().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retirement_removes_the_edge_and_exact_grants_idempotently() {
+        // Causes/effects: an existing resource plus a higher-epoch retirement
+        // removes its projection and named grants; an exact retry remains a
+        // no-op instead of failing on already-absent rows.
+        let authz = FakeAuthz::default();
+        apply_resource_provision(&provision(), &authz, &authz).unwrap();
+        let mut retirement = provision();
+        retirement.idempotency_key = "issue:42:retire".into();
+        retirement.epoch = 4;
+        retirement.grants.clear();
+        retirement.scope_edges.clear();
+        retirement.retirements = vec![awaken_iam_contract::ResourceRetirement {
+            resource_type: awaken_iam_contract::ResourceType("issue".into()),
+            resource_id: awaken_iam_contract::ResourceId("42".into()),
+            grant_ids: vec!["g_issue_42_owner".into()],
+        }];
+        apply_resource_provision(&retirement, &authz, &authz).unwrap();
+        apply_resource_provision(&retirement, &authz, &authz).unwrap();
+        assert!(authz.list_edges().unwrap().is_empty());
+        assert!(authz.list().unwrap().is_empty());
     }
 
     #[test]

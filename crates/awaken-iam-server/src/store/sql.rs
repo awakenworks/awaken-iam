@@ -1520,6 +1520,22 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
         Ok(())
     }
 
+    fn remove_edge(
+        &self,
+        resource_type: &ResourceType,
+        resource_id: &ResourceId,
+    ) -> RepositoryResult<()> {
+        let sql = format!(
+            "DELETE FROM {} WHERE resource_type = ? AND resource_id = ?",
+            self.table("resource_edges")
+        );
+        self.backend.execute(
+            &sql,
+            &[p(resource_type.0.clone()), p(resource_id.0.clone())],
+        )?;
+        Ok(())
+    }
+
     fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>> {
         let sql = format!(
             "SELECT resource_type, resource_id, CAST(parent AS TEXT) FROM {} \

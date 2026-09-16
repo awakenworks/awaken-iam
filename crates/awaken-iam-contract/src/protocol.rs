@@ -434,6 +434,9 @@ pub struct ResourceProvision {
     pub grants: Vec<GrantSnapshot>,
     /// Scope-graph parent edges anchoring the new resource in the hierarchy.
     pub scope_edges: Vec<ResourceParentEdge>,
+    /// Resources retired by this epoch, with the exact grants to revoke.
+    #[serde(default)]
+    pub retirements: Vec<ResourceRetirement>,
 }
 
 /// Complete desired authorization state for one product-owned projection stream.
@@ -737,6 +740,7 @@ mod tests {
                     namespace_id: NamespaceId("acme".into()),
                 },
             }],
+            retirements: vec![],
         };
         let json = serde_json::to_string(&provision).unwrap();
         let parsed: ResourceProvision = serde_json::from_str(&json).unwrap();

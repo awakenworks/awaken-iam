@@ -17,8 +17,8 @@ use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     DirectoryNodeId, ExternalIdentity, ExternalIdentityId, ExternalIdentityKey, NamespaceId,
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductSpacePlacement,
-    ProductSpacePlacementStatus, ProductSpaceRef, ProfileLifecycle, Session, SessionId, Timestamp,
-    WorkspaceId, WorkspaceOrgEdge,
+    ProductSpacePlacementStatus, ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType,
+    Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 
 use crate::oauth_provider::StoredAuthorizationCode;
@@ -378,6 +378,16 @@ pub trait InvitationRepository: Send + Sync {
 pub trait ResourceModelRepository: Send + Sync {
     /// Register or replace the parent edge for a resource instance.
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()>;
+    /// Idempotently remove one product resource from the authorization graph.
+    fn remove_edge(
+        &self,
+        _resource_type: &ResourceType,
+        _resource_id: &ResourceId,
+    ) -> RepositoryResult<()> {
+        Err(RepositoryError::Backend(
+            "resource edge retirement is not supported by this adapter".into(),
+        ))
+    }
     /// List every registered parent edge.
     fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>>;
     /// List persisted resource tombstones for authorization evaluation.

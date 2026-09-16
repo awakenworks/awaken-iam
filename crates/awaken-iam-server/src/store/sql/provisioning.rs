@@ -75,6 +75,14 @@ impl<B: SqlConn> OrganizationProvisioningStore for SqlStore<B> {
 }
 
 impl<B: SqlConn> ResourceProvisioningStore for SqlStore<B> {
+    fn resource_provision_replay(
+        &self,
+        provision: &ResourceProvision,
+        fingerprint: &str,
+    ) -> RepositoryResult<Option<ResourceProvisionReceipt>> {
+        self.resource_provision_receipt(provision, fingerprint)
+    }
+
     fn provision_resource(
         &self,
         provision: &ResourceProvision,
@@ -115,6 +123,39 @@ impl<B: SqlConn> ResourceProvisioningStore for SqlStore<B> {
                     p(parent),
                 ],
             });
+        }
+        for resource in &provision.retirements {
+            let head_index = writes.len();
+            writes.push(SqlWrite {
+                sql: format!(
+                    "INSERT INTO {} (resource_type, resource_id, epoch) VALUES (?, ?, ?) \
+                     ON CONFLICT (resource_type, resource_id) DO UPDATE SET epoch = excluded.epoch \
+                     WHERE epoch < excluded.epoch",
+                    self.table("resource_epochs")
+                ),
+                params: vec![
+                    p(resource.resource_type.0.clone()),
+                    p(resource.resource_id.0.clone()),
+                    p(provision.epoch.to_string()),
+                ],
+            });
+            required.push((head_index, 1));
+            writes.push(SqlWrite {
+                sql: format!(
+                    "DELETE FROM {} WHERE resource_type = ? AND resource_id = ?",
+                    self.table("resource_edges")
+                ),
+                params: vec![
+                    p(resource.resource_type.0.clone()),
+                    p(resource.resource_id.0.clone()),
+                ],
+            });
+            for grant_id in &resource.grant_ids {
+                writes.push(SqlWrite {
+                    sql: format!("DELETE FROM {} WHERE id = ?", self.table("grants")),
+                    params: vec![p(grant_id.clone())],
+                });
+            }
         }
         for grant in &provision.grants {
             writes.push(SqlWrite {

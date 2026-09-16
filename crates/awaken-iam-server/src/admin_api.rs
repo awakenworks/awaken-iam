@@ -35,11 +35,12 @@
 //! here propagates to in-process evaluators on their next poll.
 
 mod provisioning;
+pub use provisioning::ResourceProvisioningStore;
 
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, CreateInvitation, InvitationId, InvitationStatus,
-    IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ResourceProvision,
-    ResourceProvisionReceipt, ScopeRef, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp,
+    WorkspaceId, WorkspaceOrgEdge,
 };
 #[cfg(test)]
 use awaken_iam_contract::{
@@ -102,16 +103,6 @@ pub trait OrganizationProvisioningStore: Send + Sync {
         owner_binding: RoleBinding,
         audit: AuditEvent,
     ) -> Result<u64, RepositoryError>;
-}
-
-/// Atomic persistence boundary for one consumer resource/outbox delivery.
-pub trait ResourceProvisioningStore: Send + Sync {
-    fn provision_resource(
-        &self,
-        provision: &ResourceProvision,
-        fingerprint: &str,
-        audit: AuditEvent,
-    ) -> Result<ResourceProvisionReceipt, RepositoryError>;
 }
 
 /// A policy-administration domain event.

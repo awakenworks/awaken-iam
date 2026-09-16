@@ -628,6 +628,7 @@ fn issue_77_provision() -> ResourceProvision {
             resource_id: ResourceId("issue_77".into()),
             parent: proj_web(),
         }],
+        retirements: vec![],
     }
 }
 

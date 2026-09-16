@@ -11,8 +11,9 @@ use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityKey, GrantEffect, GrantSubjectRef, InvitationId,
     InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProfileLifecycle, ResourceProvision, ResourceProvisionDisposition, ResourceProvisionReceipt,
-    ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    ProfileLifecycle, ResourceId, ResourceProvision, ResourceProvisionDisposition,
+    ResourceProvisionReceipt, ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
@@ -28,18 +29,14 @@ use awaken_iam_core::{
 use super::fence::{Fence, FenceStore};
 use crate::admin_api::{OrganizationProvisioningStore, ResourceProvisioningStore};
 
+mod support;
+use support::{external_key, json_key};
+
 #[derive(Clone)]
 struct StoredResourceProvision {
     fingerprint: String,
     epoch: u64,
     version: u64,
-}
-
-/// JSON-serializable key used to index rows whose natural key is a contract
-/// value object (principal, scope, resource coordinate).
-fn json_key<T: serde::Serialize>(value: &T, what: &str) -> RepositoryResult<String> {
-    serde_json::to_string(value)
-        .map_err(|err| RepositoryError::Backend(format!("encode {what}: {err}")))
 }
 
 #[derive(Default)]
@@ -85,23 +82,6 @@ pub struct InMemoryStore {
     entitlement: Arc<Mutex<Entitlement>>,
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     fence: Arc<Mutex<Fence>>,
-}
-
-impl std::fmt::Debug for InMemoryStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InMemoryStore").finish_non_exhaustive()
-    }
-}
-
-impl InMemoryStore {
-    /// Create an empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-fn external_key(key: &ExternalIdentityKey) -> String {
-    format!("{}\u{1f}{}", key.provider_key.0, key.subject.0)
 }
 
 impl AccountRepository for InMemoryStore {
@@ -519,6 +499,28 @@ impl OrganizationProvisioningStore for InMemoryStore {
 }
 
 impl ResourceProvisioningStore for InMemoryStore {
+    fn resource_provision_replay(
+        &self,
+        provision: &ResourceProvision,
+        fingerprint: &str,
+    ) -> RepositoryResult<Option<ResourceProvisionReceipt>> {
+        let authz = self.authz.lock().unwrap();
+        let Some(existing) = authz.resource_provisions.get(&provision.idempotency_key) else {
+            return Ok(None);
+        };
+        if existing.fingerprint != fingerprint || existing.epoch != provision.epoch {
+            return Err(RepositoryError::Conflict(
+                "idempotency key belongs to another resource provision".into(),
+            ));
+        }
+        Ok(Some(ResourceProvisionReceipt {
+            idempotency_key: provision.idempotency_key.clone(),
+            epoch: existing.epoch,
+            version: existing.version,
+            disposition: ResourceProvisionDisposition::Replayed,
+        }))
+    }
+
     fn provision_resource(
         &self,
         provision: &ResourceProvision,
@@ -549,6 +551,22 @@ impl ResourceProvisioningStore for InMemoryStore {
                 return Err(RepositoryError::Conflict(format!(
                     "resource epoch is stale for {}:{}",
                     edge.resource_type.0, edge.resource_id.0
+                )));
+            }
+        }
+        for resource in &provision.retirements {
+            let key = format!(
+                "{}\u{1f}{}",
+                resource.resource_type.0, resource.resource_id.0
+            );
+            if authz
+                .resource_epochs
+                .get(&key)
+                .is_some_and(|epoch| *epoch >= provision.epoch)
+            {
+                return Err(RepositoryError::Conflict(format!(
+                    "resource epoch is stale for {}:{}",
+                    resource.resource_type.0, resource.resource_id.0
                 )));
             }
         }
@@ -589,6 +607,17 @@ impl ResourceProvisioningStore for InMemoryStore {
                 },
             };
             authz.grants.insert(grant.id.0.clone(), grant);
+        }
+        for resource in &provision.retirements {
+            let key = format!(
+                "{}\u{1f}{}",
+                resource.resource_type.0, resource.resource_id.0
+            );
+            authz.resource_edges.remove(&key);
+            authz.resource_epochs.insert(key, provision.epoch);
+            for grant_id in &resource.grant_ids {
+                authz.grants.remove(grant_id);
+            }
         }
         audits.push(audit);
         fence.version += 1;
@@ -979,6 +1008,16 @@ impl ResourceModelRepository for InMemoryStore {
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
         let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
         self.authz.lock().unwrap().resource_edges.insert(key, edge);
+        Ok(())
+    }
+
+    fn remove_edge(
+        &self,
+        resource_type: &ResourceType,
+        resource_id: &ResourceId,
+    ) -> RepositoryResult<()> {
+        let key = format!("{}\u{1f}{}", resource_type.0, resource_id.0);
+        self.authz.lock().unwrap().resource_edges.remove(&key);
         Ok(())
     }
 

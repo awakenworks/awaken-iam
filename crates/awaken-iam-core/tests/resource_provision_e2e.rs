@@ -109,6 +109,7 @@ fn provision_with_subject(subject: GrantSubjectRef) -> ResourceProvision {
             resource_id: ResourceId("42".into()),
             parent: ScopeRef::Global,
         }],
+        retirements: vec![],
     }
 }
 
@@ -329,6 +330,7 @@ fn provision_with_multiple_grants_writes_each_one() {
             resource_id: ResourceId("99".into()),
             parent: ScopeRef::Global,
         }],
+        retirements: vec![],
     };
     apply_resource_provision(&provision, &port, &port).unwrap();
 
