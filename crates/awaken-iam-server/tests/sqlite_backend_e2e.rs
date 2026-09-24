@@ -11,6 +11,53 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+#[test]
+fn sqlite_new_database_is_owner_only_without_changing_existing_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // File-opening decision table: C1 absent file under a writable directory
+    // => E1 create mode 0600 even with a permissive process umask; C2 existing
+    // file mode 0640 => E2 open without chmod; C3 missing parent => E3 backend
+    // error and no file. R1 C1=>E1, R2 C2=>E2, R3 C3=>E3.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("iam-sqlite-mode-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let fresh = root.join("fresh.sqlite");
+    let backend = SqliteBackend::open_path(&fresh).unwrap();
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "R1"
+    );
+    drop(backend);
+
+    let existing = root.join("existing.sqlite");
+    std::fs::write(&existing, b"").unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let backend = SqliteBackend::open_path(&existing).unwrap();
+    assert_eq!(
+        std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "R2"
+    );
+    drop(backend);
+
+    let missing = root.join("missing").join("database.sqlite");
+    assert!(
+        matches!(
+            SqliteBackend::open_path(&missing),
+            Err(RepositoryError::Backend(_))
+        ),
+        "R3"
+    );
+    assert!(!missing.exists(), "R3");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 use awaken_iam_contract::{
     AcceptInvitation, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, CreateInvitation,
     EnsureProductSpacePlacement, InvitationBinding, InvitationStatus, OrgId, PrincipalRef,

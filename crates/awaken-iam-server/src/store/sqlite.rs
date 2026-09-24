@@ -57,6 +57,24 @@ impl SqliteBackend {
 
     /// Open (creating if absent) a file-backed database at `path`.
     pub fn open_path(path: impl AsRef<std::path::Path>) -> RepositoryResult<Self> {
+        let path = path.as_ref();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Reserve a new database with owner-only permissions before SQLite
+            // can create it under the process's more permissive default umask.
+            // Existing databases retain their operator-selected permissions.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(RepositoryError::Backend(error.to_string())),
+            }
+        }
         let conn = Connection::open(path).map_err(backend_err)?;
         Ok(Self::new(conn))
     }
