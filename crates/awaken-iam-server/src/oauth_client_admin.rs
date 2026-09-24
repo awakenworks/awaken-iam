@@ -150,6 +150,26 @@ where
     /// confidential); a confidential client's secret is already hashed into it
     /// by [`RegisteredClient::confidential`].
     pub fn register(&mut self, client: RegisteredClient, at: Timestamp) -> AdminResult<u64> {
+        if client.client_id.trim().is_empty()
+            || client.client_id != client.client_id.trim()
+            || client.redirect_uris.is_empty()
+            || client.allowed_scopes.is_empty()
+            || client
+                .redirect_uris
+                .iter()
+                .any(|uri| match url::Url::parse(uri) {
+                    Ok(parsed) => {
+                        parsed.fragment().is_some()
+                            || matches!(parsed.scheme(), "javascript" | "data" | "file")
+                    }
+                    Err(_) => true,
+                })
+        {
+            return Err(AdminError::Invalid(
+                "oauth client requires an id, exact redirect URIs without fragments, and scopes"
+                    .into(),
+            ));
+        }
         if OAuthClientRepository::get(&self.store, &client.client_id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!(
                 "oauth client {}",
@@ -159,6 +179,28 @@ where
         let id = client.client_id.clone();
         OAuthClientRepository::upsert(&self.store, client)?;
         self.commit(OAuthClientEvent::Registered(id), at)
+    }
+
+    /// Register a confidential client with a fresh secret returned exactly once.
+    /// The cleartext is never passed to the repository or audit trail.
+    pub fn register_confidential<I, T>(
+        &mut self,
+        client_id: impl Into<String>,
+        redirect_uris: Vec<String>,
+        scopes: I,
+        entropy: &mut impl EntropySource,
+        at: Timestamp,
+    ) -> AdminResult<(u64, IssuedClientSecret)>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let client_id = client_id.into();
+        let secret = mint_secret(entropy);
+        let client =
+            RegisteredClient::confidential(client_id.clone(), &secret, redirect_uris, scopes);
+        let version = self.register(client, at)?;
+        Ok((version, IssuedClientSecret { client_id, secret }))
     }
 
     /// Rotate a confidential client's secret, returning the fresh cleartext
@@ -288,6 +330,66 @@ mod tests {
         );
         // A failed register does not advance the version.
         assert_eq!(api.version(), 2);
+    }
+
+    #[test]
+    fn confidential_registration_returns_secret_once_and_refuses_invalid_coordinates() {
+        // Decision table: C1 valid client/redirect/scope + C2 fresh id => E1
+        // hash-only storage, one cleartext receipt and audit; C3 duplicate id
+        // => E2 conflict without replacement; C4 fragmented or active-content URI
+        // => E3 reject before storage. R1 C1+C2=>E1; R2 C3=>E2; R3 C4=>E3.
+        let mut api = api();
+        let (version, issued) = api
+            .register_confidential(
+                "awaken-design",
+                vec!["https://design.example/auth/callback".into()],
+                ["openid", "email", "profile"],
+                &mut SeqEntropy { next: 11 },
+                at(),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(issued.client_id, "awaken-design");
+        assert_eq!(
+            api.get_client("awaken-design")
+                .unwrap()
+                .unwrap()
+                .secret_hash,
+            Some(hash_session_token(&issued.secret))
+        );
+        assert!(matches!(
+            api.register_confidential(
+                "awaken-design",
+                vec!["https://other.example/cb".into()],
+                ["openid"],
+                &mut SeqEntropy { next: 12 },
+                at()
+            ),
+            Err(AdminError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            api.register_confidential(
+                "invalid",
+                vec!["https://design.example/cb#fragment".into()],
+                ["openid"],
+                &mut SeqEntropy { next: 13 },
+                at()
+            ),
+            Err(AdminError::Invalid(_))
+        ));
+        assert!(matches!(
+            api.register_confidential(
+                "script",
+                vec!["javascript:alert(1)".into()],
+                ["openid"],
+                &mut SeqEntropy { next: 14 },
+                at()
+            ),
+            Err(AdminError::Invalid(_))
+        ));
+        assert_eq!(api.version(), 2);
+        assert_eq!(api.list_clients().unwrap().len(), 1);
+        assert_eq!(AuditSink::events(api.store()).unwrap().len(), 1);
     }
 
     #[test]
