@@ -91,6 +91,35 @@ The product never calls a provider-specific login URL as its normal entrypoint.
 That keeps GitHub, Google, enterprise SSO, account chooser, and future factors
 inside IAM's bounded context.
 
+### Register a hosted product client
+
+The standalone IAM daemon exposes the existing OAuth client administration
+authority at `/v1/admin/oauth-clients`. An IAM administrator registers a
+separate confidential client for Awaken Design with the exact public callback:
+
+```http
+POST /v1/admin/oauth-clients
+Authorization: Bearer <IAM_ADMIN_TOKEN>
+Content-Type: application/json
+
+{
+  "kind": "confidential",
+  "client_id": "awaken-design",
+  "redirect_uris": ["https://design.example/auth/callback"],
+  "allowed_scopes": ["openid", "email", "profile"]
+}
+```
+
+The response returns `client_secret` once; place it in Design's
+`DESIGN_OIDC_CLIENT_SECRET_FILE` without committing or logging it. Read/list
+responses omit both the secret and its stored hash. Rotating through
+`POST /v1/admin/oauth-clients/{id}/rotate-secret` issues a new secret and
+invalidates the old one; `DELETE /v1/admin/oauth-clients/{id}` deregisters it.
+Only an IAM admin credential may use these routes. The callback must use HTTPS,
+with loopback HTTP allowed for local development. Registering a client does not
+configure an upstream login provider; IAM still needs a working provider before
+an interactive user can complete the authorization flow.
+
 WeChat Mini Programs are the deliberate non-browser exception: `wx.login`
 produces a provider code rather than a redirect. The Mini Program sends that
 code to IAM's customer-scoped `/v1/auth/wechat-miniapp/token` endpoint. IAM
@@ -379,4 +408,3 @@ issuers set `subject_kind: service`. A verifier reconstructs the exact
   tools — those stay product-side (ADR-0001 guardrail).
 - It does not own product session *semantics* (what a workspace session means);
   it issues and validates the identity, products attach meaning.
-

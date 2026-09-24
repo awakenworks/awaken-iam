@@ -1,6 +1,6 @@
 use super::*;
 use crate::{DEFAULT_SESSION_COOKIE_NAME, InMemoryStore};
-use awaken_iam_contract::IdentityProviderConfigId;
+use awaken_iam_contract::{IdentityProviderConfigId, IdentityProviderKind};
 
 /// Deterministic entropy so minted ids and secrets are reproducible.
 #[derive(Clone, Default)]
