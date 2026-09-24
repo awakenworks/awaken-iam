@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use awaken_iam_core::{OAuthAuthorizationRequest, OAuthProviderError, TokenRedemption};
-use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{Form, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,6 +19,8 @@ use crate::{
 const ACCESS_TOKEN_TTL_SECS: u64 = 3_600;
 const AUTHORIZATION_CODE_TTL_SECS: u64 = 300;
 const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 3_600;
+const LOGIN_TTL_SECS: u64 = 300;
+const BROWSER_SESSION_TTL_SECS: u64 = 24 * 3_600;
 
 /// One shared mutable OP instance. Embedded hosts mount this handle rather than
 /// reimplementing authorization-code, PKCE, refresh, revoke, or UserInfo logic.
@@ -47,6 +49,8 @@ pub fn op_router(auth: SharedAuthApi, issuer: impl Into<String>) -> Router {
             get(openid_configuration),
         )
         .route("/v1/oauth/authorize", get(authorize))
+        .route("/v1/auth/login/{provider}", get(start_provider_login))
+        .route("/v1/auth/callback/{provider}", get(complete_provider_login))
         .route("/v1/oauth/browser/start", get(browser_start))
         .route("/v1/oauth/browser/callback", get(browser_callback))
         .route("/v1/oauth/token", post(token))
@@ -110,6 +114,8 @@ struct RevokeForm {
 #[derive(Debug, Serialize)]
 struct TokenResponse {
     access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
     token_type: &'static str,
     expires_in: u64,
     refresh_token: String,
@@ -326,6 +332,106 @@ async fn login_required(state: &OpHttpState, return_to: &str) -> Response {
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct ProviderLoginQuery {
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProviderCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+fn redirect_with_cookies(location: &str, cookies: &[&str]) -> Response {
+    let mut response = Redirect::to(location).into_response();
+    for cookie in cookies {
+        let Ok(value) = HeaderValue::from_str(cookie) else {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        };
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+fn provider_login_error(error: AuthApiError) -> Response {
+    match error {
+        AuthApiError::UnknownProvider(_) => oauth_error(StatusCode::NOT_FOUND, "invalid_request"),
+        AuthApiError::ProviderDisabled(_) => oauth_error(StatusCode::FORBIDDEN, "access_denied"),
+        AuthApiError::Provider(_) | AuthApiError::Repository(_) => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        }
+        _ => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    }
+}
+
+async fn start_provider_login(
+    State(state): State<OpHttpState>,
+    Path(provider): Path<String>,
+    Query(query): Query<ProviderLoginQuery>,
+) -> Response {
+    let now = crate::clock::unix_seconds();
+    let request = crate::StartLogin {
+        provider_key: awaken_iam_contract::IdentityProviderKey(provider),
+        return_to: query.return_to,
+        created_at: crate::clock::timestamp(now),
+        expires_at: crate::clock::timestamp(now + LOGIN_TTL_SECS),
+        cookie_max_age_secs: Some(LOGIN_TTL_SECS),
+    };
+    let auth = state.auth.clone();
+    match tokio::task::spawn_blocking(move || auth.blocking_lock().start_login(request)).await {
+        Ok(Ok(started)) => redirect_with_cookies(
+            &started.redirect_url,
+            &[&started.set_cookie, &started.set_proof_cookie],
+        ),
+        Ok(Err(error)) => provider_login_error(error),
+        Err(_) => oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+    }
+}
+
+async fn complete_provider_login(
+    State(state): State<OpHttpState>,
+    Path(provider): Path<String>,
+    Query(query): Query<ProviderCallbackQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if query.error.is_some() {
+        return oauth_error(StatusCode::BAD_REQUEST, "access_denied");
+    }
+    let (Some(code), Some(oauth_state)) = (query.code, query.state) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let now = crate::clock::unix_seconds();
+    let request = crate::CallbackRequest {
+        provider_key: awaken_iam_contract::IdentityProviderKey(provider),
+        cookie_header: headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned(),
+        code,
+        state: oauth_state,
+        now: crate::clock::timestamp(now),
+        session_expires_at: crate::clock::timestamp(now + BROWSER_SESSION_TTL_SECS),
+        session_cookie_max_age_secs: Some(BROWSER_SESSION_TTL_SECS),
+    };
+    let auth = state.auth.clone();
+    match tokio::task::spawn_blocking(move || auth.blocking_lock().complete_callback(request)).await
+    {
+        Ok(Ok(completed)) => redirect_with_cookies(
+            &completed.redirect_to,
+            &[
+                &completed.set_session_cookie,
+                &completed.clear_login_cookie,
+                &completed.clear_login_proof_cookie,
+            ],
+        ),
+        Ok(Err(error)) => provider_login_error(error),
+        Err(_) => oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+    }
+}
+
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -385,6 +491,7 @@ async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) ->
     match result {
         Ok(grant) => Json(TokenResponse {
             access_token: grant.access_token,
+            id_token: grant.id_token,
             token_type: "Bearer",
             expires_in: ACCESS_TOKEN_TTL_SECS,
             refresh_token: grant.refresh_token,
@@ -707,6 +814,9 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_pkce_http_flow_authorizes_redeems_refreshes_and_reads_userinfo() {
+        // Wire decision rules: W1 a valid authorization code => access,
+        // refresh and ID token from the one canonical grant; W2 a refresh
+        // token => rotated access/refresh only, never a new ID token.
         let (app, cookie) = logged_in_router().await;
         let verifier = "desktop-verifier-with-enough-entropy";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -756,6 +866,11 @@ mod tests {
         let grant: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let access_token = grant["access_token"].as_str().unwrap();
         let refresh_token = grant["refresh_token"].as_str().unwrap();
+        assert_eq!(
+            grant["id_token"].as_str().unwrap().split('.').count(),
+            3,
+            "W1"
+        );
 
         let response = app
             .clone()
@@ -784,6 +899,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(refreshed.get("id_token").is_none(), "W2");
+    }
+
+    #[tokio::test]
+    async fn provider_login_routes_resume_the_same_product_oidc_authorization() {
+        // End-to-end decision rule L1: C1 no IAM Session + one configured
+        // upstream provider + registered product/PKCE => E1 redirect through
+        // provider login, bind two correlation cookies, establish an IAM
+        // Session, resume the exact authorization, then issue one code and a
+        // verified ID token. State-mismatch rejection is owned by AuthApi's
+        // separate challenge tests.
+        let shared = Arc::new(Mutex::new(configured_auth(&[("fake", "Fake")])));
+        let app = op_router(shared.clone(), "https://accounts.example");
+        let verifier = "desktop-verifier-with-enough-entropy";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let authorize_uri = format!(
+            "/v1/oauth/authorize?client_id=desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A9234%2Fcallback&response_type=code&scope=openid%20email&state=product-state&nonce=product-nonce&code_challenge={challenge}&code_challenge_method=S256"
+        );
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(authorize_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        let login_uri = first.headers()[header::LOCATION].to_str().unwrap();
+        assert!(login_uri.starts_with("/v1/auth/login/fake?return_to="));
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(login_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let upstream =
+            url::Url::parse(login.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let upstream_state = upstream
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1;
+        let cookies = login
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(cookies.split(';').count(), 2);
+        let callback_uri = format!("/v1/auth/callback/fake?code=accepted&state={upstream_state}");
+        let callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(callback_uri)
+                    .header(header::COOKIE, cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+        let session_cookie = callback
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .find(|value| value.starts_with(crate::DEFAULT_SESSION_COOKIE_NAME))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let return_to = callback.headers()[header::LOCATION].to_str().unwrap();
+        assert!(return_to.starts_with("/v1/oauth/authorize?"));
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(return_to)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::SEE_OTHER);
+        let product =
+            url::Url::parse(authorized.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        assert_eq!(
+            product
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .unwrap()
+                .1,
+            "product-state"
+        );
+        let code = product
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .unwrap()
+            .1;
+        let form = format!(
+            "grant_type=authorization_code&client_id=desktop&code={code}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9234%2Fcallback&code_verifier={verifier}"
+        );
+        let redeemed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redeemed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(redeemed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let grant: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = crate::verify_id_token(
+            grant["id_token"].as_str().unwrap(),
+            &shared.lock().await.jwks(),
+        )
+        .unwrap();
+        assert_eq!(id.aud, "desktop");
+        assert_eq!(id.nonce.as_deref(), Some("product-nonce"));
     }
 
     /// Logged-out authorization cause/effect decision table:

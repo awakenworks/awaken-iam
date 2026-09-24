@@ -870,11 +870,15 @@ async fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
 }
 
 async fn issue_grant(api: &mut AuthApi<SequentialEntropy>) -> TokenGrant {
+    issue_grant_for(api, "packs-service").await
+}
+
+async fn issue_grant_for(api: &mut AuthApi<SequentialEntropy>, audience: &str) -> TokenGrant {
     api.issue_token_grant(IssueTokenGrant {
         account_id: AccountId("acct_1".into()),
         issuer: "https://iam.example".into(),
         subject: "acct_1".into(),
-        audience: "packs-service".into(),
+        audience: audience.into(),
         scopes: vec!["pack.read".into()],
         issued_at: 1_899_996_400,
         access_expires_at: 1_900_000_000,
@@ -896,33 +900,32 @@ fn refresh_grant(presented: &str, now: &str) -> RefreshGrant {
     }
 }
 
-/// A downstream OP registry with one confidential and one public product client.
-fn op_provider() -> OAuthAuthorizationServer<SequentialEntropy> {
-    let registry = awaken_iam_core::OAuthClientRegistry::new();
-    registry.register(awaken_iam_core::RegisteredClient::confidential(
-        "packs-web",
+/// The same registered-client authority the live OP endpoint reads.
+fn register_op_clients(api: &mut AuthApi<SequentialEntropy>) {
+    api.register_oauth_client(awaken_iam_core::RegisteredClient::confidential(
+        "packs-service",
         "client-secret",
         vec!["https://packs.example/cb".into()],
         ["pack.read"],
-    ));
-    registry.register(awaken_iam_core::RegisteredClient::public(
+    ))
+    .unwrap();
+    api.register_oauth_client(awaken_iam_core::RegisteredClient::public(
         "packs-spa",
         vec!["https://packs.example/spa".into()],
         ["pack.read"],
-    ));
-    OAuthAuthorizationServer::new(registry, SequentialEntropy::default())
+    ))
+    .unwrap();
 }
 
 #[tokio::test]
-async fn op_refresh_grant_authenticates_the_client_then_rotates() {
+async fn registered_client_refresh_authenticates_the_client_then_rotates() {
     let mut api = api();
-    let provider = op_provider();
+    register_op_clients(&mut api);
     let first = issue_grant(&mut api).await;
 
     let rotated = api
-        .op_refresh_token_grant(
-            &provider,
-            "packs-web",
+        .refresh_registered_client(
+            "packs-service",
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
@@ -946,14 +949,13 @@ async fn op_refresh_grant_authenticates_the_client_then_rotates() {
 }
 
 #[tokio::test]
-async fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
+async fn registered_client_refresh_accepts_a_public_client_without_a_secret() {
     let mut api = api();
-    let provider = op_provider();
-    let first = issue_grant(&mut api).await;
+    register_op_clients(&mut api);
+    let first = issue_grant_for(&mut api, "packs-spa").await;
 
     let rotated = api
-        .op_refresh_token_grant(
-            &provider,
+        .refresh_registered_client(
             "packs-spa",
             None,
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
@@ -964,15 +966,14 @@ async fn op_refresh_grant_accepts_a_public_client_without_a_secret() {
 }
 
 #[tokio::test]
-async fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
+async fn registered_client_refresh_rejects_a_wrong_client_secret_without_rotating() {
     let mut api = api();
-    let provider = op_provider();
+    register_op_clients(&mut api);
     let first = issue_grant(&mut api).await;
 
     let err = api
-        .op_refresh_token_grant(
-            &provider,
-            "packs-web",
+        .refresh_registered_client(
+            "packs-service",
             Some("wrong"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
@@ -986,9 +987,8 @@ async fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
     // Failed client authentication never touched the chain: an authenticated
     // rotation of the still-current token then succeeds.
     let rotated = api
-        .op_refresh_token_grant(
-            &provider,
-            "packs-web",
+        .refresh_registered_client(
+            "packs-service",
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
         )
@@ -998,14 +998,13 @@ async fn op_refresh_grant_rejects_a_wrong_client_secret_without_rotating() {
 }
 
 #[tokio::test]
-async fn op_refresh_grant_rejects_an_unknown_client() {
+async fn registered_client_refresh_rejects_an_unknown_client() {
     let mut api = api();
-    let provider = op_provider();
+    register_op_clients(&mut api);
     let first = issue_grant(&mut api).await;
 
     let err = api
-        .op_refresh_token_grant(
-            &provider,
+        .refresh_registered_client(
             "ghost",
             Some("anything"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
@@ -1019,16 +1018,15 @@ async fn op_refresh_grant_rejects_an_unknown_client() {
 }
 
 #[tokio::test]
-async fn op_refresh_grant_revokes_the_chain_on_replay() {
+async fn registered_client_refresh_revokes_the_chain_on_replay() {
     let mut api = api();
-    let provider = op_provider();
+    register_op_clients(&mut api);
     let first = issue_grant(&mut api).await;
 
     // Legitimate rotation through the OP endpoint.
     let _second = api
-        .op_refresh_token_grant(
-            &provider,
-            "packs-web",
+        .refresh_registered_client(
+            "packs-service",
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T00:00:00Z"),
         )
@@ -1038,9 +1036,8 @@ async fn op_refresh_grant_revokes_the_chain_on_replay() {
     // Replaying the retired token — even with valid client auth — is a theft
     // signal that revokes the whole chain and fails closed.
     let err = api
-        .op_refresh_token_grant(
-            &provider,
-            "packs-web",
+        .refresh_registered_client(
+            "packs-service",
             Some("client-secret"),
             refresh_grant(&first.refresh_token, "2026-06-20T01:00:00Z"),
         )
@@ -1282,65 +1279,13 @@ fn redeem(code: &str) -> RedeemAuthorizationCode {
     }
 }
 
-/// Stand up a downstream provider with a single confidential client registered
-/// for the `product.example` callback, and issue a code for `acct_ada`.
-fn op_provider_with_issued_code(
-    nonce: Option<&str>,
-) -> (
-    awaken_iam_core::OAuthAuthorizationServer<SequentialEntropy>,
-    awaken_iam_core::IssuedAuthorizationCode,
-) {
-    let registry = awaken_iam_core::OAuthClientRegistry::new();
-    registry.register(awaken_iam_core::RegisteredClient::confidential(
-        "product-web",
-        "top-secret",
-        vec!["https://product.example/cb".into()],
-        ["openid", "email", "profile"],
-    ));
-    let mut provider =
-        awaken_iam_core::OAuthAuthorizationServer::new(registry, SequentialEntropy::default());
-    let issued = provider
-        .issue_code(
-            AccountId("acct_ada".into()),
-            &awaken_iam_core::OAuthAuthorizationRequest {
-                client_id: "product-web".into(),
-                redirect_uri: "https://product.example/cb".into(),
-                scopes: vec!["openid".into(), "email".into()],
-                code_challenge: None,
-                code_challenge_method: None,
-                nonce: nonce.map(Into::into),
-                state: Some("state-1".into()),
-            },
-            Timestamp("2026-06-21T00:00:00Z".into()),
-            Timestamp("2026-06-21T00:05:00Z".into()),
-        )
-        .expect("issue code");
-    (provider, issued)
-}
-
-fn redemption(code: &str) -> awaken_iam_core::TokenRedemption {
-    awaken_iam_core::TokenRedemption {
-        client_id: "product-web".into(),
-        client_secret: Some("top-secret".into()),
-        code: code.into(),
-        redirect_uri: "https://product.example/cb".into(),
-        code_verifier: None,
-    }
-}
-
-fn op_request() -> OpCodeRedemption {
-    OpCodeRedemption {
-        issuer: "https://iam.example".into(),
-        access_audience: "packs-service".into(),
-        issued_at: 1_899_996_400,
-        access_expires_at: 1_900_000_000,
-        id_token_expires_at: 1_899_999_999,
-        now: Timestamp("2026-06-21T00:01:00Z".into()),
-    }
-}
-
 #[tokio::test]
 async fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
+    // One authority table: C1 authenticated Session and registered client,
+    // C2 exact one-time code with nonce => E1 access/refresh/ID tokens from the
+    // same grant; E2 ID token's issuer, subject, client audience and nonce
+    // verify, while its token family cannot authenticate as access. Rule O1
+    // C1+C2=>E1+E2. A replay is covered by the adjacent single-use rule.
     let mut api = api();
     register_downstream_client(&mut api);
     let (result, cookie) = logged_in_session(&mut api);
@@ -1373,11 +1318,44 @@ async fn downstream_authorization_code_flow_issues_and_redeems_tokens() {
     assert_eq!(claims.aud, "product-web");
     assert_eq!(claims.scope, vec!["openid".to_owned(), "email".to_owned()]);
     assert!(grant.refresh_token.starts_with("oiamr_"));
+    let id_token = grant
+        .id_token
+        .as_ref()
+        .expect("authorization code returns ID token");
+    let identity = crate::verify_id_token(id_token, &api.jwks()).unwrap();
+    assert_eq!(identity.iss, "https://iam.example");
+    assert_eq!(identity.sub, account_id.0);
+    assert_eq!(identity.aud, "product-web");
+    assert_eq!(identity.nonce.as_deref(), Some("nonce-xyz"));
+    assert!(
+        api.verify_access_token(id_token).is_err(),
+        "OIDC family fence"
+    );
     assert!(
         api.audit_log()
             .iter()
             .any(|event| matches!(event, AuthAuditEvent::DownstreamCodeRedeemed { .. }))
     );
+}
+
+#[tokio::test]
+async fn authorization_code_without_nonce_omits_only_the_id_token_nonce() {
+    // Decision rule O2: C1 valid code flow with no requested nonce => E1 a
+    // signed ID token still returns, with no nonce claim; access and refresh
+    // remain on the same canonical redemption path.
+    let mut api = api();
+    register_downstream_client(&mut api);
+    let (_result, cookie) = logged_in_session(&mut api);
+    let mut request = downstream_authorize(&cookie);
+    request.authorization.nonce = None;
+    let authorized = api.authorize(request).unwrap();
+    let grant = api
+        .redeem_authorization_code(redeem(&code_from_redirect(&authorized.redirect_to)))
+        .await
+        .unwrap();
+    let id = crate::verify_id_token(grant.id_token.as_ref().unwrap(), &api.jwks()).unwrap();
+    assert_eq!(id.nonce, None);
+    assert!(!grant.refresh_token.is_empty());
 }
 
 #[test]
@@ -1420,81 +1398,6 @@ async fn downstream_authorization_code_is_single_use() {
     // Replaying the consumed code fails closed; it can never mint a second grant.
     let err = api
         .redeem_authorization_code(redeem(&code))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err,
-        AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)
-    );
-}
-
-#[tokio::test]
-async fn redeeming_a_code_mints_a_signed_access_token_and_an_id_token() {
-    let mut api = api();
-    let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
-
-    let grant = api
-        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
-        .await
-        .expect("redeem");
-
-    // The grant carries the down-scoped set and the authenticated account.
-    assert_eq!(grant.account_id, AccountId("acct_ada".into()));
-    assert_eq!(grant.scopes, vec!["openid".to_owned(), "email".to_owned()]);
-
-    // The access token verifies against the published JWKS + denylist and stamps
-    // the grant's subject and scopes — never client-supplied claims.
-    let access = api.verify_access_token(&grant.access_token).unwrap();
-    assert_eq!(access.iss, "https://iam.example");
-    assert_eq!(access.sub, "acct_ada");
-    assert_eq!(access.aud, "packs-service");
-    assert_eq!(access.scope, vec!["openid".to_owned(), "email".to_owned()]);
-    assert_eq!(access.jti, grant.access_token_jti);
-
-    // The id_token verifies against the same JWKS and asserts the OIDC subject to
-    // the redeeming client: its audience is the client_id, and the request nonce
-    // is bound in.
-    let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
-    assert_eq!(id.iss, "https://iam.example");
-    assert_eq!(id.sub, "acct_ada");
-    assert_eq!(id.aud, "product-web");
-    assert_eq!(id.iat, 1_899_996_400);
-    assert_eq!(id.exp, 1_899_999_999);
-    assert_eq!(id.nonce.as_deref(), Some("nonce-xyz"));
-
-    // Family fence on the real artifacts: the id_token cannot be replayed as an
-    // access token.
-    assert!(api.verify_access_token(&grant.id_token).is_err());
-}
-
-#[tokio::test]
-async fn redeeming_without_a_request_nonce_omits_the_id_token_nonce() {
-    let mut api = api();
-    let (mut provider, issued) = op_provider_with_issued_code(None);
-
-    let grant = api
-        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
-        .await
-        .expect("redeem");
-
-    let id = crate::verify_id_token(&grant.id_token, &api.jwks()).unwrap();
-    assert_eq!(id.nonce, None);
-}
-
-#[tokio::test]
-async fn a_replayed_code_fails_closed_through_the_provider() {
-    let mut api = api();
-    let (mut provider, issued) = op_provider_with_issued_code(Some("nonce-xyz"));
-
-    // First redemption succeeds and consumes the single-use code.
-    api.redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
-        .await
-        .expect("first redeem");
-
-    // A second redemption surfaces the provider's invalid-grant error and mints
-    // nothing.
-    let err = api
-        .redeem_op_code(&mut provider, &redemption(&issued.code), op_request())
         .await
         .unwrap_err();
     assert_eq!(

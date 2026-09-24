@@ -54,9 +54,12 @@ trait IdentityProvider {
 }
 ```
 
-Config loads from environment, never hardcoded (`GOOGLE_CLIENT_ID`,
-`GITHUB_CLIENT_ID`, …); see [provider setup](provider-setup.md) for the operator
-runbook (upstream app registration, callback URLs, env vars, local vs prod).
+The standalone daemon reads `IAM_OIDC_PROVIDERS_FILE` from its environment and
+client secret bytes from owner-only files; its generic OIDC adapter and HTTP
+transport own the browser login flow. Google/GitHub-specific adapters remain
+available to embedding hosts, while the standalone daemon currently binds the
+generic OIDC family. See [provider setup](provider-setup.md) for the exact
+runtime file, callback and upstream app registration.
 Each adapter normalizes the upstream profile into the
 single `ExternalIdentityClaims` shape; the rest of IAM never sees a
 provider-specific field. Adding a provider later is: enum variant + config +
