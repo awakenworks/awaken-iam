@@ -210,18 +210,49 @@ For an issuer of `https://idp.example/realms/acme`, discovery resolves to:
 Only the issuer is configured; the other three rows are read from the discovery
 document at login time.
 
+### Standalone daemon configuration
+
+The core generic adapter supports discovery for an embedding host. The
+standalone `iam-daemon` binds the same adapter through
+`IAM_OIDC_PROVIDERS_FILE` and requires the three explicit HTTPS endpoints at
+startup. This keeps its outbound destinations fixed before accepting browser
+logins. The file contains no secret bytes; each entry names an owner-only
+`client_secret_file`. For example:
+
+```json
+[
+  {
+    "provider_key": "company",
+    "display_name": "Company SSO",
+    "issuer_url": "https://idp.example/realms/acme",
+    "client_id": "iam-upstream-client",
+    "client_secret_file": "/run/secrets/iam-upstream-client-secret",
+    "authorization_endpoint": "https://idp.example/realms/acme/protocol/openid-connect/auth",
+    "token_endpoint": "https://idp.example/realms/acme/protocol/openid-connect/token",
+    "userinfo_endpoint": "https://idp.example/realms/acme/protocol/openid-connect/userinfo"
+  }
+]
+```
+
+`IAM_ISSUER` is IAM's own public HTTPS origin, distinct from each upstream
+`issuer_url`. IAM derives the upstream app callback as
+`<IAM_ISSUER>/v1/auth/callback/<provider_key>`; register that exact value in
+the upstream app. Duplicate keys, remote HTTP endpoints and group/world-readable
+secret files fail startup. Loopback HTTP is accepted only for local tests.
+The daemon's Google- and GitHub-specific adapters are not mounted by this
+configuration; use a standard OIDC provider here.
+
 ## Secret references
 
 Client secrets are **deployment secrets** and never belong in tracked files
 (guardrail [G5](../../AGENTS.md#architecture-guardrails)) or in the shared
 `IdentityProviderConfig` DTO — that contract carries only the public client id.
-Adapters read configuration from the environment, never from hardcoded values
-([auth server](auth-server.md#provider-adapter-genericity)).
+The standalone daemon reads the file path from the environment, never hardcodes
+provider credentials ([auth server](auth-server.md#provider-adapter-genericity)).
 
 - **Local development** — copy [`.env.example`](../../.env.example) to a
-  git-ignored `.env` and fill in real values. `.env` is ignored by
-  [`.gitignore`](../../.gitignore); only `.env.example` (placeholders only) is
-  tracked.
+  git-ignored `.env`, set `IAM_OIDC_PROVIDERS_FILE` to a private JSON file, and
+  put the upstream client secret in its referenced owner-only file.
 - **Production** — inject the variables from the platform secret manager
   (Kubernetes `Secret`, cloud secret store, CI/CD secret) into the process
   environment. Do not bake secrets into images or config maps. Rotate by

@@ -52,9 +52,9 @@ pub use auth_api::{
     AuthApi, AuthApiError, AuthAuditEvent, CallbackOutcome, CallbackRequest,
     DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_LOGIN_PROOF_COOKIE_NAME, DownstreamAuthorizeOutcome,
     DownstreamAuthorizeRequest, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
-    OpCodeRedemption, OpTokenGrant, ProviderRegistration, RedeemAuthorizationCode, RefreshGrant,
-    ReturnToDecision, ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin,
-    StartLoginOutcome, TokenGrant, UnlinkIdentity,
+    ProviderRegistration, RedeemAuthorizationCode, RefreshGrant, ReturnToDecision, ReturnToPolicy,
+    RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant,
+    UnlinkIdentity,
 };
 pub use auth_types::{
     AuthFailureReason, ExternalLoginResolution, PrincipalResolutionFailure, ProviderSummary,

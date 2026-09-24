@@ -27,12 +27,19 @@
 //! - `IAM_WECHAT_MINI_PROGRAMS_JSON` — JSON array of customer-specific
 //!   `provider_key`, `app_id`, `app_secret`, `audience`, optional `scopes`, and
 //!   optional `endpoint` registrations for `/v1/auth/wechat-miniapp/token`.
+//! - `IAM_OIDC_PROVIDERS_FILE` — owner-controlled JSON registration of upstream
+//!   OIDC issuers and their client-secret file paths. Callback URLs derive from
+//!   `IAM_ISSUER` and each provider key; no duplicate callback setting exists.
+
+#[path = "iam-daemon/oidc_providers.rs"]
+mod oidc_providers;
 
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{IdentityProviderKey, ProductId};
 use awaken_iam_core::{
-    AuthCodeRepository, OAuthClientRepository, RegisteredClient, SessionRepository,
+    AccountIdentityRepository, AccountRepository, AuthCodeRepository, ExternalIdentityRepository,
+    LoginFlowRepository, OAuthClientRepository, SessionRepository,
 };
 use awaken_iam_server::{
     AdminAuthPolicy,
@@ -42,6 +49,7 @@ use awaken_iam_server::{
     IamDaemon,
     RecordingExecutor,
     ReqwestWechatMiniProgramExchange,
+    SessionCookieConfig,
     SharedAuthApi,
     SqlConn,
     SqlStore,
@@ -68,6 +76,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut auth, authz) = daemon.into_assembly().into_auth_and_authz();
     let issuer = std::env::var("IAM_ISSUER").unwrap_or_else(|_| format!("http://{bind_addr}"));
     auth = auth.with_issuer(issuer.clone());
+    if issuer.starts_with("http://127.0.0.1:") || issuer.starts_with("http://localhost:") {
+        // A loopback-only dev issuer cannot set Secure/__Host- cookies. Keep
+        // production cookies hardened; use distinct names only on loopback.
+        auth = auth
+            .with_session_cookie(SessionCookieConfig {
+                name: "awaken_session_local".into(),
+                secure: false,
+                ..SessionCookieConfig::default()
+            })
+            .with_login_cookie(SessionCookieConfig {
+                name: "awaken_login_local".into(),
+                secure: false,
+                ..SessionCookieConfig::default()
+            })
+            .with_login_proof_cookie(SessionCookieConfig {
+                name: "awaken_login_proof_local".into(),
+                secure: false,
+                ..SessionCookieConfig::default()
+            });
+    }
     let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
     if let Some(database_url) = std::env::var("IAM_DATABASE_URL")
         .ok()
@@ -94,30 +122,27 @@ async fn serve<B: SqlConn + Clone + 'static>(
     issuer: String,
     bind_addr: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let accounts: Arc<dyn AccountRepository> = profile_store.clone();
+    let external_identities: Arc<dyn ExternalIdentityRepository> = profile_store.clone();
+    let identity_commands: Arc<dyn AccountIdentityRepository> = profile_store.clone();
+    let login_flows: Arc<dyn LoginFlowRepository> = profile_store.clone();
     let sessions: Arc<dyn SessionRepository> = profile_store.clone();
     let oauth_clients: Arc<dyn OAuthClientRepository> = profile_store.clone();
     let oauth_codes: Arc<dyn AuthCodeRepository> = profile_store.clone();
     auth = auth
+        .with_identity_repositories(accounts, external_identities, identity_commands)
+        .with_login_repository(login_flows)
         .with_session_repository(sessions)
         .with_oauth_repositories(oauth_clients, oauth_codes);
-    if let (Ok(client_id), Ok(redirect_uris)) = (
-        std::env::var("IAM_DESKTOP_CLIENT_ID"),
-        std::env::var("IAM_DESKTOP_REDIRECT_URIS"),
-    ) {
-        let redirect_uris = redirect_uris
-            .split(',')
-            .map(str::trim)
-            .filter(|uri| !uri.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if !client_id.trim().is_empty() && !redirect_uris.is_empty() {
-            auth.register_oauth_client(RegisteredClient::public(
-                client_id,
-                redirect_uris,
-                ["openid", "email", "profile"],
-            ))?;
-        }
-    }
+    let provider_file = std::env::var("IAM_OIDC_PROVIDERS_FILE").ok();
+    let provider_issuer = issuer.clone();
+    auth = tokio::task::spawn_blocking(move || {
+        oidc_providers::register_from_file(&mut auth, &provider_issuer, provider_file.as_deref())?;
+        Ok::<_, String>(auth)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    .map_err(std::io::Error::other)?;
     let capability_tokens = auth.token_authority();
     let auth: SharedAuthApi = Arc::new(tokio::sync::Mutex::new(auth));
     let wechat_registrations = wechat_registrations(
