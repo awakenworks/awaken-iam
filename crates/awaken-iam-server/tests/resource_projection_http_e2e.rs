@@ -152,6 +152,71 @@ async fn authorize_account(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_daemon_observes_product_grant_and_revocation_from_shared_store() {
+    let store = sqlite_in_memory_store("iam_projection_replicas").unwrap();
+    seed(&store);
+    let (writer, writer_handle) = serve(store.clone()).await;
+    let (reader, reader_handle) = serve(store).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    assert_eq!(
+        authorize(&client, &reader).await,
+        AuthorizationDecision::Deny
+    );
+    client
+        .post(format!("{writer}/v1/authz/resource-model"))
+        .bearer_auth("tutor-product-token")
+        .json(&model())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let grant = create();
+    client
+        .post(format!("{writer}/v1/authz/resource-provisions"))
+        .bearer_auth("tutor-product-token")
+        .json(&grant)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        authorize(&client, &reader).await,
+        AuthorizationDecision::Allow
+    );
+
+    let mut revoked = grant;
+    revoked.epoch = 2;
+    revoked.idempotency_key = "campus:campus-1:2".into();
+    revoked.grants.clear();
+    revoked.scope_edges.clear();
+    revoked.retirements.push(ResourceRetirement {
+        resource_type: ResourceType("tutor.campus".into()),
+        resource_id: ResourceId("campus-1".into()),
+        grant_ids: vec!["campus-creator-manage".into()],
+    });
+    client
+        .post(format!("{writer}/v1/authz/resource-provisions"))
+        .bearer_auth("tutor-product-token")
+        .json(&revoked)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        authorize(&client, &reader).await,
+        AuthorizationDecision::Deny
+    );
+    writer_handle.abort();
+    reader_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn product_route_authenticates_and_retires_under_a_restartable_policy_fence() {
     let store = sqlite_in_memory_store("iam_projection_http").unwrap();
     seed(&store);

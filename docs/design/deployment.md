@@ -145,11 +145,14 @@ The `iam-daemon` binary selects PostgreSQL through `IAM_DATABASE_URL`; when it
 is absent, `IAM_DATABASE_PATH` selects a persistent SQLite file. Both paths
 run the same migration bundles and resource-projection transaction. The
 PostgreSQL daemon has been exercised over real HTTP with Tutor and restarted
-against the same database. The daemon currently refreshes its in-memory PDP after
-mutations handled by that process; a second replica does not yet reload policy
-changes made through the first. Production must run a single daemon replica until
-cross-replica policy refresh and its revocation test pass. Credential management
-is also a deployment gate. Set
+against the same database. Authorization and snapshot reads now compare the shared
+policy fence before using the in-memory PDP; a second PostgreSQL daemon was tested
+to observe a grant, its revocation, and the resulting policy version without a
+restart. Product projection grant and retirement synchronisation has also passed a
+two-daemon shared-store HTTP test. Authorization-profile activation still uses a
+separate revision lifecycle and has not passed a cross-replica activation test;
+production should keep one replica if that feature is in use. Credential management
+and a full multi-replica rollout remain deployment gates. Set
 `IAM_DIRECTORY_PRODUCT_TOKENS=tutor=<secret>` for Tutor's product-scoped
 resource-model and versioned projection requests; `IAM_ADMIN_TOKEN` remains
 independent for organization, workspace and global policy administration.

@@ -48,16 +48,15 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
-    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryNodeId, DirectoryRevisionQuery, EnsureProductSpacePlacement,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
-    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
-    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductResourceModelRequest,
-    ProductSpacePlacementQuery, ReplaceScopedMemberships, ResendInvitation,
-    ResourceProjectionBatch, RetireAuthorizationProfile, RetireProductSpacePlacement,
-    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode,
-    WorkspaceOrgEdge,
+    AuthorizationRequest, BatchAuthorizationRequest, CreateAuthorizationProfile,
+    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryNodeId,
+    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
+    EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView, InvitationId, InvitationQuery,
+    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgView,
+    PolicySnapshot, ProductId, ProductResourceModelRequest, ProductSpacePlacementQuery,
+    ReplaceScopedMemberships, ResendInvitation, ResourceProjectionBatch,
+    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
+    ScopeMembershipQuery, Timestamp, UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
@@ -151,6 +150,7 @@ pub struct DaemonState<S> {
     profiles: AuthorizationProfileAdmin,
     capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
+    observed_store_version: u64,
 }
 
 impl<S> std::fmt::Debug for DaemonState<S> {
@@ -181,14 +181,17 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + Clone> DaemonState<
         profiles
             .hydrate_all(&mut authz, &base)
             .map_err(|error| AdminError::Backend(error.to_string()))?;
-        Ok(Self {
+        let mut state = Self {
             authz,
             admin,
             directory,
             profiles,
             capability_tokens,
             auth,
-        })
+            observed_store_version: version,
+        };
+        state.ensure_fresh()?;
+        Ok(state)
     }
 }
 
@@ -197,10 +200,30 @@ impl<S: PolicyStore> DaemonState<S> {
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;
         let base_snapshot = base.snapshot(version);
-        let active_profiles = self.authz.snapshot().active_profiles;
+        let active_profiles = self
+            .profiles
+            .durable_active_profiles()
+            .map_err(|error| AdminError::Backend(error.to_string()))?;
         let policy = PolicySet::from_snapshot_and_profiles(&base_snapshot, &active_profiles);
         self.authz.replace_policy_at_version(policy, version);
+        self.observed_store_version = version;
         Ok(())
+    }
+
+    fn ensure_fresh(&mut self) -> Result<(), AdminError> {
+        for _ in 0..3 {
+            let latest = self.admin.store_version()?;
+            if latest == self.observed_store_version {
+                return Ok(());
+            }
+            self.refresh_authorization(latest)?;
+            if self.admin.store_version()? == latest {
+                return Ok(());
+            }
+        }
+        Err(AdminError::Backend(
+            "policy changed repeatedly while refreshing".into(),
+        ))
     }
 }
 
@@ -766,17 +789,31 @@ async fn healthz() -> Json<serde_json::Value> {
 async fn authorize(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<AuthorizationRequest>,
-) -> Json<AuthorizationOutcome> {
-    let guard = lock(&state);
-    Json(guard.authz.authorize(&request))
+) -> Response {
+    let mut guard = lock(&state);
+    if guard.ensure_fresh().is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "policy_unavailable",
+            "Policy store is unavailable",
+        );
+    }
+    Json(guard.authz.authorize(&request)).into_response()
 }
 
 async fn authorize_batch(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<BatchAuthorizationRequest>,
-) -> Json<BatchAuthorizationResponse> {
-    let guard = lock(&state);
-    Json(guard.authz.authorize_batch(&request))
+) -> Response {
+    let mut guard = lock(&state);
+    if guard.ensure_fresh().is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "policy_unavailable",
+            "Policy store is unavailable",
+        );
+    }
+    Json(guard.authz.authorize_batch(&request)).into_response()
 }
 
 async fn check_entitlement(
@@ -797,7 +834,14 @@ async fn snapshot(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
-    let guard = lock(&state);
+    let mut guard = lock(&state);
+    if guard.ensure_fresh().is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "policy_unavailable",
+            "Policy store is unavailable",
+        );
+    }
     match query.since {
         Some(since) => match guard.authz.snapshot_since(since) {
             Some(snapshot) => Json(snapshot).into_response(),

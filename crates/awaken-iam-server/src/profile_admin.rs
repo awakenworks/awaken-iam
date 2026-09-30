@@ -256,6 +256,12 @@ impl AuthorizationProfileAdmin {
         );
         Ok(count)
     }
+
+    /// Read the active profiles from the shared store when another daemon has
+    /// advanced the policy fence.
+    pub fn durable_active_profiles(&self) -> Result<Vec<AuthorizationProfile>, ProfileAdminError> {
+        Ok(self.repository.active_profiles()?)
+    }
 }
 
 fn checksum(document: &AuthorizationProfileDocument) -> Result<String, ProfileAdminError> {
