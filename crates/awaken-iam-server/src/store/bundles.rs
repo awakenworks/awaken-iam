@@ -128,6 +128,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 (5, "initialize the singleton freshness fence", AUTHZ_0005),
                 (6, "persist Workspace to Org scope projections", AUTHZ_0006),
                 (7, "organization invitation lifecycle", AUTHZ_0007),
+                (
+                    8,
+                    "product projection ownership and resource tombstones",
+                    AUTHZ_0008,
+                ),
             ],
         ),
         bundle(
@@ -401,6 +406,61 @@ CREATE TABLE {prefix}_invitations (\
 CREATE INDEX {prefix}_invitations_org_idx \
  ON {prefix}_invitations (org_id, created_at);";
 
+// Stream coordinates and ownership are durable so retries after a daemon
+// restart cannot restore an older grant. The owner tables also fence a product
+// projection from replacing another stream's grant or resource edge.
+const AUTHZ_0008: &str = "\
+CREATE TABLE {prefix}_resource_projection_streams (\
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ idempotency_key TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ payload_digest TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ grant_ids {json} NOT NULL, \
+ edge_keys {json} NOT NULL, \
+ PRIMARY KEY (product_id, org_id, projection_id));\n\
+CREATE TABLE {prefix}_resource_projection_keys (\
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ idempotency_key TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ payload_digest TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ PRIMARY KEY (product_id, org_id, idempotency_key));\n\
+CREATE TABLE {prefix}_resource_projection_grant_owners (\
+ grant_id TEXT PRIMARY KEY, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL);\n\
+CREATE TABLE {prefix}_resource_projection_edge_owners (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));\n\
+CREATE TABLE {prefix}_resource_projection_tombstones (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));\n\
+CREATE TABLE {prefix}_product_resource_types (\
+ product_id TEXT NOT NULL, \
+ resource_type TEXT NOT NULL, \
+ parent_type TEXT, \
+ actions {json} NOT NULL, \
+ PRIMARY KEY (product_id, resource_type));\n\
+CREATE TABLE {prefix}_product_actions (\
+ product_id TEXT NOT NULL, \
+ action_key TEXT NOT NULL, \
+ PRIMARY KEY (product_id, action_key));";
+
 // User-visible placement is independent from both the fixed compatibility
 // ScopeRef shapes and product business tables. An empty `parent_id` is the
 // portable SQL root sentinel, allowing any number of roots inside one immutable
@@ -514,7 +574,88 @@ CREATE TABLE {prefix}_audit_events (\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{SqlConn, SqliteBackend};
+    use crate::store::{SqlConn, SqliteBackend, sqlite_in_memory_store};
+
+    #[test]
+    fn projection_migration_applies_and_fences_cross_stream_ownership() {
+        let store = sqlite_in_memory_store("iam").expect("migrate all IAM bundles");
+        let backend = store.backend();
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_grant_owners \
+             (grant_id, product_id, org_id, projection_id) VALUES (?, ?, ?, ?)",
+                &[
+                    Some("grant-1".into()),
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("campus:1".into()),
+                ],
+            )
+            .expect("first owner");
+        assert!(
+            backend
+                .execute(
+                    "INSERT INTO iam_resource_projection_grant_owners \
+             (grant_id, product_id, org_id, projection_id) VALUES (?, ?, ?, ?)",
+                    &[
+                        Some("grant-1".into()),
+                        Some("tutor".into()),
+                        Some("org-b".into()),
+                        Some("staff:2".into())
+                    ],
+                )
+                .is_err()
+        );
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_keys \
+             (product_id, org_id, idempotency_key, projection_id, epoch, payload_digest, version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("event-1".into()),
+                    Some("campus:1".into()),
+                    Some("1".into()),
+                    Some("digest-a".into()),
+                    Some("2".into()),
+                ],
+            )
+            .expect("first idempotency key");
+        assert!(
+            backend
+                .execute(
+                    "INSERT INTO iam_resource_projection_keys \
+             (product_id, org_id, idempotency_key, projection_id, epoch, payload_digest, version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        Some("tutor".into()),
+                        Some("org-a".into()),
+                        Some("event-1".into()),
+                        Some("staff:2".into()),
+                        Some("2".into()),
+                        Some("digest-b".into()),
+                        Some("3".into())
+                    ],
+                )
+                .is_err()
+        );
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_tombstones \
+             (resource_type, resource_id, product_id, org_id, projection_id, epoch) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+                &[
+                    Some("tutor.campus".into()),
+                    Some("1".into()),
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("campus:1".into()),
+                    Some("2".into()),
+                ],
+            )
+            .expect("retirement survives in migrated schema");
+    }
 
     #[test]
     fn directory_v3_preserves_rows_and_scopes_identity_and_revision_by_org() {

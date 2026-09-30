@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActionKey, AuthorizationDecision, AuthorizationRequest, EntitlementDecision, NamespaceId,
-    OrgId, PrincipalRef, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
+    OrgId, PrincipalRef, ProductId, ResourceId, ResourceType, ScopeRef, SignerKey, WorkspaceId,
 };
 
 /// Liveness status of an authenticated API token.
@@ -280,6 +280,15 @@ pub struct ScopeGraphSnapshot {
     pub workspace_orgs: Vec<WorkspaceOrgEdge>,
     /// Open-resource parent edges.
     pub resource_parents: Vec<ResourceParentEdge>,
+    /// Permanently retired resources. No grant may authorize an exact retired resource.
+    #[serde(default)]
+    pub retired_resources: Vec<RetiredResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredResource {
+    pub resource_type: ResourceType,
+    pub resource_id: ResourceId,
 }
 
 /// Wire shape of one resource type a consumer registers.
@@ -301,15 +310,15 @@ pub struct ResourceTypeRegistration {
     pub actions: Vec<ActionKey>,
 }
 
-/// Request body for `POST /v1/authz/resource-model`.
+/// Reusable resource-model vocabulary and in-process edge registration.
 ///
 /// A consumer teaches IAM its hierarchy and vocabulary **as data**: the resource
 /// types it anchors grants at, any standalone actions, and the per-instance
 /// scope parent edges that let the evaluator resolve open
 /// [`ScopeRef::Resource`](crate::ScopeRef::Resource) scopes through the same
-/// ancestor walk used for the well-known scopes. Registration is additive and
-/// idempotent: re-registering a type replaces its definition and re-registering
-/// an edge replaces that instance's parent.
+/// ancestor walk used for the well-known scopes. The guarded daemon route
+/// wraps this in [`ProductResourceModelRequest`] and accepts vocabulary only;
+/// instance edges must use a versioned [`ResourceProjectionBatch`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceModelRegistration {
     /// Resource types the consumer registers, with their declared actions.
@@ -332,6 +341,14 @@ pub struct ResourceModelRegistration {
 pub struct ResourceModelRegistered {
     /// Monotonic policy version after the registration was applied.
     pub version: u64,
+}
+
+/// Product-scoped vocabulary registration for the daemon's guarded route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductResourceModelRequest {
+    pub product_id: ProductId,
+    pub resource_model: ResourceModelRegistration,
 }
 
 /// Versioned snapshot of the authorization policy served for local-mode sync.
@@ -395,12 +412,10 @@ pub struct SignerSetSnapshot {
 /// consumer applies the same payload directly inside the single shared-database
 /// transaction instead.
 ///
-/// Propagation is **idempotent**: the `idempotency_key` (a deterministic
-/// function of the created resource, e.g. its id) lets IAM collapse a redelivery
-/// — inevitable under at-least-once relay — to a no-op, and the carried grants
-/// upsert by their own ids regardless. The `epoch` is the consumer's monotonic
-/// resource epoch at mint time; it rides the `version`/`epoch` fence so a stale
-/// redelivery can never resurrect a grant a later revocation already retired.
+/// The legacy applier upserts grants and edges by their own ids. It does not
+/// persist the idempotency key or enforce the carried epoch. Consumers that
+/// need replacement, revocation, or retirement must use a persisted
+/// [`ResourceProjectionBatch`] stream instead.
 /// Eventual consistency is safe because authorization fails closed: until this
 /// payload lands, a request against the new resource simply matches no grant and
 /// is denied — it never over-permits.
@@ -409,12 +424,58 @@ pub struct ResourceProvision {
     /// Deterministic dedup key for the resource-create event (e.g. the resource
     /// id), so an at-least-once redelivery collapses to a no-op.
     pub idempotency_key: String,
-    /// Consumer's monotonic resource epoch at mint time, fencing stale replays.
+    /// Consumer's resource epoch at mint time; the legacy applier ignores it.
     pub epoch: u64,
     /// Grants that make the new resource authorizable, upserted by grant id.
     pub grants: Vec<GrantSnapshot>,
     /// Scope-graph parent edges anchoring the new resource in the hierarchy.
     pub scope_edges: Vec<ResourceParentEdge>,
+}
+
+/// Complete desired authorization state for one product-owned projection stream.
+///
+/// `projection_id` is stable across changes to the same campus or staff member;
+/// `epoch` increases on each change. IAM atomically replaces grants and edges
+/// owned by that stream, so a delayed older delivery cannot restore retired
+/// access. This is the wire body for `POST /v1/authz/resource-provisions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceProjectionBatch {
+    pub product_id: ProductId,
+    pub org_id: OrgId,
+    pub projection_id: String,
+    pub idempotency_key: String,
+    pub epoch: u64,
+    pub grants: Vec<GrantSnapshot>,
+    pub scope_edges: Vec<ResourceParentEdge>,
+    pub retirements: Vec<ResourceRetirement>,
+}
+
+/// Retire one product resource and the grants that made it authorizable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRetirement {
+    pub resource_type: ResourceType,
+    pub resource_id: ResourceId,
+    pub grant_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProjectionDisposition {
+    Applied,
+    Replayed,
+    Stale,
+}
+
+/// IAM policy version and disposition returned for the submitted stream epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceProjectionReceipt {
+    pub idempotency_key: String,
+    pub epoch: u64,
+    pub version: u64,
+    pub disposition: ResourceProjectionDisposition,
 }
 
 #[cfg(test)]
@@ -549,6 +610,7 @@ mod tests {
                         namespace_id: NamespaceId("acme".into()),
                     },
                 }],
+                retired_resources: Vec::new(),
             },
             active_profiles: Vec::new(),
         };
@@ -658,6 +720,40 @@ mod tests {
     }
 
     #[test]
+    fn product_projection_wire_requires_stream_and_round_trips_retirement() {
+        let body = serde_json::json!({
+            "product_id": "tutor", "org_id": "acme", "projection_id": "campus:c1",
+            "idempotency_key": "campus:c1:2", "epoch": 2,
+            "grants": [], "scope_edges": [],
+            "retirements": [{"resource_type": "tutor.campus", "resource_id": "c1",
+                "grant_ids": ["tutor:campus:c1:creator"]}]
+        });
+        let parsed: ResourceProjectionBatch = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+        assert_eq!(parsed.product_id.as_str(), "tutor");
+        assert_eq!(parsed.retirements.len(), 1);
+        let mut missing_stream = body.clone();
+        missing_stream
+            .as_object_mut()
+            .unwrap()
+            .remove("projection_id");
+        assert!(serde_json::from_value::<ResourceProjectionBatch>(missing_stream).is_err());
+        let mut unknown = body;
+        unknown["untrusted_owner"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<ResourceProjectionBatch>(unknown).is_err());
+        let receipt = ResourceProjectionReceipt {
+            idempotency_key: parsed.idempotency_key,
+            epoch: parsed.epoch,
+            version: 7,
+            disposition: ResourceProjectionDisposition::Replayed,
+        };
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap()["disposition"],
+            "replayed"
+        );
+    }
+
+    #[test]
     fn snapshot_without_group_fields_defaults_to_empty() {
         // A snapshot minted before groups became a subject omits the new fields;
         // it must still deserialize, with empty group rosters and bindings.
@@ -665,5 +761,6 @@ mod tests {
         let parsed: PolicySnapshot = serde_json::from_str(legacy).unwrap();
         assert!(parsed.group_rosters.is_empty());
         assert!(parsed.group_role_bindings.is_empty());
+        assert!(parsed.scope_graph.retired_resources.is_empty());
     }
 }

@@ -31,7 +31,9 @@ pub use access_token::{
     verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi, PolicyStore};
-pub use admin_http::{AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router};
+pub use admin_http::{
+    AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router, projection_router,
+};
 pub use anthropic_admin::{
     ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,
     DEFAULT_PAGE_LIMIT, FEDERATION_ISSUER_ID_PREFIX, FEDERATION_RULE_ID_PREFIX, FederationIssuer,

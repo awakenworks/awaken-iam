@@ -30,7 +30,7 @@ use awaken_iam_core::{
 };
 use awaken_iam_server::{
     AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi, SqliteBackend,
-    daemon_router, http, jwks_router, op_router, sqlite_migrated_store,
+    daemon_router, http, jwks_router, op_router, projection_router, sqlite_migrated_store,
 };
 
 #[tokio::main]
@@ -90,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (*profile_store).clone(),
         capability_tokens,
     )?));
-    let router = daemon_router(state)
+    let router = daemon_router(state.clone())
+        .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))
         .merge(op_router(auth, issuer));
 

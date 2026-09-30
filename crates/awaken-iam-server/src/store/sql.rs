@@ -42,6 +42,7 @@ use super::{Fence, FenceStore};
 mod directory;
 mod identity_rows;
 mod privacy;
+mod projections;
 
 use identity_rows::*;
 
@@ -1152,10 +1153,12 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
              VALUES (?, ?j, ?, ?j, ?) \
              ON CONFLICT (id) DO UPDATE SET subject = excluded.subject, \
              action_pattern = excluded.action_pattern, scope = excluded.scope, \
-             effect = excluded.effect",
-            t = self.table("grants")
+             effect = excluded.effect \
+             WHERE NOT EXISTS (SELECT 1 FROM {owners} WHERE grant_id = excluded.id)",
+            t = self.table("grants"),
+            owners = self.table("resource_projection_grant_owners")
         );
-        self.backend.execute(
+        if self.backend.execute(
             &sql,
             &[
                 p(grant.id.0),
@@ -1164,7 +1167,12 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
                 p(scope),
                 p(encode_effect(grant.effect)),
             ],
-        )?;
+        )? == 0
+        {
+            return Err(RepositoryError::Conflict(
+                "grant belongs to a product projection".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1192,8 +1200,17 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("grants"));
-        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
+        let sql = format!(
+            "DELETE FROM {grants} WHERE id = ? AND NOT EXISTS \
+            (SELECT 1 FROM {owners} WHERE grant_id = ?)",
+            grants = self.table("grants"),
+            owners = self.table("resource_projection_grant_owners")
+        );
+        if self
+            .backend
+            .execute(&sql, &[p(id.0.clone()), p(id.0.clone())])?
+            == 0
+        {
             return Err(RepositoryError::NotFound(format!(
                 "grant {} not found",
                 id.0
@@ -1460,17 +1477,45 @@ fn encode_invitation_status(status: InvitationStatus) -> &'static str {
 }
 
 impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
+    fn list_retired_resources(
+        &self,
+    ) -> RepositoryResult<Vec<awaken_iam_contract::RetiredResource>> {
+        let rows = self.backend.query(
+            &format!(
+                "SELECT resource_type, resource_id FROM {} ORDER BY resource_type, resource_id",
+                self.table("resource_projection_tombstones")
+            ),
+            &[],
+        )?;
+        rows.iter()
+            .map(|row| {
+                Ok(awaken_iam_contract::RetiredResource {
+                    resource_type: ResourceType(req(row, 0, "retired resource type")?),
+                    resource_id: ResourceId(req(row, 1, "retired resource id")?),
+                })
+            })
+            .collect()
+    }
+
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
         let parent = json_encode(&edge.parent, "edge parent")?;
         let sql = format!(
             "INSERT INTO {t} (resource_type, resource_id, parent) VALUES (?, ?, ?j) \
-             ON CONFLICT (resource_type, resource_id) DO UPDATE SET parent = excluded.parent",
-            t = self.table("resource_edges")
+             ON CONFLICT (resource_type, resource_id) DO UPDATE SET parent = excluded.parent \
+             WHERE NOT EXISTS (SELECT 1 FROM {owners} WHERE resource_type = excluded.resource_type \
+             AND resource_id = excluded.resource_id)",
+            t = self.table("resource_edges"),
+            owners = self.table("resource_projection_edge_owners")
         );
-        self.backend.execute(
+        if self.backend.execute(
             &sql,
             &[p(edge.resource_type.0), p(edge.resource_id.0), p(parent)],
-        )?;
+        )? == 0
+        {
+            return Err(RepositoryError::Conflict(
+                "resource edge belongs to a product projection".into(),
+            ));
+        }
         Ok(())
     }
 

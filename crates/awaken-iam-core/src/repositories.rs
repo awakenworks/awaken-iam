@@ -380,6 +380,12 @@ pub trait ResourceModelRepository: Send + Sync {
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()>;
     /// List every registered parent edge.
     fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>>;
+    /// List persisted resource tombstones for authorization evaluation.
+    fn list_retired_resources(
+        &self,
+    ) -> RepositoryResult<Vec<awaken_iam_contract::RetiredResource>> {
+        Ok(Vec::new())
+    }
     /// Persist or replace one well-known Workspace → Org scope edge.
     fn put_workspace_org(&self, _edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
         Err(RepositoryError::Backend(

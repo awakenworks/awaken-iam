@@ -53,14 +53,15 @@ use awaken_iam_contract::{
     DirectoryChildrenQuery, DirectoryNodeId, DirectoryRevisionQuery, EnsureProductSpacePlacement,
     EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
     InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
-    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
-    ReplaceScopedMemberships, ResendInvitation, RetireAuthorizationProfile,
-    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
-    UpdateDirectoryNode, WorkspaceOrgEdge,
+    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductResourceModelRequest,
+    ProductSpacePlacementQuery, ReplaceScopedMemberships, ResendInvitation,
+    ResourceProjectionBatch, RetireAuthorizationProfile, RetireProductSpacePlacement,
+    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode,
+    WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    ActionPattern, AuthorizationProfileRepository, Effect, Grant, GrantId, GrantSubject, Group,
-    GroupId, Organization, PolicySet, RoleBinding, RoleDef, RoleId,
+    ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
+    GrantSubject, Group, GroupId, Organization, PolicySet, RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -72,12 +73,14 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::store::ResourceProjectionStore;
 use crate::{
     AccessTokenAuthority, AdminCredential, AdminError, AuthorizationProfileAdmin, CapabilityCheck,
     LeaseEpoch, MintCapability, PolicyAdminApi, PolicyStore, ProfileAdminError, mint_capability,
     verify_capability,
 };
 use awaken_iam_contract::GrantEffect;
+use awaken_iam_core::RepositoryError;
 
 /// Who may administer policy over the wire.
 ///
@@ -311,6 +314,184 @@ where
             post(rollback_profile),
         )
         .with_state(state)
+}
+
+/// Mount product-scoped resource-model and versioned projection commands beside
+/// the generic daemon router. Only durable projection stores implement this
+/// extension; callers cannot accidentally serve the route over an unversioned
+/// in-memory adapter.
+pub fn projection_router<S>(state: SharedDaemonState<S>) -> Router
+where
+    S: PolicyStore + ResourceProjectionStore + 'static,
+{
+    Router::new()
+        .route(
+            "/v1/authz/resource-model",
+            post(register_product_resource_model::<S>),
+        )
+        .route(
+            "/v1/authz/resource-provisions",
+            post(project_product_resources::<S>),
+        )
+        .with_state(state)
+}
+
+async fn register_product_resource_model<S: PolicyStore + ResourceProjectionStore>(
+    State(state): State<SharedDaemonState<S>>,
+    headers: HeaderMap,
+    Json(request): Json<ProductResourceModelRequest>,
+) -> Response {
+    let mut guard = lock(&state);
+    if let Some(rejection) =
+        authorize_product_projection(&guard.auth, &headers, &request.product_id)
+    {
+        if directory_credential_access(&guard.auth, &headers).is_ok() {
+            if audit_projection_rejection(
+                guard.admin.store(),
+                &headers,
+                request.product_id.as_str(),
+                "resource-model",
+                "credential_scope",
+            )
+            .is_err()
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "audit_error",
+                    "rejection audit failed",
+                );
+            }
+        }
+        return rejection;
+    }
+    match guard.admin.store().register_product_model(&request) {
+        Ok(receipt) => match guard.refresh_authorization(receipt.version) {
+            Ok(()) => Json(receipt).into_response(),
+            Err(error) => admin_error_response(&error),
+        },
+        Err(error) => {
+            if audit_projection_rejection(
+                guard.admin.store(),
+                &headers,
+                request.product_id.as_str(),
+                "resource-model",
+                &error.to_string(),
+            )
+            .is_err()
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "audit_error",
+                    "rejection audit failed",
+                );
+            }
+            projection_error_response(error)
+        }
+    }
+}
+
+async fn project_product_resources<S: PolicyStore + ResourceProjectionStore>(
+    State(state): State<SharedDaemonState<S>>,
+    headers: HeaderMap,
+    Json(batch): Json<ResourceProjectionBatch>,
+) -> Response {
+    let mut guard = lock(&state);
+    if let Some(rejection) = authorize_product_projection(&guard.auth, &headers, &batch.product_id)
+    {
+        if directory_credential_access(&guard.auth, &headers).is_ok() {
+            if audit_projection_rejection(
+                guard.admin.store(),
+                &headers,
+                batch.product_id.as_str(),
+                &batch.projection_id,
+                "credential_scope",
+            )
+            .is_err()
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "audit_error",
+                    "rejection audit failed",
+                );
+            }
+        }
+        return rejection;
+    }
+    match guard.admin.store().apply_projection(&batch) {
+        Ok(receipt) => match guard.refresh_authorization(receipt.version) {
+            Ok(()) => Json(receipt).into_response(),
+            Err(error) => admin_error_response(&error),
+        },
+        Err(error) => {
+            if audit_projection_rejection(
+                guard.admin.store(),
+                &headers,
+                batch.product_id.as_str(),
+                &batch.projection_id,
+                &error.to_string(),
+            )
+            .is_err()
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "audit_error",
+                    "rejection audit failed",
+                );
+            }
+            projection_error_response(error)
+        }
+    }
+}
+
+fn authorize_product_projection(
+    auth: &AdminAuthPolicy,
+    headers: &HeaderMap,
+    product: &ProductId,
+) -> Option<Response> {
+    match directory_credential_access(auth, headers) {
+        Ok(DirectoryCredentialAccess::Administrator) => None,
+        Ok(DirectoryCredentialAccess::Product(owned)) if &owned == product => None,
+        Ok(DirectoryCredentialAccess::Product(_)) => Some(error_response(
+            StatusCode::FORBIDDEN,
+            "product_mismatch",
+            "credential belongs to another product",
+        )),
+        Err(rejection) => Some(rejection.into_response()),
+    }
+}
+
+fn projection_error_response(error: RepositoryError) -> Response {
+    match error {
+        RepositoryError::Conflict(detail) => {
+            error_response(StatusCode::CONFLICT, "projection_conflict", &detail)
+        }
+        RepositoryError::NotFound(detail) => {
+            error_response(StatusCode::NOT_FOUND, "not_found", &detail)
+        }
+        RepositoryError::Backend(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "backend_error",
+            "resource projection failed",
+        ),
+    }
+}
+
+fn audit_projection_rejection<S: PolicyStore>(
+    store: &S,
+    headers: &HeaderMap,
+    product: &str,
+    projection: &str,
+    reason: &str,
+) -> Result<(), RepositoryError> {
+    AuditSink::record(
+        store,
+        AuditEvent {
+            at: now_timestamp(),
+            actor: Some(admin_actor(headers)),
+            action: "resource_projection.reject".into(),
+            detail: format!("product={product}; projection={projection}; reason={reason}"),
+        },
+    )
 }
 
 #[derive(Debug, Deserialize)]

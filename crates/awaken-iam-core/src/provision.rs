@@ -12,11 +12,12 @@
 //! - **Embedded** consumers call this directly inside their single shared-database
 //!   transaction, alongside the domain write.
 //!
-//! Either way application is **idempotent**: grants upsert by their own id
+//! Reapplying an identical create payload is idempotent: grants upsert by their own id
 //! through [`GrantRepository::put`] and each scope edge upserts by its
 //! `(resource_type, resource_id)` key through [`ResourceModelRepository::put_edge`], so
 //! re-applying an identical provision overwrites like with like and changes
-//! nothing. Edges are written before grants so a grant anchored at the new
+//! nothing. This function does not enforce an epoch or retire grants; callers
+//! must use a persisted versioned projection for revocable access. Edges are written before grants so a grant anchored at the new
 //! resource always resolves its ancestor scope the moment it lands — never a
 //! grant referencing an edge that is not yet present.
 

@@ -47,8 +47,10 @@ pub use protocol::{
     ApiTokenStatus, ApprovalAuthority, ApprovalObligation, AuthorizationOutcome,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect,
     GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
-    NamespaceOrgEdge, PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration,
-    ResourceParentEdge, ResourceProvision, ResourceTypeRegistration, RoleBindingSnapshot,
+    NamespaceOrgEdge, PolicySnapshot, ProductResourceModelRequest, ResourceModelRegistered,
+    ResourceModelRegistration, ResourceParentEdge, ResourceProjectionBatch,
+    ResourceProjectionDisposition, ResourceProjectionReceipt, ResourceProvision,
+    ResourceRetirement, ResourceTypeRegistration, RetiredResource, RoleBindingSnapshot,
     ScopeGraphSnapshot, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
     WorkspaceOrgEdge,
 };

@@ -788,6 +788,133 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
     assert_eq!(AccountRepository::list(&other).unwrap().len(), 0);
 }
 
+#[test]
+fn postgres_product_projection_is_atomic_and_fenced_when_configured() {
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = IsolatedPostgresSchema::create(&url, "iam_projection");
+    let store = postgres_migrated_store(&schema.url, "iam").expect("migrate projection schema");
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: OrgId("org-a".into()),
+            display_name: None,
+            owner: PrincipalRef::Service {
+                service_id: "owner".into(),
+            },
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        },
+    )
+    .unwrap();
+    ResourceModelRepository::put_workspace_org(
+        &store,
+        WorkspaceOrgEdge {
+            workspace_id: WorkspaceId("workspace-a".into()),
+            org_id: OrgId("org-a".into()),
+        },
+    )
+    .unwrap();
+    let model: awaken_iam_contract::ProductResourceModelRequest = serde_json::from_value(serde_json::json!({
+        "product_id": "tutor",
+        "resource_model": {
+            "resource_types": [{"resource_type": "tutor.campus", "actions": ["tutor.campus.manage"]}],
+            "actions": [], "edges": []
+        }
+    })).unwrap();
+    store.register_product_resource_model(&model).unwrap();
+    let created: awaken_iam_contract::ResourceProjectionBatch = serde_json::from_value(serde_json::json!({
+        "product_id":"tutor", "org_id":"org-a", "projection_id":"campus:1",
+        "idempotency_key":"campus:1:1", "epoch":1,
+        "grants":[{"id":"campus-1-manage","subject":{"kind":"principal","principal":{"kind":"service","service_id":"owner"}},
+            "action_pattern":"tutor.campus.manage", "scope":{"kind":"resource","resource_type":"tutor.campus","resource_id":"1"},"effect":"allow"}],
+        "scope_edges":[{"resource_type":"tutor.campus","resource_id":"1","parent":{"kind":"workspace","workspace_id":"workspace-a"}}],
+        "retirements":[]
+    })).unwrap();
+    let first = store.apply_resource_projection(&created).unwrap();
+    assert_eq!(
+        first.disposition,
+        awaken_iam_contract::ResourceProjectionDisposition::Applied
+    );
+    assert_eq!(GrantRepository::list(&store).unwrap().len(), 1);
+    let mut retired = created.clone();
+    retired.epoch = 2;
+    retired.idempotency_key = "campus:1:2".into();
+    retired.grants.clear();
+    retired.scope_edges.clear();
+    retired.retirements = vec![awaken_iam_contract::ResourceRetirement {
+        resource_type: ResourceType("tutor.campus".into()),
+        resource_id: ResourceId("1".into()),
+        grant_ids: vec!["campus-1-manage".into()],
+    }];
+    let second = store.apply_resource_projection(&retired).unwrap();
+    assert_eq!(second.version, first.version + 1);
+    assert!(GrantRepository::list(&store).unwrap().is_empty());
+    assert_eq!(
+        store
+            .apply_resource_projection(&created)
+            .unwrap()
+            .disposition,
+        awaken_iam_contract::ResourceProjectionDisposition::Stale
+    );
+    let start = Arc::new(Barrier::new(2));
+    let mut joins = Vec::new();
+    for suffix in ["2", "3"] {
+        let mut next = created.clone();
+        next.projection_id = format!("campus:{suffix}");
+        next.idempotency_key = format!("campus:{suffix}:1");
+        next.grants[0].id = format!("campus-{suffix}-manage");
+        next.grants[0].scope = ScopeRef::Resource {
+            resource_type: ResourceType("tutor.campus".into()),
+            resource_id: ResourceId(suffix.into()),
+        };
+        next.scope_edges[0].resource_id = ResourceId(suffix.into());
+        let sibling = store.clone();
+        let start = start.clone();
+        joins.push(thread::spawn(move || {
+            start.wait();
+            sibling.apply_resource_projection(&next).unwrap()
+        }));
+    }
+    let versions = joins
+        .into_iter()
+        .map(|join| join.join().unwrap().version)
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), 2);
+    assert_ne!(versions[0], versions[1]);
+    assert_eq!(GrantRepository::list(&store).unwrap().len(), 2);
+    let mut exact = created.clone();
+    exact.projection_id = "campus:4".into();
+    exact.idempotency_key = "campus:4:1".into();
+    exact.grants[0].id = "campus-4-manage".into();
+    exact.grants[0].scope = ScopeRef::Resource {
+        resource_type: ResourceType("tutor.campus".into()),
+        resource_id: ResourceId("4".into()),
+    };
+    exact.scope_edges[0].resource_id = ResourceId("4".into());
+    let start = Arc::new(Barrier::new(2));
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let sibling = store.clone();
+        let duplicate = exact.clone();
+        let start = start.clone();
+        joins.push(thread::spawn(move || {
+            start.wait();
+            sibling.apply_resource_projection(&duplicate).unwrap()
+        }));
+    }
+    let receipts = joins
+        .into_iter()
+        .map(|join| join.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts[0].version, receipts[1].version);
+    assert!(receipts.iter().any(|receipt| receipt.disposition
+        == awaken_iam_contract::ResourceProjectionDisposition::Applied));
+    assert!(receipts.iter().any(|receipt| receipt.disposition
+        == awaken_iam_contract::ResourceProjectionDisposition::Replayed));
+}
+
 #[tokio::test]
 async fn postgres_backend_serves_every_repository_when_configured() {
     // Cause/effect graph: C1=the complete Postgres port suite runs inside an

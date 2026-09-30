@@ -996,6 +996,11 @@ where
                 edge.parent,
             );
         }
+        for retired in ResourceModelRepository::list_retired_resources(&self.store)? {
+            policy
+                .scope_graph_mut()
+                .retire_resource(retired.resource_type, retired.resource_id);
+        }
         for edge in ResourceModelRepository::list_workspace_orgs(&self.store)? {
             policy
                 .scope_graph_mut()
