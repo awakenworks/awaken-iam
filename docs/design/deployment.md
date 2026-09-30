@@ -133,18 +133,20 @@ embedded:   host builds the shared pool (Postgres) or opens a SQLite connection
             -> in-process callers use the local IamClient (no network hop)
             -> policy administration stays in-process (no /v1/admin/* seam)
 
-standalone: iam-daemon opens its own store (SQLite in the current binary;
-            Postgres is the cloud/HA target)
+standalone: iam-daemon opens its own store (Postgres for cloud/HA;
+            SQLite for local single-node use)
             -> IamStore::with_prefix(pool, "iam"); store.migrate()
             -> serve the canonical /v1 API plus the /v1/admin/* admin seam
             -> remote callers use the remote IamClient; the console administers
                policy over /v1/admin/*
 ```
 
-The current `iam-daemon` binary wires a persistent SQLite store through
-`IAM_DATABASE_PATH`. The shared SQL adapter and resource-projection transaction
-are also tested against Postgres, but the binary's Postgres DSN selection and
-multi-replica deployment wiring remain a separate release gate. Set
+The `iam-daemon` binary selects PostgreSQL through `IAM_DATABASE_URL`; when it
+is absent, `IAM_DATABASE_PATH` selects a persistent SQLite file. Both paths
+run the same migration bundles and resource-projection transaction. The
+PostgreSQL daemon has been exercised over real HTTP with Tutor and restarted
+against the same database; production replica rollout and credential management
+remain deployment gates. Set
 `IAM_DIRECTORY_PRODUCT_TOKENS=tutor=<secret>` for Tutor's product-scoped
 resource-model and versioned projection requests; `IAM_ADMIN_TOKEN` remains
 independent for organization, workspace and global policy administration.

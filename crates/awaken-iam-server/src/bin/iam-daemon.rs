@@ -22,6 +22,8 @@
 //! - `IAM_DIRECTORY_PRODUCT_TOKENS` — comma-separated `product_id=token`
 //!   credentials allowed to ensure/query only that product's Directory spaces
 //!   and register/project its own authorization resource model.
+//! - `IAM_DATABASE_URL` — PostgreSQL DSN for the standalone store. When absent,
+//!   `IAM_DATABASE_PATH` selects the single-node SQLite file (default `iam.sqlite`).
 
 use std::sync::{Arc, Mutex};
 
@@ -30,8 +32,9 @@ use awaken_iam_core::{
     AuthCodeRepository, OAuthClientRepository, RegisteredClient, SessionRepository,
 };
 use awaken_iam_server::{
-    AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi, SqliteBackend,
-    daemon_router, http, jwks_router, op_router, projection_router, sqlite_migrated_store,
+    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor, SharedAuthApi,
+    SqlConn, SqlStore, SqliteBackend, daemon_router, http, jwks_router, op_router,
+    postgres_migrated_store, projection_router, sqlite_migrated_store,
 };
 
 #[tokio::main]
@@ -44,12 +47,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut auth, authz) = daemon.into_assembly().into_auth_and_authz();
     let issuer = std::env::var("IAM_ISSUER").unwrap_or_else(|_| format!("http://{bind_addr}"));
     auth = auth.with_issuer(issuer.clone());
-    let database_path =
-        std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
-    let profile_store = Arc::new(sqlite_migrated_store(
-        SqliteBackend::open_path(&database_path)?,
-        "iam",
-    )?);
+    let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
+    if let Some(database_url) = std::env::var("IAM_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    {
+        let store = Arc::new(postgres_migrated_store(&database_url, "iam")?);
+        serve(auth, authz, store, admin_auth, issuer, bind_addr).await
+    } else {
+        let database_path =
+            std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
+        let store = Arc::new(sqlite_migrated_store(
+            SqliteBackend::open_path(&database_path)?,
+            "iam",
+        )?);
+        serve(auth, authz, store, admin_auth, issuer, bind_addr).await
+    }
+}
+
+async fn serve<B: SqlConn + Clone + 'static>(
+    mut auth: AuthApi,
+    authz: AuthzApi,
+    profile_store: Arc<SqlStore<B>>,
+    admin_auth: AdminAuthPolicy,
+    issuer: String,
+    bind_addr: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let sessions: Arc<dyn SessionRepository> = profile_store.clone();
     let oauth_clients: Arc<dyn OAuthClientRepository> = profile_store.clone();
     let oauth_codes: Arc<dyn AuthCodeRepository> = profile_store.clone();
@@ -83,7 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
-    let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
     let state = Arc::new(Mutex::new(DaemonState::with_policy_store(
         authz,
         admin_auth,
