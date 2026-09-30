@@ -133,12 +133,21 @@ embedded:   host builds the shared pool (Postgres) or opens a SQLite connection
             -> in-process callers use the local IamClient (no network hop)
             -> policy administration stays in-process (no /v1/admin/* seam)
 
-standalone: iam-daemon builds its own pool (Postgres for cloud/HA)
+standalone: iam-daemon opens its own store (SQLite in the current binary;
+            Postgres is the cloud/HA target)
             -> IamStore::with_prefix(pool, "iam"); store.migrate()
             -> serve the canonical /v1 API plus the /v1/admin/* admin seam
             -> remote callers use the remote IamClient; the console administers
                policy over /v1/admin/*
 ```
+
+The current `iam-daemon` binary wires a persistent SQLite store through
+`IAM_DATABASE_PATH`. The shared SQL adapter and resource-projection transaction
+are also tested against Postgres, but the binary's Postgres DSN selection and
+multi-replica deployment wiring remain a separate release gate. Set
+`IAM_DIRECTORY_PRODUCT_TOKENS=tutor=<secret>` for Tutor's product-scoped
+resource-model and versioned projection requests; `IAM_ADMIN_TOKEN` remains
+independent for organization, workspace and global policy administration.
 
 `store.migrate()` renders each bundle's dialect-neutral DDL for the active
 backend; see [ADR-0003](../adr/0003-storage-backends.md) for the type-token
@@ -176,4 +185,3 @@ stay storage-free, preserving the [guardrails](../../AGENTS.md): the core
 declares repository contracts; only the edge knows SQL. The process-memory
 adapter backs tests only. A local client is a call mode, not a persistence mode;
 deployed local composition still uses migrated SQLite.
-

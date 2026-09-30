@@ -20,7 +20,8 @@
 //!   admin seam is still served but fails closed — every admin call is rejected —
 //!   so the daemon never exposes an unauthenticated control plane by default.
 //! - `IAM_DIRECTORY_PRODUCT_TOKENS` — comma-separated `product_id=token`
-//!   credentials allowed to ensure/query only that product's Directory spaces.
+//!   credentials allowed to ensure/query only that product's Directory spaces
+//!   and register/project its own authorization resource model.
 
 use std::sync::{Arc, Mutex};
 
