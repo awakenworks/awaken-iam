@@ -430,19 +430,21 @@ pub trait AuthorizationProfileRepository: Send + Sync {
         revision: u64,
         lifecycle: ProfileLifecycle,
     ) -> RepositoryResult<()>;
-    /// Atomically compare-and-set the active revision, returning its predecessor.
+    /// Atomically compare-and-set the active revision and advance the shared
+    /// policy fence, returning the predecessor and committed policy version.
     fn activate_profile(
         &self,
         namespace: &NamespaceId,
         revision: u64,
         expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>>;
-    /// Compare-and-set removal of one active head while retaining the revision.
+    ) -> RepositoryResult<(Option<u64>, u64)>;
+    /// Compare-and-set removal of one active head while retaining the revision,
+    /// and advance the shared policy fence in the same transaction.
     fn retire_active_profile(
         &self,
         namespace: &NamespaceId,
         expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile>;
+    ) -> RepositoryResult<(AuthorizationProfile, u64)>;
     /// Resolve the active revision for a namespace.
     fn active_profile(
         &self,

@@ -957,7 +957,7 @@ impl AuthorizationProfileRepository for InMemoryStore {
         namespace: &NamespaceId,
         revision: u64,
         expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>> {
+    ) -> RepositoryResult<(Option<u64>, u64)> {
         let mut authz = self.authz.lock().unwrap();
         let target = authz
             .profiles
@@ -981,14 +981,16 @@ impl AuthorizationProfileRepository for InMemoryStore {
             profile.lifecycle = ProfileLifecycle::Retired;
         }
         authz.active_profiles.insert(namespace.0.clone(), revision);
-        Ok(previous)
+        let mut fence = self.fence.lock().unwrap();
+        fence.version += 1;
+        Ok((previous, fence.version))
     }
 
     fn retire_active_profile(
         &self,
         namespace: &NamespaceId,
         expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile> {
+    ) -> RepositoryResult<(AuthorizationProfile, u64)> {
         let mut authz = self.authz.lock().unwrap();
         let Some(active_revision) = authz.active_profiles.get(&namespace.0).copied() else {
             return Err(RepositoryError::NotFound(
@@ -1014,7 +1016,10 @@ impl AuthorizationProfileRepository for InMemoryStore {
             .get_mut(&(namespace.0.clone(), active_revision))
             .expect("profile existence checked while holding the same lock");
         profile.lifecycle = ProfileLifecycle::Retired;
-        Ok(profile.clone())
+        let retired = profile.clone();
+        let mut fence = self.fence.lock().unwrap();
+        fence.version += 1;
+        Ok((retired, fence.version))
     }
 
     fn active_profile(

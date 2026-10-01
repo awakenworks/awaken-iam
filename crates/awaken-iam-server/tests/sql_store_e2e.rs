@@ -9,24 +9,26 @@
 //! the ADR promises. Selecting the backend is configuration, not a code fork.
 
 use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, CreateDirectoryNode,
-    DirectoryNodeId, EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims,
-    ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderKey,
-    MoveDirectoryNode, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId,
-    ProductSpacePlacement, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
+    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
+    AuthorizationProfileDocument, CreateDirectoryNode, DirectoryNodeId,
+    EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
+    ExternalIdentityKey, ExternalSubject, IdentityProviderKey, MoveDirectoryNode, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId, ProductSpacePlacement,
+    ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType, ScopeRef, Session, SessionId,
     Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
-    AuditSink, AuthCodeRepository, DirectoryNode, DirectoryRepository, Effect,
-    ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
-    GroupRepository, LoginFlowRepository, OAuthClientRepository, OrgRepository, Organization, Plan,
-    PlanId, PlanRepository, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient,
-    RepositoryError, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
-    RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
+    AuditSink, AuthCodeRepository, AuthorizationProfileRepository, DirectoryNode,
+    DirectoryRepository, Effect, ExternalIdentityRepository, Grant, GrantId, GrantRepository,
+    GrantSubject, Group, GroupId, GroupRepository, LoginFlowRepository, OAuthClientRepository,
+    OrgRepository, Organization, Plan, PlanId, PlanRepository, PlanTier, Quota, RateLimit,
+    RateWindow, RegisteredClient, RepositoryError, ResourceEdge, ResourceModelRepository,
+    RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository, SessionRepository,
+    StoredAuthorizationCode,
 };
 use awaken_iam_server::{
-    DirectoryApi, DirectoryCommandContext, PostgresBackend, SqlConn, SqlStore,
+    DirectoryApi, DirectoryCommandContext, FenceStore, PostgresBackend, SqlConn, SqlStore,
     postgres_migrated_store, sqlite_in_memory_store,
 };
 use std::sync::{Arc, Barrier};
@@ -786,6 +788,69 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
     AccountRepository::upsert(&iam, account("only-in-iam")).unwrap();
     assert_eq!(AccountRepository::list(&iam).unwrap().len(), 1);
     assert_eq!(AccountRepository::list(&other).unwrap().len(), 0);
+}
+
+#[test]
+fn postgres_profile_head_and_policy_version_commit_together_when_configured() {
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = IsolatedPostgresSchema::create(&url, "iam_profile_fence");
+    let writer = postgres_migrated_store(&schema.url, "iam").expect("migrate profile schema");
+    let reader = postgres_migrated_store(&schema.url, "iam").expect("open second store handle");
+    let namespace = NamespaceId("awaken.runtime".into());
+    for revision in 1..=2 {
+        writer
+            .create_profile(AuthorizationProfile {
+                namespace: namespace.clone(),
+                revision,
+                lifecycle: ProfileLifecycle::Validated,
+                document: AuthorizationProfileDocument::default(),
+                checksum: format!("revision-{revision}"),
+                created_at: ts("2026-10-01T00:00:00Z"),
+            })
+            .expect("create validated profile");
+    }
+    assert_eq!(reader.fence().unwrap().version, 1);
+    assert_eq!(
+        writer.activate_profile(&namespace, 1, None).unwrap(),
+        (None, 2)
+    );
+    assert_eq!(reader.fence().unwrap().version, 2);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        1
+    );
+
+    assert!(matches!(
+        writer.activate_profile(&namespace, 2, None),
+        Err(RepositoryError::Conflict(_))
+    ));
+    assert_eq!(reader.fence().unwrap().version, 2);
+    assert_eq!(
+        writer.activate_profile(&namespace, 2, Some(1)).unwrap(),
+        (Some(1), 3)
+    );
+    assert_eq!(reader.fence().unwrap().version, 3);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        2
+    );
+
+    assert!(matches!(
+        writer.retire_active_profile(&namespace, 1),
+        Err(RepositoryError::Conflict(_))
+    ));
+    assert_eq!(reader.fence().unwrap().version, 3);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        2
+    );
+    let (retired, version) = writer.retire_active_profile(&namespace, 2).unwrap();
+    assert_eq!(retired.revision, 2);
+    assert_eq!(version, 4);
+    assert_eq!(reader.fence().unwrap().version, 4);
+    assert!(reader.active_profile(&namespace).unwrap().is_none());
 }
 
 #[test]

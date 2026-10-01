@@ -1666,7 +1666,7 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
         namespace: &NamespaceId,
         revision: u64,
         expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>> {
+    ) -> RepositoryResult<(Option<u64>, u64)> {
         let target = self
             .get_profile(namespace, revision)?
             .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
@@ -1681,15 +1681,21 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                 "active profile revision changed".into(),
             ));
         }
-        let affected = match expected_active_revision {
+        let previous_version = FenceStore::fence(self)?.version;
+        let policy_version = previous_version
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::Backend("IAM policy version exhausted".into()))?;
+        let head_write = match expected_active_revision {
             None => {
                 let sql = format!(
                     "INSERT INTO {} (namespace, active_revision) VALUES (?, ?) \
                      ON CONFLICT (namespace) DO NOTHING",
                     self.table("authorization_profile_heads")
                 );
-                self.backend
-                    .execute(&sql, &[p(namespace.0.clone()), p(revision_key(revision))])?
+                SqlWrite {
+                    sql,
+                    params: vec![p(namespace.0.clone()), p(revision_key(revision))],
+                }
             }
             Some(expected) => {
                 let sql = format!(
@@ -1697,35 +1703,47 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                      WHERE namespace = ? AND active_revision = ?",
                     self.table("authorization_profile_heads")
                 );
-                self.backend.execute(
-                    &sql,
-                    &[
+                SqlWrite {
+                    sql,
+                    params: vec![
                         p(revision_key(revision)),
                         p(namespace.0.clone()),
                         p(revision_key(expected)),
                     ],
-                )?
+                }
             }
         };
-        if affected != 1 {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        Ok(previous)
+        self.backend.execute_transaction_checked(
+            &[
+                head_write,
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {} SET version = version + 1 WHERE id = 1 AND CAST(version AS TEXT) = ?",
+                        self.table("fence")
+                    ),
+                    params: vec![p(previous_version.to_string())],
+                },
+            ],
+            &[(0, 1), (1, 1)],
+        )?;
+        Ok((previous, policy_version))
     }
 
     fn retire_active_profile(
         &self,
         namespace: &NamespaceId,
         expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile> {
+    ) -> RepositoryResult<(AuthorizationProfile, u64)> {
         let mut profile = self
             .get_profile(namespace, expected_active_revision)?
             .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
+        let previous_version = FenceStore::fence(self)?.version;
+        let policy_version = previous_version
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::Backend("IAM policy version exhausted".into()))?;
         let profiles = self.table("authorization_profiles");
         let heads = self.table("authorization_profile_heads");
-        let affected = self.backend.execute_transaction(&[
+        self.backend.execute_transaction_checked(&[
             SqlWrite {
                 sql: format!(
                     "UPDATE {profiles} SET lifecycle = 'retired' \
@@ -1753,19 +1771,16 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                     p(revision_key(expected_active_revision)),
                 ],
             },
-        ])?;
-        if affected.as_slice() != [1, 1] {
-            return match self.active_revision(namespace)? {
-                None => Err(RepositoryError::NotFound(
-                    "active profile head not found".into(),
-                )),
-                Some(_) => Err(RepositoryError::Conflict(
-                    "active profile revision changed".into(),
-                )),
-            };
-        }
+            SqlWrite {
+                sql: format!(
+                    "UPDATE {} SET version = version + 1 WHERE id = 1 AND CAST(version AS TEXT) = ?",
+                    self.table("fence")
+                ),
+                params: vec![p(previous_version.to_string())],
+            },
+        ], &[(0, 1), (1, 1), (2, 1)])?;
         profile.lifecycle = ProfileLifecycle::Retired;
-        Ok(profile)
+        Ok((profile, policy_version))
     }
 
     fn active_profile(

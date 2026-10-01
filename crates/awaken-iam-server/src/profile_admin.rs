@@ -131,7 +131,7 @@ impl AuthorizationProfileAdmin {
                 "draft must be validated before activation".into(),
             ));
         }
-        let previous = self.repository.activate_profile(
+        let (previous, policy_version) = self.repository.activate_profile(
             namespace,
             revision,
             request.expected_active_revision,
@@ -139,7 +139,6 @@ impl AuthorizationProfileAdmin {
         let mut profiles = authz.snapshot().active_profiles;
         profiles.retain(|active| active.namespace != profile.namespace);
         profiles.push(profile.clone());
-        let policy_version = authz.policy_version().max(base.version) + 1;
         authz.replace_policy_at_version(
             PolicySet::from_snapshot_and_profiles(base, &profiles),
             policy_version,
@@ -180,12 +179,11 @@ impl AuthorizationProfileAdmin {
         namespace: &NamespaceId,
         expected_active_revision: u64,
     ) -> Result<AuthorizationProfileRetired, ProfileAdminError> {
-        let retired = self
+        let (retired, policy_version) = self
             .repository
             .retire_active_profile(namespace, expected_active_revision)?;
         let mut profiles = authz.snapshot().active_profiles;
         profiles.retain(|profile| profile.namespace != *namespace);
-        let policy_version = authz.policy_version().max(base.version) + 1;
         authz.replace_policy_at_version(
             PolicySet::from_snapshot_and_profiles(base, &profiles),
             policy_version,
@@ -233,7 +231,7 @@ impl AuthorizationProfileAdmin {
         let mut profiles = authz.snapshot().active_profiles;
         profiles.retain(|active| active.namespace != profile.namespace);
         profiles.push(profile.clone());
-        let policy_version = authz.policy_version().max(base.version) + 1;
+        let policy_version = base.version;
         authz.replace_policy_at_version(
             PolicySet::from_snapshot_and_profiles(base, &profiles),
             policy_version,
@@ -249,7 +247,7 @@ impl AuthorizationProfileAdmin {
     ) -> Result<usize, ProfileAdminError> {
         let profiles = self.repository.active_profiles()?;
         let count = profiles.len();
-        let policy_version = authz.policy_version().max(base.version) + u64::from(count > 0);
+        let policy_version = base.version;
         authz.replace_policy_at_version(
             PolicySet::from_snapshot_and_profiles(base, &profiles),
             policy_version,

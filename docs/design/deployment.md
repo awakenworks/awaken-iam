@@ -149,10 +149,15 @@ against the same database. Authorization and snapshot reads now compare the shar
 policy fence before using the in-memory PDP; a second PostgreSQL daemon was tested
 to observe a grant, its revocation, and the resulting policy version without a
 restart. Product projection grant and retirement synchronisation has also passed a
-two-daemon shared-store HTTP test. Authorization-profile activation still uses a
-separate revision lifecycle and has not passed a cross-replica activation test;
-production should keep one replica if that feature is in use. Credential management
-and a full multi-replica rollout remain deployment gates. Set
+two-daemon shared-store HTTP test. Authorization-profile activation, rollback,
+and retirement now compare-and-set the active head and shared policy version
+in one database transaction. A two-daemon PostgreSQL HTTP check confirmed the
+second daemon refreshes its policy on the next request and rejects permissions
+removed by replacement, rollback, or retirement; a separate PostgreSQL store
+test covers stale compare-and-set rollback. When the shared store was stopped,
+authorization returned `503 policy_unavailable` after connection failure rather
+than serving a cached allow. Credential management, rolling replacement of old
+daemon binaries, and a full multi-replica rollout remain deployment gates. Set
 `IAM_DIRECTORY_PRODUCT_TOKENS=tutor=<secret>` for Tutor's product-scoped
 resource-model and versioned projection requests; `IAM_ADMIN_TOKEN` remains
 independent for organization, workspace and global policy administration.
