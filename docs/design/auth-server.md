@@ -34,6 +34,22 @@ document is generated from that deployment configuration, so product clients rea
 `authorization_endpoint`, `token_endpoint`, `userinfo_endpoint`, and `jwks_uri`
 from `/.well-known/openid-configuration` instead of constructing URLs.
 
+## Provider login route ownership
+
+The OP router requires an explicit `ProviderLoginRouteOwner`. A standalone IAM
+process selects `Iam` and mounts its provider login and callback HTTP handlers.
+An embedding host selects `EmbeddingHost` when it supplies those two browser
+presentation routes over the same `SharedAuthApi`; the OP router then mounts
+only its canonical OP, browser PKCE, token, revoke and UserInfo endpoints.
+
+This decision changes HTTP registration only. Provider exchange, challenge
+validation, account resolution and session persistence remain owned by the one
+`AuthApi`. The embedding host retains its response formats, safe browser error
+navigation and product metrics. Each provider path has one HTTP handler, and a
+host that selects external ownership must supply both routes before serving.
+The adjacent router composition decision table verifies standalone ownership,
+external presentation, missing external routes and retained OP discovery.
+
 ## Provider adapter (genericity)
 
 A provider is data + a small adapter, so the set is config-driven. We ship two
