@@ -168,7 +168,11 @@ async fn serve<B: SqlConn + Clone + 'static>(
     let router = daemon_router(state.clone())
         .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))
-        .merge(op_router(auth.clone(), issuer.clone()))
+        .merge(op_router(
+            auth.clone(),
+            issuer.clone(),
+            awaken_iam_server::ProviderLoginRouteOwner::Iam,
+        ))
         .merge(wechat_mini_program_router(
             auth,
             issuer,

@@ -26,6 +26,16 @@ const BROWSER_SESSION_TTL_SECS: u64 = 24 * 3_600;
 /// reimplementing authorization-code, PKCE, refresh, revoke, or UserInfo logic.
 pub type SharedAuthApi = Arc<Mutex<AuthApi>>;
 
+/// The single HTTP owner for upstream-provider login and callback paths.
+/// Authentication itself always remains in the shared [`AuthApi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderLoginRouteOwner {
+    /// The standalone IAM process supplies the default browser presentation.
+    Iam,
+    /// The embedding host supplies both presentation routes over the same API.
+    EmbeddingHost,
+}
+
 #[derive(Clone)]
 struct OpHttpState {
     auth: SharedAuthApi,
@@ -38,25 +48,33 @@ struct OpHttpState {
 /// embedding product may publish additional token families under the same
 /// platform JWKS. The supplied `AuthApi` must use that deployment's shared
 /// [`AccessTokenAuthority`](crate::AccessTokenAuthority).
-pub fn op_router(auth: SharedAuthApi, issuer: impl Into<String>) -> Router {
+pub fn op_router(
+    auth: SharedAuthApi,
+    issuer: impl Into<String>,
+    provider_login_owner: ProviderLoginRouteOwner,
+) -> Router {
     let state = OpHttpState {
         auth,
         issuer: Arc::from(issuer.into()),
     };
-    Router::new()
+    let app = Router::new()
         .route(
             "/.well-known/openid-configuration",
             get(openid_configuration),
         )
         .route("/v1/oauth/authorize", get(authorize))
-        .route("/v1/auth/login/{provider}", get(start_provider_login))
-        .route("/v1/auth/callback/{provider}", get(complete_provider_login))
         .route("/v1/oauth/browser/start", get(browser_start))
         .route("/v1/oauth/browser/callback", get(browser_callback))
         .route("/v1/oauth/token", post(token))
         .route("/v1/oauth/revoke", post(revoke))
-        .route("/v1/oauth/userinfo", get(userinfo))
-        .with_state(state)
+        .route("/v1/oauth/userinfo", get(userinfo));
+    let app = match provider_login_owner {
+        ProviderLoginRouteOwner::Iam => app
+            .route("/v1/auth/login/{provider}", get(start_provider_login))
+            .route("/v1/auth/callback/{provider}", get(complete_provider_login)),
+        ProviderLoginRouteOwner::EmbeddingHost => app,
+    };
+    app.with_state(state)
 }
 
 /// Publish the standalone IAM process's access-token trust anchor.
@@ -700,7 +718,111 @@ mod tests {
             .unwrap()
             .to_owned();
         let shared = Arc::new(Mutex::new(auth));
-        (op_router(shared, issuer), session_cookie)
+        (
+            op_router(shared, issuer, ProviderLoginRouteOwner::Iam),
+            session_cookie,
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_route_ownership_composes_one_surface_and_preserves_op_endpoints() {
+        // Cause/effect graph: C1 the composition selects IAM or embedding-host
+        // ownership; C2 the embedding host supplies both provider paths.
+        // R1 IAM + no host paths -> canonical login remains reachable and an
+        // unknown provider is rejected by AuthApi. R2 host + both paths ->
+        // the real Axum merge succeeds and each request reaches that single
+        // presentation owner. R3 host + missing paths -> 404, never a hidden
+        // standalone fallback. All rules retain canonical OP discovery.
+        // | Rule | owner         | host paths | provider result |
+        // | R1   | IAM           | absent     | typed rejection |
+        // | R2   | embedding     | present    | host presentation |
+        // | R3   | embedding     | absent     | not mounted |
+        for (owner, host_paths) in [
+            (ProviderLoginRouteOwner::Iam, false),
+            (ProviderLoginRouteOwner::EmbeddingHost, true),
+            (ProviderLoginRouteOwner::EmbeddingHost, false),
+        ] {
+            let auth = Arc::new(Mutex::new(AuthApi::new()));
+            let mut app = op_router(auth, "https://accounts.example", owner);
+            if host_paths {
+                app = app.merge(
+                    Router::new()
+                        .route("/v1/auth/login/{provider}", get(|| async { "host-login" }))
+                        .route(
+                            "/v1/auth/callback/{provider}",
+                            get(|| async { "host-callback" }),
+                        ),
+                );
+            }
+            let discovery = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/.well-known/openid-configuration")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(discovery.status(), StatusCode::OK, "all OP discovery rules");
+            let login = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/auth/login/unknown")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if host_paths {
+                assert_eq!(login.status(), StatusCode::OK, "R2 login");
+                assert_eq!(
+                    axum::body::to_bytes(login.into_body(), 128)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"host-login",
+                    "R2 exact owner"
+                );
+                let callback = app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/v1/auth/callback/unknown")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(callback.status(), StatusCode::OK, "R2 callback");
+                assert_eq!(
+                    axum::body::to_bytes(callback.into_body(), 128)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"host-callback",
+                    "R2 exact owner"
+                );
+            } else {
+                assert_eq!(
+                    login.status(),
+                    StatusCode::NOT_FOUND,
+                    "R1 rejection or R3 absent"
+                );
+                if owner == ProviderLoginRouteOwner::EmbeddingHost {
+                    let callback = app
+                        .oneshot(
+                            Request::builder()
+                                .uri("/v1/auth/callback/unknown")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(callback.status(), StatusCode::NOT_FOUND, "R3 no fallback");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -915,7 +1037,11 @@ mod tests {
         // verified ID token. State-mismatch rejection is owned by AuthApi's
         // separate challenge tests.
         let shared = Arc::new(Mutex::new(configured_auth(&[("fake", "Fake")])));
-        let app = op_router(shared.clone(), "https://accounts.example");
+        let app = op_router(
+            shared.clone(),
+            "https://accounts.example",
+            ProviderLoginRouteOwner::Iam,
+        );
         let verifier = "desktop-verifier-with-enough-entropy";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let authorize_uri = format!(
@@ -1092,6 +1218,7 @@ mod tests {
         let empty = op_router(
             Arc::new(Mutex::new(configured_auth(&[]))),
             "https://accounts.example",
+            ProviderLoginRouteOwner::Iam,
         )
         .oneshot(
             Request::builder()
@@ -1109,6 +1236,7 @@ mod tests {
                 ("google", "Google"),
             ]))),
             "https://accounts.example",
+            ProviderLoginRouteOwner::Iam,
         )
         .oneshot(
             Request::builder()
