@@ -49,6 +49,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 url = "2"
 
+[target.'cfg(windows)'.dependencies]
+atomicwrites = "=0.4.4"
+
 [dev-dependencies]
 awaken-iam-contract.workspace = true
 awaken-iam-core.workspace = true

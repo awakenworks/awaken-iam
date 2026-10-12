@@ -475,11 +475,7 @@ impl LicenseFloorStore {
             .collect::<String>();
         let temporary = self.path.with_extension(format!("tmp-{suffix}"));
         let result = write_owner_only(&temporary, next)
-            .and_then(|()| {
-                fs::rename(&temporary, &self.path)
-                    .map_err(|error| LicenseStateError::Write(error.to_string()))
-            })
-            .and_then(|()| sync_parent(&self.path));
+            .and_then(|()| replace_floor_file(&temporary, &self.path));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
@@ -612,6 +608,23 @@ fn write_owner_only(path: &Path, record: &LicenseFloorRecord) -> Result<(), Lice
         .map_err(|error| LicenseStateError::Write(error.to_string()))
 }
 
+#[cfg(windows)]
+fn replace_floor_file(temporary: &Path, destination: &Path) -> Result<(), LicenseStateError> {
+    // Windows does not support the Unix directory-fsync path. This safe library
+    // uses MoveFileExW with REPLACE_EXISTING and WRITE_THROUGH; the temporary
+    // file has already been flushed, and remains on the destination filesystem.
+    atomicwrites::replace_atomic(temporary, destination)
+        .map_err(|error| LicenseStateError::Write(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_floor_file(temporary: &Path, destination: &Path) -> Result<(), LicenseStateError> {
+    fs::rename(temporary, destination)
+        .map_err(|error| LicenseStateError::Write(error.to_string()))?;
+    sync_parent(destination)
+}
+
+#[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<(), LicenseStateError> {
     let Some(parent) = path.parent() else {
         return Ok(());

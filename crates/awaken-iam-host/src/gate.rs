@@ -8,11 +8,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_client::{HttpAuthzTransport, IamClient, RemoteIamClient};
+use awaken_iam_client::{HttpAuthzTransport, IamClient, IamDecisionError, RemoteIamClient};
 use awaken_iam_contract::{
-    AccountId, AuthorizationDecision, AuthorizationRequest, EntitlementDecision,
-    EntitlementRequest, Jwks, PrincipalRef, Timestamp, TokenIntrospectionRequest,
-    TokenIntrospectionResponse, WorkspaceId,
+    AccountId, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    EntitlementDecision, EntitlementRequest, Jwks, PrincipalRef, ResourceAuthorizationRequest,
+    Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
 use awaken_iam_server::{AccessTokenSubjectKind, AuthzApi, SessionGateway, verify_access_token};
@@ -354,6 +354,25 @@ fn is_api_token(token: &str) -> bool {
 }
 
 impl IamClient for IamGate {
+    fn authorize_resource_result(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        match self.inner.as_ref() {
+            GateInner::Open => Ok(AuthorizationOutcome {
+                decision: AuthorizationDecision::Allow,
+                reason: "open_mode".into(),
+                matched_grants: Vec::new(),
+                matched_roles: Vec::new(),
+                obligation: None,
+            }),
+            GateInner::Local { state, .. } => {
+                let guard = state.lock().expect("local state lock");
+                Ok(guard.authz.authorize_resource(&request))
+            }
+            GateInner::Remote { client, .. } => client.authorize_resource_result(request),
+        }
+    }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         match self.inner.as_ref() {
             GateInner::Open => AuthorizationDecision::Allow,

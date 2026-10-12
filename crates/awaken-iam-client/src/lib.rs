@@ -27,7 +27,8 @@ pub use remote::{AuthzTransport, DirectoryClient, IamClientMode, RemoteError, Re
 pub use snapshot::{REASON_UNSYNCED, SnapshotCache, SyncStatus};
 
 use awaken_iam_contract::{
-    AuthorizationDecision, AuthorizationRequest, EntitlementDecision, EntitlementRequest,
+    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, EntitlementDecision,
+    EntitlementRequest, ResourceAuthorizationRequest,
 };
 
 /// Availability failure at the IAM decision boundary.
@@ -43,6 +44,13 @@ pub enum IamDecisionError {
 
 /// Shared client interface for services that delegate IAM decisions.
 pub trait IamClient {
+    /// Contextual authorization is an explicit capability; legacy providers fail closed.
+    fn authorize_resource_result(
+        &self,
+        _request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        Err(IamDecisionError::Unavailable)
+    }
     /// Check authorization for an action and scope.
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision;
 
@@ -74,6 +82,12 @@ pub trait IamClient {
 /// of [`IamClientMode`] by borrow, without surrendering ownership or cloning the
 /// policy — the local client and the mounted routes then share one engine.
 impl<C: IamClient + ?Sized> IamClient for &C {
+    fn authorize_resource_result(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        (**self).authorize_resource_result(request)
+    }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         (**self).authorize(request)
     }

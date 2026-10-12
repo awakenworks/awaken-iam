@@ -151,6 +151,7 @@ const AUTH_ROUTES: &[RouteSpec] = &[
 /// signer set under the snapshot version fence.
 const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/authorize"),
+    RouteSpec::post("/v1/authorize/resource"),
     RouteSpec::post("/v1/authorize/batch"),
     RouteSpec::post("/v1/entitlements/check"),
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),

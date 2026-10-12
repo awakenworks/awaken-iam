@@ -44,6 +44,15 @@ pub struct AuthorizationProfileDocument {
     pub group_rosters: Vec<GroupRosterSnapshot>,
     #[serde(default)]
     pub group_role_bindings: Vec<GroupRoleBindingSnapshot>,
+    /// Optional finite constraints on this profile's existing grants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_constraints: Vec<crate::GrantConstraint>,
+    /// Source and display metadata for existing Roles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_bundles: Vec<crate::PermissionBundleMetadata>,
+    /// Limits on the personal/Group bindings declared by this profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_limits: Vec<crate::RoleBindingLimit>,
 }
 
 /// Administration lifecycle of a profile revision.

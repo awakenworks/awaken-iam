@@ -24,11 +24,11 @@
 
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
-    ApiToken, ApiTokenStatus, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot, ResourceModelRegistered,
-    ResourceModelRegistration, SignerSetSnapshot, Timestamp, TokenIntrospectionRequest,
-    TokenIntrospectionResponse,
+    ApiToken, ApiTokenStatus, AuthorizationContext, AuthorizationDecision, AuthorizationOutcome,
+    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
+    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot,
+    ResourceAuthorizationRequest, ResourceModelRegistered, ResourceModelRegistration,
+    SignerSetSnapshot, Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 use awaken_iam_core::{
     ApiTokenDirectory, EntitlementEngine, EntitlementProvider, IamCore, IamError,
@@ -176,7 +176,26 @@ impl AuthzApi {
     /// `POST /v1/authorize`: evaluate one authorization request into a reasoned
     /// outcome (decision, reason code, matched grant/role ids).
     pub fn authorize(&self, request: &AuthorizationRequest) -> AuthorizationOutcome {
-        self.core.evaluate(request).to_outcome()
+        self.authorize_resource(&ResourceAuthorizationRequest {
+            request: request.clone(),
+            context: AuthorizationContext::default(),
+        })
+    }
+
+    /// Evaluate owner facts using the server's clock, never a client timestamp.
+    pub fn authorize_resource(
+        &self,
+        request: &ResourceAuthorizationRequest,
+    ) -> AuthorizationOutcome {
+        let mut trusted = request.clone();
+        trusted.context.evaluated_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(i64::MAX, |duration| {
+                    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+                }),
+        );
+        self.core.policy().evaluate_resource(&trusted).to_outcome()
     }
 
     /// `POST /v1/authorize/batch`: evaluate several requests in one round trip,
@@ -317,6 +336,12 @@ impl AuthzApi {
 /// the same policy — no network hop, no second policy copy. Standalone callers
 /// instead reach this API through the remote `IamClient`.
 impl IamClient for AuthzApi {
+    fn authorize_resource_result(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, awaken_iam_client::IamDecisionError> {
+        Ok(AuthzApi::authorize_resource(self, &request))
+    }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         self.authorize(&request).decision
     }

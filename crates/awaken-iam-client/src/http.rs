@@ -16,6 +16,7 @@
 //! site. The client is `Send + Sync` and cheaply cloneable, so one instance is
 //! shared across a service's request handlers.
 
+use awaken_iam_contract::ResourceAuthorizationRequest;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -251,6 +252,17 @@ impl HttpAuthzTransport {
 }
 
 impl AuthzTransport for HttpAuthzTransport {
+    fn authorize_resource(
+        &self,
+        request: &ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authorize/resource"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
     fn authorize(
         &self,
         request: &AuthorizationRequest,
@@ -1235,10 +1247,22 @@ mod tests {
     fn projected_service_token_is_reloaded_for_each_request() {
         let body = r#"{"decision":"allow","reason":"allowed_by_grant","matched_grants":[],"matched_roles":[]}"#;
         let server = StubServer::start(vec![Reply::Ok(body.into()), Reply::Ok(body.into())]);
+        let test_name: String = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         let path = std::env::temp_dir().join(format!(
             "awaken-iam-service-token-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            test_name
         ));
         std::fs::write(&path, "first-token\n").unwrap();
         let transport = HttpAuthzTransport::new(

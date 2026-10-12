@@ -222,6 +222,7 @@ where
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/authorize", post(authorize))
+        .route("/v1/authorize/resource", post(authorize_resource))
         .route("/v1/authorize/batch", post(authorize_batch))
         .route("/v1/entitlements/check", post(check_entitlement))
         .route("/v1/authz/snapshot", get(snapshot))
@@ -617,6 +618,14 @@ async fn authorize_batch(
 ) -> Json<BatchAuthorizationResponse> {
     let guard = lock(&state);
     Json(guard.authz.authorize_batch(&request))
+}
+
+async fn authorize_resource(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    Json(request): Json<awaken_iam_contract::ResourceAuthorizationRequest>,
+) -> Json<AuthorizationOutcome> {
+    let guard = lock(&state);
+    Json(guard.authz.authorize_resource(&request))
 }
 
 async fn check_entitlement(
