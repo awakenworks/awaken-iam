@@ -15,3 +15,4 @@
 | [0010](0010-portable-authorization-architecture.md) | Portable authorization control plane and resource-service integration | Proposed |
 | [0011](0011-isolate-profile-action-namespaces.md) | Isolate authorization profile action namespaces | Proposed |
 | [0013](0013-directory-placement-independent-product-spaces.md) | Directory placement is independent from product-space identity | Accepted |
+| [0014](0014-permission-bundles-and-trusted-resource-constraints.md) | Permission bundles and trusted resource constraints | Proposed |

@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 
 use crate::AuthzApi;
 
+#[path = "profile_admin/bundle_validation.rs"]
+mod bundle_validation;
+
 /// PAP failure with stable conflict/not-found/validation distinctions.
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileAdminError {
@@ -273,6 +276,7 @@ fn validate_document(
     document: &AuthorizationProfileDocument,
 ) -> Vec<String> {
     let mut errors = Vec::new();
+    bundle_validation::validate(namespace, document, &mut errors);
     let action_prefix = format!("{}::", namespace.0);
     let subject_prefix = format!("{}:", namespace.0);
     let mut resource_types = HashSet::new();
@@ -395,10 +399,10 @@ fn validate_document(
                 ));
             }
             awaken_iam_contract::GrantSubjectRef::Group { group_id }
-                if !group_id.starts_with(&subject_prefix) =>
+                if group_id.is_empty() || group_id.chars().any(char::is_control) =>
             {
                 errors.push(format!(
-                    "group id {group_id} is outside namespace {}",
+                    "group reference {group_id} is invalid in namespace {}",
                     namespace.0
                 ));
             }
@@ -422,9 +426,9 @@ fn validate_document(
         }
     }
     for binding in &document.group_role_bindings {
-        if !binding.group_id.starts_with(&subject_prefix) {
+        if binding.group_id.is_empty() || binding.group_id.chars().any(char::is_control) {
             errors.push(format!(
-                "group id {} is outside namespace {}",
+                "group reference {} is invalid in namespace {}",
                 binding.group_id, namespace.0
             ));
         }

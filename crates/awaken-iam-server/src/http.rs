@@ -29,7 +29,7 @@ use std::sync::Arc;
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, PolicySnapshot,
-    Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    ResourceAuthorizationRequest, Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse,
 };
 use axum::{
     Json, Router,
@@ -60,6 +60,7 @@ pub fn authz_router(state: AuthzState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/authorize", post(authorize))
+        .route("/v1/authorize/resource", post(authorize_resource))
         .route("/v1/authorize/batch", post(authorize_batch))
         .route("/v1/entitlements/check", post(check_entitlement))
         .route("/v1/authz/snapshot", get(snapshot))
@@ -91,6 +92,14 @@ async fn authorize(
     Json(request): Json<AuthorizationRequest>,
 ) -> Json<AuthorizationOutcome> {
     Json(api.authorize(&request))
+}
+
+/// `POST /v1/authorize/resource`.
+async fn authorize_resource(
+    State(api): State<AuthzState>,
+    Json(request): Json<ResourceAuthorizationRequest>,
+) -> Json<AuthorizationOutcome> {
+    Json(api.authorize_resource(&request))
 }
 
 /// `POST /v1/authorize/batch`.
@@ -228,6 +237,84 @@ mod tests {
             serde_json::from_value(body_json(response).await).expect("outcome");
         assert_eq!(outcome.decision, AuthorizationDecision::Deny);
         assert_eq!(outcome.reason, "default_deny");
+    }
+
+    #[tokio::test]
+    async fn resource_route_does_not_accept_a_caller_clock_to_extend_a_binding() {
+        use awaken_iam_contract::{
+            AuthorizationContext, AuthorizationProfile, AuthorizationProfileDocument, GrantEffect,
+            GrantSnapshot, GrantSubjectRef, NamespaceId, ProfileLifecycle, RoleBindingLimit,
+            RoleBindingSnapshot, WorkspaceId,
+        };
+        let scope = ScopeRef::Workspace {
+            workspace_id: WorkspaceId("w".into()),
+        };
+        let document = AuthorizationProfileDocument {
+            action_scope_rules: vec![awaken_iam_contract::ActionScopeRule {
+                action_pattern: "business::customer.read".into(),
+                allowed_scope_kinds: vec![awaken_iam_contract::ScopeKind::Workspace],
+            }],
+            grants: vec![GrantSnapshot {
+                id: "business:g".into(),
+                subject: GrantSubjectRef::Role {
+                    role_id: "business:r".into(),
+                },
+                action_pattern: "business::customer.read".into(),
+                scope: ScopeRef::Global,
+                effect: GrantEffect::Allow,
+            }],
+            role_bindings: vec![RoleBindingSnapshot {
+                principal: service("svc"),
+                role_id: "business:r".into(),
+                scope: scope.clone(),
+            }],
+            binding_limits: vec![RoleBindingLimit {
+                subject: GrantSubjectRef::Principal {
+                    principal: service("svc"),
+                },
+                role_id: "business:r".into(),
+                scope: scope.clone(),
+                expires_at: Some(200),
+                resource_ids: None,
+            }],
+            ..Default::default()
+        };
+        let profile = AuthorizationProfile {
+            namespace: NamespaceId("business".into()),
+            revision: 1,
+            lifecycle: ProfileLifecycle::Active,
+            document,
+            checksum: "test".into(),
+            created_at: Timestamp("2026-10-12T00:00:00Z".into()),
+        };
+        let mut api = AuthzApi::new();
+        api.replace_policy_at_version(awaken_iam_core::PolicySet::from_profile(&profile), 1);
+        let request = ResourceAuthorizationRequest {
+            request: AuthorizationRequest::direct(
+                service("svc"),
+                awaken_iam_contract::ActionKey("business::customer.read".into()),
+                scope,
+            ),
+            context: AuthorizationContext {
+                evaluated_at: Some(100),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            api.policy_mut().evaluate_resource(&request).decision,
+            AuthorizationDecision::Allow
+        );
+        let response = authz_router(Arc::new(api))
+            .oneshot(post(
+                "/v1/authorize/resource",
+                serde_json::to_value(request).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome: AuthorizationOutcome =
+            serde_json::from_value(body_json(response).await).unwrap();
+        assert_eq!(outcome.decision, AuthorizationDecision::Deny);
     }
 
     #[tokio::test]
@@ -423,6 +510,10 @@ mod tests {
     async fn router_binds_every_authz_manifest_route() {
         let router = authz_router(Arc::new(AuthzApi::new()));
         let authz_routes = [
+            RouteSpec {
+                method: HttpMethod::Post,
+                path: "/v1/authorize/resource",
+            },
             RouteSpec {
                 method: HttpMethod::Post,
                 path: "/v1/authorize",

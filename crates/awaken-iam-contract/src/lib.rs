@@ -9,7 +9,14 @@ mod admin;
 mod identity;
 mod license;
 mod protocol;
+mod resource_authorization;
 mod trust;
+
+pub use resource_authorization::{
+    AuthorizationAccess, AuthorizationAmount, AuthorizationAmountRange, AuthorizationContext,
+    AuthorizationDataScope, GrantConstraint, PermissionBundleMetadata,
+    ResourceAuthorizationRequest, RoleBindingLimit,
+};
 
 use serde::{Deserialize, Serialize};
 

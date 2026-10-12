@@ -25,10 +25,11 @@ use awaken_iam_contract::{
     InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
     NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement,
     ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
-    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
-    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
-    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
+    ReplaceScopedMemberships, ResendInvitation, ResourceAuthorizationRequest,
+    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
+    UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::{IamClient, IamDecisionError};
@@ -49,6 +50,13 @@ pub struct RemoteError(pub String);
 /// shaping, decision mapping, fail-closed policy) be unit tested without network
 /// access. Implementations should be `Send + Sync` so the client can be shared.
 pub trait AuthzTransport {
+    /// `POST /v1/authorize/resource`; unsupported transports cannot widen access.
+    fn authorize_resource(
+        &self,
+        _request: &ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        Err(RemoteError("resource authorization is unsupported".into()))
+    }
     /// `POST /v1/authorize`.
     fn authorize(
         &self,
@@ -683,6 +691,14 @@ impl<T: DirectoryClient> RemoteIamClient<T> {
 }
 
 impl<T: AuthzTransport> IamClient for RemoteIamClient<T> {
+    fn authorize_resource_result(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        self.transport
+            .authorize_resource(&request)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         self.transport
             .authorize(&request)
@@ -746,6 +762,15 @@ impl<L, R> IamClientMode<L, R> {
 }
 
 impl<L: IamClient, R: IamClient> IamClient for IamClientMode<L, R> {
+    fn authorize_resource_result(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        match self {
+            Self::Local(client) => client.authorize_resource_result(request),
+            Self::Remote(client) => client.authorize_resource_result(request),
+        }
+    }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
         match self {
             IamClientMode::Local(client) => client.authorize(request),

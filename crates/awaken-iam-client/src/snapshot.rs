@@ -177,7 +177,38 @@ impl<T: AuthzTransport> SnapshotCache<T> {
     /// use [`authorize`](Self::authorize) or
     /// [`authorize_outcome`](Self::authorize_outcome) instead.
     pub fn evaluate(&self, request: &AuthorizationRequest) -> Option<AuthorizationTrace> {
-        self.policy().map(|policy| policy.evaluate(request))
+        self.evaluate_resource(&awaken_iam_contract::ResourceAuthorizationRequest {
+            request: request.clone(),
+            context: Default::default(),
+        })
+    }
+
+    /// Evaluate trusted host facts using the cache owner's clock. A request
+    /// cannot extend an expired binding by supplying a different timestamp.
+    pub fn evaluate_resource(
+        &self,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> Option<AuthorizationTrace> {
+        let mut request = request.clone();
+        request.context.evaluated_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                .unwrap_or(i64::MAX),
+        );
+        self.policy()
+            .map(|policy| policy.evaluate_resource(&request))
+    }
+
+    /// Resource-aware counterpart of `authorize_outcome`; unsynced caches deny.
+    pub fn authorize_resource_outcome(
+        &self,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> AuthorizationOutcome {
+        self.evaluate_resource(request)
+            .map(|trace| trace.to_outcome())
+            .unwrap_or_else(|| self.authorize_outcome(&request.request))
     }
 
     /// Resolve `request` into the reasoned [`AuthorizationOutcome`], failing
@@ -374,6 +405,72 @@ mod tests {
             cache.authorize(&request("pack.delete")),
             AuthorizationDecision::Deny
         );
+    }
+
+    #[test]
+    fn expired_binding_uses_cache_clock_instead_of_supplied_time() {
+        use awaken_iam_contract::{
+            ActionScopeRule, AuthorizationContext, AuthorizationProfile,
+            AuthorizationProfileDocument, ProfileLifecycle, ResourceAuthorizationRequest,
+            RoleBindingLimit, RoleBindingSnapshot, ScopeKind,
+        };
+        let mut document = AuthorizationProfileDocument::default();
+        document.grants = vec![GrantSnapshot {
+            id: "test:read".into(),
+            subject: GrantSubjectRef::Role {
+                role_id: "test:reader".into(),
+            },
+            action_pattern: "test::read".into(),
+            scope: ScopeRef::Global,
+            effect: GrantEffect::Allow,
+        }];
+        document.resource_model.actions = vec![ActionKey("test::read".into())];
+        document.action_scope_rules = vec![ActionScopeRule {
+            action_pattern: "test::read".into(),
+            allowed_scope_kinds: vec![ScopeKind::Global],
+        }];
+        document.role_bindings = vec![RoleBindingSnapshot {
+            principal: principal(),
+            role_id: "test:reader".into(),
+            scope: ScopeRef::Global,
+        }];
+        document.binding_limits = vec![RoleBindingLimit {
+            subject: GrantSubjectRef::Principal {
+                principal: principal(),
+            },
+            role_id: "test:reader".into(),
+            scope: ScopeRef::Global,
+            expires_at: Some(200),
+            resource_ids: None,
+        }];
+        let policy = PolicySet::from_profile(&AuthorizationProfile {
+            namespace: awaken_iam_contract::NamespaceId("test".into()),
+            revision: 1,
+            lifecycle: ProfileLifecycle::Active,
+            document,
+            checksum: "fixture".into(),
+            created_at: awaken_iam_contract::Timestamp("2026-10-12T00:00:00Z".into()),
+        });
+        let query = ResourceAuthorizationRequest {
+            request: request("test::read"),
+            context: AuthorizationContext {
+                evaluated_at: Some(100),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            policy.evaluate_resource(&query).decision,
+            AuthorizationDecision::Allow
+        );
+        let cache = SnapshotCache {
+            transport: StubTransport::new(1),
+            cached: Some(Cached { version: 1, policy }),
+        };
+        assert_eq!(
+            cache.authorize_resource_outcome(&query).decision,
+            AuthorizationDecision::Deny
+        );
+        assert_eq!(cache.authorize(&query.request), AuthorizationDecision::Deny);
     }
 
     #[test]
