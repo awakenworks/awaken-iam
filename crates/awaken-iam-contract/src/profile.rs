@@ -65,6 +65,17 @@ pub enum ProfileLifecycle {
     Retired,
 }
 
+/// Read-only evidence from the Profile owner's immutable revision history.
+///
+/// This is not an authorization decision. A retired revision still counts as
+/// published. Both fields are required on the wire: an incomplete response
+/// must never look like a namespace that has not been configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationProfilePublicationState {
+    pub namespace: NamespaceId,
+    pub has_published_revision: bool,
+}
+
 /// One immutable, checksummed profile revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationProfile {
@@ -125,4 +136,33 @@ pub struct AuthorizationProfileRetired {
     pub retired_revision: u64,
     pub policy_version: u64,
     pub checksum: String,
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn publication_evidence_requires_an_explicit_boolean_and_namespace() {
+        // W1 explicit false/true -> exact round trip. W2 missing/null Boolean,
+        // W3 missing namespace -> decode failure, never inferred absence.
+        for published in [false, true] {
+            let value = serde_json::json!({
+                "namespace": "example.business", "has_published_revision": published
+            });
+            let state: AuthorizationProfilePublicationState =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(state.has_published_revision, published);
+            assert_eq!(serde_json::to_value(state).unwrap(), value);
+        }
+        for invalid in [
+            serde_json::json!({"namespace":"example.business"}),
+            serde_json::json!({"namespace":"example.business", "has_published_revision":null}),
+            serde_json::json!({"has_published_revision":false}),
+        ] {
+            assert!(
+                serde_json::from_value::<AuthorizationProfilePublicationState>(invalid).is_err()
+            );
+        }
+    }
 }

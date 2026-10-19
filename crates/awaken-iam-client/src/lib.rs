@@ -27,8 +27,9 @@ pub use remote::{AuthzTransport, DirectoryClient, IamClientMode, RemoteError, Re
 pub use snapshot::{REASON_UNSYNCED, SnapshotCache, SyncStatus};
 
 use awaken_iam_contract::{
-    AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest, EntitlementDecision,
-    EntitlementRequest, ResourceAuthorizationRequest,
+    AuthorizationDecision, AuthorizationOutcome, AuthorizationProfilePublicationState,
+    AuthorizationRequest, EntitlementDecision, EntitlementRequest, NamespaceId,
+    ResourceAuthorizationRequest,
 };
 
 /// Availability failure at the IAM decision boundary.
@@ -44,6 +45,13 @@ pub enum IamDecisionError {
 
 /// Shared client interface for services that delegate IAM decisions.
 pub trait IamClient {
+    /// Publication evidence is an explicit capability, never a permissive default.
+    fn profile_publication_state(
+        &self,
+        _namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, IamDecisionError> {
+        Err(IamDecisionError::Unavailable)
+    }
     /// Contextual authorization is an explicit capability; legacy providers fail closed.
     fn authorize_resource_result(
         &self,
@@ -82,6 +90,12 @@ pub trait IamClient {
 /// of [`IamClientMode`] by borrow, without surrendering ownership or cloning the
 /// policy — the local client and the mounted routes then share one engine.
 impl<C: IamClient + ?Sized> IamClient for &C {
+    fn profile_publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, IamDecisionError> {
+        (**self).profile_publication_state(namespace)
+    }
     fn authorize_resource_result(
         &self,
         request: ResourceAuthorizationRequest,
@@ -142,6 +156,12 @@ mod tests {
             ScopeRef::Global,
         );
         assert_eq!(borrowed.authorize(request), AuthorizationDecision::Allow);
+        // C1 an older client implements no publication capability. Its borrowed
+        // adapter must preserve unavailable, never manufacture unconfigured.
+        assert_eq!(
+            borrowed.profile_publication_state(&NamespaceId("example.business".into())),
+            Err(IamDecisionError::Unavailable)
+        );
         assert_eq!(
             borrowed.check_entitlement(EntitlementRequest {
                 principal: PrincipalRef::Account {
