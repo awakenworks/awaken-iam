@@ -16,20 +16,20 @@
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationDecision, AuthorizationOutcome, AuthorizationProfile,
-    AuthorizationProfileActivated, AuthorizationProfileRetired, AuthorizationProfileValidation,
-    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery,
-    DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult,
-    DirectoryNodeView, DirectoryRevisionQuery, EnsureProductSpacePlacement,
-    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId,
-    InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
-    NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement,
-    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
-    ReplaceScopedMemberships, ResendInvitation, ResourceAuthorizationRequest,
-    ResourceModelRegistered, ResourceModelRegistration, RetireAuthorizationProfile,
-    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
-    UserInfo, WorkspaceOrgEdge,
+    AuthorizationProfileActivated, AuthorizationProfilePublicationState,
+    AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
+    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryChildrenView,
+    DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
+    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
+    EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery,
+    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView,
+    PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
+    ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
+    ResourceAuthorizationRequest, ResourceModelRegistered, ResourceModelRegistration,
+    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
+    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::{IamClient, IamDecisionError};
@@ -50,6 +50,15 @@ pub struct RemoteError(pub String);
 /// shaping, decision mapping, fail-closed policy) be unit tested without network
 /// access. Implementations should be `Send + Sync` so the client can be shared.
 pub trait AuthzTransport {
+    /// Read publication evidence; unsupported transports cannot attest absence.
+    fn profile_publication_state(
+        &self,
+        _namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
+        Err(RemoteError(
+            "profile publication evidence is unsupported".into(),
+        ))
+    }
     /// `POST /v1/authorize/resource`; unsupported transports cannot widen access.
     fn authorize_resource(
         &self,
@@ -417,6 +426,18 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.fetch_snapshot()
     }
 
+    /// Require evidence for the exact requested namespace, never another profile.
+    pub fn profile_publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
+        let state = self.transport.profile_publication_state(namespace)?;
+        if state.namespace != *namespace {
+            return Err(RemoteError("profile publication namespace mismatch".into()));
+        }
+        Ok(state)
+    }
+
     /// Fetch a namespace's active signer set for trust-root distribution,
     /// surfacing transport errors. The set carries the same version fence as the
     /// policy snapshot, so a consumer caches it and re-syncs when the fence moves.
@@ -691,6 +712,13 @@ impl<T: DirectoryClient> RemoteIamClient<T> {
 }
 
 impl<T: AuthzTransport> IamClient for RemoteIamClient<T> {
+    fn profile_publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, IamDecisionError> {
+        RemoteIamClient::profile_publication_state(self, namespace)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
     fn authorize_resource_result(
         &self,
         request: ResourceAuthorizationRequest,
@@ -762,6 +790,15 @@ impl<L, R> IamClientMode<L, R> {
 }
 
 impl<L: IamClient, R: IamClient> IamClient for IamClientMode<L, R> {
+    fn profile_publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, IamDecisionError> {
+        match self {
+            Self::Local(client) => client.profile_publication_state(namespace),
+            Self::Remote(client) => client.profile_publication_state(namespace),
+        }
+    }
     fn authorize_resource_result(
         &self,
         request: ResourceAuthorizationRequest,

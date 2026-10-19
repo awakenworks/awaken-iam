@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use awaken_iam_contract::{
     ActivateAuthorizationProfile, AuthorizationProfile, AuthorizationProfileActivated,
-    AuthorizationProfileDocument, AuthorizationProfileRetired, AuthorizationProfileValidation,
-    CreateAuthorizationProfile, NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
+    AuthorizationProfileDocument, AuthorizationProfilePublicationState,
+    AuthorizationProfileRetired, AuthorizationProfileValidation, CreateAuthorizationProfile,
+    NamespaceId, PolicySnapshot, ProfileLifecycle, ScopeKind,
 };
 use awaken_iam_core::{AuthorizationProfileRepository, PolicySet, RepositoryError};
 use sha2::{Digest, Sha256};
@@ -212,6 +213,23 @@ impl AuthorizationProfileAdmin {
         namespace: &NamespaceId,
     ) -> Result<Vec<AuthorizationProfile>, ProfileAdminError> {
         Ok(self.repository.list_profiles(namespace)?)
+    }
+
+    /// Project publication history without exposing documents or creating state.
+    pub fn publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, ProfileAdminError> {
+        let has_published_revision = self.list(namespace)?.iter().any(|profile| {
+            matches!(
+                profile.lifecycle,
+                ProfileLifecycle::Active | ProfileLifecycle::Retired
+            )
+        });
+        Ok(AuthorizationProfilePublicationState {
+            namespace: namespace.clone(),
+            has_published_revision,
+        })
     }
 
     pub fn active(

@@ -635,6 +635,9 @@ async fn scoped_role_change_reaches_the_live_pdp_as_one_http_command() {
     assert_eq!(roles, ["custom:auditor", "product:admin"].into(), "R2/R3");
 }
 
+#[path = "admin_http_e2e/profile_tests.rs"]
+mod profile_tests;
+
 #[tokio::test]
 async fn admin_crud_is_served_over_http_and_advances_the_snapshot_version() {
     let router = daemon();

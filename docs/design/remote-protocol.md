@@ -31,6 +31,8 @@ Directory methods.
 | Transport method | HTTP endpoint |
 |---|---|
 | `authorize` | `POST /v1/authorize` |
+| `authorize_resource` | `POST /v1/authorize/resource` |
+| `profile_publication_state` | `GET /v1/authz/profiles/{namespace}/publication` |
 | `authorize_batch` | `POST /v1/authorize/batch` |
 | `check_entitlement` | `POST /v1/entitlements/check` |
 | `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
@@ -72,6 +74,8 @@ internals.
 
 ```http
 POST /v1/authorize
+POST /v1/authorize/resource
+GET  /v1/authz/profiles/{namespace}/publication
 POST /v1/authorize/batch
 POST /v1/entitlements/check
 GET  /v1/namespaces/{namespace_id}/signers
@@ -114,6 +118,32 @@ Returns the versioned [`AuthzSnapshot`](authorization-engine.md#snapshot) for
 consumers that prefer to evaluate locally and only sync on the `version` fence. `since` lets the client skip an unchanged snapshot. Decisions
 computed from a synced snapshot are byte-identical to remote `authorize` calls —
 the evaluation code is shared, the transport differs.
+
+### Profile publication evidence
+
+The existing profile PAP owns a small read projection for decision consumers:
+
+```json
+{ "namespace": "example.business", "has_published_revision": false }
+```
+
+`AuthorizationProfileAdmin` reads its existing immutable revision history.
+Draft and validated-only history is false; any active or retired revision is
+true. Retirement cannot turn a previously configured namespace back into an
+unconfigured one. No flag, policy copy, or additional repository is stored.
+
+This is evidence about publication, not permission. A consumer must first
+authorize its platform operation; an optional business layer may retain legacy
+behavior only after a successful, exact-namespace false response. Published
+namespaces still require the ordinary contextual PDP. The caller verifies the
+echoed namespace. Missing fields, an unsupported endpoint, malformed replies,
+transport errors, and unavailable history are errors, never false. The Boolean
+is required on the wire and has no deserialization default.
+
+The read uses the existing decision transport and credential source; it cannot
+create, activate, retire, or enumerate policy documents. PAP mutations retain
+their separate administrator credential. Embedded hosts call the same native
+projection; remote hosts expose it through the existing decision router.
 
 ### POST /v1/tokens/introspect
 

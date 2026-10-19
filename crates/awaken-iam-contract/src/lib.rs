@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 mod profile;
 pub use profile::{
     ActionScopeRule, ActivateAuthorizationProfile, AuthorizationProfile,
-    AuthorizationProfileActivated, AuthorizationProfileDocument, AuthorizationProfileRetired,
+    AuthorizationProfileActivated, AuthorizationProfileDocument,
+    AuthorizationProfilePublicationState, AuthorizationProfileRetired,
     AuthorizationProfileValidation, CreateAuthorizationProfile, ProfileLifecycle,
     RetireAuthorizationProfile, ScopeKind,
 };

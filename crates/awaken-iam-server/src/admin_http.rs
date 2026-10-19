@@ -278,6 +278,10 @@ where
         .route("/v1/authorize/batch", post(authorize_batch))
         .route("/v1/entitlements/check", post(check_entitlement))
         .route("/v1/authz/snapshot", get(snapshot))
+        .route(
+            "/v1/authz/profiles/{namespace}/publication",
+            get(profile_publication_state),
+        )
         .route("/v1/capabilities/introspect", post(introspect_capability))
         .route("/v1/admin/orgs", post(create_org).get(list_orgs))
         .route(
@@ -689,6 +693,16 @@ async fn list_profiles(
         return rejection;
     }
     profile_result(guard.profiles.list(&NamespaceId(namespace)))
+}
+
+async fn profile_publication_state(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    Path(namespace): Path<String>,
+) -> Response {
+    let guard = lock(&state);
+    // Read-only decision evidence shares the existing decision transport;
+    // it exposes neither policy documents nor any PAP mutation capability.
+    profile_result(guard.profiles.publication_state(&NamespaceId(namespace)))
 }
 
 async fn active_profile(

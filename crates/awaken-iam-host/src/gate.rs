@@ -354,6 +354,19 @@ fn is_api_token(token: &str) -> bool {
 }
 
 impl IamClient for IamGate {
+    fn profile_publication_state(
+        &self,
+        namespace: &awaken_iam_contract::NamespaceId,
+    ) -> Result<awaken_iam_contract::AuthorizationProfilePublicationState, IamDecisionError> {
+        match self.inner.as_ref() {
+            GateInner::Remote { client, .. } => {
+                IamClient::profile_publication_state(client, namespace)
+            }
+            // This gate owns the PDP, not Profile administration history.
+            // Embedded products query their existing native PAP owner directly.
+            GateInner::Open | GateInner::Local { .. } => Err(IamDecisionError::Unavailable),
+        }
+    }
     fn authorize_resource_result(
         &self,
         request: ResourceAuthorizationRequest,

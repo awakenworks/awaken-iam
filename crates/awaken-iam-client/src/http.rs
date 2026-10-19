@@ -23,20 +23,20 @@ use std::time::Duration;
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
     AuthorizationOutcome, AuthorizationProfile, AuthorizationProfileActivated,
-    AuthorizationProfileRetired, AuthorizationProfileValidation, AuthorizationRequest,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, CreateAuthorizationProfile,
-    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryChildrenView,
-    DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
-    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
-    EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery, InvitationView,
-    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot,
-    ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
-    ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
-    ResourceModelRegistered, ResourceModelRegistration, ResourceProvision,
-    ResourceProvisionReceipt, RetireAuthorizationProfile, RetireProductSpacePlacement,
-    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
-    WorkspaceOrgEdge,
+    AuthorizationProfilePublicationState, AuthorizationProfileRetired,
+    AuthorizationProfileValidation, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
+    DirectoryChildrenQuery, DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId,
+    DirectoryNodeMutationResult, DirectoryNodeView, DirectoryRevisionQuery,
+    EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
+    InvitationId, InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery,
+    MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult,
+    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
+    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered,
+    ResourceModelRegistration, ResourceProvision, ResourceProvisionReceipt,
+    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
+    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -252,6 +252,19 @@ impl HttpAuthzTransport {
 }
 
 impl AuthzTransport for HttpAuthzTransport {
+    fn profile_publication_state(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
+        let mut url = reqwest::Url::parse(&self.url("/v1/authz/profiles"))
+            .map_err(|error| RemoteError(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteError("IAM base URL cannot carry path segments".into()))?
+            .push(&namespace.0)
+            .push("publication");
+        let response = self.send_with_retry(|| self.client.get(url.clone()))?;
+        Self::decode(response)
+    }
     fn authorize_resource(
         &self,
         request: &ResourceAuthorizationRequest,
@@ -836,6 +849,96 @@ mod tests {
             ActionKey(action.into()),
             ScopeRef::Global,
         )
+    }
+
+    #[test]
+    fn publication_evidence_is_exact_or_unavailable_never_a_default() {
+        use crate::{IamClient, IamClientMode, RemoteIamClient};
+        // P1 exact false/true -> evidence. P2 foreign namespace, P3 incomplete
+        // or malformed body, P4 unsupported/failed endpoint -> unavailable.
+        // Existing transport tests own timeout/retry/rotating-file behavior;
+        // this query must use that same transport and credential resolution.
+        for (reply, expected) in [
+            (
+                Reply::Ok(
+                    r#"{"namespace":"example.business","has_published_revision":false}"#.into(),
+                ),
+                Some(false),
+            ),
+            (
+                Reply::Ok(
+                    r#"{"namespace":"example.business","has_published_revision":true}"#.into(),
+                ),
+                Some(true),
+            ),
+            (
+                Reply::Ok(r#"{"namespace":"other","has_published_revision":false}"#.into()),
+                None,
+            ),
+            (
+                Reply::Ok(r#"{"namespace":"example.business"}"#.into()),
+                None,
+            ),
+            (Reply::Ok("not-json".into()), None),
+            (Reply::Status(404), None),
+            (Reply::Status(500), None),
+        ] {
+            let server = StubServer::start(vec![reply]);
+            let transport = HttpAuthzTransport::new(
+                HttpTransportConfig::new(&server.addr)
+                    .with_audience("example-service")
+                    .with_service_token("test-service")
+                    .with_max_retries(0),
+            )
+            .unwrap();
+            let client = RemoteIamClient::new(transport);
+            // A borrowed mode-switch client must preserve the same capability;
+            // it cannot turn an unsupported/error response into false.
+            let mode: IamClientMode<
+                &RemoteIamClient<HttpAuthzTransport>,
+                &RemoteIamClient<HttpAuthzTransport>,
+            > = IamClientMode::Remote(&client);
+            let result = IamClient::profile_publication_state(
+                &mode,
+                &NamespaceId("example.business".into()),
+            );
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap().has_published_revision, expected),
+                None => assert_eq!(result, Err(crate::IamDecisionError::Unavailable)),
+            }
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0].starts_with("GET /v1/authz/profiles/example.business/publication ")
+            );
+            let headers = requests[0].to_ascii_lowercase();
+            assert!(headers.contains("x-iam-audience: example-service"));
+            assert!(headers.contains("authorization: bearer test-service"));
+        }
+    }
+
+    #[test]
+    fn publication_namespace_is_one_encoded_path_segment() {
+        // U1 a namespace containing separators must remain data, not a new
+        // endpoint or query. Its echoed identity still has to match exactly.
+        let namespace = NamespaceId("example/with space".into());
+        let server = StubServer::start(vec![Reply::Ok(
+            serde_json::json!({
+                "namespace": namespace, "has_published_revision": false,
+            })
+            .to_string(),
+        )]);
+        let client = crate::RemoteIamClient::new(transport(&server));
+        assert!(
+            !client
+                .profile_publication_state(&namespace)
+                .unwrap()
+                .has_published_revision
+        );
+        assert!(
+            server.requests()[0]
+                .starts_with("GET /v1/authz/profiles/example%2Fwith%20space/publication ")
+        );
     }
 
     #[test]
