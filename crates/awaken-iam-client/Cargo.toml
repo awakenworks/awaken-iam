@@ -43,5 +43,8 @@ getrandom = { version = "0.3", optional = true }
 sha2 = { version = "0.10", optional = true }
 url = { version = "2", optional = true }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

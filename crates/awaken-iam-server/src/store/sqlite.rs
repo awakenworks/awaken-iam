@@ -277,6 +277,14 @@ impl MigrationExecutor for SqliteBackend {
 
             let recorded = read_applied(&tx, ledger, bundle.bundle_id())?;
             let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+            let bridge = super::migration_compatibility::atomic_v8_bridge(
+                bundle, &recorded, prefix, dialect,
+            )?;
+            if let Some(bridge) = &bridge {
+                for sql in &bridge.before {
+                    tx.execute_batch(sql).map_err(backend_err)?;
+                }
+            }
             for migration in pending {
                 let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
                 tx.execute_batch(&sql).map_err(backend_err)?;
@@ -303,6 +311,11 @@ impl MigrationExecutor for SqliteBackend {
                     checksum,
                     description,
                 });
+            }
+            if let Some(bridge) = &bridge {
+                for sql in &bridge.after {
+                    tx.execute_batch(sql).map_err(backend_err)?;
+                }
             }
             tx.commit().map_err(backend_err)?;
         }

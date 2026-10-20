@@ -617,7 +617,7 @@ impl ProvisionTransport for HttpAuthzTransport {
     fn provision(&self, provision: &ResourceProvision) -> Result<(), RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
-                .post(self.url("/v1/authz/resource-provisions"))
+                .post(self.url("/v1/authz/resource-provision-transactions"))
                 .json(provision)
         })?;
         let _: ResourceProvisionReceipt = Self::decode(response)?;
@@ -1484,6 +1484,8 @@ mod tests {
         ProvisionTransport::provision(&transport, &provision).unwrap();
         assert!(ProvisionTransport::provision(&transport, &provision).is_err());
         drop(transport);
-        assert!(server.requests()[0].starts_with("POST /v1/authz/resource-provisions "));
+        assert!(
+            server.requests()[0].starts_with("POST /v1/authz/resource-provision-transactions ")
+        );
     }
 }

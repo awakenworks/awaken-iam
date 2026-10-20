@@ -28,8 +28,8 @@ use awaken_iam_core::{
     StoredAuthorizationCode,
 };
 use awaken_iam_server::{
-    DirectoryApi, DirectoryCommandContext, FenceStore, PolicyAdminApi, PostgresBackend, SqlConn, SqlStore,
-    postgres_migrated_store, sqlite_in_memory_store,
+    DirectoryApi, DirectoryCommandContext, FenceStore, PolicyAdminApi, PostgresBackend, SqlConn,
+    SqlStore, postgres_migrated_store, sqlite_in_memory_store,
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -1324,4 +1324,123 @@ fn postgres_backend_clones_recover_after_transport_loss_when_configured() {
     admin
         .batch_execute(&format!("DROP TABLE {table}"))
         .expect("drop reconnect fixture");
+}
+
+#[test]
+fn postgres_published_and_consumed_v8_upgrade_preserves_rows_and_receipts_when_configured() {
+    use awaken_iam_server::{Migration, MigrationBundle, MigrationExecutor, bundles};
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    for consumed in [false, true] {
+        let schema = IsolatedPostgresSchema::create(&url, "iam_v8_upgrade");
+        let mut backend = PostgresBackend::connect(&schema.url).unwrap();
+        let previous = bundles()
+            .into_iter()
+            .map(|bundle| {
+                let migrations = bundle
+                    .migrations()
+                    .iter()
+                    .filter(|migration| {
+                        bundle.bundle_id() != "iam.authz" || migration.version() <= 8
+                    })
+                    .map(|migration| {
+                        if consumed && bundle.bundle_id() == "iam.authz" && migration.version() == 8
+                        {
+                            Migration::new(
+                                8,
+                                "consumed atomic provision schema",
+                                include_str!("fixtures/consumed-authz-v8.sql"),
+                            )
+                            .unwrap()
+                        } else {
+                            migration.clone()
+                        }
+                    })
+                    .collect();
+                MigrationBundle::new(bundle.bundle_id(), migrations).unwrap()
+            })
+            .collect::<Vec<_>>();
+        backend.run_migrations("iam", &previous).unwrap();
+        let table = if consumed {
+            "iam_resource_epochs"
+        } else {
+            "iam_product_actions"
+        };
+        let insert = if consumed {
+            "INSERT INTO iam_resource_epochs (resource_type, resource_id, epoch) VALUES ('test.resource', 'retained', 7)"
+        } else {
+            "INSERT INTO iam_product_actions (product_id, action_key) VALUES ('test', 'retained')"
+        };
+        backend.execute(insert, &[]).unwrap();
+        let receipt = backend.applied_versions("iam", "iam.authz").unwrap()[&8].clone();
+        if consumed {
+            // Fail after the private tables have been saved. The same migration
+            // transaction must roll back every rename/DDL and preserve the data.
+            backend
+                .execute(
+                    "CREATE TABLE iam_product_actions (product_id TEXT, action_key TEXT)",
+                    &[],
+                )
+                .unwrap();
+            assert!(backend.run_migrations("iam", &bundles()).is_err());
+            assert!(
+                !backend
+                    .applied_versions("iam", "iam.authz")
+                    .unwrap()
+                    .contains_key(&9)
+            );
+            assert!(
+                backend
+                    .query("SELECT * FROM iam_atomic_v8_resource_epochs", &[])
+                    .is_err()
+            );
+            assert_eq!(
+                backend
+                    .query(
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM iam_resource_epochs",
+                        &[]
+                    )
+                    .unwrap()[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+            backend
+                .execute("DROP TABLE iam_product_actions", &[])
+                .unwrap();
+        }
+        assert_eq!(backend.run_migrations("iam", &bundles()).unwrap().len(), 1);
+        assert_eq!(
+            backend.applied_versions("iam", "iam.authz").unwrap()[&8],
+            receipt
+        );
+        assert_eq!(
+            backend
+                .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                .unwrap()[0][0]
+                .as_deref(),
+            Some("1")
+        );
+        for created in ["iam_resource_projection_streams", "iam_resource_provisions"] {
+            backend
+                .query(
+                    &format!("SELECT CAST(COUNT(*) AS TEXT) FROM {created}"),
+                    &[],
+                )
+                .unwrap();
+        }
+        assert!(
+            backend
+                .run_migrations("iam", &bundles())
+                .unwrap()
+                .is_empty()
+        );
+        backend
+            .execute(
+                "UPDATE iam_schema_migrations SET checksum = ? WHERE bundle_id = ? AND version = 8",
+                &[Some("f".repeat(64)), Some("iam.authz".into())],
+            )
+            .unwrap();
+        assert!(backend.run_migrations("iam", &bundles()).is_err());
+    }
 }

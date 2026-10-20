@@ -1,0 +1,2 @@
+CREATE TABLE {prefix}_resource_provisions (idempotency_key TEXT PRIMARY KEY, epoch BIGINT NOT NULL, fingerprint TEXT NOT NULL, version BIGINT NOT NULL, applied_at TEXT NOT NULL);
+CREATE TABLE {prefix}_resource_epochs (resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (resource_type, resource_id));

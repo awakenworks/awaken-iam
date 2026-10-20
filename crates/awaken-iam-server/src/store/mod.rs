@@ -12,6 +12,7 @@ mod fence;
 mod health;
 mod memory;
 mod migration;
+mod migration_compatibility;
 mod postgres;
 mod sql;
 mod sqlite;

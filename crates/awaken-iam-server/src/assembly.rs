@@ -157,6 +157,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::post("/v1/authz/resource-model"),
     RouteSpec::post("/v1/authz/resource-provisions"),
+    RouteSpec::post("/v1/authz/resource-provision-transactions"),
     RouteSpec::get("/v1/authz/snapshot"),
     RouteSpec::post("/v1/capabilities/introspect"),
 ];

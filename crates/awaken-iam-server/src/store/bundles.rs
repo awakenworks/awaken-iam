@@ -133,7 +133,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "product projection ownership and resource tombstones",
                     AUTHZ_0008,
                 ),
-                (9, "resource provision receipts and epoch fences", AUTHZ_0009),
+                (
+                    9,
+                    "resource provision receipts and epoch fences",
+                    AUTHZ_0009,
+                ),
             ],
         ),
         bundle(
@@ -181,8 +185,20 @@ fn bundle(scope: BundleScope, steps: Vec<(i64, &'static str, &'static str)>) -> 
     let migrations = steps
         .into_iter()
         .map(|(version, description, sql)| {
-            Migration::new(version, description, sql)
-                .unwrap_or_else(|err| panic!("invalid {} migration: {err}", scope.id()))
+            let migration = if scope == BundleScope::Authz && version == 8 {
+                // Exact receipts from GitHub main 17c3c638 and the consumed
+                // db9cd845 track converge through append-only migration 9.
+                Migration::published_legacy_with_aliases(
+                    version,
+                    description,
+                    sql,
+                    "f164a6739d1212600d879f441fd1e1b79fbfe83abdcf86431512dde621fae548",
+                    [super::migration_compatibility::CONSUMED_AUTHZ_V8_CHECKSUM],
+                )
+            } else {
+                Migration::new(version, description, sql)
+            };
+            migration.unwrap_or_else(|err| panic!("invalid {} migration: {err}", scope.id()))
         })
         .collect();
     MigrationBundle::new(scope.id(), migrations)
@@ -462,6 +478,7 @@ CREATE TABLE {prefix}_product_actions (\
  action_key TEXT NOT NULL, \
  PRIMARY KEY (product_id, action_key));";
 
+// Append the atomic schema; the known-v8 bridge preserves existing rows.
 const AUTHZ_0009: &str = "\
 CREATE TABLE {prefix}_resource_provisions (\
  idempotency_key TEXT PRIMARY KEY, \
@@ -589,6 +606,116 @@ CREATE TABLE {prefix}_audit_events (\
 mod tests {
     use super::*;
     use crate::store::{SqlConn, SqliteBackend, sqlite_in_memory_store};
+
+    #[test]
+    fn published_and_consumed_v8_ledgers_converge_without_rewriting_receipts() {
+        use crate::store::migration::{Migration, MigrationBundle, MigrationExecutor};
+        const CONSUMED_V8: &str = include_str!("../../tests/fixtures/consumed-authz-v8.sql");
+        for consumed in [false, true] {
+            let mut backend = SqliteBackend::open_in_memory().unwrap();
+            let previous = super::bundles()
+                .into_iter()
+                .map(|bundle| {
+                    let migrations = bundle
+                        .migrations()
+                        .iter()
+                        .filter(|migration| {
+                            bundle.bundle_id() != "iam.authz" || migration.version() <= 8
+                        })
+                        .map(|migration| {
+                            if consumed
+                                && bundle.bundle_id() == "iam.authz"
+                                && migration.version() == 8
+                            {
+                                Migration::new(8, "consumed atomic provision schema", CONSUMED_V8)
+                                    .unwrap()
+                            } else {
+                                migration.clone()
+                            }
+                        })
+                        .collect();
+                    MigrationBundle::new(bundle.bundle_id(), migrations).unwrap()
+                })
+                .collect::<Vec<_>>();
+            backend.run_migrations("iam", &previous).unwrap();
+            if consumed {
+                backend.execute("INSERT INTO iam_resource_epochs (resource_type, resource_id, epoch) VALUES ('test.resource', 'retained', 7)", &[]).unwrap();
+            } else {
+                backend.execute("INSERT INTO iam_product_actions (product_id, action_key) VALUES ('test', 'retained')", &[]).unwrap();
+            }
+            let receipt = backend.applied_versions("iam", "iam.authz").unwrap()[&8].clone();
+            if consumed {
+                backend
+                    .execute(
+                        "CREATE TABLE iam_product_actions (product_id TEXT, action_key TEXT)",
+                        &[],
+                    )
+                    .unwrap();
+                assert!(backend.run_migrations("iam", &super::bundles()).is_err());
+                assert!(
+                    !backend
+                        .applied_versions("iam", "iam.authz")
+                        .unwrap()
+                        .contains_key(&9)
+                );
+                assert!(
+                    backend
+                        .query("SELECT * FROM iam_atomic_v8_resource_epochs", &[])
+                        .is_err()
+                );
+                assert_eq!(
+                    backend
+                        .query(
+                            "SELECT CAST(COUNT(*) AS TEXT) FROM iam_resource_epochs",
+                            &[]
+                        )
+                        .unwrap()[0][0]
+                        .as_deref(),
+                    Some("1")
+                );
+                backend
+                    .execute("DROP TABLE iam_product_actions", &[])
+                    .unwrap();
+            }
+            let applied = backend.run_migrations("iam", &super::bundles()).unwrap();
+            assert_eq!(applied.len(), 1, "only the new convergence step applies");
+            assert_eq!(
+                backend.applied_versions("iam", "iam.authz").unwrap()[&8],
+                receipt
+            );
+            for table in [
+                "iam_product_actions",
+                "iam_resource_epochs",
+                "iam_resource_projection_streams",
+                "iam_resource_provisions",
+            ] {
+                backend
+                    .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                    .unwrap();
+            }
+            let table = if consumed {
+                "iam_resource_epochs"
+            } else {
+                "iam_product_actions"
+            };
+            assert_eq!(
+                backend
+                    .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                    .unwrap()[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+            assert!(
+                backend
+                    .run_migrations("iam", &super::bundles())
+                    .unwrap()
+                    .is_empty()
+            );
+            // Only the two known receipts are accepted; drift still fails closed.
+            backend.execute("UPDATE iam_schema_migrations SET checksum = ? WHERE bundle_id = ? AND version = 8", &[Some("f".repeat(64)), Some("iam.authz".into())]).unwrap();
+            assert!(backend.run_migrations("iam", &super::bundles()).is_err());
+        }
+    }
 
     #[test]
     fn projection_migration_applies_and_fences_cross_stream_ownership() {

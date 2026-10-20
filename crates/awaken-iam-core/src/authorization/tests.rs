@@ -606,8 +606,7 @@ fn obligation_id_is_stable_across_re_queries_and_varies_by_question() {
 
     let first = policy.evaluate(&request(account("ada"), "issue.delete", ScopeRef::Global));
     let again = policy.evaluate(&request(account("ada"), "issue.delete", ScopeRef::Global));
-    let other_action =
-        policy.evaluate(&request(account("ada"), "issue.archive", ScopeRef::Global));
+    let other_action = policy.evaluate(&request(account("ada"), "issue.archive", ScopeRef::Global));
     let other_principal =
         policy.evaluate(&request(account("bob"), "issue.delete", ScopeRef::Global));
 

@@ -420,6 +420,7 @@ pub struct SignerSetSnapshot {
 /// payload lands, a request against the new resource simply matches no grant and
 /// is denied — it never over-permits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceProvision {
     /// Product namespace that owns the resource semantics and outbox record.
     pub product_id: ProductId,
