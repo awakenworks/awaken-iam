@@ -7,6 +7,8 @@
 pre-commit:
   parallel: true
   commands:
+    trust-roots:
+      run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     rustfmt:
       glob: "*.rs"
       run: cargo fmt --all
@@ -36,6 +38,8 @@ pre-commit:
 pre-push:
   parallel: false
   commands:
+    trust-roots:
+      run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     clippy:
       run: cargo clippy --workspace --all-targets -- -D clippy::correctness
     guardrails:
