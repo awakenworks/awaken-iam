@@ -100,8 +100,8 @@ mod tests {
     use awaken_iam_contract::{
         AccountId, ApiTokenStatus, AuthorizationOutcome, AuthorizationRequest,
         BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
-        EntitlementRequest, NamespaceId, PolicySnapshot, PrincipalRef, ResourceModelRegistered,
-        ResourceModelRegistration, SignerSetSnapshot, TokenIntrospectionRequest,
+        EntitlementRequest, NamespaceId, PolicySnapshot, PrincipalRef, ProductResourceModelRequest,
+        ResourceModelRegistered, SignerSetSnapshot, TokenIntrospectionRequest,
         TokenIntrospectionResponse, WorkspaceId,
     };
 
@@ -125,7 +125,7 @@ mod tests {
         }
         fn register_resource_model(
             &self,
-            _: &ResourceModelRegistration,
+            _: &ProductResourceModelRequest,
         ) -> Result<ResourceModelRegistered, RemoteError> {
             unreachable!()
         }
@@ -169,7 +169,7 @@ mod tests {
         }
         fn register_resource_model(
             &self,
-            _: &ResourceModelRegistration,
+            _: &ProductResourceModelRequest,
         ) -> Result<ResourceModelRegistered, RemoteError> {
             unreachable!()
         }

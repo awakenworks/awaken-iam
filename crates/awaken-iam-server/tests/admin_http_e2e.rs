@@ -1863,3 +1863,149 @@ async fn principal_membership_and_workspace_projection_drive_one_live_policy() {
 }
 
 // -- helpers ------------------------------------------------------------------
+
+#[tokio::test]
+async fn exact_privacy_http_preserves_identity_auth_and_current_policy_receipt() {
+    use awaken_iam_contract::{OrgId, OrgPrivacyCommitReceipt};
+    // CF2 actual router/PAP/SQLite table: H1 unauthorized -> no erasure;
+    // H2 original Org in typed BODY (including URL punctuation) -> exact
+    // confirmed commit; H3 response loss/replay -> original erasure version;
+    // H4 unrelated policy advance -> CURRENT observed version; H5 Never ->
+    // committed negative admission, explicitly unconfirmed; H6 old DELETE ack
+    // remains only its original {version} JSON and cannot supply this receipt.
+    let app = daemon();
+    let org = "org/../foreign?x#z";
+    for id in [org, "foreign"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(authed_json("POST", "/v1/admin/orgs", org_body(id)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let unauthenticated = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/orgs/privacy-erasure")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(org).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "H1"
+    );
+    let live = body_json(
+        app.clone()
+            .oneshot(authed_get("/v1/admin/orgs"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        live.as_array().unwrap().iter().any(|row| row["id"] == org),
+        "H1 no effect"
+    );
+    let response = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/admin/orgs/privacy-erasure",
+            serde_json::json!(org),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "H2");
+    let first: OrgPrivacyCommitReceipt = serde_json::from_value(body_json(response).await).unwrap();
+    first.validate_for(&OrgId(org.into())).unwrap();
+    assert!(
+        first.confirmed_organization && first.changed && first.admission_changed,
+        "H2"
+    );
+    let replay: OrgPrivacyCommitReceipt = serde_json::from_value(
+        body_json(
+            app.clone()
+                .oneshot(authed_json(
+                    "POST",
+                    "/v1/admin/orgs/privacy-erasure",
+                    serde_json::json!(org),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(replay.erasure_version, first.erasure_version, "H3");
+    assert!(!replay.changed && !replay.admission_changed, "H3");
+    let advanced = body_json(
+        app.clone()
+            .oneshot(authed_json("POST", "/v1/admin/orgs", org_body("unrelated")))
+            .await
+            .unwrap(),
+    )
+    .await["version"]
+        .as_u64()
+        .unwrap();
+    let replay: OrgPrivacyCommitReceipt = serde_json::from_value(
+        body_json(
+            app.clone()
+                .oneshot(authed_json(
+                    "POST",
+                    "/v1/admin/orgs/privacy-erasure",
+                    serde_json::json!(org),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        replay.erasure_version, first.erasure_version,
+        "H4 original erasure"
+    );
+    assert_eq!(
+        replay.observed_policy_version, advanced,
+        "H4 current policy"
+    );
+    let never: OrgPrivacyCommitReceipt = serde_json::from_value(
+        body_json(
+            app.clone()
+                .oneshot(authed_json(
+                    "POST",
+                    "/v1/admin/orgs/privacy-erasure",
+                    serde_json::json!("never-known"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert!(
+        !never.confirmed_organization && !never.changed && never.admission_changed,
+        "H5 not certificate proof"
+    );
+    let old = body_json(
+        app.clone()
+            .oneshot(authed("DELETE", "/v1/admin/orgs/foreign", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        old.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["version"],
+        "H6 unchanged legacy shape"
+    );
+    assert!(
+        serde_json::from_value::<OrgPrivacyCommitReceipt>(old).is_err(),
+        "H6 no fabricated receipt"
+    );
+}

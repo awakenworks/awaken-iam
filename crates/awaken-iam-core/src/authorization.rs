@@ -30,7 +30,7 @@ use awaken_iam_contract::{
     ActionKey, ApprovalAuthority, ApprovalObligation, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationProfile, AuthorizationRequest, GrantEffect, GrantSnapshot, GrantSubjectRef,
     GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceId, NamespaceOrgEdge, OrgId,
-    PolicySnapshot, PrincipalRef, ResourceId, ResourceParentEdge, ResourceType,
+    PolicySnapshot, PrincipalRef, ResourceId, ResourceParentEdge, ResourceType, RetiredResource,
     RoleBindingSnapshot, ScopeGraphSnapshot, ScopeKind, ScopeRef, WorkspaceId, WorkspaceOrgEdge,
 };
 
@@ -257,6 +257,7 @@ pub struct ScopeGraph {
     namespace_org: HashMap<NamespaceId, OrgId>,
     workspace_org: HashMap<WorkspaceId, OrgId>,
     resource_parent: HashMap<(ResourceType, ResourceId), ScopeRef>,
+    retired_resources: HashSet<(ResourceType, ResourceId)>,
 }
 
 impl ScopeGraph {
@@ -290,6 +291,16 @@ impl ScopeGraph {
     ) -> &mut Self {
         self.resource_parent
             .insert((resource_type, resource_id), parent);
+        self
+    }
+
+    /// Keep a retired resource inaccessible even if an older or manual grant remains.
+    pub fn retire_resource(
+        &mut self,
+        resource_type: ResourceType,
+        resource_id: ResourceId,
+    ) -> &mut Self {
+        self.retired_resources.insert((resource_type, resource_id));
         self
     }
 
@@ -334,10 +345,22 @@ impl ScopeGraph {
                 .cmp(&(right.resource_type.0.as_str(), right.resource_id.0.as_str()))
         });
 
+        let mut retired_resources: Vec<_> = self
+            .retired_resources
+            .iter()
+            .map(|(resource_type, resource_id)| RetiredResource {
+                resource_type: resource_type.clone(),
+                resource_id: resource_id.clone(),
+            })
+            .collect();
+        retired_resources.sort_by(|a, b| {
+            (&a.resource_type.0, &a.resource_id.0).cmp(&(&b.resource_type.0, &b.resource_id.0))
+        });
         ScopeGraphSnapshot {
             namespace_orgs,
             workspace_orgs,
             resource_parents,
+            retired_resources,
         }
     }
 
@@ -404,6 +427,16 @@ impl ScopeGraph {
     /// `request_scope`, i.e. `grant_scope` is `request_scope` or one of its
     /// ancestors.
     pub fn covers(&self, grant_scope: &ScopeRef, request_scope: &ScopeRef) -> bool {
+        if let ScopeRef::Resource {
+            resource_type,
+            resource_id,
+        } = request_scope
+            && self
+                .retired_resources
+                .contains(&(resource_type.clone(), resource_id.clone()))
+        {
+            return false;
+        }
         self.ancestors(request_scope)
             .iter()
             .any(|ancestor| ancestor == grant_scope)
@@ -957,6 +990,9 @@ impl PolicySet {
                 edge.resource_id.clone(),
                 edge.parent.clone(),
             );
+        }
+        for retired in &snapshot.scope_graph.retired_resources {
+            graph.retire_resource(retired.resource_type.clone(), retired.resource_id.clone());
         }
         for profile in &snapshot.active_profiles {
             for constraint in &profile.document.grant_constraints {

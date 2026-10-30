@@ -12,6 +12,7 @@ mod fence;
 mod health;
 mod memory;
 mod migration;
+mod migration_compatibility;
 mod postgres;
 mod sql;
 mod sqlite;
@@ -25,8 +26,25 @@ pub use migration::{
     PlannedMigration, RecordingExecutor,
 };
 pub use postgres::{PostgresBackend, migrated_store as postgres_migrated_store};
-pub use sql::{SqlConn, SqlParam, SqlRow, SqlStore};
+pub use sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlTransaction};
 pub use sqlite::{
     SqliteBackend, in_memory_store as sqlite_in_memory_store,
     migrated_store as sqlite_migrated_store,
 };
+
+/// Atomic product projection and vocabulary persistence used by the guarded
+/// standalone-daemon routes. The SQL adapters implement the same contract.
+pub trait ResourceProjectionStore: Send + Sync {
+    fn apply_projection(
+        &self,
+        batch: &awaken_iam_contract::ResourceProjectionBatch,
+    ) -> awaken_iam_core::RepositoryResult<awaken_iam_contract::ResourceProjectionReceipt>;
+
+    fn register_product_model(
+        &self,
+        request: &awaken_iam_contract::ProductResourceModelRequest,
+    ) -> awaken_iam_core::RepositoryResult<awaken_iam_contract::ResourceModelRegistered>;
+}
+
+#[cfg(test)]
+mod privacy_tests;

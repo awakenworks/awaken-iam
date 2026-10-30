@@ -73,7 +73,9 @@ pub use oauth_provider::{
     OAuthAuthorizationServer, OAuthClientRegistry, OAuthProviderError, RegisteredClient,
     StoredAuthorizationCode, TokenRedemption,
 };
-pub use privacy::OrganizationPrivacyScope;
+pub use privacy::{
+    OrgPrivacyCommitPlan, OrgPrivacyTerminal, OrganizationPrivacyScope, plan_org_privacy_commit,
+};
 pub use provider::{
     AuthorizationRedirect, AuthorizationUrlRequest, CallbackExchange, IdentityProviderAdapter,
     ProviderError,

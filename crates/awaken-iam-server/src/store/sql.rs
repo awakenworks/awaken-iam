@@ -22,7 +22,7 @@ use awaken_iam_contract::{
     GrantSubjectRef, InvitationBinding, InvitationId, InvitationStatus, NamespaceId,
     OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId, ProductSpacePlacement,
     ProductSpacePlacementStatus, ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType,
-    Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
+    ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
@@ -39,9 +39,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::migration::Dialect;
 use super::{Fence, FenceStore};
 
+mod admission;
 mod directory;
 mod identity_rows;
+mod invitations;
 mod privacy;
+mod profiles;
+mod projections;
 mod provisioning;
 
 use identity_rows::*;
@@ -61,6 +65,36 @@ pub struct SqlWrite {
     pub params: Vec<SqlParam>,
 }
 
+/// Borrowed access to one backend-owned transaction. The context cannot
+/// commit, open another connection or outlive the callback that receives it.
+pub trait SqlTransaction {
+    fn execute(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64>;
+    fn query(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>;
+
+    /// The original checked-write law, reusable inside a transaction which
+    /// already performed its canonical reads. There is only ONE write runner.
+    fn execute_checked(
+        &mut self,
+        writes: &[SqlWrite],
+        required: &[(usize, u64)],
+    ) -> RepositoryResult<Vec<u64>> {
+        let mut affected = Vec::with_capacity(writes.len());
+        for write in writes {
+            affected.push(self.execute(&write.sql, &write.params)?);
+        }
+        if let Some((index, expected)) = required
+            .iter()
+            .find(|(index, expected)| affected.get(*index) != Some(expected))
+        {
+            return Err(RepositoryError::Conflict(format!(
+                "transaction write {index} affected {} rows; expected {expected}",
+                affected.get(*index).copied().unwrap_or(0)
+            )));
+        }
+        Ok(affected)
+    }
+}
+
 /// The driver seam each backend implements: render the portable placeholder
 /// dialect, bind parameters, and run a statement against its connection.
 ///
@@ -74,8 +108,20 @@ pub trait SqlConn: Send + Sync {
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64>;
     /// Execute a read, returning every matching row.
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>;
+    /// Run the callback exactly once inside the original backend transaction.
+    /// All callback reads and writes use this context, never the outer
+    /// connection. An error rolls back; captured results are publishable only
+    /// after this method returns success. Send preserves the Postgres adapter's
+    /// scoped plain-thread boundary without requiring a 'static callback.
+    fn with_transaction(
+        &self,
+        operation: &mut (dyn FnMut(&mut dyn SqlTransaction) -> RepositoryResult<()> + Send),
+    ) -> RepositoryResult<()>;
+
     /// Execute every write atomically and return each affected-row count.
-    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>>;
+    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
+        self.execute_transaction_checked(writes, &[])
+    }
     /// Execute every write atomically and roll back unless each indexed write
     /// affected exactly the required number of rows.
     ///
@@ -86,7 +132,14 @@ pub trait SqlConn: Send + Sync {
         &self,
         writes: &[SqlWrite],
         required: &[(usize, u64)],
-    ) -> RepositoryResult<Vec<u64>>;
+    ) -> RepositoryResult<Vec<u64>> {
+        let mut affected = Vec::new();
+        self.with_transaction(&mut |transaction| {
+            affected = transaction.execute_checked(writes, required)?;
+            Ok(())
+        })?;
+        Ok(affected)
+    }
 }
 
 /// A storage adapter that serves every IAM repository from a real database.
@@ -117,6 +170,92 @@ impl<B: SqlConn> SqlStore<B> {
             )));
         }
         Ok(Self { backend, prefix })
+    }
+
+    fn read_org_with(
+        &self,
+        id: &OrgId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<Organization>> {
+        let sql = format!(
+            "SELECT id,display_name,CAST(owner AS TEXT),created_at,updated_at FROM {} WHERE id=? AND erasure_version IS NULL",
+            self.table("orgs")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_org)
+            .transpose()
+    }
+
+    fn read_grant_with(
+        &self,
+        id: &GrantId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<Grant>> {
+        let sql = format!(
+            "SELECT id,CAST(subject AS TEXT),action_pattern,CAST(scope AS TEXT),effect FROM {} WHERE id=?",
+            self.table("grants")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_grant)
+            .transpose()
+    }
+
+    fn read_group_with(
+        &self,
+        id: &GroupId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<Group>> {
+        let sql = format!(
+            "SELECT id,org_id,display_name,CAST(members AS TEXT),created_at,updated_at FROM {} WHERE id=?",
+            self.table("groups")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_group)
+            .transpose()
+    }
+
+    fn read_token_with(
+        &self,
+        id: &ApiTokenId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<ApiToken>> {
+        let sql = format!(
+            "SELECT id,prefix,CAST(principal AS TEXT),secret_hash,workspace,created_at,expires_at,revoked_at FROM {} WHERE id=?",
+            self.table("api_tokens")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_api_token)
+            .transpose()
+    }
+
+    fn read_edges_with(
+        &self,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Vec<ResourceEdge>> {
+        let sql = format!(
+            "SELECT resource_type,resource_id,CAST(parent AS TEXT) FROM {} ORDER BY resource_type,resource_id",
+            self.table("resource_edges")
+        );
+        query(&sql, &[])?.iter().map(decode_resource_edge).collect()
+    }
+
+    fn read_workspace_org_with(
+        &self,
+        id: &WorkspaceId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<WorkspaceOrgEdge>> {
+        let sql = format!(
+            "SELECT workspace_id,org_id FROM {} WHERE workspace_id=?",
+            self.table("workspace_org_edges")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_workspace_org)
+            .transpose()
     }
 
     /// Borrow the underlying backend.
@@ -270,46 +409,6 @@ fn decode_workspace_org(row: &SqlRow) -> RepositoryResult<WorkspaceOrgEdge> {
         workspace_id: WorkspaceId(req(row, 0, "workspace_org.workspace_id")?),
         org_id: OrgId(req(row, 1, "workspace_org.org_id")?),
     })
-}
-
-fn decode_invitation(row: &SqlRow) -> RepositoryResult<Invitation> {
-    let status = match req(row, 7, "invitation.status")?.as_str() {
-        "pending" => InvitationStatus::Pending,
-        "accepted" => InvitationStatus::Accepted,
-        "revoked" => InvitationStatus::Revoked,
-        "expired" => InvitationStatus::Expired,
-        other => {
-            return Err(RepositoryError::Backend(format!(
-                "invalid invitation status {other}"
-            )));
-        }
-    };
-    Ok(Invitation {
-        id: InvitationId(req(row, 0, "invitation.id")?),
-        idempotency_key: req(row, 1, "invitation.idempotency_key")?,
-        org_id: OrgId(req(row, 2, "invitation.org_id")?),
-        email: req(row, 3, "invitation.email")?,
-        bindings: json_decode::<Vec<InvitationBinding>>(
-            &req(row, 4, "invitation.bindings")?,
-            "invitation bindings",
-        )?,
-        invited_by: json_decode::<PrincipalRef>(
-            &req(row, 5, "invitation.invited_by")?,
-            "invitation inviter",
-        )?,
-        token_hash: req(row, 6, "invitation.token_hash")?,
-        status,
-        expires_at: Timestamp(req(row, 8, "invitation.expires_at")?),
-        created_at: Timestamp(req(row, 9, "invitation.created_at")?),
-        updated_at: Timestamp(req(row, 10, "invitation.updated_at")?),
-        accepted_by_account_id: opt(row, 11).map(AccountId),
-    })
-}
-
-fn invitation_columns() -> &'static str {
-    "id, idempotency_key, org_id, email, CAST(bindings AS TEXT), \
-     CAST(invited_by AS TEXT), token_hash, status, expires_at, created_at, \
-     updated_at, accepted_by_account_id"
 }
 
 fn revision_key(revision: u64) -> String {
@@ -876,37 +975,45 @@ impl<B: SqlConn> AuthCodeRepository for SqlStore<B> {
 
 impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     fn create(&self, token: ApiToken) -> RepositoryResult<()> {
-        let principal = json_encode(&token.principal, "principal")?;
-        let sql = format!(
-            "INSERT INTO {t} \
+        self.with_policy_transaction(|transaction, _| {
+            let mut scopes = vec![ScopeRef::Workspace {
+                workspace_id: token.workspace.clone(),
+            }];
+            if let Some(previous) =
+                self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?
+            {
+                scopes.push(ScopeRef::Workspace {
+                    workspace_id: previous.workspace,
+                });
+            }
+            self.ensure_scope_admission(transaction, &scopes, &[])?;
+
+            let principal = json_encode(&token.principal, "principal")?;
+            let sql = format!(
+                "INSERT INTO {t} \
              (id, prefix, principal, secret_hash, workspace, created_at, expires_at, revoked_at) \
              VALUES (?, ?, ?j, ?, ?, ?, ?, ?)",
-            t = self.table("api_tokens")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(token.id.0),
-                p(token.prefix.0),
-                p(principal),
-                p(token.secret_hash),
-                p(token.workspace.0),
-                p(token.created_at.0),
-                token.expires_at.map(|t| t.0),
-                token.revoked_at.map(|t| t.0),
-            ],
-        )?;
-        Ok(())
+                t = self.table("api_tokens")
+            );
+            transaction.execute(
+                &sql,
+                &[
+                    p(token.id.0),
+                    p(token.prefix.0),
+                    p(principal),
+                    p(token.secret_hash),
+                    p(token.workspace.0),
+                    p(token.created_at.0),
+                    token.expires_at.map(|t| t.0),
+                    token.revoked_at.map(|t| t.0),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn get(&self, id: &ApiTokenId) -> RepositoryResult<Option<ApiToken>> {
-        let sql = format!(
-            "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
-             created_at, expires_at, revoked_at FROM {} WHERE id = ?",
-            self.table("api_tokens")
-        );
-        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
-        rows.first().map(decode_api_token).transpose()
+        self.read_token_with(id, |sql, params| self.backend.query(sql, params))
     }
 
     fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepositoryResult<Option<ApiToken>> {
@@ -934,32 +1041,46 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     }
 
     fn update(&self, token: ApiToken) -> RepositoryResult<()> {
-        let principal = json_encode(&token.principal, "principal")?;
-        let sql = format!(
-            "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, workspace = ?, \
+        self.with_policy_transaction(|transaction, _| {
+            let mut scopes = vec![ScopeRef::Workspace {
+                workspace_id: token.workspace.clone(),
+            }];
+            if let Some(previous) =
+                self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?
+            {
+                scopes.push(ScopeRef::Workspace {
+                    workspace_id: previous.workspace,
+                });
+            }
+            self.ensure_scope_admission(transaction, &scopes, &[])?;
+
+            let principal = json_encode(&token.principal, "principal")?;
+            let sql = format!(
+                "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, workspace = ?, \
              created_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
-            t = self.table("api_tokens")
-        );
-        let affected = self.backend.execute(
-            &sql,
-            &[
-                p(token.prefix.0),
-                p(principal),
-                p(token.secret_hash),
-                p(token.workspace.0),
-                p(token.created_at.0),
-                token.expires_at.map(|t| t.0),
-                token.revoked_at.map(|t| t.0),
-                p(token.id.0.clone()),
-            ],
-        )?;
-        if affected == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "api token {} does not exist",
-                token.id.0
-            )));
-        }
-        Ok(())
+                t = self.table("api_tokens")
+            );
+            let affected = transaction.execute(
+                &sql,
+                &[
+                    p(token.prefix.0),
+                    p(principal),
+                    p(token.secret_hash),
+                    p(token.workspace.0),
+                    p(token.created_at.0),
+                    token.expires_at.map(|t| t.0),
+                    token.revoked_at.map(|t| t.0),
+                    p(token.id.0.clone()),
+                ],
+            )?;
+            if affected == 0 {
+                return Err(RepositoryError::NotFound(format!(
+                    "api token {} does not exist",
+                    token.id.0
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -967,42 +1088,51 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
 
 impl<B: SqlConn> OrgRepository for SqlStore<B> {
     fn get(&self, id: &OrgId) -> RepositoryResult<Option<Organization>> {
-        let sql = format!(
-            "SELECT id, display_name, CAST(owner AS TEXT), created_at, updated_at \
-             FROM {} WHERE id = ?",
-            self.table("orgs")
-        );
-        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
-        rows.first().map(decode_org).transpose()
+        self.read_org_with(id, |sql, params| self.backend.query(sql, params))
     }
 
     fn upsert(&self, org: Organization) -> RepositoryResult<()> {
-        let owner = json_encode(&org.owner, "org owner")?;
-        let sql = format!(
-            "INSERT INTO {t} (id, display_name, owner, created_at, updated_at) \
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: org.id.clone(),
+                }],
+                &[],
+            )?;
+
+            let owner = json_encode(&org.owner, "org owner")?;
+            let sql = format!(
+                "INSERT INTO {t} (id, display_name, owner, created_at, updated_at) \
              VALUES (?, ?, ?j, ?, ?) \
              ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, \
              owner = excluded.owner, created_at = excluded.created_at, \
-             updated_at = excluded.updated_at",
-            t = self.table("orgs")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(org.id.0),
-                org.display_name,
-                p(owner),
-                p(org.created_at.0),
-                p(org.updated_at.0),
-            ],
-        )?;
-        Ok(())
+             updated_at = excluded.updated_at WHERE {t}.erasure_version IS NULL",
+                t = self.table("orgs")
+            );
+            let affected = transaction.execute(
+                &sql,
+                &[
+                    p(org.id.0),
+                    org.display_name,
+                    p(owner),
+                    p(org.created_at.0),
+                    p(org.updated_at.0),
+                ],
+            )?;
+            if affected != 1 {
+                return Err(RepositoryError::Conflict(
+                    "organization admission is terminal".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn list(&self) -> RepositoryResult<Vec<Organization>> {
         let sql = format!(
             "SELECT id, display_name, CAST(owner AS TEXT), created_at, updated_at \
-             FROM {} ORDER BY id",
+             FROM {} WHERE erasure_version IS NULL ORDER BY id",
             self.table("orgs")
         );
         self.backend
@@ -1013,50 +1143,63 @@ impl<B: SqlConn> OrgRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &OrgId) -> RepositoryResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("orgs"));
-        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "organization {} not found",
-                id.0
-            )));
-        }
-        Ok(())
+        self.with_policy_transaction(|transaction, _| {
+            let sql = format!(
+                "DELETE FROM {} WHERE id = ? AND erasure_version IS NULL",
+                self.table("orgs")
+            );
+            if transaction.execute(&sql, &[p(id.0.clone())])? == 0 {
+                return Err(RepositoryError::NotFound(format!(
+                    "organization {} not found",
+                    id.0
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
 impl<B: SqlConn> GroupRepository for SqlStore<B> {
     fn get(&self, id: &GroupId) -> RepositoryResult<Option<Group>> {
-        let sql = format!(
-            "SELECT id, org_id, display_name, CAST(members AS TEXT), created_at, updated_at \
-             FROM {} WHERE id = ?",
-            self.table("groups")
-        );
-        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
-        rows.first().map(decode_group).transpose()
+        self.read_group_with(id, |sql, params| self.backend.query(sql, params))
     }
 
     fn upsert(&self, group: Group) -> RepositoryResult<()> {
-        let members = json_encode(&group.members, "group members")?;
-        let sql = format!(
-            "INSERT INTO {t} (id, org_id, display_name, members, created_at, updated_at) \
+        self.with_policy_transaction(|transaction, _| {
+            let mut scopes = vec![ScopeRef::Org {
+                org_id: group.org.clone(),
+            }];
+            if let Some(previous) =
+                self.read_group_with(&group.id, |sql, params| transaction.query(sql, params))?
+            {
+                scopes.push(ScopeRef::Org {
+                    org_id: previous.org,
+                });
+            }
+            self.ensure_scope_admission(transaction, &scopes, &[group.id.0.clone()])?;
+
+            let members = json_encode(&group.members, "group members")?;
+            let sql = format!(
+                "INSERT INTO {t} (id, org_id, display_name, members, created_at, updated_at) \
              VALUES (?, ?, ?, ?j, ?, ?) \
              ON CONFLICT (id) DO UPDATE SET org_id = excluded.org_id, \
              display_name = excluded.display_name, members = excluded.members, \
              created_at = excluded.created_at, updated_at = excluded.updated_at",
-            t = self.table("groups")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(group.id.0),
-                p(group.org.0),
-                group.display_name,
-                p(members),
-                p(group.created_at.0),
-                p(group.updated_at.0),
-            ],
-        )?;
-        Ok(())
+                t = self.table("groups")
+            );
+            transaction.execute(
+                &sql,
+                &[
+                    p(group.id.0),
+                    p(group.org.0),
+                    group.display_name,
+                    p(members),
+                    p(group.created_at.0),
+                    p(group.updated_at.0),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn list(&self) -> RepositoryResult<Vec<Group>> {
@@ -1073,14 +1216,18 @@ impl<B: SqlConn> GroupRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &GroupId) -> RepositoryResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("groups"));
-        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "group {} not found",
-                id.0
-            )));
-        }
-        Ok(())
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(transaction, &[], &[id.0.clone()])?;
+
+            let sql = format!("DELETE FROM {} WHERE id = ?", self.table("groups"));
+            if transaction.execute(&sql, &[p(id.0.clone())])? == 0 {
+                return Err(RepositoryError::NotFound(format!(
+                    "group {} not found",
+                    id.0
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1146,37 +1293,53 @@ impl<B: SqlConn> RoleRepository for SqlStore<B> {
 
 impl<B: SqlConn> GrantRepository for SqlStore<B> {
     fn put(&self, grant: Grant) -> RepositoryResult<()> {
-        let subject = encode_grant_subject(&grant.subject)?;
-        let scope = json_encode(&grant.scope, "grant scope")?;
-        let sql = format!(
-            "INSERT INTO {t} (id, subject, action_pattern, scope, effect) \
+        self.with_policy_transaction(|transaction, _| {
+            let groups = if let GrantSubject::Group(group) = &grant.subject {
+                vec![group.0.clone()]
+            } else {
+                vec![]
+            };
+            self.grant_admission(
+                transaction,
+                &[grant.id.0.clone()],
+                &[grant.scope.clone()],
+                &groups,
+            )?;
+            self.require_raw_grant_effect(transaction, &grant.id.0, &grant.scope)?;
+
+            let subject = encode_grant_subject(&grant.subject)?;
+            let scope = json_encode(&grant.scope, "grant scope")?;
+            let sql = format!(
+                "INSERT INTO {t} (id, subject, action_pattern, scope, effect) \
              VALUES (?, ?j, ?, ?j, ?) \
              ON CONFLICT (id) DO UPDATE SET subject = excluded.subject, \
              action_pattern = excluded.action_pattern, scope = excluded.scope, \
-             effect = excluded.effect",
-            t = self.table("grants")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(grant.id.0),
-                p(subject),
-                p(grant.action_pattern.0),
-                p(scope),
-                p(encode_effect(grant.effect)),
-            ],
-        )?;
-        Ok(())
+             effect = excluded.effect \
+             WHERE NOT EXISTS (SELECT 1 FROM {owners} WHERE grant_id = excluded.id)",
+                t = self.table("grants"),
+                owners = self.table("resource_projection_grant_owners")
+            );
+            if transaction.execute(
+                &sql,
+                &[
+                    p(grant.id.0),
+                    p(subject),
+                    p(grant.action_pattern.0),
+                    p(scope),
+                    p(encode_effect(grant.effect)),
+                ],
+            )? == 0
+            {
+                return Err(RepositoryError::Conflict(
+                    "grant belongs to a product projection".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn get(&self, id: &GrantId) -> RepositoryResult<Option<Grant>> {
-        let sql = format!(
-            "SELECT id, CAST(subject AS TEXT), action_pattern, CAST(scope AS TEXT), effect \
-             FROM {} WHERE id = ?",
-            self.table("grants")
-        );
-        let rows = self.backend.query(&sql, &[p(id.0.clone())])?;
-        rows.first().map(decode_grant).transpose()
+        self.read_grant_with(id, |sql, params| self.backend.query(sql, params))
     }
 
     fn list(&self) -> RepositoryResult<Vec<Grant>> {
@@ -1193,29 +1356,42 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = ?", self.table("grants"));
-        if self.backend.execute(&sql, &[p(id.0.clone())])? == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "grant {} not found",
-                id.0
-            )));
-        }
-        Ok(())
+        self.with_policy_transaction(|transaction, _| {
+            self.grant_admission(transaction, &[id.0.clone()], &[], &[])?;
+
+            let sql = format!(
+                "DELETE FROM {grants} WHERE id = ? AND NOT EXISTS \
+            (SELECT 1 FROM {owners} WHERE grant_id = ?)",
+                grants = self.table("grants"),
+                owners = self.table("resource_projection_grant_owners")
+            );
+            if transaction.execute(&sql, &[p(id.0.clone()), p(id.0.clone())])? == 0 {
+                return Err(RepositoryError::NotFound(format!(
+                    "grant {} not found",
+                    id.0
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
 impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
-        let principal = json_encode(&binding.principal, "principal")?;
-        let scope = json_encode(&binding.scope, "binding scope")?;
-        let sql = format!(
-            "INSERT INTO {t} (principal, role, scope) VALUES (?j, ?, ?j) \
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(transaction, &[binding.scope.clone()], &[])?;
+            self.require_live_effect_scopes(transaction, &[binding.scope.clone()])?;
+
+            let principal = json_encode(&binding.principal, "principal")?;
+            let scope = json_encode(&binding.scope, "binding scope")?;
+            let sql = format!(
+                "INSERT INTO {t} (principal, role, scope) VALUES (?j, ?, ?j) \
              ON CONFLICT (principal, role, scope) DO NOTHING",
-            t = self.table("role_bindings")
-        );
-        self.backend
-            .execute(&sql, &[p(principal), p(binding.role.0), p(scope)])?;
-        Ok(())
+                t = self.table("role_bindings")
+            );
+            transaction.execute(&sql, &[p(principal), p(binding.role.0), p(scope)])?;
+            Ok(())
+        })
     }
 
     fn list_for_principal(&self, principal: &PrincipalRef) -> RepositoryResult<Vec<RoleBinding>> {
@@ -1246,21 +1422,24 @@ impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
     }
 
     fn remove(&self, binding: &RoleBinding) -> RepositoryResult<()> {
-        let principal = json_encode(&binding.principal, "principal")?;
-        let scope = json_encode(&binding.scope, "binding scope")?;
-        let sql = format!(
-            "DELETE FROM {} WHERE principal = ?j AND role = ? AND scope = ?j",
-            self.table("role_bindings")
-        );
-        let affected = self
-            .backend
-            .execute(&sql, &[p(principal), p(binding.role.0.clone()), p(scope)])?;
-        if affected == 0 {
-            return Err(RepositoryError::NotFound(
-                "role binding not found".to_owned(),
-            ));
-        }
-        Ok(())
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(transaction, &[binding.scope.clone()], &[])?;
+
+            let principal = json_encode(&binding.principal, "principal")?;
+            let scope = json_encode(&binding.scope, "binding scope")?;
+            let sql = format!(
+                "DELETE FROM {} WHERE principal = ?j AND role = ? AND scope = ?j",
+                self.table("role_bindings")
+            );
+            let affected =
+                transaction.execute(&sql, &[p(principal), p(binding.role.0.clone()), p(scope)])?;
+            if affected == 0 {
+                return Err(RepositoryError::NotFound(
+                    "role binding not found".to_owned(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn replace_scoped(
@@ -1270,209 +1449,85 @@ impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
         managed_roles: &[RoleId],
         replacement_roles: &[RoleId],
     ) -> RepositoryResult<()> {
-        let principal = json_encode(principal, "principal")?;
-        let scope = json_encode(scope, "binding scope")?;
-        let table = self.table("role_bindings");
-        let mut writes = Vec::with_capacity(managed_roles.len() + replacement_roles.len());
-        for role in managed_roles {
-            writes.push(SqlWrite {
-                sql: format!(
-                    "DELETE FROM {table} WHERE principal = ?j AND role = ? AND scope = ?j"
-                ),
-                params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
-            });
-        }
-        for role in replacement_roles {
-            writes.push(SqlWrite {
-                sql: format!(
-                    "INSERT INTO {table} (principal, role, scope) VALUES (?j, ?, ?j) \
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(transaction, &[scope.clone()], &[])?;
+            if !replacement_roles.is_empty() {
+                self.require_live_effect_scopes(transaction, &[scope.clone()])?;
+            }
+
+            let principal = json_encode(principal, "principal")?;
+            let scope = json_encode(scope, "binding scope")?;
+            let table = self.table("role_bindings");
+            let mut writes = Vec::with_capacity(managed_roles.len() + replacement_roles.len());
+            for role in managed_roles {
+                writes.push(SqlWrite {
+                    sql: format!(
+                        "DELETE FROM {table} WHERE principal = ?j AND role = ? AND scope = ?j"
+                    ),
+                    params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
+                });
+            }
+            for role in replacement_roles {
+                writes.push(SqlWrite {
+                    sql: format!(
+                        "INSERT INTO {table} (principal, role, scope) VALUES (?j, ?, ?j) \
                      ON CONFLICT (principal, role, scope) DO NOTHING"
-                ),
-                params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
-            });
-        }
-        self.backend.execute_transaction(&writes)?;
-        Ok(())
-    }
-}
-
-impl<B: SqlConn> InvitationRepository for SqlStore<B> {
-    fn create_invitation(&self, invitation: Invitation) -> RepositoryResult<()> {
-        let bindings = json_encode(&invitation.bindings, "invitation bindings")?;
-        let invited_by = json_encode(&invitation.invited_by, "invitation inviter")?;
-        let sql = format!(
-            "INSERT INTO {} (id,idempotency_key,org_id,email,bindings,invited_by,token_hash,status,expires_at,created_at,updated_at,accepted_by_account_id) \
-             VALUES (?,?,?,?,?j,?j,?,?,?,?,?,?)",
-            self.table("invitations")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(invitation.id.0),
-                p(invitation.idempotency_key),
-                p(invitation.org_id.0),
-                p(invitation.email),
-                p(bindings),
-                p(invited_by),
-                p(invitation.token_hash),
-                p(encode_invitation_status(invitation.status)),
-                p(invitation.expires_at.0),
-                p(invitation.created_at.0),
-                p(invitation.updated_at.0),
-                invitation.accepted_by_account_id.map(|id| id.0),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn get_invitation(&self, id: &InvitationId) -> RepositoryResult<Option<Invitation>> {
-        let sql = format!(
-            "SELECT {} FROM {} WHERE id = ?",
-            invitation_columns(),
-            self.table("invitations")
-        );
-        self.backend
-            .query(&sql, &[p(id.0.clone())])?
-            .first()
-            .map(decode_invitation)
-            .transpose()
-    }
-
-    fn get_invitation_by_idempotency(
-        &self,
-        org_id: &OrgId,
-        key: &str,
-    ) -> RepositoryResult<Option<Invitation>> {
-        let sql = format!(
-            "SELECT {} FROM {} WHERE org_id = ? AND idempotency_key = ?",
-            invitation_columns(),
-            self.table("invitations")
-        );
-        self.backend
-            .query(&sql, &[p(org_id.0.clone()), p(key.to_owned())])?
-            .first()
-            .map(decode_invitation)
-            .transpose()
-    }
-
-    fn list_invitations_for_org(&self, org_id: &OrgId) -> RepositoryResult<Vec<Invitation>> {
-        let sql = format!(
-            "SELECT {} FROM {} WHERE org_id = ? ORDER BY created_at, id",
-            invitation_columns(),
-            self.table("invitations")
-        );
-        self.backend
-            .query(&sql, &[p(org_id.0.clone())])?
-            .iter()
-            .map(decode_invitation)
-            .collect()
-    }
-
-    fn replace_pending_invitation(
-        &self,
-        invitation: Invitation,
-        expected: &str,
-    ) -> RepositoryResult<bool> {
-        let bindings = json_encode(&invitation.bindings, "invitation bindings")?;
-        let invited_by = json_encode(&invitation.invited_by, "invitation inviter")?;
-        let sql = format!(
-            "UPDATE {} SET email=?,bindings=?j,invited_by=?j,token_hash=?,status=?,expires_at=?,updated_at=?,accepted_by_account_id=? \
-             WHERE id=? AND status='pending' AND token_hash=?",
-            self.table("invitations")
-        );
-        Ok(self.backend.execute(
-            &sql,
-            &[
-                p(invitation.email),
-                p(bindings),
-                p(invited_by),
-                p(invitation.token_hash),
-                p(encode_invitation_status(invitation.status)),
-                p(invitation.expires_at.0),
-                p(invitation.updated_at.0),
-                invitation.accepted_by_account_id.map(|id| id.0),
-                p(invitation.id.0),
-                p(expected.to_owned()),
-            ],
-        )? == 1)
-    }
-
-    fn accept_pending_invitation(
-        &self,
-        id: &InvitationId,
-        expected: &str,
-        account_id: &AccountId,
-        at: &Timestamp,
-    ) -> RepositoryResult<Option<Invitation>> {
-        let current = self
-            .get_invitation(id)?
-            .ok_or_else(|| RepositoryError::NotFound("invitation not found".into()))?;
-        if current.status == InvitationStatus::Accepted
-            && current.accepted_by_account_id.as_ref() == Some(account_id)
-            && current.token_hash == expected
-        {
-            return Ok(Some(current));
-        }
-        let mut writes = vec![SqlWrite {
-            sql: format!(
-                "UPDATE {} SET status='accepted',accepted_by_account_id=?,updated_at=? WHERE id=? AND status='pending' AND token_hash=?",
-                self.table("invitations")
-            ),
-            params: vec![
-                p(account_id.0.clone()),
-                p(at.0.clone()),
-                p(id.0.clone()),
-                p(expected.to_owned()),
-            ],
-        }];
-        let principal = json_encode(
-            &PrincipalRef::Account {
-                account_id: account_id.clone(),
-            },
-            "principal",
-        )?;
-        for target in &current.bindings {
-            let scope = json_encode(&target.scope, "binding scope")?;
-            writes.push(SqlWrite {
-                sql: format!(
-                    "INSERT INTO {bindings} (principal,role,scope) \
-                     SELECT ?j,?,?j WHERE EXISTS (SELECT 1 FROM {invites} WHERE id=? AND status='accepted' AND accepted_by_account_id=? AND token_hash=?) \
-                     ON CONFLICT (principal,role,scope) DO NOTHING",
-                    bindings = self.table("role_bindings"), invites = self.table("invitations")
-                ),
-                params: vec![p(principal.clone()), p(target.role_id.clone()), p(scope), p(id.0.clone()), p(account_id.0.clone()), p(expected.to_owned())],
-            });
-        }
-        let affected = self.backend.execute_transaction(&writes)?;
-        if affected.first().copied() != Some(1) {
-            return Ok(None);
-        }
-        self.get_invitation(id)
-    }
-}
-
-fn encode_invitation_status(status: InvitationStatus) -> &'static str {
-    match status {
-        InvitationStatus::Pending => "pending",
-        InvitationStatus::Accepted => "accepted",
-        InvitationStatus::Revoked => "revoked",
-        InvitationStatus::Expired => "expired",
+                    ),
+                    params: vec![p(principal.clone()), p(role.0.clone()), p(scope.clone())],
+                });
+            }
+            transaction.execute_checked(&writes, &[])?;
+            Ok(())
+        })
     }
 }
 
 impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
-    fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
-        let parent = json_encode(&edge.parent, "edge parent")?;
-        let sql = format!(
-            "INSERT INTO {t} (resource_type, resource_id, parent) VALUES (?, ?, ?j) \
-             ON CONFLICT (resource_type, resource_id) DO UPDATE SET parent = excluded.parent",
-            t = self.table("resource_edges")
-        );
-        self.backend.execute(
-            &sql,
-            &[p(edge.resource_type.0), p(edge.resource_id.0), p(parent)],
+    fn list_retired_resources(
+        &self,
+    ) -> RepositoryResult<Vec<awaken_iam_contract::RetiredResource>> {
+        let rows = self.backend.query(
+            &format!(
+                "SELECT resource_type, resource_id FROM {} ORDER BY resource_type, resource_id",
+                self.table("resource_projection_tombstones")
+            ),
+            &[],
         )?;
-        Ok(())
+        rows.iter()
+            .map(|row| {
+                Ok(awaken_iam_contract::RetiredResource {
+                    resource_type: ResourceType(req(row, 0, "retired resource type")?),
+                    resource_id: ResourceId(req(row, 1, "retired resource id")?),
+                })
+            })
+            .collect()
+    }
+
+    fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
+        self.with_policy_transaction(|transaction, _| {
+            self.edge_admission(transaction, &edge)?;
+            self.require_raw_edge_effect(transaction, &edge)?;
+
+            let parent = json_encode(&edge.parent, "edge parent")?;
+            let sql = format!(
+                "INSERT INTO {t} (resource_type, resource_id, parent) VALUES (?, ?, ?j) \
+             ON CONFLICT (resource_type, resource_id) DO UPDATE SET parent = excluded.parent \
+             WHERE NOT EXISTS (SELECT 1 FROM {owners} WHERE resource_type = excluded.resource_type \
+             AND resource_id = excluded.resource_id)",
+                t = self.table("resource_edges"),
+                owners = self.table("resource_projection_edge_owners")
+            );
+            if transaction.execute(
+                &sql,
+                &[p(edge.resource_type.0), p(edge.resource_id.0), p(parent)],
+            )? == 0
+            {
+                return Err(RepositoryError::Conflict(
+                    "resource edge belongs to a product projection".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn remove_edge(
@@ -1480,51 +1535,69 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
         resource_type: &ResourceType,
         resource_id: &ResourceId,
     ) -> RepositoryResult<()> {
-        let sql = format!(
-            "DELETE FROM {} WHERE resource_type = ? AND resource_id = ?",
-            self.table("resource_edges")
-        );
-        self.backend.execute(
-            &sql,
-            &[p(resource_type.0.clone()), p(resource_id.0.clone())],
-        )?;
-        Ok(())
+        self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Resource {
+                    resource_type: resource_type.clone(),
+                    resource_id: resource_id.clone(),
+                }],
+                &[],
+            )?;
+            self.require_unprojected_resource(transaction, &resource_type.0, &resource_id.0)?;
+
+            let sql = format!(
+                "DELETE FROM {} WHERE resource_type = ? AND resource_id = ?",
+                self.table("resource_edges")
+            );
+            transaction.execute(
+                &sql,
+                &[p(resource_type.0.clone()), p(resource_id.0.clone())],
+            )?;
+            Ok(())
+        })
     }
 
     fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>> {
-        let sql = format!(
-            "SELECT resource_type, resource_id, CAST(parent AS TEXT) FROM {} \
-             ORDER BY resource_type, resource_id",
-            self.table("resource_edges")
-        );
-        self.backend
-            .query(&sql, &[])?
-            .iter()
-            .map(decode_resource_edge)
-            .collect()
+        self.read_edges_with(|sql, params| self.backend.query(sql, params))
     }
 
     fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
-        let sql = format!(
-            "INSERT INTO {t} (workspace_id, org_id) VALUES (?, ?) \
+        self.with_policy_transaction(|transaction, _| {
+            let mut scopes = vec![
+                ScopeRef::Workspace {
+                    workspace_id: edge.workspace_id.clone(),
+                },
+                ScopeRef::Org {
+                    org_id: edge.org_id.clone(),
+                },
+            ];
+            if let Some(previous) = self
+                .read_workspace_org_with(&edge.workspace_id, |sql, params| {
+                    transaction.query(sql, params)
+                })?
+            {
+                scopes.push(ScopeRef::Org {
+                    org_id: previous.org_id,
+                });
+            }
+            self.ensure_scope_admission(transaction, &scopes, &[])?;
+
+            let sql = format!(
+                "INSERT INTO {t} (workspace_id, org_id) VALUES (?, ?) \
              ON CONFLICT (workspace_id) DO UPDATE SET org_id = excluded.org_id",
-            t = self.table("workspace_org_edges")
-        );
-        self.backend
-            .execute(&sql, &[p(edge.workspace_id.0), p(edge.org_id.0)])?;
-        Ok(())
+                t = self.table("workspace_org_edges")
+            );
+            transaction.execute(&sql, &[p(edge.workspace_id.0), p(edge.org_id.0)])?;
+            Ok(())
+        })
     }
 
     fn workspace_org(
         &self,
         workspace_id: &WorkspaceId,
     ) -> RepositoryResult<Option<WorkspaceOrgEdge>> {
-        let sql = format!(
-            "SELECT workspace_id, org_id FROM {} WHERE workspace_id = ?",
-            self.table("workspace_org_edges")
-        );
-        let rows = self.backend.query(&sql, &[p(workspace_id.0.clone())])?;
-        rows.first().map(decode_workspace_org).transpose()
+        self.read_workspace_org_with(workspace_id, |sql, params| self.backend.query(sql, params))
     }
 
     fn list_workspace_orgs(&self) -> RepositoryResult<Vec<WorkspaceOrgEdge>> {
@@ -1536,238 +1609,6 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
             .query(&sql, &[])?
             .iter()
             .map(decode_workspace_org)
-            .collect()
-    }
-}
-
-impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
-    fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()> {
-        let document = json_encode(&profile.document, "authorization profile document")?;
-        let sql = format!(
-            "INSERT INTO {} (namespace, revision, lifecycle, document, checksum, created_at) \
-             VALUES (?, ?, ?, ?j, ?, ?)",
-            self.table("authorization_profiles")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(profile.namespace.0),
-                p(revision_key(profile.revision)),
-                p(lifecycle_name(profile.lifecycle)),
-                p(document),
-                p(profile.checksum),
-                p(profile.created_at.0),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn get_profile(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-    ) -> RepositoryResult<Option<AuthorizationProfile>> {
-        let sql = format!(
-            "SELECT namespace, revision, lifecycle, CAST(document AS TEXT), checksum, created_at \
-             FROM {} WHERE namespace = ? AND revision = ?",
-            self.table("authorization_profiles")
-        );
-        let rows = self
-            .backend
-            .query(&sql, &[p(namespace.0.clone()), p(revision_key(revision))])?;
-        let mut profile = rows.first().map(decode_profile).transpose()?;
-        if let Some(profile) = &mut profile
-            && self.active_revision(namespace)? == Some(revision)
-        {
-            profile.lifecycle = ProfileLifecycle::Active;
-        }
-        Ok(profile)
-    }
-
-    fn list_profiles(
-        &self,
-        namespace: &NamespaceId,
-    ) -> RepositoryResult<Vec<AuthorizationProfile>> {
-        let sql = format!(
-            "SELECT namespace, revision, lifecycle, CAST(document AS TEXT), checksum, created_at \
-             FROM {} WHERE namespace = ? ORDER BY revision",
-            self.table("authorization_profiles")
-        );
-        let active = self.active_revision(namespace)?;
-        self.backend
-            .query(&sql, &[p(namespace.0.clone())])?
-            .iter()
-            .map(|row| {
-                let mut profile = decode_profile(row)?;
-                if active == Some(profile.revision) {
-                    profile.lifecycle = ProfileLifecycle::Active;
-                }
-                Ok(profile)
-            })
-            .collect()
-    }
-
-    fn set_profile_lifecycle(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-        lifecycle: ProfileLifecycle,
-    ) -> RepositoryResult<()> {
-        let sql = format!(
-            "UPDATE {} SET lifecycle = ? WHERE namespace = ? AND revision = ?",
-            self.table("authorization_profiles")
-        );
-        let affected = self.backend.execute(
-            &sql,
-            &[
-                p(lifecycle_name(lifecycle)),
-                p(namespace.0.clone()),
-                p(revision_key(revision)),
-            ],
-        )?;
-        if affected == 0 {
-            return Err(RepositoryError::NotFound(
-                "profile revision not found".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn activate_profile(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-        expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>> {
-        let target = self
-            .get_profile(namespace, revision)?
-            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
-        if target.lifecycle == ProfileLifecycle::Draft {
-            return Err(RepositoryError::Conflict(
-                "profile revision is not validated".into(),
-            ));
-        }
-        let previous = self.active_revision(namespace)?;
-        if previous != expected_active_revision {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        let affected = match expected_active_revision {
-            None => {
-                let sql = format!(
-                    "INSERT INTO {} (namespace, active_revision) VALUES (?, ?) \
-                     ON CONFLICT (namespace) DO NOTHING",
-                    self.table("authorization_profile_heads")
-                );
-                self.backend
-                    .execute(&sql, &[p(namespace.0.clone()), p(revision_key(revision))])?
-            }
-            Some(expected) => {
-                let sql = format!(
-                    "UPDATE {} SET active_revision = ? \
-                     WHERE namespace = ? AND active_revision = ?",
-                    self.table("authorization_profile_heads")
-                );
-                self.backend.execute(
-                    &sql,
-                    &[
-                        p(revision_key(revision)),
-                        p(namespace.0.clone()),
-                        p(revision_key(expected)),
-                    ],
-                )?
-            }
-        };
-        if affected != 1 {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        Ok(previous)
-    }
-
-    fn retire_active_profile(
-        &self,
-        namespace: &NamespaceId,
-        expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile> {
-        let mut profile = self
-            .get_profile(namespace, expected_active_revision)?
-            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
-        let profiles = self.table("authorization_profiles");
-        let heads = self.table("authorization_profile_heads");
-        let affected = self.backend.execute_transaction(&[
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {profiles} SET lifecycle = 'retired' \
-                     WHERE namespace = ? AND revision = ? \
-                       AND EXISTS (SELECT 1 FROM {heads} \
-                                   WHERE namespace = ? AND active_revision = ?)"
-                ),
-                params: vec![
-                    p(namespace.0.clone()),
-                    p(revision_key(expected_active_revision)),
-                    p(namespace.0.clone()),
-                    p(revision_key(expected_active_revision)),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "DELETE FROM {heads} WHERE namespace = ? AND active_revision = ? \
-                     AND EXISTS (SELECT 1 FROM {profiles} \
-                                 WHERE namespace = ? AND revision = ? AND lifecycle = 'retired')"
-                ),
-                params: vec![
-                    p(namespace.0.clone()),
-                    p(revision_key(expected_active_revision)),
-                    p(namespace.0.clone()),
-                    p(revision_key(expected_active_revision)),
-                ],
-            },
-        ])?;
-        if affected.as_slice() != [1, 1] {
-            return match self.active_revision(namespace)? {
-                None => Err(RepositoryError::NotFound(
-                    "active profile head not found".into(),
-                )),
-                Some(_) => Err(RepositoryError::Conflict(
-                    "active profile revision changed".into(),
-                )),
-            };
-        }
-        profile.lifecycle = ProfileLifecycle::Retired;
-        Ok(profile)
-    }
-
-    fn active_profile(
-        &self,
-        namespace: &NamespaceId,
-    ) -> RepositoryResult<Option<AuthorizationProfile>> {
-        let Some(revision) = self.active_revision(namespace)? else {
-            return Ok(None);
-        };
-        self.get_profile(namespace, revision)
-    }
-
-    fn active_profiles(&self) -> RepositoryResult<Vec<AuthorizationProfile>> {
-        let sql = format!(
-            "SELECT p.namespace, p.revision, p.lifecycle, CAST(p.document AS TEXT), \
-                    p.checksum, p.created_at \
-             FROM {profiles} p JOIN {heads} h \
-               ON p.namespace = h.namespace AND p.revision = h.active_revision \
-             ORDER BY p.namespace",
-            profiles = self.table("authorization_profiles"),
-            heads = self.table("authorization_profile_heads")
-        );
-        self.backend
-            .query(&sql, &[])?
-            .iter()
-            .map(|row| {
-                let mut profile = decode_profile(row)?;
-                profile.lifecycle = ProfileLifecycle::Active;
-                Ok(profile)
-            })
             .collect()
     }
 }

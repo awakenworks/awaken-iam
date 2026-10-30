@@ -350,7 +350,7 @@ mod tests {
 
         fn register_resource_model(
             &self,
-            _registration: &awaken_iam_contract::ResourceModelRegistration,
+            _registration: &awaken_iam_contract::ProductResourceModelRequest,
         ) -> Result<awaken_iam_contract::ResourceModelRegistered, RemoteError> {
             unimplemented!("snapshot cache is authorization-only")
         }

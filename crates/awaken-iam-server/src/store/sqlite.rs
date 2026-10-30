@@ -26,7 +26,7 @@ use awaken_scoped_migration::{
 use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
-use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
+use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlTransaction};
 
 /// A SQLite connection usable as both a migration executor and a repository
 /// backend. Cheap to [`Clone`]: clones share one connection.
@@ -176,77 +176,62 @@ impl SqlConn for SqliteBackend {
     }
 
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn
-            .execute(&render(sql), params_from_iter(values(params)))
-            .map_err(backend_err)?;
-        Ok(affected as u64)
+        let connection = self.conn.lock().unwrap();
+        execute_sql(&connection, sql, params)
     }
 
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&render(sql)).map_err(backend_err)?;
-        let column_count = stmt.column_count();
-        let rows = stmt
-            .query_map(params_from_iter(values(params)), |row| {
-                let mut out: SqlRow = Vec::with_capacity(column_count);
-                for idx in 0..column_count {
-                    out.push(row.get::<usize, Option<String>>(idx)?);
-                }
-                Ok(out)
-            })
-            .map_err(backend_err)?;
-        let mut collected = Vec::new();
-        for row in rows {
-            collected.push(row.map_err(backend_err)?);
-        }
-        Ok(collected)
+        let connection = self.conn.lock().unwrap();
+        query_sql(&connection, sql, params)
     }
 
-    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend_err)?;
-        let mut affected = Vec::with_capacity(writes.len());
-        for write in writes {
-            affected.push(
-                tx.execute(&render(&write.sql), params_from_iter(values(&write.params)))
-                    .map_err(backend_err)? as u64,
-            );
-        }
-        tx.commit().map_err(backend_err)?;
-        Ok(affected)
-    }
-
-    fn execute_transaction_checked(
+    fn with_transaction(
         &self,
-        writes: &[SqlWrite],
-        required: &[(usize, u64)],
-    ) -> RepositoryResult<Vec<u64>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn
+        operation: &mut (dyn FnMut(&mut dyn SqlTransaction) -> RepositoryResult<()> + Send),
+    ) -> RepositoryResult<()> {
+        let mut connection = self.conn.lock().unwrap();
+        let mut transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend_err)?;
-        let mut affected = Vec::with_capacity(writes.len());
-        for write in writes {
-            affected.push(
-                tx.execute(&render(&write.sql), params_from_iter(values(&write.params)))
-                    .map_err(backend_err)? as u64,
-            );
-        }
-        if let Some((index, expected)) = required
-            .iter()
-            .find(|(index, expected)| affected.get(*index) != Some(expected))
-        {
-            return Err(RepositoryError::Conflict(format!(
-                "transaction write {index} affected {} rows; expected {expected}",
-                affected.get(*index).copied().unwrap_or(0)
-            )));
-        }
-        tx.commit().map_err(backend_err)?;
-        Ok(affected)
+        operation(&mut transaction)?;
+        transaction.commit().map_err(backend_err)
     }
+}
+
+impl SqlTransaction for rusqlite::Transaction<'_> {
+    fn execute(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
+        execute_sql(self, sql, params)
+    }
+
+    fn query(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
+        query_sql(self, sql, params)
+    }
+}
+
+fn execute_sql(connection: &Connection, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
+    connection
+        .execute(&render(sql), params_from_iter(values(params)))
+        .map(|affected| affected as u64)
+        .map_err(backend_err)
+}
+
+fn query_sql(
+    connection: &Connection,
+    sql: &str,
+    params: &[SqlParam],
+) -> RepositoryResult<Vec<SqlRow>> {
+    let mut statement = connection.prepare(&render(sql)).map_err(backend_err)?;
+    let columns = statement.column_count();
+    let rows = statement
+        .query_map(params_from_iter(values(params)), |row| {
+            let mut cells = Vec::with_capacity(columns);
+            for index in 0..columns {
+                cells.push(row.get::<usize, Option<String>>(index)?);
+            }
+            Ok(cells)
+        })
+        .map_err(backend_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend_err)
 }
 
 impl MigrationExecutor for SqliteBackend {
@@ -277,12 +262,21 @@ impl MigrationExecutor for SqliteBackend {
 
             let recorded = read_applied(&tx, ledger, bundle.bundle_id())?;
             let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+            let bridge = super::migration_compatibility::atomic_v8_bridge(
+                bundle, &recorded, prefix, dialect,
+            )?;
+            if let Some(bridge) = &bridge {
+                for sql in &bridge.before {
+                    tx.execute_batch(sql).map_err(backend_err)?;
+                }
+            }
             for migration in pending {
                 let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
                 tx.execute_batch(&sql).map_err(backend_err)?;
                 let checksum = migration.checksum_for(dialect);
                 let description = migration.ledger_description();
-                tx.execute(
+                Connection::execute(
+                    &tx,
                     &format!(
                         "INSERT INTO {ledger} \
                          (bundle_id, version, checksum, description, applied_by) \
@@ -303,6 +297,11 @@ impl MigrationExecutor for SqliteBackend {
                     checksum,
                     description,
                 });
+            }
+            if let Some(bridge) = &bridge {
+                for sql in &bridge.after {
+                    tx.execute_batch(sql).map_err(backend_err)?;
+                }
             }
             tx.commit().map_err(backend_err)?;
         }

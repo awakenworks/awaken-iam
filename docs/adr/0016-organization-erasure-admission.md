@@ -1,6 +1,6 @@
 # ADR-0016 - Organization erasure admission and atomic publication
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Implementation:** in-progress
 - **Date:** 2026-10-30
 - **Related:** ADR-0003, ADR-0008, ADR-0010, ADR-0013, ADR-0015

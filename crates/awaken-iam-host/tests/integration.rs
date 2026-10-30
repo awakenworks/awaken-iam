@@ -5,7 +5,7 @@ use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
     EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot, PrincipalRef,
-    ResourceModelRegistered, ResourceModelRegistration, ScopeRef, SignerSetSnapshot, Timestamp,
+    ProductResourceModelRequest, ResourceModelRegistered, ScopeRef, SignerSetSnapshot, Timestamp,
 };
 use awaken_iam_core::{MintApiToken, RoleId};
 use awaken_iam_host::{
@@ -161,7 +161,7 @@ impl AuthzTransport for AlwaysFailTransport {
 
     fn register_resource_model(
         &self,
-        _: &ResourceModelRegistration,
+        _: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         Err(RemoteError("simulated connection refused".into()))
     }

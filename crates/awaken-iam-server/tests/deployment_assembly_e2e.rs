@@ -14,7 +14,7 @@ use awaken_iam_client::{AuthzTransport, IamClient, IamClientMode, RemoteError, R
 use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
     BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementRequest, NamespaceId,
-    PolicySnapshot, ResourceModelRegistered, ResourceModelRegistration, SignerSetSnapshot,
+    PolicySnapshot, ProductResourceModelRequest, ResourceModelRegistered, SignerSetSnapshot,
 };
 use awaken_iam_server::{
     AuthzApi, Deployment, IamAssembly, IamDaemon, RecordingExecutor, RouteSpec,
@@ -82,7 +82,7 @@ impl AuthzTransport for DaemonTransport<'_> {
 
     fn register_resource_model(
         &self,
-        _registration: &ResourceModelRegistration,
+        _registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         // This parity fixture borrows the daemon's API immutably to compare
         // decisions; registration is a mutating endpoint exercised in the remote

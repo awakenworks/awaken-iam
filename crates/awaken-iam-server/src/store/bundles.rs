@@ -24,6 +24,12 @@
 //! `CREATE TABLE` (not the conditional form) fails loudly on drift instead of
 //! masking it.
 
+// migration-allow-edit: reviewed ADR-0015 reconciliation retains both exact v8
+// receipt histories and main's atomic SQL as the appended v9. The descriptor,
+// Rust constructor and test-import lines move/format here; the tested 21 SQL
+// constants and immutable consumed-v8 fixture remain byte-identical. Both
+// native backends verified old receipts/rows, rollback, replay and drift denial.
+
 use awaken_scoped_migration::{Migration, MigrationBundle};
 
 // reviewed: migration-allow-edit — append the next Directory step while preserving
@@ -130,8 +136,18 @@ pub fn bundles() -> Vec<MigrationBundle> {
                 (7, "organization invitation lifecycle", AUTHZ_0007),
                 (
                     8,
-                    "resource provision receipts and epoch fences",
+                    "product projection ownership and resource tombstones",
                     AUTHZ_0008,
+                ),
+                (
+                    9,
+                    "resource provision receipts and epoch fences",
+                    AUTHZ_0009,
+                ),
+                (
+                    10,
+                    "terminal organization privacy admission and exact receipts",
+                    AUTHZ_0010,
                 ),
             ],
         ),
@@ -180,8 +196,20 @@ fn bundle(scope: BundleScope, steps: Vec<(i64, &'static str, &'static str)>) -> 
     let migrations = steps
         .into_iter()
         .map(|(version, description, sql)| {
-            Migration::new(version, description, sql)
-                .unwrap_or_else(|err| panic!("invalid {} migration: {err}", scope.id()))
+            let migration = if scope == BundleScope::Authz && version == 8 {
+                // Exact receipts from GitHub main 17c3c638 and the consumed
+                // db9cd845 track converge through append-only migration 9.
+                Migration::published_legacy_with_aliases(
+                    version,
+                    description,
+                    sql,
+                    "f164a6739d1212600d879f441fd1e1b79fbfe83abdcf86431512dde621fae548",
+                    [super::migration_compatibility::CONSUMED_AUTHZ_V8_CHECKSUM],
+                )
+            } else {
+                Migration::new(version, description, sql)
+            };
+            migration.unwrap_or_else(|err| panic!("invalid {} migration: {err}", scope.id()))
         })
         .collect();
     MigrationBundle::new(scope.id(), migrations)
@@ -406,7 +434,63 @@ CREATE TABLE {prefix}_invitations (\
 CREATE INDEX {prefix}_invitations_org_idx \
  ON {prefix}_invitations (org_id, created_at);";
 
+// Stream coordinates and ownership are durable so retries after a daemon
+// restart cannot restore an older grant. The owner tables also fence a product
+// projection from replacing another stream's grant or resource edge.
 const AUTHZ_0008: &str = "\
+CREATE TABLE {prefix}_resource_projection_streams (\
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ idempotency_key TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ payload_digest TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ grant_ids {json} NOT NULL, \
+ edge_keys {json} NOT NULL, \
+ PRIMARY KEY (product_id, org_id, projection_id));\n\
+CREATE TABLE {prefix}_resource_projection_keys (\
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ idempotency_key TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ payload_digest TEXT NOT NULL, \
+ version BIGINT NOT NULL, \
+ PRIMARY KEY (product_id, org_id, idempotency_key));\n\
+CREATE TABLE {prefix}_resource_projection_grant_owners (\
+ grant_id TEXT PRIMARY KEY, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL);\n\
+CREATE TABLE {prefix}_resource_projection_edge_owners (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));\n\
+CREATE TABLE {prefix}_resource_projection_tombstones (\
+ resource_type TEXT NOT NULL, \
+ resource_id TEXT NOT NULL, \
+ product_id TEXT NOT NULL, \
+ org_id TEXT NOT NULL, \
+ projection_id TEXT NOT NULL, \
+ epoch BIGINT NOT NULL, \
+ PRIMARY KEY (resource_type, resource_id));\n\
+CREATE TABLE {prefix}_product_resource_types (\
+ product_id TEXT NOT NULL, \
+ resource_type TEXT NOT NULL, \
+ parent_type TEXT, \
+ actions {json} NOT NULL, \
+ PRIMARY KEY (product_id, resource_type));\n\
+CREATE TABLE {prefix}_product_actions (\
+ product_id TEXT NOT NULL, \
+ action_key TEXT NOT NULL, \
+ PRIMARY KEY (product_id, action_key));";
+
+// Append the atomic schema; the known-v8 bridge preserves existing rows.
+const AUTHZ_0009: &str = "\
 CREATE TABLE {prefix}_resource_provisions (\
  idempotency_key TEXT PRIMARY KEY, \
  epoch BIGINT NOT NULL, \
@@ -418,6 +502,23 @@ CREATE TABLE {prefix}_resource_epochs (\
  resource_id TEXT NOT NULL, \
  epoch BIGINT NOT NULL, \
  PRIMARY KEY (resource_type, resource_id));";
+
+// Rebuild only the original Org table so erased rows can retain negative
+// admission without retaining owner/name/timestamps. Legacy live data is copied
+// exactly; no receipt table/parallel organization registry is introduced.
+// migration-allow-destructive: authz 10 copies every live row exactly before replacing only the original Org table; the transaction rolls back on failure.
+const AUTHZ_0010: &str = "\
+CREATE TABLE {prefix}_orgs_erasure_upgrade (\
+ id TEXT PRIMARY KEY, display_name TEXT, owner {json}, created_at TEXT, updated_at TEXT, \
+ erasure_version BIGINT, erasure_confirmed BIGINT, erased_scope {json}, erased_groups {json}, \
+ CHECK ((erasure_version IS NULL AND owner IS NOT NULL AND created_at IS NOT NULL AND updated_at IS NOT NULL \
+ AND erasure_confirmed IS NULL AND erased_scope IS NULL AND erased_groups IS NULL) OR \
+ (erasure_version IS NOT NULL AND erasure_version > 0 AND erasure_confirmed IS NOT NULL AND erasure_confirmed IN (0,1) AND display_name IS NULL AND owner IS NULL \
+ AND created_at IS NULL AND updated_at IS NULL AND erased_scope IS NOT NULL AND erased_groups IS NOT NULL)));\n\
+INSERT INTO {prefix}_orgs_erasure_upgrade (id,display_name,owner,created_at,updated_at) \
+ SELECT id,display_name,owner,created_at,updated_at FROM {prefix}_orgs;\n\
+DROP TABLE {prefix}_orgs;\n\
+ALTER TABLE {prefix}_orgs_erasure_upgrade RENAME TO {prefix}_orgs;";
 
 // User-visible placement is independent from both the fixed compatibility
 // ScopeRef shapes and product business tables. An empty `parent_id` is the
@@ -532,7 +633,230 @@ CREATE TABLE {prefix}_audit_events (\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{SqlConn, SqliteBackend};
+    use crate::store::{SqlConn, SqliteBackend, sqlite_in_memory_store};
+
+    #[test]
+    fn published_and_consumed_v8_ledgers_converge_without_rewriting_receipts() {
+        use crate::store::migration::{Migration, MigrationBundle, MigrationExecutor};
+        const CONSUMED_V8: &str = include_str!("../../tests/fixtures/consumed-authz-v8.sql");
+        for consumed in [false, true] {
+            let mut backend = SqliteBackend::open_in_memory().unwrap();
+            let previous = super::bundles()
+                .into_iter()
+                .map(|bundle| {
+                    let migrations = bundle
+                        .migrations()
+                        .iter()
+                        .filter(|migration| {
+                            bundle.bundle_id() != "iam.authz" || migration.version() <= 8
+                        })
+                        .map(|migration| {
+                            if consumed
+                                && bundle.bundle_id() == "iam.authz"
+                                && migration.version() == 8
+                            {
+                                Migration::new(8, "consumed atomic provision schema", CONSUMED_V8)
+                                    .unwrap()
+                            } else {
+                                migration.clone()
+                            }
+                        })
+                        .collect();
+                    MigrationBundle::new(bundle.bundle_id(), migrations).unwrap()
+                })
+                .collect::<Vec<_>>();
+            backend.run_migrations("iam", &previous).unwrap();
+            if consumed {
+                backend.execute("INSERT INTO iam_resource_epochs (resource_type, resource_id, epoch) VALUES ('test.resource', 'retained', 7)", &[]).unwrap();
+            } else {
+                backend.execute("INSERT INTO iam_product_actions (product_id, action_key) VALUES ('test', 'retained')", &[]).unwrap();
+            }
+            let receipt = backend.applied_versions("iam", "iam.authz").unwrap()[&8].clone();
+            if consumed {
+                backend
+                    .execute(
+                        "CREATE TABLE iam_product_actions (product_id TEXT, action_key TEXT)",
+                        &[],
+                    )
+                    .unwrap();
+                assert!(backend.run_migrations("iam", &super::bundles()).is_err());
+                assert!(
+                    !backend
+                        .applied_versions("iam", "iam.authz")
+                        .unwrap()
+                        .contains_key(&9)
+                );
+                assert!(
+                    backend
+                        .query("SELECT * FROM iam_atomic_v8_resource_epochs", &[])
+                        .is_err()
+                );
+                assert_eq!(
+                    backend
+                        .query(
+                            "SELECT CAST(COUNT(*) AS TEXT) FROM iam_resource_epochs",
+                            &[]
+                        )
+                        .unwrap()[0][0]
+                        .as_deref(),
+                    Some("1")
+                );
+                backend
+                    .execute("DROP TABLE iam_product_actions", &[])
+                    .unwrap();
+            }
+            // M9: both published and consumed v8 histories must still execute
+            // exactly ONE canonical convergence step and preserve their v8 receipt.
+            let convergence = super::bundles()
+                .into_iter()
+                .map(|bundle| {
+                    MigrationBundle::new(
+                        bundle.bundle_id(),
+                        bundle
+                            .migrations()
+                            .iter()
+                            .filter(|migration| {
+                                bundle.bundle_id() != "iam.authz" || migration.version() <= 9
+                            })
+                            .cloned()
+                            .collect(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let applied = backend.run_migrations("iam", &convergence).unwrap();
+            assert_eq!(applied.len(), 1, "only the new convergence step applies");
+            assert_eq!(
+                backend.applied_versions("iam", "iam.authz").unwrap()[&8],
+                receipt
+            );
+            // M10: append privacy migration after successful v9; it cannot rewrite
+            // either old receipt, and an exact retry below must apply no migration.
+            let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
+            let privacy = backend.run_migrations("iam", &super::bundles()).unwrap();
+            assert_eq!(privacy.len(), 1, "only appended privacy step applies");
+            let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
+            assert!(current_receipts.contains_key(&10));
+            for version in [8, 9] {
+                assert_eq!(
+                    current_receipts[&version], converged_receipts[&version],
+                    "M10 historical receipt preserved"
+                );
+            }
+            for table in [
+                "iam_product_actions",
+                "iam_resource_epochs",
+                "iam_resource_projection_streams",
+                "iam_resource_provisions",
+            ] {
+                backend
+                    .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                    .unwrap();
+            }
+            let table = if consumed {
+                "iam_resource_epochs"
+            } else {
+                "iam_product_actions"
+            };
+            assert_eq!(
+                backend
+                    .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                    .unwrap()[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+            assert!(
+                backend
+                    .run_migrations("iam", &super::bundles())
+                    .unwrap()
+                    .is_empty()
+            );
+            // Only the two known receipts are accepted; drift still fails closed.
+            backend.execute("UPDATE iam_schema_migrations SET checksum = ? WHERE bundle_id = ? AND version = 8", &[Some("f".repeat(64)), Some("iam.authz".into())]).unwrap();
+            assert!(backend.run_migrations("iam", &super::bundles()).is_err());
+        }
+    }
+
+    #[test]
+    fn projection_migration_applies_and_fences_cross_stream_ownership() {
+        let store = sqlite_in_memory_store("iam").expect("migrate all IAM bundles");
+        let backend = store.backend();
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_grant_owners \
+             (grant_id, product_id, org_id, projection_id) VALUES (?, ?, ?, ?)",
+                &[
+                    Some("grant-1".into()),
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("campus:1".into()),
+                ],
+            )
+            .expect("first owner");
+        assert!(
+            backend
+                .execute(
+                    "INSERT INTO iam_resource_projection_grant_owners \
+             (grant_id, product_id, org_id, projection_id) VALUES (?, ?, ?, ?)",
+                    &[
+                        Some("grant-1".into()),
+                        Some("tutor".into()),
+                        Some("org-b".into()),
+                        Some("staff:2".into())
+                    ],
+                )
+                .is_err()
+        );
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_keys \
+             (product_id, org_id, idempotency_key, projection_id, epoch, payload_digest, version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("event-1".into()),
+                    Some("campus:1".into()),
+                    Some("1".into()),
+                    Some("digest-a".into()),
+                    Some("2".into()),
+                ],
+            )
+            .expect("first idempotency key");
+        assert!(
+            backend
+                .execute(
+                    "INSERT INTO iam_resource_projection_keys \
+             (product_id, org_id, idempotency_key, projection_id, epoch, payload_digest, version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        Some("tutor".into()),
+                        Some("org-a".into()),
+                        Some("event-1".into()),
+                        Some("staff:2".into()),
+                        Some("2".into()),
+                        Some("digest-b".into()),
+                        Some("3".into())
+                    ],
+                )
+                .is_err()
+        );
+        backend
+            .execute(
+                "INSERT INTO iam_resource_projection_tombstones \
+             (resource_type, resource_id, product_id, org_id, projection_id, epoch) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+                &[
+                    Some("tutor.campus".into()),
+                    Some("1".into()),
+                    Some("tutor".into()),
+                    Some("org-a".into()),
+                    Some("campus:1".into()),
+                    Some("2".into()),
+                ],
+            )
+            .expect("retirement survives in migrated schema");
+    }
 
     #[test]
     fn directory_v3_preserves_rows_and_scopes_identity_and_revision_by_org() {

@@ -43,26 +43,30 @@
 //! host never mounts this router — it administers the model in-process — so the
 //! seam is exposed over HTTP only by the standalone daemon.
 
+mod resource_provisioning;
+pub use resource_provisioning::projection_router;
+use resource_provisioning::provision_resource;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, ActivateAuthorizationProfile, AdminMutationAck,
-    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
-    BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
-    DirectoryChildrenQuery, DirectoryNodeId, DirectoryRevisionQuery, EnsureProductSpacePlacement,
-    EntitlementCheckResponse, EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView,
-    InvitationId, InvitationQuery, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
-    NamespaceId, OrgId, OrgView, PolicySnapshot, ProductId, ProductSpacePlacementQuery,
-    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, ResourceProvision,
-    ResourceProvisionReceipt, RetireAuthorizationProfile, RetireProductSpacePlacement,
-    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp, UpdateDirectoryNode,
-    WorkspaceOrgEdge,
+    AuthorizationRequest, BatchAuthorizationRequest, CreateAuthorizationProfile,
+    CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryNodeId,
+    DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
+    EntitlementRequest, GrantSnapshot, GrantSubjectRef, GroupView, InvitationId, InvitationQuery,
+    IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgView,
+    PolicySnapshot, ProductId, ProductResourceModelRequest, ProductSpacePlacementQuery,
+    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, ResourceProjectionBatch,
+    ResourceProvision, ResourceProvisionReceipt, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery, Timestamp,
+    UpdateDirectoryNode, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    ActionPattern, AuthorizationProfileRepository, Effect, Grant, GrantId, GrantSubject, Group,
-    GroupId, OAuthClientRepository, Organization, OsEntropy, PolicySet, RegisteredClient,
-    RoleBinding, RoleDef, RoleId,
+    ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
+    GrantSubject, Group, GroupId, OAuthClientRepository, Organization, OsEntropy, PolicySet,
+    RegisteredClient, RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -74,12 +78,14 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::store::ResourceProjectionStore;
 use crate::{
     AccessTokenAuthority, AdminCredential, AdminError, AuthorizationProfileAdmin, CapabilityCheck,
     LeaseEpoch, MintCapability, OAuthClientAdminApi, PolicyAdminApi, PolicyStore,
     ProfileAdminError, mint_capability, verify_capability,
 };
 use awaken_iam_contract::GrantEffect;
+use awaken_iam_core::RepositoryError;
 
 /// Who may administer policy over the wire.
 ///
@@ -151,6 +157,7 @@ pub struct DaemonState<S> {
     profiles: AuthorizationProfileAdmin,
     capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
+    observed_store_version: u64,
 }
 
 impl<S> std::fmt::Debug for DaemonState<S> {
@@ -184,7 +191,7 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
         profiles
             .hydrate_all(&mut authz, &base)
             .map_err(|error| AdminError::Backend(error.to_string()))?;
-        Ok(Self {
+        let mut state = Self {
             authz,
             admin,
             oauth_clients,
@@ -192,7 +199,10 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
             profiles,
             capability_tokens,
             auth,
-        })
+            observed_store_version: version,
+        };
+        state.ensure_fresh()?;
+        Ok(state)
     }
 }
 
@@ -201,10 +211,47 @@ impl<S: PolicyStore> DaemonState<S> {
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;
         let base_snapshot = base.snapshot(version);
-        let active_profiles = self.authz.snapshot().active_profiles;
+        let active_profiles = self
+            .profiles
+            .durable_active_profiles()
+            .map_err(|error| AdminError::Backend(error.to_string()))?;
         let policy = PolicySet::from_snapshot_and_profiles(&base_snapshot, &active_profiles);
         self.authz.replace_policy_at_version(policy, version);
+        self.observed_store_version = version;
         Ok(())
+    }
+
+    /// One HTTP projection of the existing shared-fence refresh decision.
+    /// Keep all policy decisions and snapshots behind the same failure law;
+    /// rendering borrows the current PDP under this state's original mutex.
+    fn with_fresh_authorization(
+        &mut self,
+        render: impl FnOnce(&crate::AuthzApi) -> Response,
+    ) -> Response {
+        match self.ensure_fresh() {
+            Ok(()) => render(&self.authz),
+            Err(_) => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "policy_unavailable",
+                "Policy store is unavailable",
+            ),
+        }
+    }
+
+    fn ensure_fresh(&mut self) -> Result<(), AdminError> {
+        for _ in 0..3 {
+            let latest = self.admin.store_version()?;
+            if latest == self.observed_store_version {
+                return Ok(());
+            }
+            self.refresh_authorization(latest)?;
+            if self.admin.store_version()? == latest {
+                return Ok(());
+            }
+        }
+        Err(AdminError::Backend(
+            "policy changed repeatedly while refreshing".into(),
+        ))
     }
 }
 
@@ -245,7 +292,11 @@ where
             post(rotate_oauth_client_secret),
         )
         .route("/v1/admin/orgs/provision", post(provision_org))
-        .route("/v1/authz/resource-provisions", post(provision_resource))
+        .route("/v1/admin/orgs/privacy-erasure", post(erase_org_privacy))
+        .route(
+            "/v1/authz/resource-provision-transactions",
+            post(provision_resource),
+        )
         .route(
             "/v1/admin/orgs/{id}",
             get(get_org).put(update_org).delete(delete_org),
@@ -621,25 +672,25 @@ async fn healthz() -> Json<serde_json::Value> {
 async fn authorize(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<AuthorizationRequest>,
-) -> Json<AuthorizationOutcome> {
-    let guard = lock(&state);
-    Json(guard.authz.authorize(&request))
+) -> Response {
+    let mut guard = lock(&state);
+    guard.with_fresh_authorization(|authz| Json(authz.authorize(&request)).into_response())
 }
 
 async fn authorize_batch(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<BatchAuthorizationRequest>,
-) -> Json<BatchAuthorizationResponse> {
-    let guard = lock(&state);
-    Json(guard.authz.authorize_batch(&request))
+) -> Response {
+    let mut guard = lock(&state);
+    guard.with_fresh_authorization(|authz| Json(authz.authorize_batch(&request)).into_response())
 }
 
 async fn authorize_resource(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Json(request): Json<awaken_iam_contract::ResourceAuthorizationRequest>,
-) -> Json<AuthorizationOutcome> {
-    let guard = lock(&state);
-    Json(guard.authz.authorize_resource(&request))
+) -> Response {
+    let mut guard = lock(&state);
+    guard.with_fresh_authorization(|authz| Json(authz.authorize_resource(&request)).into_response())
 }
 
 async fn check_entitlement(
@@ -660,14 +711,14 @@ async fn snapshot(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
-    let guard = lock(&state);
-    match query.since {
-        Some(since) => match guard.authz.snapshot_since(since) {
+    let mut guard = lock(&state);
+    guard.with_fresh_authorization(|authz| match query.since {
+        Some(since) => match authz.snapshot_since(since) {
             Some(snapshot) => Json(snapshot).into_response(),
             None => StatusCode::NOT_MODIFIED.into_response(),
         },
-        None => Json::<PolicySnapshot>(guard.authz.snapshot()).into_response(),
-    }
+        None => Json::<PolicySnapshot>(authz.snapshot()).into_response(),
+    })
 }
 
 // -- policy-administration seam (shared state, mutating) ----------------------
@@ -864,33 +915,6 @@ async fn provision_org(
     })
 }
 
-async fn provision_resource(
-    State(state): State<SharedDaemonState<impl PolicyStore>>,
-    headers: HeaderMap,
-    Json(command): Json<ResourceProvision>,
-) -> Response {
-    let mut guard = lock(&state);
-    match directory_credential_access(&guard.auth, &headers) {
-        Ok(DirectoryCredentialAccess::Administrator) => {}
-        Ok(DirectoryCredentialAccess::Product(product)) if product == command.product_id => {}
-        Ok(DirectoryCredentialAccess::Product(_)) => {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "product credential does not own this resource provision",
-            );
-        }
-        Err(rejection) => return rejection.into_response(),
-    }
-    match guard.admin.provision_resource(command, now_timestamp()) {
-        Ok(receipt) => match guard.refresh_authorization(receipt.version) {
-            Ok(()) => (StatusCode::OK, Json::<ResourceProvisionReceipt>(receipt)).into_response(),
-            Err(error) => admin_error_response(&error),
-        },
-        Err(error) => admin_error_response(&error),
-    }
-}
-
 async fn get_org(
     State(state): State<SharedDaemonState<impl PolicyStore>>,
     headers: HeaderMap,
@@ -927,6 +951,20 @@ async fn delete_org(
     apply(&state, &headers, move |admin, at| {
         admin.delete_org(&OrgId(id), at)
     })
+}
+
+async fn erase_org_privacy(
+    State(state): State<SharedDaemonState<impl PolicyStore>>,
+    headers: HeaderMap,
+    Json(id): Json<OrgId>,
+) -> Response {
+    // SAME authenticated PAP/refresh pipeline and canonical receipt type.
+    apply_value(
+        &state,
+        &headers,
+        move |admin, at| admin.delete_org_with_receipt(&id, at),
+        |receipt: &awaken_iam_contract::OrgPrivacyCommitReceipt| receipt.observed_policy_version,
+    )
 }
 
 async fn list_orgs(

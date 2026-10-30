@@ -34,7 +34,9 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
+mod privacy;
 mod provisioning;
+pub(crate) use privacy::organization_erasure_audit;
 pub use provisioning::ResourceProvisioningStore;
 
 use awaken_iam_contract::{
@@ -506,16 +508,6 @@ where
         let id = org.id.clone();
         OrgRepository::upsert(&self.store, org)?;
         self.commit(DomainEvent::OrganizationUpdated(id), at)
-    }
-
-    /// Idempotently erase an organization and every IAM-owned projection in
-    /// its authoritative scope closure.
-    pub fn delete_org(&mut self, id: &OrgId, at: Timestamp) -> AdminResult<u64> {
-        if self.store.erase_org_privacy(id)? {
-            self.commit(DomainEvent::OrganizationDeleted(id.clone()), at)
-        } else {
-            self.store_version()
-        }
     }
 
     /// Resolve an organization by id.
@@ -1062,6 +1054,11 @@ where
                 edge.parent,
             );
         }
+        for retired in ResourceModelRepository::list_retired_resources(&self.store)? {
+            policy
+                .scope_graph_mut()
+                .retire_resource(retired.resource_type, retired.resource_id);
+        }
         for edge in ResourceModelRepository::list_workspace_orgs(&self.store)? {
             policy
                 .scope_graph_mut()
@@ -1529,9 +1526,10 @@ mod tests {
     fn create_update_require_existence_and_privacy_delete_is_idempotent() {
         // Cause/effect decision table:
         // R1 duplicate create -> conflict/no version change; R2 missing update
-        // -> not found/no version change; R3 missing privacy delete -> exact
-        // idempotent success/no version change; R4 existing Org -> delete and
-        // one version advance; R5 exact retry -> success at the same version.
+        // -> not found/no version change; R3 first missing privacy delete ->
+        // negative admission + one version publication, but NOT confirmed
+        // historical erasure; R4 existing Org -> delete + one publication;
+        // R5 exact retry -> no new publication, current observed version.
         let mut pap = pap();
         pap.create_org(org("acme"), at()).unwrap();
         assert_eq!(
@@ -1545,18 +1543,18 @@ mod tests {
             pap.update_org(org("ghost"), at()),
             Err(AdminError::NotFound(_))
         ));
-        assert_eq!(pap.delete_org(&OrgId("ghost".into()), at()).unwrap(), 2);
-        assert_eq!(pap.version(), 2);
+        assert_eq!(pap.delete_org(&OrgId("ghost".into()), at()).unwrap(), 3);
+        assert_eq!(pap.version(), 3);
 
         pap.update_org(org("acme"), at()).unwrap();
         let deleted = pap.delete_org(&OrgId("acme".into()), at()).unwrap();
         assert!(pap.list_orgs().unwrap().is_empty());
-        assert_eq!(pap.version(), 4);
+        assert_eq!(pap.version(), 5);
         assert_eq!(
             pap.delete_org(&OrgId("acme".into()), at()).unwrap(),
             deleted
         );
-        assert_eq!(pap.version(), 4);
+        assert_eq!(pap.version(), 5);
     }
 
     #[test]

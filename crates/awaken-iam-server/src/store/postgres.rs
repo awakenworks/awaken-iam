@@ -17,9 +17,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use postgres::Client;
 use postgres::error::SqlState;
 use postgres::types::ToSql;
-use postgres::{Client, NoTls};
+use postgres_native_tls::MakeTlsConnector;
 use r2d2_postgres::PostgresConnectionManager;
 
 use awaken_scoped_migration::{
@@ -30,7 +31,7 @@ use awaken_scoped_migration::{
 use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 use super::migration::{Dialect, IamStore, MigrationExecutor, migration_err};
-use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlWrite};
+use super::sql::{SqlConn, SqlParam, SqlRow, SqlStore, SqlTransaction};
 
 /// Execute a synchronous-driver operation without an entered Tokio runtime.
 ///
@@ -62,7 +63,7 @@ pub struct PostgresBackend {
     client: Arc<PlainThreadOwner<ConnectionOwner>>,
 }
 
-type PostgresPool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
+type PostgresPool = r2d2::Pool<PostgresConnectionManager<MakeTlsConnector>>;
 
 enum ConnectionOwner {
     Direct(Box<Mutex<Client>>),
@@ -150,10 +151,19 @@ impl PostgresBackend {
 
     /// Connect to Postgres using a libpq-style connection string or URL.
     pub fn connect(params: &str) -> RepositoryResult<Self> {
+        let tls = native_tls::TlsConnector::new()
+            .map_err(|error| RepositoryError::Backend(error.to_string()))?;
+        Self::connect_with_tls(params, MakeTlsConnector::new(tls))
+    }
+
+    /// Use the embedding binary's verified TLS policy with the original slot.
+    /// Private CA selection belongs to that binary. This constructor adds no
+    /// SQL replay, pool, runtime or client-lifetime authority.
+    pub fn connect_with_tls(params: &str, tls: MakeTlsConnector) -> RepositoryResult<Self> {
         let config = params
             .parse()
             .map_err(|error: postgres::Error| RepositoryError::Backend(error.to_string()))?;
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(config, tls);
         let pool = run_outside_tokio("connect", || {
             r2d2::Pool::builder()
                 // Preserve the existing one-client serialization and advisory
@@ -294,66 +304,51 @@ impl SqlConn for PostgresBackend {
 
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
         self.with_client("query", |client| {
-            let rows = client
-                .query(&render(sql), &refs(params))
-                .map_err(backend_err)?;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let mut cells: SqlRow = Vec::with_capacity(row.len());
-                for idx in 0..row.len() {
-                    cells.push(
-                        row.try_get::<usize, Option<String>>(idx)
-                            .map_err(backend_err)?,
-                    );
-                }
-                out.push(cells);
-            }
-            Ok(out)
+            sql_rows(
+                client
+                    .query(&render(sql), &refs(params))
+                    .map_err(backend_err)?,
+            )
         })
     }
 
-    fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
-        self.with_client("transaction", |client| {
-            let mut tx = client.transaction().map_err(backend_err)?;
-            let mut affected = Vec::with_capacity(writes.len());
-            for write in writes {
-                affected.push(
-                    tx.execute(&render(&write.sql), &refs(&write.params))
-                        .map_err(backend_err)?,
-                );
-            }
-            tx.commit().map_err(backend_err)?;
-            Ok(affected)
-        })
-    }
-
-    fn execute_transaction_checked(
+    fn with_transaction(
         &self,
-        writes: &[SqlWrite],
-        required: &[(usize, u64)],
-    ) -> RepositoryResult<Vec<u64>> {
-        self.with_client("checked transaction", |client| {
-            let mut tx = client.transaction().map_err(backend_err)?;
-            let mut affected = Vec::with_capacity(writes.len());
-            for write in writes {
-                affected.push(
-                    tx.execute(&render(&write.sql), &refs(&write.params))
-                        .map_err(backend_err)?,
-                );
-            }
-            if let Some((index, expected)) = required
-                .iter()
-                .find(|(index, expected)| affected.get(*index) != Some(expected))
-            {
-                return Err(RepositoryError::Conflict(format!(
-                    "transaction write {index} affected {} rows; expected {expected}",
-                    affected.get(*index).copied().unwrap_or(0)
-                )));
-            }
-            tx.commit().map_err(backend_err)?;
-            Ok(affected)
+        operation: &mut (dyn FnMut(&mut dyn SqlTransaction) -> RepositoryResult<()> + Send),
+    ) -> RepositoryResult<()> {
+        self.with_client("transaction", |client| {
+            let mut transaction = client.transaction().map_err(backend_err)?;
+            operation(&mut transaction)?;
+            transaction.commit().map_err(backend_err)
         })
     }
+}
+
+impl SqlTransaction for postgres::Transaction<'_> {
+    fn execute(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
+        postgres::Transaction::execute(self, &render(sql), &refs(params)).map_err(backend_err)
+    }
+
+    fn query(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
+        sql_rows(
+            postgres::Transaction::query(self, &render(sql), &refs(params)).map_err(backend_err)?,
+        )
+    }
+}
+
+fn sql_rows(rows: Vec<postgres::Row>) -> RepositoryResult<Vec<SqlRow>> {
+    let mut output = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut cells = Vec::with_capacity(row.len());
+        for index in 0..row.len() {
+            cells.push(
+                row.try_get::<usize, Option<String>>(index)
+                    .map_err(backend_err)?,
+            );
+        }
+        output.push(cells);
+    }
+    Ok(output)
 }
 
 impl MigrationExecutor for PostgresBackend {
@@ -388,6 +383,14 @@ impl MigrationExecutor for PostgresBackend {
 
                 let recorded = read_applied(&mut tx, ledger, bundle.bundle_id())?;
                 let pending = plan(bundle, &recorded, dialect).map_err(migration_err)?;
+                let bridge = super::migration_compatibility::atomic_v8_bridge(
+                    bundle, &recorded, prefix, dialect,
+                )?;
+                if let Some(bridge) = &bridge {
+                    for sql in &bridge.before {
+                        tx.batch_execute(sql).map_err(backend_err)?;
+                    }
+                }
                 for migration in pending {
                     let sql = render_ddl(migration.sql_for(dialect), dialect, prefix);
                     tx.batch_execute(&sql).map_err(backend_err)?;
@@ -414,6 +417,11 @@ impl MigrationExecutor for PostgresBackend {
                         checksum,
                         description,
                     });
+                }
+                if let Some(bridge) = &bridge {
+                    for sql in &bridge.after {
+                        tx.batch_execute(sql).map_err(backend_err)?;
+                    }
                 }
                 tx.commit().map_err(backend_err)?;
             }
@@ -532,6 +540,107 @@ mod tests {
         drop(clone);
 
         assert_ne!(receiver.recv().expect("destructor thread id"), caller);
+    }
+
+    #[test]
+    #[ignore = "requires IAM_TEST_POSTGRES_TLS_URL and IAM_TEST_POSTGRES_CA_CERT"]
+    fn verified_tls_reuses_the_original_slot_without_replaying_an_interrupted_write() {
+        // Causes: C1 TLS-required endpoint; C2 trusted/untrusted root;
+        // C3 matching/wrong peer name; C4 original socket is terminated.
+        // Effects: E1 no usable client on trust/identity refusal; E2 a verified
+        // encrypted shared slot; E3 later checkout replaces the same slot;
+        // E4 an interrupted SQL write has at most one effect, never replay.
+        // T1=C1+!C2=>E1; T2=C1+C2+!C3=>E1; T3=C1+C2+C3=>E2;
+        // T4=T3+C4=>E3+E4. This opt-in case fails on missing fixture inputs;
+        // ordinary plaintext fixtures do not count as TLS evidence.
+        use super::{PostgresBackend, SqlConn, backend_err};
+        use postgres::config::SslMode;
+        use postgres_native_tls::MakeTlsConnector;
+        let url = std::env::var("IAM_TEST_POSTGRES_TLS_URL").expect("TLS URL");
+        let ca = std::env::var("IAM_TEST_POSTGRES_CA_CERT").expect("private CA path");
+        assert_eq!(
+            url.parse::<postgres::Config>().unwrap().get_ssl_mode(),
+            SslMode::Require,
+            "C1"
+        );
+        let tls = |trusted: bool| {
+            let mut builder = native_tls::TlsConnector::builder();
+            builder.disable_built_in_roots(true);
+            if trusted {
+                builder.add_root_certificate(
+                    native_tls::Certificate::from_pem(&std::fs::read(&ca).unwrap()).unwrap(),
+                );
+            }
+            MakeTlsConnector::new(builder.build().unwrap())
+        };
+        assert!(
+            PostgresBackend::connect_with_tls(&url, tls(false)).is_err(),
+            "T1"
+        );
+        let mut wrong_peer = url::Url::parse(&url).unwrap();
+        wrong_peer.set_host(Some("wrong-peer.invalid")).unwrap();
+        wrong_peer
+            .query_pairs_mut()
+            .append_pair("hostaddr", "127.0.0.1");
+        wrong_peer
+            .as_str()
+            .parse::<postgres::Config>()
+            .expect("hostaddr keeps the TCP endpoint while changing TLS peer identity");
+        assert!(
+            PostgresBackend::connect_with_tls(wrong_peer.as_str(), tls(true)).is_err(),
+            "T2"
+        );
+        let backend = PostgresBackend::connect_with_tls(&url, tls(true)).expect("T3");
+        let clone = backend.clone();
+        let observe = |store: &PostgresBackend| {
+            store.with_client("tls-proof", |client| {
+            let row = client.query_one("SELECT pg_backend_pid(), (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid())", &[]).map_err(backend_err)?;
+            Ok((row.get::<_, i32>(0), row.get::<_, bool>(1)))
+        })
+        };
+        let (original, encrypted) = observe(&backend).unwrap();
+        assert!(encrypted, "T3 actual server-side TLS");
+        assert_eq!(observe(&clone).unwrap(), (original, true), "T3 one slot");
+        let mut admin = url
+            .parse::<postgres::Config>()
+            .unwrap()
+            .connect(tls(true))
+            .unwrap();
+        let table = format!("iam_tls_reconnect_{}", std::process::id());
+        admin
+            .batch_execute(&format!("CREATE TABLE {table} (value BIGINT NOT NULL)"))
+            .unwrap();
+        assert!(
+            admin
+                .query_one("SELECT pg_terminate_backend($1)", &[&original])
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        let _write_result = backend.execute(&format!("INSERT INTO {table} VALUES (1)"), &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let replacement = loop {
+            if let Ok(value) = observe(&clone) {
+                break value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "T4 replacement deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_ne!(replacement.0, original, "T4 new connection");
+        assert!(replacement.1, "T4 replacement still verifies/encrypts");
+        assert_eq!(
+            observe(&backend).unwrap(),
+            replacement,
+            "T4 all clones share it"
+        );
+        let effects: i64 = admin
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .unwrap()
+            .get(0);
+        assert!(effects <= 1, "T4 interrupted SQL is never replayed");
+        admin.batch_execute(&format!("DROP TABLE {table}")).unwrap();
     }
 
     #[test]

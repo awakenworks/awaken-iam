@@ -20,7 +20,10 @@
 //!   admin seam is still served but fails closed — every admin call is rejected —
 //!   so the daemon never exposes an unauthenticated control plane by default.
 //! - `IAM_DIRECTORY_PRODUCT_TOKENS` — comma-separated `product_id=token`
-//!   credentials allowed to ensure/query only that product's Directory spaces.
+//!   credentials allowed to ensure/query only that product's Directory spaces
+//!   and register/project its own authorization resource model.
+//! - `IAM_DATABASE_URL` — PostgreSQL DSN for the standalone store. When absent,
+//!   `IAM_DATABASE_PATH` selects the single-node SQLite file (default `iam.sqlite`).
 //! - `IAM_WECHAT_MINI_PROGRAMS_JSON` — JSON array of customer-specific
 //!   `provider_key`, `app_id`, `app_secret`, `audience`, optional `scopes`, and
 //!   optional `endpoint` registrations for `/v1/auth/wechat-miniapp/token`.
@@ -39,9 +42,10 @@ use awaken_iam_core::{
     LoginFlowRepository, OAuthClientRepository, SessionRepository,
 };
 use awaken_iam_server::{
-    AdminAuthPolicy, DaemonState, IamDaemon, RecordingExecutor, ReqwestWechatMiniProgramExchange,
-    SessionCookieConfig, SharedAuthApi, SqliteBackend, WechatMiniProgramRegistration,
-    daemon_router, http, jwks_router, op_router, sqlite_migrated_store, wechat_mini_program_router,
+    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor,
+    ReqwestWechatMiniProgramExchange, SessionCookieConfig, SharedAuthApi, SqlConn, SqlStore,
+    SqliteBackend, WechatMiniProgramRegistration, daemon_router, http, jwks_router, op_router,
+    postgres_migrated_store, projection_router, sqlite_migrated_store, wechat_mini_program_router,
 };
 use serde::Deserialize;
 
@@ -75,12 +79,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..SessionCookieConfig::default()
             });
     }
-    let database_path =
-        std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
-    let profile_store = Arc::new(sqlite_migrated_store(
-        SqliteBackend::open_path(&database_path)?,
-        "iam",
-    )?);
+    let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
+    if let Some(database_url) = std::env::var("IAM_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    {
+        let store = Arc::new(postgres_migrated_store(&database_url, "iam")?);
+        serve(auth, authz, store, admin_auth, issuer, bind_addr).await
+    } else {
+        let database_path =
+            std::env::var("IAM_DATABASE_PATH").unwrap_or_else(|_| "iam.sqlite".to_owned());
+        let store = Arc::new(sqlite_migrated_store(
+            SqliteBackend::open_path(&database_path)?,
+            "iam",
+        )?);
+        serve(auth, authz, store, admin_auth, issuer, bind_addr).await
+    }
+}
+
+async fn serve<B: SqlConn + Clone + 'static>(
+    mut auth: AuthApi,
+    authz: AuthzApi,
+    profile_store: Arc<SqlStore<B>>,
+    admin_auth: AdminAuthPolicy,
+    issuer: String,
+    bind_addr: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let accounts: Arc<dyn AccountRepository> = profile_store.clone();
     let external_identities: Arc<dyn ExternalIdentityRepository> = profile_store.clone();
     let identity_commands: Arc<dyn AccountIdentityRepository> = profile_store.clone();
@@ -117,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
-    let admin_auth = admin_auth_from_env().map_err(std::io::Error::other)?;
     let state = Arc::new(Mutex::new(DaemonState::with_policy_store(
         authz,
         admin_auth,
@@ -125,7 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (*profile_store).clone(),
         capability_tokens,
     )?));
-    let router = daemon_router(state)
+    let router = daemon_router(state.clone())
+        .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))
         .merge(op_router(
             auth.clone(),

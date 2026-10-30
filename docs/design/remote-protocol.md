@@ -35,6 +35,7 @@ Directory methods.
 | `profile_publication_state` | `GET /v1/authz/profiles/{namespace}/publication` |
 | `authorize_batch` | `POST /v1/authorize/batch` |
 | `check_entitlement` | `POST /v1/entitlements/check` |
+| `register_resource_model` with `ProductResourceModelRequest` | `POST /v1/authz/resource-model` |
 | `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
 | `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
 | `introspect_token` | `POST /v1/tokens/introspect` |
@@ -112,6 +113,23 @@ outcome, reason code, and matched grant/role/scope ids — enough for an audit/d
 UI without a second round trip. `/v1/authorize/batch` takes an array and returns
 decisions positionally, for list filtering.
 
+### Product resource vocabulary and instances
+
+The existing `AuthzTransport::register_resource_model` and `RemoteIamClient`
+method take the canonical `ProductResourceModelRequest`, containing an explicit
+`product_id` and the original `resource_model`. The client sends that complete
+request once through its existing authenticated transport. It does not infer the
+product from an audience, token or resource-type prefix, or retry a rejected
+wrapper as a bare registration.
+
+The guarded daemon route checks the product credential and accepts vocabulary
+only. Instance edges and revocable grants use `ResourceProjectionBatch` on
+`/v1/authz/resource-provisions`; atomic `ResourceProvision` clients use
+`/v1/authz/resource-provision-transactions`. The published route's existing strict
+dispatch and both v8 histories remain owned by [ADR-0015](../adr/0015-reconcile-published-and-consumed-provisioning.md).
+The local `AuthzApi`/Core model-registration method retains its embedded model
+input and does not simulate the daemon's product-admission policy.
+
 ### GET /v1/authz/snapshot
 
 Returns the versioned [`AuthzSnapshot`](authorization-engine.md#snapshot) for
@@ -184,6 +202,13 @@ to invalidate every older link. IAM stores no second share registry.
 
 ## Caching and freshness
 
+`authorize`, `authorize_batch`, `authorize_resource` and policy snapshots reuse
+the daemon's one shared-fence refresh owner before reading its local PDP. A quiet
+replica's contextual decision must observe peer revocation on its first request;
+an unreadable or repeatedly changing policy returns the same `503 policy_unavailable`
+response rather than serving cached policy. The existing refresh retry bound is
+unchanged.
+
 - Remote `authorize` results may be cached briefly keyed by
   `(principal, action, scope, snapshot_version)`; a `version` bump invalidates
   the cache.
@@ -210,6 +235,7 @@ organization and membership writes.
 | `POST` | `/v1/admin/invitations/{id}/resend` | rotated one-time token |
 | `POST` | `/v1/admin/invitations/{id}/accept` | accepted invitation + visible policy version |
 | `DELETE` | `/v1/admin/orgs/{id}` | idempotently erase the IAM-owned organization scope closure |
+| `POST` | `/v1/admin/orgs/privacy-erasure` | erase through the same owner and return its exact versioned participant receipt; body is the existing `OrgId` JSON value |
 
 The clear token is never persisted. Accept requires an IAM account id and a
 verified email assertion obtained from IAM UserInfo by the trusted relying
@@ -272,3 +298,21 @@ configured credential source
   [IAM model](iam-model.md#external-identity-and-sessions).
 - Wire framing details (gRPC vs JSON/HTTP) — an implementation choice; the shape
   above is transport-agnostic.
+
+### Exact organization privacy receipt
+
+The strict privacy operation uses the same authenticated PAP and atomic
+organization lifecycle as legacy DELETE. It returns the single contract
+`OrgPrivacyCommitReceipt`: receipt format version, exact Org, payload-change and
+new-admission flags, explicit identity confirmation, stored erasure policy version
+and current observed policy version. Missing/unknown format, foreign Org or
+reversed coordinates fail closed. `confirmed_organization=false` is a committed
+negative admission, not proof that an unknown historical identity was erased.
+
+Legacy `AdminMutationAck` JSON remains unchanged and exposes only the current
+policy coordinate. Strict callers never fall back to it: an older server or
+transport must refuse the strict request, retain recovery intent and withhold
+certificate completion. The static strict path carries the original `OrgId` in
+the body, preserving exact identities without raw URL-segment interpolation.
+The existing transport timeout, bounded retries and authenticated TLS policy are
+unchanged; a lost reply repeats the same terminal owner operation.

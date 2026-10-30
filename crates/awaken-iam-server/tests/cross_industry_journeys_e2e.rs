@@ -6,7 +6,7 @@ use awaken_iam_contract::ProductId;
 use awaken_iam_core::AuthorizationProfileRepository;
 use awaken_iam_server::{
     AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, SqlStore, SqliteBackend, daemon_router,
-    sqlite_in_memory_store,
+    projection_router, sqlite_in_memory_store,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -29,7 +29,8 @@ fn app() -> axum::Router {
         AuthApi::new().token_authority(),
     )
     .expect("hydrate daemon");
-    daemon_router(Arc::new(Mutex::new(state)))
+    let state = Arc::new(Mutex::new(state));
+    daemon_router(state.clone()).merge(projection_router(state))
 }
 
 fn request(method: &str, path: &str, body: Value, authenticated: bool) -> Request<Body> {
@@ -46,7 +47,7 @@ fn request(method: &str, path: &str, body: Value, authenticated: bool) -> Reques
 fn product_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/authz/resource-provisions")
+        .uri("/v1/authz/resource-provision-transactions")
         .header("content-type", "application/json")
         .header("authorization", "Bearer cross-industry-product")
         .body(Body::from(body.to_string()))
@@ -174,6 +175,22 @@ async fn organization_business_resource_agent_and_revocation_journeys_are_one_mo
         let replay = json_body(app.clone().oneshot(product_request(command)).await.unwrap()).await;
         assert_eq!(replay["disposition"], "replayed", "R3");
         assert_eq!(replay["version"], applied["version"], "R3 fence");
+        // The previously consumed command remains valid at the published route;
+        // it reaches the same atomic owner and returns the same durable receipt.
+        let legacy = json_body(
+            app.clone()
+                .oneshot(request(
+                    "POST",
+                    "/v1/authz/resource-provisions",
+                    provision(resource_type, id, &format!("{resource_type}:{id}"), 1),
+                    true,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(legacy["disposition"], "replayed");
+        assert_eq!(legacy["version"], applied["version"]);
     }
 
     let stale = provision("tutor.campus", "nanshan", "different-key", 1);
@@ -263,4 +280,50 @@ async fn organization_business_resource_agent_and_revocation_journeys_are_one_mo
     )
     .await;
     assert_eq!(denied["decision"], "deny", "R6");
+}
+
+#[tokio::test]
+async fn malformed_projection_cannot_fall_through_to_atomic_provisioning() {
+    let app = app();
+    let before = json_body(
+        app.clone()
+            .oneshot(request("GET", "/v1/authz/snapshot", Value::Null, false))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let command = provision("tutor.campus", "malformed", "malformed", 1);
+    let mut malformed = command.clone();
+    malformed["projection_id"] = json!(37);
+    let mut unknown = command.clone();
+    unknown["untrusted_owner"] = json!("other");
+    for path in [
+        "/v1/authz/resource-provisions",
+        "/v1/authz/resource-provision-transactions",
+    ] {
+        for body in [malformed.clone(), unknown.clone()] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", path, body, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let response = app
+            .clone()
+            .oneshot(request("POST", path, command.clone(), false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let after = json_body(
+        app.oneshot(request("GET", "/v1/authz/snapshot", Value::Null, false))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        before, after,
+        "rejections do not advance policy or add grants"
+    );
 }

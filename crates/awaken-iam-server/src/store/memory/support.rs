@@ -3,6 +3,17 @@ use awaken_iam_core::{RepositoryError, RepositoryResult};
 
 use super::InMemoryStore;
 
+/// Changed privacy/admission boundaries cannot attest consistent state after
+/// another operation panicked while holding a participant mutex.
+pub(super) fn checked_lock<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    component: &str,
+) -> RepositoryResult<std::sync::MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| RepositoryError::Backend(format!("IAM memory {component} mutex poisoned")))
+}
+
 pub(super) fn json_key<T: serde::Serialize>(value: &T, what: &str) -> RepositoryResult<String> {
     serde_json::to_string(value)
         .map_err(|err| RepositoryError::Backend(format!("encode {what}: {err}")))

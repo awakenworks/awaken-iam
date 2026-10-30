@@ -149,3 +149,31 @@ Axum/AuthApi -> repository contract -> PostgresBackend
 | entered Tokio runtime | query/transaction | scoped plain thread | original result |
 | entered Tokio runtime | direct driver call | forbidden | nested-runtime panic |
 | either | backend error | same selected boundary | unchanged fail-closed error |
+
+## Amendment: one verified PostgreSQL transport and reconnect slot (2026-10-30)
+
+`PostgresBackend` owns one checked reconnecting slot, SQL execution and client
+lifetime. Its default connector verifies platform trust roots. An embedding
+binary may supply a `postgres_native_tls::MakeTlsConnector` through
+`connect_with_tls`, using its existing deployment trust policy and private CA.
+The store does not read product-specific environment variables, add a second
+pool, or implement a second migration or retry authority. `sslmode=require`
+therefore performs a real TLS handshake; explicit driver configuration still
+selects plaintext local fixtures when intended. No verification bypass is added.
+
+```text
+embedding trust builder -> connect_with_tls -> existing one-slot r2d2 owner
+standalone platform roots -> connect -------> same owner
+  -> checked checkout -> original SQL/transaction exactly once
+  -> transport failure returned -> later checkout replaces the same slot
+```
+
+A missing/untrusted CA or wrong peer identity fails before a usable client is
+returned. Connection replacement reuses the supplied immutable TLS policy; it
+never replays SQL whose commit outcome may be unknown. The original direct-client
+constructor remains for callers that own a connected client and its replacement
+lifecycle; production reconnecting consumers use the pool constructor.
+
+Live tests distinguish TLS admission, encryption, shared-slot replacement and
+non-replayed effects. Plaintext CI fixtures alone cannot establish those TLS
+properties.

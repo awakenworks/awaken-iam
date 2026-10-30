@@ -11,7 +11,7 @@
     "hooks:install": "lefthook install",
     "check": "pnpm check:guardrails && pnpm check:backend",
     "check:guardrails": "cargo run -p xtask -- guardrail-lints",
-    "check:backend": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D clippy::correctness && cargo test && cargo deny check"
+    "check:backend": "python3 scripts/ci/check_trust_roots.py && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D clippy::correctness && cargo test && cargo deny check"
   },
   "devDependencies": {
     "lefthook": "^2.1.0"

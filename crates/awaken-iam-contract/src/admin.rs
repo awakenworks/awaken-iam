@@ -440,6 +440,57 @@ pub struct RoleView {
     pub updated_at: Timestamp,
 }
 
+/// Exact erasure receipt format; independent of the global policy counter.
+pub const ORG_PRIVACY_RECEIPT_VERSION: u32 = 1;
+
+/// Result of the one atomic organization privacy commit. Stored erasure
+/// identity and CURRENT observed global policy coordinate are distinct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgPrivacyCommitReceipt {
+    pub receipt_version: u32,
+    pub org_id: OrgId,
+    /// Legacy payload-effect result; false does not imply no new terminal fact.
+    pub changed: bool,
+    pub admission_changed: bool,
+    pub confirmed_organization: bool,
+    pub erasure_version: u64,
+    pub observed_policy_version: u64,
+}
+
+impl OrgPrivacyCommitReceipt {
+    /// Shape/provenance coordinate validation only, never a storage guarantee.
+    pub fn validate(&self) -> Result<(), InvalidOrgPrivacyReceipt> {
+        if self.receipt_version != ORG_PRIVACY_RECEIPT_VERSION
+            || self.org_id.0.trim().is_empty()
+            || self.erasure_version == 0
+            || self.observed_policy_version < self.erasure_version
+            || (self.changed && !self.admission_changed)
+            || (self.confirmed_organization && self.admission_changed && !self.changed)
+        {
+            return Err(InvalidOrgPrivacyReceipt);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, org: &OrgId) -> Result<(), InvalidOrgPrivacyReceipt> {
+        self.validate()?;
+        if &self.org_id != org {
+            return Err(InvalidOrgPrivacyReceipt);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidOrgPrivacyReceipt;
+impl fmt::Display for InvalidOrgPrivacyReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid organization privacy receipt")
+    }
+}
+impl std::error::Error for InvalidOrgPrivacyReceipt {}
+
 /// Acknowledgement returned by every `/v1/admin/*` mutation.
 ///
 /// Carries the authorization snapshot `version` the mutation advanced to, so the
@@ -461,6 +512,69 @@ mod tests {
         PrincipalRef::Account {
             account_id: crate::AccountId(id.into()),
         }
+    }
+
+    #[test]
+    fn privacy_receipt_is_versioned_data_distinct_from_legacy_policy_ack() {
+        // CF2 wire decision table: V1 exact original Org + stored erasure<=
+        // current policy -> accepted; missing/unknown format, empty identity or
+        // reversed coordinates -> refuse. Never/unknown confirmation remains
+        // explicit false, not reinterpreted by an HTTP success/old policy ack.
+        let receipt = OrgPrivacyCommitReceipt {
+            receipt_version: ORG_PRIVACY_RECEIPT_VERSION,
+            org_id: OrgId("org".into()),
+            changed: false,
+            admission_changed: false,
+            confirmed_organization: true,
+            erasure_version: 2,
+            observed_policy_version: 7,
+        };
+        receipt.validate().unwrap();
+        assert!(receipt.validate_for(&OrgId("foreign".into())).is_err());
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            serde_json::from_value::<OrgPrivacyCommitReceipt>(value.clone()).unwrap(),
+            receipt
+        );
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("receipt_version");
+        assert!(serde_json::from_value::<OrgPrivacyCommitReceipt>(missing).is_err());
+        for invalid in [
+            OrgPrivacyCommitReceipt {
+                receipt_version: 2,
+                ..receipt.clone()
+            },
+            OrgPrivacyCommitReceipt {
+                org_id: OrgId(" ".into()),
+                ..receipt.clone()
+            },
+            OrgPrivacyCommitReceipt {
+                erasure_version: 0,
+                ..receipt.clone()
+            },
+            OrgPrivacyCommitReceipt {
+                observed_policy_version: 1,
+                ..receipt.clone()
+            },
+            OrgPrivacyCommitReceipt {
+                changed: true,
+                admission_changed: false,
+                ..receipt.clone()
+            },
+            OrgPrivacyCommitReceipt {
+                admission_changed: true,
+                changed: false,
+                confirmed_organization: true,
+                ..receipt.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        assert_eq!(
+            serde_json::to_string(&AdminMutationAck { version: 7 }).unwrap(),
+            r#"{"version":7}"#,
+            "old JSON unchanged"
+        );
     }
 
     #[test]

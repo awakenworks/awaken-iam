@@ -133,12 +133,34 @@ embedded:   host builds the shared pool (Postgres) or opens a SQLite connection
             -> in-process callers use the local IamClient (no network hop)
             -> policy administration stays in-process (no /v1/admin/* seam)
 
-standalone: iam-daemon builds its own pool (Postgres for cloud/HA)
+standalone: iam-daemon opens its own store (Postgres for cloud/HA;
+            SQLite for local single-node use)
             -> IamStore::with_prefix(pool, "iam"); store.migrate()
             -> serve the canonical /v1 API plus the /v1/admin/* admin seam
             -> remote callers use the remote IamClient; the console administers
                policy over /v1/admin/*
 ```
+
+The `iam-daemon` binary selects PostgreSQL through `IAM_DATABASE_URL`; when it
+is absent, `IAM_DATABASE_PATH` selects a persistent SQLite file. Both paths
+run the same migration bundles and resource-projection transaction. The
+PostgreSQL daemon has been exercised over real HTTP with Tutor and restarted
+against the same database. Authorization and snapshot reads now compare the shared
+policy fence before using the in-memory PDP; a second PostgreSQL daemon was tested
+to observe a grant, its revocation, and the resulting policy version without a
+restart. Product projection grant and retirement synchronisation has also passed a
+two-daemon shared-store HTTP test. Authorization-profile activation, rollback,
+and retirement now compare-and-set the active head and shared policy version
+in one database transaction. A two-daemon PostgreSQL HTTP check confirmed the
+second daemon refreshes its policy on the next request and rejects permissions
+removed by replacement, rollback, or retirement; a separate PostgreSQL store
+test covers stale compare-and-set rollback. When the shared store was stopped,
+authorization returned `503 policy_unavailable` after connection failure rather
+than serving a cached allow. Credential management, rolling replacement of old
+daemon binaries, and a full multi-replica rollout remain deployment gates. Set
+`IAM_DIRECTORY_PRODUCT_TOKENS=tutor=<secret>` for Tutor's product-scoped
+resource-model and versioned projection requests; `IAM_ADMIN_TOKEN` remains
+independent for organization, workspace and global policy administration.
 
 `store.migrate()` renders each bundle's dialect-neutral DDL for the active
 backend; see [ADR-0003](../adr/0003-storage-backends.md) for the type-token
@@ -176,4 +198,3 @@ stay storage-free, preserving the [guardrails](../../AGENTS.md): the core
 declares repository contracts; only the edge knows SQL. The process-memory
 adapter backs tests only. A local client is a call mode, not a persistence mode;
 deployed local composition still uses migrated SQLite.
-

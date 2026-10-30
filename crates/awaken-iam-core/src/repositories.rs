@@ -265,7 +265,19 @@ pub trait DirectoryRepository: Send + Sync {
 /// boolean reports whether this invocation changed any row; an exact retry is
 /// a successful `false`, never a not-found error.
 pub trait OrgPrivacyRepository: Send + Sync {
+    /// Compatibility result projects the SAME atomic owner command; false is
+    /// payload-only and must never be treated as an exact erasure receipt.
     fn erase_org_privacy(&self, id: &OrgId) -> RepositoryResult<bool>;
+
+    /// Atomically retain terminal admission, remove owned payload, append the
+    /// ORIGINAL audit input and publish the global fence once. A new negative
+    /// admission publishes even when changed=false. Replays return the stored
+    /// erasure version together with the CURRENT observed policy version.
+    fn erase_org_privacy_with_audit(
+        &self,
+        id: &OrgId,
+        audit: AuditEvent,
+    ) -> RepositoryResult<awaken_iam_contract::OrgPrivacyCommitReceipt>;
 }
 
 /// Persistence for [`Group`] aggregates.
@@ -390,6 +402,12 @@ pub trait ResourceModelRepository: Send + Sync {
     }
     /// List every registered parent edge.
     fn list_edges(&self) -> RepositoryResult<Vec<ResourceEdge>>;
+    /// List persisted resource tombstones for authorization evaluation.
+    fn list_retired_resources(
+        &self,
+    ) -> RepositoryResult<Vec<awaken_iam_contract::RetiredResource>> {
+        Ok(Vec::new())
+    }
     /// Persist or replace one well-known Workspace → Org scope edge.
     fn put_workspace_org(&self, _edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
         Err(RepositoryError::Backend(
@@ -434,19 +452,21 @@ pub trait AuthorizationProfileRepository: Send + Sync {
         revision: u64,
         lifecycle: ProfileLifecycle,
     ) -> RepositoryResult<()>;
-    /// Atomically compare-and-set the active revision, returning its predecessor.
+    /// Atomically compare-and-set the active revision and advance the shared
+    /// policy fence, returning the predecessor and committed policy version.
     fn activate_profile(
         &self,
         namespace: &NamespaceId,
         revision: u64,
         expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>>;
-    /// Compare-and-set removal of one active head while retaining the revision.
+    ) -> RepositoryResult<(Option<u64>, u64)>;
+    /// Compare-and-set removal of one active head while retaining the revision,
+    /// and advance the shared policy fence in the same transaction.
     fn retire_active_profile(
         &self,
         namespace: &NamespaceId,
         expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile>;
+    ) -> RepositoryResult<(AuthorizationProfile, u64)>;
     /// Resolve the active revision for a namespace.
     fn active_profile(
         &self,

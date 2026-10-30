@@ -1,6 +1,6 @@
 # ADR-0015 - Reconcile published and consumed provisioning boundaries
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Implementation:** done
 - **Date:** 2026-10-21
 - **Related:** ADR-0003, ADR-0007, ADR-0014

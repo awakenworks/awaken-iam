@@ -30,13 +30,14 @@ use awaken_iam_contract::{
     DirectoryNodeMutationResult, DirectoryNodeView, DirectoryRevisionQuery,
     EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
     InvitationId, InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery,
-    MoveDirectoryNode, NamespaceId, OrgView, PolicySnapshot, ProductSpaceLifecycleResult,
-    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
-    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered,
-    ResourceModelRegistration, ResourceProvision, ResourceProvisionReceipt,
-    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
-    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
-    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
+    MoveDirectoryNode, NamespaceId, OrgId, OrgPrivacyCommitReceipt, OrgView, PolicySnapshot,
+    ProductResourceModelRequest, ProductSpaceLifecycleResult, ProductSpacePlacement,
+    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
+    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceProvision,
+    ResourceProvisionReceipt, RetireAuthorizationProfile, RetireProductSpacePlacement,
+    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
+    WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -316,7 +317,7 @@ impl AuthzTransport for HttpAuthzTransport {
 
     fn register_resource_model(
         &self,
-        registration: &ResourceModelRegistration,
+        registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
@@ -377,10 +378,39 @@ impl AuthzTransport for HttpAuthzTransport {
     }
 
     fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
+        // The old route has no identity-bearing receipt. Reject inputs whose
+        // URL normalization/decoding could address a DIFFERENT Org before any
+        // request; the exact body-based operation supports the original value.
+        if org_id.is_empty()
+            || org_id.ends_with(' ')
+            || matches!(org_id, "." | "..")
+            || org_id
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | '?' | '#' | '%'))
+        {
+            return Err(RemoteError(
+                "organization identity is not losslessly addressable by legacy DELETE".into(),
+            ));
+        }
         let path = format!("/v1/admin/orgs/{org_id}");
         let response = self.send_with_retry(|| self.client.delete(self.url(&path)))?;
         Self::decode(response)
     }
+    fn erase_org_privacy(&self, org: &OrgId) -> Result<OrgPrivacyCommitReceipt, RemoteError> {
+        // Static path + original typed identity body: no path interpolation or
+        // alternate Org interpretation, and no downgrade to the legacy DELETE.
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/orgs/privacy-erasure"))
+                .json(org)
+        })?;
+        let receipt: OrgPrivacyCommitReceipt = Self::decode(response)?;
+        receipt
+            .validate_for(org)
+            .map_err(|error| RemoteError(error.to_string()))?;
+        Ok(receipt)
+    }
+
     fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/roles")).json(role))?;
@@ -617,7 +647,7 @@ impl ProvisionTransport for HttpAuthzTransport {
     fn provision(&self, provision: &ResourceProvision) -> Result<(), RemoteError> {
         let response = self.send_with_retry(|| {
             self.client
-                .post(self.url("/v1/authz/resource-provisions"))
+                .post(self.url("/v1/authz/resource-provision-transactions"))
                 .json(provision)
         })?;
         let _: ResourceProvisionReceipt = Self::decode(response)?;
@@ -793,11 +823,35 @@ mod tests {
                         Err(_) => return,
                     };
                     let mut buf = [0u8; 4096];
-                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let mut request = Vec::new();
+                    // JSON request assertions need the WHOLE existing request,
+                    // not whichever prefix one TCP read happens to return. Keep
+                    // the same socket/reply/timeout fixture; reqwest supplies a
+                    // Content-Length for its serialized JSON bodies.
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let content_length = headers
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + content_length {
+                                break;
+                            }
+                        }
+                    }
                     recorded
                         .lock()
                         .unwrap()
-                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        .push(String::from_utf8_lossy(&request).to_string());
                     let payload = match reply {
                         Reply::Ok(body) => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1196,6 +1250,92 @@ mod tests {
     }
 
     #[test]
+    fn strict_privacy_receipt_is_exact_versioned_and_never_downgrades() {
+        use crate::RemoteIamClient;
+        // CF2 transport table: T1 matching format/Org/stored<=current -> data;
+        // T2 missing/unknown format, foreign Org, reversed version or legacy
+        // ack -> error; T3 old endpoint unsupported -> error with NO DELETE
+        // fallback. Same original auth/TLS/retry/timeout transport is exercised.
+        let org = OrgId("org/../foreign?x#z".into());
+        let valid = OrgPrivacyCommitReceipt {
+            receipt_version: awaken_iam_contract::ORG_PRIVACY_RECEIPT_VERSION,
+            org_id: org.clone(),
+            changed: false,
+            admission_changed: false,
+            confirmed_organization: true,
+            erasure_version: 2,
+            observed_policy_version: 7,
+        };
+        let mut missing = serde_json::to_value(&valid).unwrap();
+        missing.as_object_mut().unwrap().remove("receipt_version");
+        let mut unknown = valid.clone();
+        unknown.receipt_version = 2;
+        let mut foreign = valid.clone();
+        foreign.org_id = OrgId("foreign".into());
+        let mut reversed = valid.clone();
+        reversed.observed_policy_version = 1;
+        for (reply, accepted) in [
+            (Reply::Ok(serde_json::to_string(&valid).unwrap()), true),
+            (Reply::Ok(missing.to_string()), false),
+            (Reply::Ok(serde_json::to_string(&unknown).unwrap()), false),
+            (Reply::Ok(serde_json::to_string(&foreign).unwrap()), false),
+            (Reply::Ok(serde_json::to_string(&reversed).unwrap()), false),
+            (Reply::Ok(r#"{"version":7}"#.into()), false),
+            (Reply::Status(404), false),
+        ] {
+            let server = StubServer::start(vec![reply]);
+            let client = RemoteIamClient::new(transport(&server));
+            assert_eq!(client.erase_org_privacy(&org).is_ok(), accepted);
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1, "T2/T3 no downgrade/recovery effects");
+            assert!(
+                requests[0].starts_with("POST /v1/admin/orgs/privacy-erasure "),
+                "T1 static path preserves raw identity only in typed body"
+            );
+            assert!(!requests[0].starts_with("DELETE "), "T3");
+        }
+    }
+
+    #[test]
+    fn legacy_destructive_path_refuses_ambiguous_identity_before_network_effects() {
+        // T4 raw slash/dot/query/fragment/percent/control normalization could
+        // target a foreign Org, and the old {version} ack cannot detect it.
+        // Actual unaccepted socket proves refusal BEFORE HTTP; safe original
+        // identity/path/JSON remain covered by the unchanged old golden test.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let transport = HttpAuthzTransport::new(
+            HttpTransportConfig::new(format!("http://{}", listener.local_addr().unwrap()))
+                .with_max_retries(0),
+        )
+        .unwrap();
+        for org in [
+            "",
+            "x ",
+            ".",
+            "..",
+            "x/../foreign",
+            "x?foreign",
+            "x#foreign",
+            "x%2fforeign",
+            "x\\foreign",
+            "x\tforeign",
+        ] {
+            assert!(
+                transport
+                    .delete_org(org)
+                    .unwrap_err()
+                    .0
+                    .contains("not losslessly addressable")
+            );
+            assert!(
+                matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
+                "T4 no transport effect"
+            );
+        }
+    }
+
+    #[test]
     fn organization_deletion_uses_the_canonical_admin_path() {
         // Cause/effect decision table:
         // R1 existing org + 2xx ack -> one DELETE to the canonical PAP route,
@@ -1458,6 +1598,65 @@ mod tests {
     }
 
     #[test]
+    fn resource_model_transport_uses_the_canonical_product_request_without_fallback() {
+        // Cause/effect graph: explicit product + original vocabulary + same
+        // service credentials -> ONE canonical wrapped JSON POST -> decode the
+        // existing version or surface its failure. Never infer product identity
+        // from a token/type name, retry a 4xx or downgrade to a bare model body.
+        // RM1 valid response => exact version; RM2 401/403/409 => error with one
+        // request; RM3 malformed 200 acknowledgement => error with one request.
+        // Existing guarded-server tests own product/vocabulary authorization;
+        // this real socket checks the actual client's complete bytes and auth.
+        let request = ProductResourceModelRequest {
+            product_id: ProductId::new("tutor").unwrap(),
+            resource_model: awaken_iam_contract::ResourceModelRegistration::default(),
+        };
+        assert!(
+            serde_json::from_value::<ProductResourceModelRequest>(
+                serde_json::to_value(&request.resource_model).unwrap()
+            )
+            .is_err(),
+            "RM0 the old bare body cannot satisfy the guarded contract"
+        );
+        for (reply, accepted) in [
+            (Reply::Ok(r#"{"version":7}"#.into()), true),
+            (Reply::Status(401), false),
+            (Reply::Status(403), false),
+            (Reply::Status(409), false),
+            (Reply::Ok(r#"{"other":7}"#.into()), false),
+        ] {
+            let server = StubServer::start(vec![reply]);
+            let transport = HttpAuthzTransport::new(
+                HttpTransportConfig::new(&server.addr)
+                    .with_audience("tutor-service")
+                    .with_service_token("tutor-product-token")
+                    .with_max_retries(0)
+                    .with_timeout(Duration::from_secs(2)),
+            )
+            .unwrap();
+            let result = transport.register_resource_model(&request);
+            if accepted {
+                assert_eq!(result.unwrap().version, 7, "RM1");
+            } else {
+                assert!(result.is_err(), "RM2/RM3");
+            }
+            drop(transport);
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1, "RM1-RM3 no fallback or extra request");
+            assert!(requests[0].starts_with("POST /v1/authz/resource-model "));
+            let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::to_value(&request).unwrap(),
+                "RM1 full canonical request"
+            );
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("x-iam-audience: tutor-service"));
+            assert!(headers.contains("authorization: bearer tutor-product-token"));
+        }
+    }
+
+    #[test]
     fn outbox_transport_posts_resource_provision_and_requires_a_receipt() {
         // Cause/effect rules: a 200 receipt confirms the relay delivery and
         // uses the sole provisioning path; a non-success response remains a
@@ -1484,6 +1683,8 @@ mod tests {
         ProvisionTransport::provision(&transport, &provision).unwrap();
         assert!(ProvisionTransport::provision(&transport, &provision).is_err());
         drop(transport);
-        assert!(server.requests()[0].starts_with("POST /v1/authz/resource-provisions "));
+        assert!(
+            server.requests()[0].starts_with("POST /v1/authz/resource-provision-transactions ")
+        );
     }
 }

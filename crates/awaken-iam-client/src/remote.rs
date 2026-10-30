@@ -23,13 +23,14 @@ use awaken_iam_contract::{
     DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
     DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
     EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery,
-    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgView,
-    PolicySnapshot, ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
+    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId,
+    OrgPrivacyCommitReceipt, OrgView, PolicySnapshot, ProductResourceModelRequest,
+    ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
     ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
-    ResourceAuthorizationRequest, ResourceModelRegistered, ResourceModelRegistration,
-    RetireAuthorizationProfile, RetireProductSpacePlacement, RoleBindingSnapshot, RoleView,
-    ScopeMembershipQuery, SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse,
-    UpdateDirectoryNode, UserInfo, WorkspaceOrgEdge,
+    ResourceAuthorizationRequest, ResourceModelRegistered, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
+    UserInfo, WorkspaceOrgEdge,
 };
 
 use crate::{IamClient, IamDecisionError};
@@ -84,10 +85,12 @@ pub trait AuthzTransport {
         request: &EntitlementRequest,
     ) -> Result<EntitlementCheckResponse, RemoteError>;
 
-    /// `POST /v1/authz/resource-model`.
+    /// `POST /v1/authz/resource-model`: the existing product-scoped request.
+    /// Product identity is caller input, never inferred from credentials or
+    /// resource type names. The server owns product/vocabulary admission.
     fn register_resource_model(
         &self,
-        registration: &ResourceModelRegistration,
+        registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError>;
 
     /// `GET /v1/authz/snapshot`.
@@ -150,6 +153,14 @@ pub trait AuthzTransport {
 
     fn delete_org(&self, _org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("organization PAP is not supported".into()))
+    }
+
+    /// Strict participant operation; old transports cannot attest erasure from
+    /// a policy-version acknowledgement and must fail closed without fallback.
+    fn erase_org_privacy(&self, _org: &OrgId) -> Result<OrgPrivacyCommitReceipt, RemoteError> {
+        Err(RemoteError(
+            "exact organization privacy receipt is unsupported".into(),
+        ))
     }
 
     fn create_role(&self, _role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
@@ -411,12 +422,13 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         self.transport.check_entitlement(request)
     }
 
-    /// Register a consumer's resource model so the server resolves its open
-    /// resource scopes, surfacing transport errors. Returns the policy version
-    /// the registration advanced to.
+    /// Register this product's resource vocabulary through the guarded route,
+    /// surfacing transport errors. The canonical request carries product scope;
+    /// instance edges use the existing versioned projection protocol. Returns
+    /// the policy version the registration advanced to.
     pub fn register_resource_model(
         &self,
-        registration: &ResourceModelRegistration,
+        registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         self.transport.register_resource_model(registration)
     }
@@ -484,6 +496,14 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     /// Delete organization metadata through IAM's canonical policy-admin path.
     pub fn delete_org(&self, org_id: &str) -> Result<AdminMutationAck, RemoteError> {
         self.transport.delete_org(org_id)
+    }
+
+    pub fn erase_org_privacy(&self, org: &OrgId) -> Result<OrgPrivacyCommitReceipt, RemoteError> {
+        let receipt = self.transport.erase_org_privacy(org)?;
+        receipt
+            .validate_for(org)
+            .map_err(|error| RemoteError(error.to_string()))?;
+        Ok(receipt)
     }
 
     pub fn create_role(&self, role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
@@ -931,7 +951,7 @@ mod tests {
 
         fn register_resource_model(
             &self,
-            _registration: &ResourceModelRegistration,
+            _registration: &ProductResourceModelRequest,
         ) -> Result<ResourceModelRegistered, RemoteError> {
             if self.fail {
                 return Err(RemoteError("boom".into()));
@@ -990,17 +1010,22 @@ mod tests {
     fn remote_client_registers_resource_model_and_surfaces_errors() {
         use awaken_iam_contract::ResourceModelRegistration;
 
+        // RM0 the one product-scoped request reaches the existing port; RM1
+        // success keeps its version and an outage remains the original error.
+        // No product identity is guessed and no bare-body fallback is added.
+        let request = ProductResourceModelRequest {
+            product_id: awaken_iam_contract::ProductId::new("product").unwrap(),
+            resource_model: ResourceModelRegistration::default(),
+        };
         let client = RemoteIamClient::new(StubTransport { fail: false });
-        let registered = client
-            .register_resource_model(&ResourceModelRegistration::default())
-            .unwrap();
+        let registered = client.register_resource_model(&request).unwrap();
         assert_eq!(registered.version, 5);
 
         // Registration is not a decision: a transport outage surfaces the error
         // to the caller rather than failing closed to a deny.
         let down = RemoteIamClient::new(StubTransport { fail: true });
         assert_eq!(
-            down.register_resource_model(&ResourceModelRegistration::default()),
+            down.register_resource_model(&request),
             Err(RemoteError("boom".into()))
         );
     }
@@ -1180,7 +1205,7 @@ mod tests {
             }
             fn register_resource_model(
                 &self,
-                _: &ResourceModelRegistration,
+                _: &ProductResourceModelRequest,
             ) -> Result<ResourceModelRegistered, RemoteError> {
                 unreachable!()
             }

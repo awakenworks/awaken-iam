@@ -181,7 +181,7 @@ mod tests {
             }
             fn register_resource_model(
                 &self,
-                _: &awaken_iam_contract::ResourceModelRegistration,
+                _: &awaken_iam_contract::ProductResourceModelRequest,
             ) -> Result<awaken_iam_contract::ResourceModelRegistered, awaken_iam_client::RemoteError>
             {
                 unreachable!()

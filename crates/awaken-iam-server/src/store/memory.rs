@@ -10,27 +10,31 @@ use std::sync::{Arc, Mutex};
 use awaken_iam_contract::{
     Account, AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
     ExternalIdentity, ExternalIdentityKey, GrantEffect, GrantSubjectRef, InvitationId,
-    InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef,
-    ProfileLifecycle, ResourceId, ResourceProvision, ResourceProvisionDisposition,
-    ResourceProvisionReceipt, ResourceType, ScopeRef, Session, SessionId, Timestamp, WorkspaceId,
-    WorkspaceOrgEdge,
+    InvitationStatus, NamespaceId, OAuthLoginState, OAuthLoginStateId, OrgId,
+    OrgPrivacyCommitReceipt, PrincipalRef, ProfileLifecycle, ResourceId, ResourceProvision,
+    ResourceProvisionDisposition, ResourceProvisionReceipt, ResourceType, ScopeRef, Session,
+    SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
     AuditSink, AuthCodeRepository, AuthorizationProfileRepository, Effect,
     ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
     GroupRepository, Invitation, InvitationRepository, LoginFlowRepository, OAuthClientRepository,
-    OrgPrivacyRepository, OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId,
-    PlanRepository, RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge,
-    ResourceModelRepository, RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository,
-    SessionRepository, StoredAuthorizationCode,
+    OrgPrivacyCommitPlan, OrgPrivacyRepository, OrgPrivacyTerminal, OrgRepository, Organization,
+    OrganizationPrivacyScope, Plan, PlanId, PlanRepository, RegisteredClient, RepositoryError,
+    RepositoryResult, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
+    RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
+    plan_org_privacy_commit,
 };
 
 use super::fence::{Fence, FenceStore};
 use crate::admin_api::{OrganizationProvisioningStore, ResourceProvisioningStore};
 
+mod privacy;
+mod profiles;
+use privacy::{edge_admission, ensure_admitted, invitation_admission, provision_admission};
 mod support;
-use support::{external_key, json_key};
+use support::{checked_lock, external_key, json_key};
 
 #[derive(Clone)]
 struct StoredResourceProvision {
@@ -52,9 +56,15 @@ struct Identity {
     oauth_codes: BTreeMap<String, StoredAuthorizationCode>,
 }
 
+#[derive(Clone)]
+enum StoredOrganization {
+    Live(Organization),
+    Erased(OrgPrivacyTerminal),
+}
+
 #[derive(Default)]
 struct Authz {
-    orgs: BTreeMap<String, Organization>,
+    orgs: BTreeMap<String, StoredOrganization>,
     groups: BTreeMap<String, Group>,
     roles: BTreeMap<String, RoleDef>,
     grants: BTreeMap<String, Grant>,
@@ -293,7 +303,17 @@ impl LoginFlowRepository for InMemoryStore {
 
 impl ApiTokenRepository for InMemoryStore {
     fn create(&self, token: ApiToken) -> RepositoryResult<()> {
-        let mut guard = self.identity.lock().unwrap();
+        let authz = checked_lock(&self.authz, "authz")?;
+        let mut guard = checked_lock(&self.identity, "identity")?;
+        let mut scopes = vec![ScopeRef::Workspace {
+            workspace_id: token.workspace.clone(),
+        }];
+        if let Some(previous) = guard.api_tokens.get(&token.id.0) {
+            scopes.push(ScopeRef::Workspace {
+                workspace_id: previous.workspace.clone(),
+            });
+        }
+        ensure_admitted(&authz, &scopes, &[])?;
         if guard.api_tokens.contains_key(&token.id.0) {
             return Err(RepositoryError::Conflict(format!(
                 "api token {} already exists",
@@ -339,7 +359,17 @@ impl ApiTokenRepository for InMemoryStore {
     }
 
     fn update(&self, token: ApiToken) -> RepositoryResult<()> {
-        let mut guard = self.identity.lock().unwrap();
+        let authz = checked_lock(&self.authz, "authz")?;
+        let mut guard = checked_lock(&self.identity, "identity")?;
+        let mut scopes = vec![ScopeRef::Workspace {
+            workspace_id: token.workspace.clone(),
+        }];
+        if let Some(previous) = guard.api_tokens.get(&token.id.0) {
+            scopes.push(ScopeRef::Workspace {
+                workspace_id: previous.workspace.clone(),
+            });
+        }
+        ensure_admitted(&authz, &scopes, &[])?;
         if !guard.api_tokens.contains_key(&token.id.0) {
             return Err(RepositoryError::NotFound(format!(
                 "api token {} does not exist",
@@ -433,30 +463,51 @@ impl AuthCodeRepository for InMemoryStore {
 
 impl OrgRepository for InMemoryStore {
     fn get(&self, id: &OrgId) -> RepositoryResult<Option<Organization>> {
-        Ok(self.authz.lock().unwrap().orgs.get(&id.0).cloned())
+        Ok(match self.authz.lock().unwrap().orgs.get(&id.0) {
+            Some(StoredOrganization::Live(org)) => Some(org.clone()),
+            _ => None,
+        })
     }
 
     fn upsert(&self, org: Organization) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(
+            &authz,
+            &[ScopeRef::Org {
+                org_id: org.id.clone(),
+            }],
+            &[],
+        )?;
+        authz
             .orgs
-            .insert(org.id.0.clone(), org);
+            .insert(org.id.0.clone(), StoredOrganization::Live(org));
         Ok(())
     }
 
     fn list(&self) -> RepositoryResult<Vec<Organization>> {
-        Ok(self.authz.lock().unwrap().orgs.values().cloned().collect())
-    }
-
-    fn remove(&self, id: &OrgId) -> RepositoryResult<()> {
-        self.authz
+        Ok(self
+            .authz
             .lock()
             .unwrap()
             .orgs
-            .remove(&id.0)
-            .map(|_| ())
-            .ok_or_else(|| RepositoryError::NotFound(format!("organization {} not found", id.0)))
+            .values()
+            .filter_map(|row| match row {
+                StoredOrganization::Live(org) => Some(org.clone()),
+                StoredOrganization::Erased(_) => None,
+            })
+            .collect())
+    }
+
+    fn remove(&self, id: &OrgId) -> RepositoryResult<()> {
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        if !matches!(authz.orgs.get(&id.0), Some(StoredOrganization::Live(_))) {
+            return Err(RepositoryError::NotFound(format!(
+                "organization {} not found",
+                id.0
+            )));
+        }
+        authz.orgs.remove(&id.0);
+        Ok(())
     }
 }
 
@@ -475,7 +526,17 @@ impl OrganizationProvisioningStore for InMemoryStore {
             ),
             "role binding",
         )?;
-        let mut authz = self.authz.lock().unwrap();
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(
+            &authz,
+            &[
+                ScopeRef::Org {
+                    org_id: organization.id.clone(),
+                },
+                owner_binding.scope.clone(),
+            ],
+            &[],
+        )?;
         if authz.orgs.contains_key(&organization.id.0) {
             return Err(RepositoryError::Conflict(format!(
                 "organization {} already exists",
@@ -488,9 +549,12 @@ impl OrganizationProvisioningStore for InMemoryStore {
                 owner_binding.role.0
             )));
         }
-        let mut audits = self.audit.lock().unwrap();
-        let mut fence = self.fence.lock().unwrap();
-        authz.orgs.insert(organization.id.0.clone(), organization);
+        let mut audits = checked_lock(&self.audit, "audit")?;
+        let mut fence = checked_lock(&self.fence, "fence")?;
+        authz.orgs.insert(
+            organization.id.0.clone(),
+            StoredOrganization::Live(organization),
+        );
         authz.role_bindings.insert(binding_key, owner_binding);
         audits.push(audit);
         fence.version += 1;
@@ -504,7 +568,8 @@ impl ResourceProvisioningStore for InMemoryStore {
         provision: &ResourceProvision,
         fingerprint: &str,
     ) -> RepositoryResult<Option<ResourceProvisionReceipt>> {
-        let authz = self.authz.lock().unwrap();
+        let authz = checked_lock(&self.authz, "authz")?;
+        provision_admission(&authz, provision)?;
         let Some(existing) = authz.resource_provisions.get(&provision.idempotency_key) else {
             return Ok(None);
         };
@@ -527,7 +592,8 @@ impl ResourceProvisioningStore for InMemoryStore {
         fingerprint: &str,
         audit: AuditEvent,
     ) -> RepositoryResult<ResourceProvisionReceipt> {
-        let mut authz = self.authz.lock().unwrap();
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        provision_admission(&authz, provision)?;
         if let Some(existing) = authz.resource_provisions.get(&provision.idempotency_key) {
             if existing.fingerprint != fingerprint || existing.epoch != provision.epoch {
                 return Err(RepositoryError::Conflict(
@@ -570,8 +636,8 @@ impl ResourceProvisioningStore for InMemoryStore {
                 )));
             }
         }
-        let mut audits = self.audit.lock().unwrap();
-        let mut fence = self.fence.lock().unwrap();
+        let mut audits = checked_lock(&self.audit, "audit")?;
+        let mut fence = checked_lock(&self.fence, "fence")?;
         for edge in &provision.scope_edges {
             let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
             authz.resource_edges.insert(
@@ -639,86 +705,23 @@ impl ResourceProvisioningStore for InMemoryStore {
     }
 }
 
-impl OrgPrivacyRepository for InMemoryStore {
-    fn erase_org_privacy(&self, id: &OrgId) -> RepositoryResult<bool> {
-        let mut authz = self.authz.lock().unwrap_or_else(|error| error.into_inner());
-        let workspace_edges = authz.workspace_orgs.values().cloned().collect::<Vec<_>>();
-        let resource_edges = authz.resource_edges.values().cloned().collect::<Vec<_>>();
-        let privacy = OrganizationPrivacyScope::resolve(id, &workspace_edges, &resource_edges);
-        let group_ids = authz
-            .groups
-            .values()
-            .filter(|group| &group.org == id)
-            .map(|group| group.id.0.clone())
-            .collect::<BTreeSet<_>>();
-        let authz_before = authz.orgs.len()
-            + authz.groups.len()
-            + authz.grants.len()
-            + authz.role_bindings.len()
-            + authz.invitations.len()
-            + authz.resource_edges.len()
-            + authz.workspace_orgs.len();
-
-        authz.orgs.remove(&id.0);
-        authz.groups.retain(|_, group| &group.org != id);
-        authz
-            .invitations
-            .retain(|_, invitation| &invitation.org_id != id);
-        authz.workspace_orgs.retain(|_, edge| &edge.org_id != id);
-        authz
-            .role_bindings
-            .retain(|_, binding| !privacy.contains(&binding.scope));
-        authz.grants.retain(|_, grant| {
-            !privacy.contains(&grant.scope)
-                && !matches!(
-                    &grant.subject,
-                    GrantSubject::Group(group) if group_ids.contains(&group.0)
-                )
-        });
-        authz.resource_edges.retain(|_, edge| {
-            !privacy.contains(&edge.parent)
-                && !privacy.contains(&ScopeRef::Resource {
-                    resource_type: edge.resource_type.clone(),
-                    resource_id: edge.resource_id.clone(),
-                })
-        });
-        let authz_after = authz.orgs.len()
-            + authz.groups.len()
-            + authz.grants.len()
-            + authz.role_bindings.len()
-            + authz.invitations.len()
-            + authz.resource_edges.len()
-            + authz.workspace_orgs.len();
-        drop(authz);
-
-        let mut identity = self
-            .identity
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let token_count = identity.api_tokens.len();
-        identity
-            .api_tokens
-            .retain(|_, token| !privacy.contains_workspace(&token.workspace.0));
-        let retained_token_ids = identity.api_tokens.keys().cloned().collect::<BTreeSet<_>>();
-        identity
-            .api_tokens_by_prefix
-            .retain(|_, token_id| retained_token_ids.contains(token_id));
-
-        Ok(authz_before != authz_after || token_count != identity.api_tokens.len())
-    }
-}
-
 impl GroupRepository for InMemoryStore {
     fn get(&self, id: &GroupId) -> RepositoryResult<Option<Group>> {
         Ok(self.authz.lock().unwrap().groups.get(&id.0).cloned())
     }
 
     fn upsert(&self, group: Group) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
-            .groups
-            .insert(group.id.0.clone(), group);
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        let mut scopes = vec![ScopeRef::Org {
+            org_id: group.org.clone(),
+        }];
+        if let Some(previous) = authz.groups.get(&group.id.0) {
+            scopes.push(ScopeRef::Org {
+                org_id: previous.org.clone(),
+            });
+        }
+        ensure_admitted(&authz, &scopes, &[group.id.0.clone()])?;
+        authz.groups.insert(group.id.0.clone(), group);
         Ok(())
     }
 
@@ -734,9 +737,9 @@ impl GroupRepository for InMemoryStore {
     }
 
     fn remove(&self, id: &GroupId) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(&authz, &[], &[id.0.clone()])?;
+        authz
             .groups
             .remove(&id.0)
             .map(|_| ())
@@ -775,11 +778,20 @@ impl RoleRepository for InMemoryStore {
 
 impl GrantRepository for InMemoryStore {
     fn put(&self, grant: Grant) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
-            .grants
-            .insert(grant.id.0.clone(), grant);
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        let mut scopes = vec![grant.scope.clone()];
+        let mut groups = Vec::new();
+        if let GrantSubject::Group(group) = &grant.subject {
+            groups.push(group.0.clone());
+        }
+        if let Some(previous) = authz.grants.get(&grant.id.0) {
+            scopes.push(previous.scope.clone());
+            if let GrantSubject::Group(group) = &previous.subject {
+                groups.push(group.0.clone());
+            }
+        }
+        ensure_admitted(&authz, &scopes, &groups)?;
+        authz.grants.insert(grant.id.0.clone(), grant);
         Ok(())
     }
 
@@ -799,9 +811,16 @@ impl GrantRepository for InMemoryStore {
     }
 
     fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        if let Some(previous) = authz.grants.get(&id.0) {
+            let groups = if let GrantSubject::Group(group) = &previous.subject {
+                vec![group.0.clone()]
+            } else {
+                vec![]
+            };
+            ensure_admitted(&authz, &[previous.scope.clone()], &groups)?;
+        }
+        authz
             .grants
             .remove(&id.0)
             .map(|_| ())
@@ -815,11 +834,9 @@ impl RoleBindingRepository for InMemoryStore {
             &(&binding.principal, &binding.role.0, &binding.scope),
             "role binding",
         )?;
-        self.authz
-            .lock()
-            .unwrap()
-            .role_bindings
-            .insert(key, binding);
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(&authz, &[binding.scope.clone()], &[])?;
+        authz.role_bindings.insert(key, binding);
         Ok(())
     }
 
@@ -851,9 +868,9 @@ impl RoleBindingRepository for InMemoryStore {
             &(&binding.principal, &binding.role.0, &binding.scope),
             "role binding",
         )?;
-        self.authz
-            .lock()
-            .unwrap()
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(&authz, &[binding.scope.clone()], &[])?;
+        authz
             .role_bindings
             .remove(&key)
             .map(|_| ())
@@ -868,7 +885,8 @@ impl RoleBindingRepository for InMemoryStore {
         replacement_roles: &[RoleId],
     ) -> RepositoryResult<()> {
         let managed: BTreeSet<&str> = managed_roles.iter().map(|role| role.0.as_str()).collect();
-        let mut guard = self.authz.lock().unwrap();
+        let mut guard = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(&guard, &[scope.clone()], &[])?;
         guard.role_bindings.retain(|_, binding| {
             &binding.principal != principal
                 || &binding.scope != scope
@@ -892,7 +910,8 @@ impl RoleBindingRepository for InMemoryStore {
 
 impl InvitationRepository for InMemoryStore {
     fn create_invitation(&self, invitation: Invitation) -> RepositoryResult<()> {
-        let mut guard = self.authz.lock().unwrap();
+        let mut guard = checked_lock(&self.authz, "authz")?;
+        invitation_admission(&guard, &invitation)?;
         if guard.invitations.contains_key(&invitation.id.0)
             || guard.invitations.values().any(|existing| {
                 existing.org_id == invitation.org_id
@@ -945,7 +964,8 @@ impl InvitationRepository for InMemoryStore {
         invitation: Invitation,
         expected_token_hash: &str,
     ) -> RepositoryResult<bool> {
-        let mut guard = self.authz.lock().unwrap();
+        let mut guard = checked_lock(&self.authz, "authz")?;
+        invitation_admission(&guard, &invitation)?;
         let Some(current) = guard.invitations.get(&invitation.id.0) else {
             return Err(RepositoryError::NotFound("invitation not found".into()));
         };
@@ -966,10 +986,11 @@ impl InvitationRepository for InMemoryStore {
         account_id: &AccountId,
         at: &Timestamp,
     ) -> RepositoryResult<Option<Invitation>> {
-        let mut guard = self.authz.lock().unwrap();
+        let mut guard = checked_lock(&self.authz, "authz")?;
         let Some(current) = guard.invitations.get(&id.0).cloned() else {
             return Err(RepositoryError::NotFound("invitation not found".into()));
         };
+        invitation_admission(&guard, &current)?;
         if current.status == InvitationStatus::Accepted
             && current.accepted_by_account_id.as_ref() == Some(account_id)
             && current.token_hash == expected_token_hash
@@ -1007,7 +1028,9 @@ impl InvitationRepository for InMemoryStore {
 impl ResourceModelRepository for InMemoryStore {
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
         let key = format!("{}\u{1f}{}", edge.resource_type.0, edge.resource_id.0);
-        self.authz.lock().unwrap().resource_edges.insert(key, edge);
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        edge_admission(&authz, &edge)?;
+        authz.resource_edges.insert(key, edge);
         Ok(())
     }
 
@@ -1017,7 +1040,16 @@ impl ResourceModelRepository for InMemoryStore {
         resource_id: &ResourceId,
     ) -> RepositoryResult<()> {
         let key = format!("{}\u{1f}{}", resource_type.0, resource_id.0);
-        self.authz.lock().unwrap().resource_edges.remove(&key);
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        ensure_admitted(
+            &authz,
+            &[ScopeRef::Resource {
+                resource_type: resource_type.clone(),
+                resource_id: resource_id.clone(),
+            }],
+            &[],
+        )?;
+        authz.resource_edges.remove(&key);
         Ok(())
     }
 
@@ -1033,9 +1065,22 @@ impl ResourceModelRepository for InMemoryStore {
     }
 
     fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
-        self.authz
-            .lock()
-            .unwrap()
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        let mut scopes = vec![
+            ScopeRef::Workspace {
+                workspace_id: edge.workspace_id.clone(),
+            },
+            ScopeRef::Org {
+                org_id: edge.org_id.clone(),
+            },
+        ];
+        if let Some(previous) = authz.workspace_orgs.get(&edge.workspace_id.0) {
+            scopes.push(ScopeRef::Org {
+                org_id: previous.org_id.clone(),
+            });
+        }
+        ensure_admitted(&authz, &scopes, &[])?;
+        authz
             .workspace_orgs
             .insert(edge.workspace_id.0.clone(), edge);
         Ok(())
@@ -1063,174 +1108,6 @@ impl ResourceModelRepository for InMemoryStore {
             .values()
             .cloned()
             .collect())
-    }
-}
-
-impl AuthorizationProfileRepository for InMemoryStore {
-    fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()> {
-        let key = (profile.namespace.0.clone(), profile.revision);
-        let mut authz = self.authz.lock().unwrap();
-        if authz.profiles.contains_key(&key) {
-            return Err(RepositoryError::Conflict(
-                "profile revision already exists".into(),
-            ));
-        }
-        authz.profiles.insert(key, profile);
-        Ok(())
-    }
-
-    fn get_profile(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-    ) -> RepositoryResult<Option<AuthorizationProfile>> {
-        let authz = self.authz.lock().unwrap();
-        let mut profile = authz
-            .profiles
-            .get(&(namespace.0.clone(), revision))
-            .cloned();
-        if authz.active_profiles.get(&namespace.0) == Some(&revision)
-            && let Some(profile) = &mut profile
-        {
-            profile.lifecycle = ProfileLifecycle::Active;
-        }
-        Ok(profile)
-    }
-
-    fn list_profiles(
-        &self,
-        namespace: &NamespaceId,
-    ) -> RepositoryResult<Vec<AuthorizationProfile>> {
-        let authz = self.authz.lock().unwrap();
-        let active = authz.active_profiles.get(&namespace.0).copied();
-        Ok(authz
-            .profiles
-            .iter()
-            .filter(|((owner, _), _)| owner == &namespace.0)
-            .map(|((_, revision), profile)| {
-                let mut profile = profile.clone();
-                if active == Some(*revision) {
-                    profile.lifecycle = ProfileLifecycle::Active;
-                }
-                profile
-            })
-            .collect())
-    }
-
-    fn set_profile_lifecycle(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-        lifecycle: ProfileLifecycle,
-    ) -> RepositoryResult<()> {
-        let mut authz = self.authz.lock().unwrap();
-        let profile = authz
-            .profiles
-            .get_mut(&(namespace.0.clone(), revision))
-            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
-        profile.lifecycle = lifecycle;
-        Ok(())
-    }
-
-    fn activate_profile(
-        &self,
-        namespace: &NamespaceId,
-        revision: u64,
-        expected_active_revision: Option<u64>,
-    ) -> RepositoryResult<Option<u64>> {
-        let mut authz = self.authz.lock().unwrap();
-        let target = authz
-            .profiles
-            .get(&(namespace.0.clone(), revision))
-            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
-        if target.lifecycle == ProfileLifecycle::Draft {
-            return Err(RepositoryError::Conflict(
-                "profile revision is not validated".into(),
-            ));
-        }
-        let previous = authz.active_profiles.get(&namespace.0).copied();
-        if previous != expected_active_revision {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous != revision
-            && let Some(profile) = authz.profiles.get_mut(&(namespace.0.clone(), previous))
-        {
-            profile.lifecycle = ProfileLifecycle::Retired;
-        }
-        authz.active_profiles.insert(namespace.0.clone(), revision);
-        Ok(previous)
-    }
-
-    fn retire_active_profile(
-        &self,
-        namespace: &NamespaceId,
-        expected_active_revision: u64,
-    ) -> RepositoryResult<AuthorizationProfile> {
-        let mut authz = self.authz.lock().unwrap();
-        let Some(active_revision) = authz.active_profiles.get(&namespace.0).copied() else {
-            return Err(RepositoryError::NotFound(
-                "active profile head not found".into(),
-            ));
-        };
-        if active_revision != expected_active_revision {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        if !authz
-            .profiles
-            .contains_key(&(namespace.0.clone(), active_revision))
-        {
-            return Err(RepositoryError::Backend(
-                "active profile head is dangling".into(),
-            ));
-        }
-        authz.active_profiles.remove(&namespace.0);
-        let profile = authz
-            .profiles
-            .get_mut(&(namespace.0.clone(), active_revision))
-            .expect("profile existence checked while holding the same lock");
-        profile.lifecycle = ProfileLifecycle::Retired;
-        Ok(profile.clone())
-    }
-
-    fn active_profile(
-        &self,
-        namespace: &NamespaceId,
-    ) -> RepositoryResult<Option<AuthorizationProfile>> {
-        let authz = self.authz.lock().unwrap();
-        let Some(revision) = authz.active_profiles.get(&namespace.0) else {
-            return Ok(None);
-        };
-        let mut profile = authz
-            .profiles
-            .get(&(namespace.0.clone(), *revision))
-            .cloned()
-            .ok_or_else(|| RepositoryError::Backend("active profile head is dangling".into()))?;
-        profile.lifecycle = ProfileLifecycle::Active;
-        Ok(Some(profile))
-    }
-
-    fn active_profiles(&self) -> RepositoryResult<Vec<AuthorizationProfile>> {
-        let authz = self.authz.lock().unwrap();
-        authz
-            .active_profiles
-            .iter()
-            .map(|(namespace, revision)| {
-                let mut profile = authz
-                    .profiles
-                    .get(&(namespace.clone(), *revision))
-                    .cloned()
-                    .ok_or_else(|| {
-                        RepositoryError::Backend("active profile head is dangling".into())
-                    })?;
-                profile.lifecycle = ProfileLifecycle::Active;
-                Ok(profile)
-            })
-            .collect()
     }
 }
 
@@ -1828,132 +1705,9 @@ mod tests {
 
     #[test]
     fn organization_privacy_erases_owned_closure_and_retains_foreign_state() {
-        // Cause/effect decision table:
-        // C1 row is the Org, its group/invitation, owned Workspace, Project or
-        // recursive Resource scope or Directory placement -> E1 remove; C2 API
-        // token is bound to an owned Workspace -> E2 remove; C3 row belongs to
-        // a foreign Org -> E3 retain; C4 exact retry after E1/E2 -> E4 false
-        // with no new effect.
-        let store = InMemoryStore::new();
-        let owner = PrincipalRef::Account {
-            account_id: AccountId("owner".into()),
-        };
-        for id in ["org-a", "org-b"] {
-            OrgRepository::upsert(
-                &store,
-                Organization {
-                    id: OrgId(id.into()),
-                    display_name: None,
-                    owner: owner.clone(),
-                    created_at: ts("2026-06-19T00:00:00Z"),
-                    updated_at: ts("2026-06-19T00:00:00Z"),
-                },
-            )
-            .unwrap();
-        }
-        GroupRepository::upsert(
-            &store,
-            Group {
-                id: GroupId("group-a".into()),
-                org: OrgId("org-a".into()),
-                display_name: None,
-                members: vec![owner.clone()],
-                created_at: ts("2026-06-19T00:00:00Z"),
-                updated_at: ts("2026-06-19T00:00:00Z"),
-            },
-        )
-        .unwrap();
-        for (workspace, org) in [("ws-a", "org-a"), ("ws-b", "org-b")] {
-            ResourceModelRepository::put_workspace_org(
-                &store,
-                WorkspaceOrgEdge {
-                    workspace_id: WorkspaceId(workspace.into()),
-                    org_id: OrgId(org.into()),
-                },
-            )
-            .unwrap();
-        }
-        let owned_resource = ResourceEdge {
-            resource_type: awaken_iam_contract::ResourceType("issue".into()),
-            resource_id: awaken_iam_contract::ResourceId("owned".into()),
-            parent: ScopeRef::Project {
-                workspace_id: WorkspaceId("ws-a".into()),
-                project_id: awaken_iam_contract::ProjectId("project-a".into()),
-            },
-        };
-        ResourceModelRepository::put_edge(&store, owned_resource.clone()).unwrap();
-        GrantRepository::put(
-            &store,
-            Grant {
-                id: GrantId("owned-grant".into()),
-                subject: GrantSubject::Group(GroupId("group-a".into())),
-                action_pattern: ActionPattern("issue.read".into()),
-                scope: ScopeRef::Resource {
-                    resource_type: owned_resource.resource_type.clone(),
-                    resource_id: owned_resource.resource_id.clone(),
-                },
-                effect: Effect::Allow,
-            },
-        )
-        .unwrap();
-        RoleBindingRepository::add(
-            &store,
-            RoleBinding {
-                principal: owner.clone(),
-                role: RoleId("member".into()),
-                scope: ScopeRef::Workspace {
-                    workspace_id: WorkspaceId("ws-a".into()),
-                },
-            },
-        )
-        .unwrap();
-        for (id, workspace) in [("token-a", "ws-a"), ("token-b", "ws-b")] {
-            ApiTokenRepository::create(
-                &store,
-                ApiToken {
-                    id: ApiTokenId(id.into()),
-                    prefix: ApiTokenPrefix(format!("prefix-{id}")),
-                    principal: owner.clone(),
-                    secret_hash: "hash".into(),
-                    workspace: WorkspaceId(workspace.into()),
-                    created_at: ts("2026-06-19T00:00:00Z"),
-                    expires_at: None,
-                    revoked_at: None,
-                },
-            )
-            .unwrap();
-        }
-
-        assert!(store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
-        assert!(!store.erase_org_privacy(&OrgId("org-a".into())).unwrap());
-        assert!(
-            OrgRepository::get(&store, &OrgId("org-a".into()))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            OrgRepository::get(&store, &OrgId("org-b".into()))
-                .unwrap()
-                .is_some()
-        );
-        assert!(GroupRepository::list(&store).unwrap().is_empty());
-        assert!(GrantRepository::list(&store).unwrap().is_empty());
-        assert!(RoleBindingRepository::list(&store).unwrap().is_empty());
-        assert!(
-            ResourceModelRepository::list_edges(&store)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            ApiTokenRepository::get(&store, &ApiTokenId("token-a".into()))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            ApiTokenRepository::get(&store, &ApiTokenId("token-b".into()))
-                .unwrap()
-                .is_some()
-        );
+        // Original entrypoint retains its original assertions in ONE shared
+        // fixture, now also exercised by the actual SQLite/Postgres owners.
+        super::super::privacy_tests::closure_and_late_writer_cases(&InMemoryStore::new());
     }
 
     #[test]

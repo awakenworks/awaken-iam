@@ -84,8 +84,8 @@ so a rolling deploy that briefly mixes node versions stays safe.
 
 There is one source of truth, so there is no split-brain to reconcile:
 
-- A grant, role, or membership change advances the policy `version` **in the same
-  transaction** as the write.
+- A grant, role, membership, product-resource projection, or authorization-profile
+  head change advances the policy `version` **in the same transaction** as the write.
 - A session revoke or capability-lease change bumps the principal/token `epoch`
   in the store.
 - Caches — the remote client's snapshot cache and any in-node decision cache — are
@@ -132,34 +132,17 @@ HA is purely running N of the same node against one highly available store.
 
 ## Status
 
-This document is the target the edge adapters build to; it introduces no new IAM
-concept. The mechanisms it composes — the versioned fence, epoch-fenced tokens,
-scope-partitioned bundles, and the stateless assembly — are designed; the
-stateless assembly and the bundle plan exist, the rest is not yet wired.
+The standalone daemon now serves `/v1` over PostgreSQL or single-node SQLite.
+PostgreSQL stores the policy `version` and token `epoch` shared by replicas;
+authorization and snapshot reads check the store before using the local PDP.
+Grant and product-resource projection changes have passed two-daemon shared-store
+HTTP checks. Authorization-profile activation, rollback, and retirement now
+commit their active-head change and policy-version increment together; a
+two-daemon PostgreSQL check confirmed the second node refreshes on its next
+request, and a disconnected store produced `503 policy_unavailable` rather than
+a stale allow. The portable migration bundles and PostgreSQL single-applier
+guard are implemented.
 
-Today the policy `version` and token `epoch` are **in-memory per node**, so a
-single process is already correct, and the fence now rides the store rather than
-per-node memory. Making every node interchangeable per the three rules is the
-remaining work, all of it edge adapters over existing repository contracts, none of it a change
-to `contract`, `core`, or `client`. Wired at the edge today:
-
-- store-backed `version` / `epoch` advancement, advanced in the same step as the
-  change it fences (the policy administration point bumps the store fence with
-  each mutation; the in-memory adapter holds it under its lock);
-- the backend-neutral single-applier guard on the `MigrationExecutor` — the
-  migration run acquires it before applying and releases it after, success or
-  failure, so concurrent node startup is safe (Postgres renders it as a
-  `pg_advisory_lock`, SQLite is a single writer);
-- the `/healthz` (liveness) and `/readyz` (readiness: store reachable and this
-  node's migrations applied) probes on the assembly and daemon.
-
-Still pending:
-
-- the backend repository adapters and `MigrationExecutor`s behind the
-  [migration plan](deployment.md#crate-placement) — Postgres for this HA
-  topology, SQLite for the single-node band
-  ([ADR-0003](../adr/0003-storage-backends.md)) — with the dialect-token
-  rendering they share (only an in-memory adapter exists today);
-- an HTTP server binding the manifested `/v1` routes and probes (the assembly
-  produces a route manifest, not yet a served router).
-
+Production still requires credential provisioning, rolling replacement of old
+daemon binaries before profile changes resume, multi-replica rollout rehearsal,
+and verification of readiness and alerting in the deployment environment.

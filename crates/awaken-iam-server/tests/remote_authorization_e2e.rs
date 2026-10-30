@@ -14,10 +14,10 @@ use awaken_iam_contract::{
     AccountId, ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse,
     EntitlementDecision, EntitlementRequest, NamespaceId, NamespaceOwner, OrgId, PolicySnapshot,
-    PrincipalRef, ResourceId, ResourceModelRegistered, ResourceModelRegistration,
-    ResourceParentEdge, ResourceType, ResourceTypeRegistration, ScopeRef, SignerKey,
-    SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus, SignerSetSnapshot,
-    Timestamp,
+    PrincipalRef, ProductId, ProductResourceModelRequest, ResourceId, ResourceModelRegistered,
+    ResourceModelRegistration, ResourceParentEdge, ResourceType, ResourceTypeRegistration,
+    ScopeRef, SignerKey, SignerKeyAlgorithm, SignerKeyFingerprint, SignerKeyId, SignerKeyStatus,
+    SignerSetSnapshot, Timestamp,
 };
 use awaken_iam_core::{
     ActionPattern, Effect, EntitlementCatalog, EntitlementEngine, Grant, GrantId, GrantSubject,
@@ -95,16 +95,21 @@ impl AuthzTransport for JsonLoopbackTransport {
 
     fn register_resource_model(
         &self,
-        registration: &ResourceModelRegistration,
+        registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         if !self.online {
             return Err(RemoteError("offline".into()));
         }
         let body =
             serde_json::to_string(registration).map_err(|err| RemoteError(err.to_string()))?;
-        let parsed: ResourceModelRegistration =
+        let parsed: ProductResourceModelRequest =
             serde_json::from_str(&body).map_err(|err| RemoteError(err.to_string()))?;
-        let registered = self.api.borrow_mut().register_resource_model(&parsed);
+        // Codec/embedded-kernel fixture only: this directly calls the existing
+        // local model API. It does not simulate the guarded product HTTP route.
+        let registered = self
+            .api
+            .borrow_mut()
+            .register_resource_model(&parsed.resource_model);
         serde_json::from_str(&serde_json::to_string(&registered).unwrap())
             .map_err(|err| RemoteError(err.to_string()))
     }
@@ -309,10 +314,12 @@ fn remote_mode_signer_fetch_fails_closed_when_iam_is_unreachable() {
 
 #[test]
 fn registering_a_resource_model_over_the_wire_resolves_open_scopes() {
-    // A consumer teaches IAM, over the wire, that issue:42 nests under a project
-    // it already holds a grant at. After registration the remote `authorize`
-    // resolves the open resource scope up to that project, and the registered
-    // edge rides the snapshot so a synced consumer answers identically.
+    // Original codec/embedded-kernel law: the JSON loopback retains this full
+    // model and project-ancestry domain, and all old authorization/snapshot
+    // assertions. It is not HTTP product-admission evidence: the published
+    // guarded route accepts vocabulary only and edges use versioned projection.
+    // RM0 the canonical product wrapper round-trips without changing the inner
+    // model; the existing kernel still resolves the original open scope.
     let mut core = IamCore::new();
     core.policy_mut().add_grant(Grant {
         id: GrantId("g_proj".into()),
@@ -347,21 +354,24 @@ fn registering_a_resource_model_over_the_wire_resolves_open_scopes() {
     );
 
     let registered = client
-        .register_resource_model(&ResourceModelRegistration {
-            resource_types: vec![ResourceTypeRegistration {
-                resource_type: ResourceType("issue".into()),
-                parent_type: None,
-                actions: vec![ActionKey("issue.close".into())],
-            }],
-            actions: Vec::new(),
-            edges: vec![ResourceParentEdge {
-                resource_type: ResourceType("issue".into()),
-                resource_id: ResourceId("42".into()),
-                parent: ScopeRef::Project {
-                    workspace_id: awaken_iam_contract::WorkspaceId("ws_main".into()),
-                    project_id: awaken_iam_contract::ProjectId("proj_web".into()),
-                },
-            }],
+        .register_resource_model(&ProductResourceModelRequest {
+            product_id: ProductId::new("issues").unwrap(),
+            resource_model: ResourceModelRegistration {
+                resource_types: vec![ResourceTypeRegistration {
+                    resource_type: ResourceType("issue".into()),
+                    parent_type: None,
+                    actions: vec![ActionKey("issue.close".into())],
+                }],
+                actions: Vec::new(),
+                edges: vec![ResourceParentEdge {
+                    resource_type: ResourceType("issue".into()),
+                    resource_id: ResourceId("42".into()),
+                    parent: ScopeRef::Project {
+                        workspace_id: awaken_iam_contract::WorkspaceId("ws_main".into()),
+                        project_id: awaken_iam_contract::ProjectId("proj_web".into()),
+                    },
+                }],
+            },
         })
         .unwrap();
     assert!(registered.version >= 1);

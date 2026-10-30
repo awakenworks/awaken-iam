@@ -157,6 +157,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::get("/v1/namespaces/{namespace_id}/signers"),
     RouteSpec::post("/v1/authz/resource-model"),
     RouteSpec::post("/v1/authz/resource-provisions"),
+    RouteSpec::post("/v1/authz/resource-provision-transactions"),
     RouteSpec::get("/v1/authz/snapshot"),
     RouteSpec::post("/v1/capabilities/introspect"),
 ];
@@ -173,6 +174,7 @@ const AUTHZ_ROUTES: &[RouteSpec] = &[
 const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/admin/orgs"),
     RouteSpec::post("/v1/admin/orgs/provision"),
+    RouteSpec::post("/v1/admin/orgs/privacy-erasure"),
     RouteSpec::get("/v1/admin/orgs/{id}"),
     RouteSpec::put("/v1/admin/orgs/{id}"),
     RouteSpec::delete("/v1/admin/orgs/{id}"),
@@ -665,6 +667,7 @@ mod tests {
         assert!(standalone.contains(&RouteSpec::post("/v1/admin/orgs")));
         assert!(standalone.contains(&RouteSpec::put("/v1/admin/orgs/{id}")));
         assert!(standalone.contains(&RouteSpec::delete("/v1/admin/orgs/{id}")));
+        assert!(standalone.contains(&RouteSpec::post("/v1/admin/orgs/privacy-erasure")));
         assert!(standalone.contains(&RouteSpec::get("/v1/admin/orgs")));
         assert!(standalone.contains(&RouteSpec::post("/v1/admin/groups")));
         assert!(standalone.contains(&RouteSpec::put("/v1/admin/groups/{id}")));

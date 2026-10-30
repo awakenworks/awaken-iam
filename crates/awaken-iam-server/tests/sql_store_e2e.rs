@@ -1,3 +1,10 @@
+// migration-allow-edit: this reviewed diff formats Rust imports and extends
+// the original two-v8 upgrade fixture through append-only privacy v10. The
+// consumed-v8 SQL fixture, SQL constants and old receipt/drift/row assertions
+// remain intact; these import/fixture changes are not shipped SQL edits.
+
+// migration-allow-destructive: these tests own disposable schemas and legacy rollback fixtures; cleanup never targets a serving deployment.
+// migration-allow-raw-sql: backend-specific negative fixtures and Rust wall/monotonic clocks are test inputs, not published portable migration DDL.
 //! End-to-end proof that the real database adapters are switchable behind the
 //! repository contracts (ADR-0003).
 //!
@@ -9,25 +16,27 @@
 //! the ADR promises. Selecting the backend is configuration, not a code fork.
 
 use awaken_iam_contract::{
-    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, CreateDirectoryNode,
-    DirectoryNodeId, EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims,
-    ExternalIdentityId, ExternalIdentityKey, ExternalSubject, IdentityProviderKey,
-    MoveDirectoryNode, OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId,
-    ProductSpacePlacement, ProductSpaceRef, ResourceId, ResourceType, ScopeRef, Session, SessionId,
+    Account, AccountId, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, AuthorizationProfile,
+    AuthorizationProfileDocument, CreateDirectoryNode, DirectoryNodeId,
+    EnsureProductSpacePlacement, ExternalIdentity, ExternalIdentityClaims, ExternalIdentityId,
+    ExternalIdentityKey, ExternalSubject, IdentityProviderKey, MoveDirectoryNode, NamespaceId,
+    OAuthLoginState, OAuthLoginStateId, OrgId, PrincipalRef, ProductId, ProductSpacePlacement,
+    ProductSpaceRef, ProfileLifecycle, ResourceId, ResourceType, ScopeRef, Session, SessionId,
     Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
     AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
-    AuditSink, AuthCodeRepository, DirectoryNode, DirectoryRepository, Effect,
-    ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
-    GroupRepository, LoginFlowRepository, OAuthClientRepository, OrgRepository, Organization, Plan,
-    PlanId, PlanRepository, PlanTier, Quota, RateLimit, RateWindow, RegisteredClient,
-    RepositoryError, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
-    RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
+    AuditSink, AuthCodeRepository, AuthorizationProfileRepository, DirectoryNode,
+    DirectoryRepository, Effect, ExternalIdentityRepository, Grant, GrantId, GrantRepository,
+    GrantSubject, Group, GroupId, GroupRepository, LoginFlowRepository, OAuthClientRepository,
+    OrgRepository, Organization, Plan, PlanId, PlanRepository, PlanTier, Quota, RateLimit,
+    RateWindow, RegisteredClient, RepositoryError, ResourceEdge, ResourceModelRepository,
+    RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository, SessionRepository,
+    StoredAuthorizationCode,
 };
 use awaken_iam_server::{
-    DirectoryApi, DirectoryCommandContext, PolicyAdminApi, PostgresBackend, SqlConn, SqlStore,
-    postgres_migrated_store, sqlite_in_memory_store,
+    DirectoryApi, DirectoryCommandContext, FenceStore, PolicyAdminApi, PostgresBackend, SqlConn,
+    SqlStore, postgres_migrated_store, sqlite_in_memory_store,
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -183,6 +192,79 @@ fn sqlite_organization_onboarding_is_one_durable_transaction() {
 
 /// Drive every repository through its success, failure, and guardrail paths.
 fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
+    // CF2 transaction-context cause/effect table, exercised by the ORIGINAL
+    // SQLite and configured real PostgreSQL tests below, on their same backend:
+    // T1 write -> read sees that write -> update -> success commits once;
+    // T2 write -> query failure rolls back every write, preserving Backend;
+    // T3 write -> domain refusal rolls back, preserving Conflict. A separate
+    // connection or pre-transaction read would fail T1/atomic rollback evidence.
+    let backend: &dyn SqlConn = store.backend();
+    backend
+        .execute(
+            "CREATE TABLE transaction_context_probe (entry_id TEXT PRIMARY KEY, entry_value TEXT NOT NULL)",
+            &[],
+        )
+        .unwrap();
+    let mut callbacks = Vec::new();
+    backend
+        .with_transaction(&mut |transaction| {
+            callbacks.push(());
+            transaction.execute(
+                "INSERT INTO transaction_context_probe(entry_id, entry_value) VALUES(?, ?)",
+                &[Some("committed".into()), Some("before".into())],
+            )?;
+            assert_eq!(
+                transaction.query(
+                    "SELECT entry_value FROM transaction_context_probe WHERE entry_id = ?",
+                    &[Some("committed".into())],
+                )?,
+                vec![vec![Some("before".into())]],
+                "T1 reads share the write transaction"
+            );
+            transaction.execute(
+                "UPDATE transaction_context_probe SET entry_value = ? WHERE entry_id = ?",
+                &[Some("after".into()), Some("committed".into())],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        callbacks.len(),
+        1,
+        "T1 callback is never implicitly replayed"
+    );
+    let query_failure = backend
+        .with_transaction(&mut |transaction| {
+            transaction.execute(
+                "INSERT INTO transaction_context_probe(entry_id, entry_value) VALUES(?, ?)",
+                &[Some("query-failure".into()), Some("not-committed".into())],
+            )?;
+            transaction.query("INVALID SQL QUERY FOR TRANSACTION TEST", &[])?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(query_failure, RepositoryError::Backend(_)), "T2");
+    let refusal = backend
+        .with_transaction(&mut |transaction| {
+            transaction.execute(
+                "INSERT INTO transaction_context_probe(entry_id, entry_value) VALUES(?, ?)",
+                &[Some("refused".into()), Some("not-committed".into())],
+            )?;
+            Err(RepositoryError::Conflict("transaction test refusal".into()))
+        })
+        .unwrap_err();
+    assert!(matches!(refusal, RepositoryError::Conflict(_)), "T3");
+    assert_eq!(
+        backend
+            .query(
+                "SELECT entry_id, entry_value FROM transaction_context_probe ORDER BY entry_id",
+                &[],
+            )
+            .unwrap(),
+        vec![vec![Some("committed".into()), Some("after".into())]],
+        "T1 commits; T2/T3 cannot leak partial writes"
+    );
+
     // --- accounts: upsert is idempotent replace; list is ordered ---
     assert_eq!(
         AccountRepository::get(store, &AccountId("a".into())).unwrap(),
@@ -847,6 +929,196 @@ fn sqlite_isolates_a_sibling_by_prefix_in_one_database() {
     assert_eq!(AccountRepository::list(&other).unwrap().len(), 0);
 }
 
+#[test]
+fn postgres_profile_head_and_policy_version_commit_together_when_configured() {
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = IsolatedPostgresSchema::create(&url, "iam_profile_fence");
+    let writer = postgres_migrated_store(&schema.url, "iam").expect("migrate profile schema");
+    let reader = postgres_migrated_store(&schema.url, "iam").expect("open second store handle");
+    let namespace = NamespaceId("awaken.runtime".into());
+    for revision in 1..=2 {
+        writer
+            .create_profile(AuthorizationProfile {
+                namespace: namespace.clone(),
+                revision,
+                lifecycle: ProfileLifecycle::Validated,
+                document: AuthorizationProfileDocument::default(),
+                checksum: format!("revision-{revision}"),
+                created_at: ts("2026-10-01T00:00:00Z"),
+            })
+            .expect("create validated profile");
+    }
+    assert_eq!(reader.fence().unwrap().version, 1);
+    assert_eq!(
+        writer.activate_profile(&namespace, 1, None).unwrap(),
+        (None, 2)
+    );
+    assert_eq!(reader.fence().unwrap().version, 2);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        1
+    );
+
+    assert!(matches!(
+        writer.activate_profile(&namespace, 2, None),
+        Err(RepositoryError::Conflict(_))
+    ));
+    assert_eq!(reader.fence().unwrap().version, 2);
+    assert_eq!(
+        writer.activate_profile(&namespace, 2, Some(1)).unwrap(),
+        (Some(1), 3)
+    );
+    assert_eq!(reader.fence().unwrap().version, 3);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        2
+    );
+
+    assert!(matches!(
+        writer.retire_active_profile(&namespace, 1),
+        Err(RepositoryError::Conflict(_))
+    ));
+    assert_eq!(reader.fence().unwrap().version, 3);
+    assert_eq!(
+        reader.active_profile(&namespace).unwrap().unwrap().revision,
+        2
+    );
+    let (retired, version) = writer.retire_active_profile(&namespace, 2).unwrap();
+    assert_eq!(retired.revision, 2);
+    assert_eq!(version, 4);
+    assert_eq!(reader.fence().unwrap().version, 4);
+    assert!(reader.active_profile(&namespace).unwrap().is_none());
+}
+
+#[test]
+fn postgres_product_projection_is_atomic_and_fenced_when_configured() {
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = IsolatedPostgresSchema::create(&url, "iam_projection");
+    let store = postgres_migrated_store(&schema.url, "iam").expect("migrate projection schema");
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: OrgId("org-a".into()),
+            display_name: None,
+            owner: PrincipalRef::Service {
+                service_id: "owner".into(),
+            },
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        },
+    )
+    .unwrap();
+    ResourceModelRepository::put_workspace_org(
+        &store,
+        WorkspaceOrgEdge {
+            workspace_id: WorkspaceId("workspace-a".into()),
+            org_id: OrgId("org-a".into()),
+        },
+    )
+    .unwrap();
+    let model: awaken_iam_contract::ProductResourceModelRequest = serde_json::from_value(serde_json::json!({
+        "product_id": "tutor",
+        "resource_model": {
+            "resource_types": [{"resource_type": "tutor.campus", "actions": ["tutor.campus.manage"]}],
+            "actions": [], "edges": []
+        }
+    })).unwrap();
+    store.register_product_resource_model(&model).unwrap();
+    let created: awaken_iam_contract::ResourceProjectionBatch = serde_json::from_value(serde_json::json!({
+        "product_id":"tutor", "org_id":"org-a", "projection_id":"campus:1",
+        "idempotency_key":"campus:1:1", "epoch":1,
+        "grants":[{"id":"campus-1-manage","subject":{"kind":"principal","principal":{"kind":"service","service_id":"owner"}},
+            "action_pattern":"tutor.campus.manage", "scope":{"kind":"resource","resource_type":"tutor.campus","resource_id":"1"},"effect":"allow"}],
+        "scope_edges":[{"resource_type":"tutor.campus","resource_id":"1","parent":{"kind":"workspace","workspace_id":"workspace-a"}}],
+        "retirements":[]
+    })).unwrap();
+    let first = store.apply_resource_projection(&created).unwrap();
+    assert_eq!(
+        first.disposition,
+        awaken_iam_contract::ResourceProjectionDisposition::Applied
+    );
+    assert_eq!(GrantRepository::list(&store).unwrap().len(), 1);
+    let mut retired = created.clone();
+    retired.epoch = 2;
+    retired.idempotency_key = "campus:1:2".into();
+    retired.grants.clear();
+    retired.scope_edges.clear();
+    retired.retirements = vec![awaken_iam_contract::ResourceRetirement {
+        resource_type: ResourceType("tutor.campus".into()),
+        resource_id: ResourceId("1".into()),
+        grant_ids: vec!["campus-1-manage".into()],
+    }];
+    let second = store.apply_resource_projection(&retired).unwrap();
+    assert_eq!(second.version, first.version + 1);
+    assert!(GrantRepository::list(&store).unwrap().is_empty());
+    assert_eq!(
+        store
+            .apply_resource_projection(&created)
+            .unwrap()
+            .disposition,
+        awaken_iam_contract::ResourceProjectionDisposition::Stale
+    );
+    let start = Arc::new(Barrier::new(2));
+    let mut joins = Vec::new();
+    for suffix in ["2", "3"] {
+        let mut next = created.clone();
+        next.projection_id = format!("campus:{suffix}");
+        next.idempotency_key = format!("campus:{suffix}:1");
+        next.grants[0].id = format!("campus-{suffix}-manage");
+        next.grants[0].scope = ScopeRef::Resource {
+            resource_type: ResourceType("tutor.campus".into()),
+            resource_id: ResourceId(suffix.into()),
+        };
+        next.scope_edges[0].resource_id = ResourceId(suffix.into());
+        let sibling = store.clone();
+        let start = start.clone();
+        joins.push(thread::spawn(move || {
+            start.wait();
+            sibling.apply_resource_projection(&next).unwrap()
+        }));
+    }
+    let versions = joins
+        .into_iter()
+        .map(|join| join.join().unwrap().version)
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), 2);
+    assert_ne!(versions[0], versions[1]);
+    assert_eq!(GrantRepository::list(&store).unwrap().len(), 2);
+    let mut exact = created.clone();
+    exact.projection_id = "campus:4".into();
+    exact.idempotency_key = "campus:4:1".into();
+    exact.grants[0].id = "campus-4-manage".into();
+    exact.grants[0].scope = ScopeRef::Resource {
+        resource_type: ResourceType("tutor.campus".into()),
+        resource_id: ResourceId("4".into()),
+    };
+    exact.scope_edges[0].resource_id = ResourceId("4".into());
+    let start = Arc::new(Barrier::new(2));
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let sibling = store.clone();
+        let duplicate = exact.clone();
+        let start = start.clone();
+        joins.push(thread::spawn(move || {
+            start.wait();
+            sibling.apply_resource_projection(&duplicate).unwrap()
+        }));
+    }
+    let receipts = joins
+        .into_iter()
+        .map(|join| join.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts[0].version, receipts[1].version);
+    assert!(receipts.iter().any(|receipt| receipt.disposition
+        == awaken_iam_contract::ResourceProjectionDisposition::Applied));
+    assert!(receipts.iter().any(|receipt| receipt.disposition
+        == awaken_iam_contract::ResourceProjectionDisposition::Replayed));
+}
+
 #[tokio::test]
 async fn postgres_backend_serves_every_repository_when_configured() {
     // Cause/effect graph: C1=the complete Postgres port suite runs inside an
@@ -1132,4 +1404,158 @@ fn postgres_backend_clones_recover_after_transport_loss_when_configured() {
     admin
         .batch_execute(&format!("DROP TABLE {table}"))
         .expect("drop reconnect fixture");
+}
+
+#[test]
+fn postgres_published_and_consumed_v8_upgrade_preserves_rows_and_receipts_when_configured() {
+    use awaken_iam_server::{Migration, MigrationBundle, MigrationExecutor, bundles};
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    for consumed in [false, true] {
+        let schema = IsolatedPostgresSchema::create(&url, "iam_v8_upgrade");
+        let mut backend = PostgresBackend::connect(&schema.url).unwrap();
+        let previous = bundles()
+            .into_iter()
+            .map(|bundle| {
+                let migrations = bundle
+                    .migrations()
+                    .iter()
+                    .filter(|migration| {
+                        bundle.bundle_id() != "iam.authz" || migration.version() <= 8
+                    })
+                    .map(|migration| {
+                        if consumed && bundle.bundle_id() == "iam.authz" && migration.version() == 8
+                        {
+                            Migration::new(
+                                8,
+                                "consumed atomic provision schema",
+                                include_str!("fixtures/consumed-authz-v8.sql"),
+                            )
+                            .unwrap()
+                        } else {
+                            migration.clone()
+                        }
+                    })
+                    .collect();
+                MigrationBundle::new(bundle.bundle_id(), migrations).unwrap()
+            })
+            .collect::<Vec<_>>();
+        backend.run_migrations("iam", &previous).unwrap();
+        let table = if consumed {
+            "iam_resource_epochs"
+        } else {
+            "iam_product_actions"
+        };
+        let insert = if consumed {
+            "INSERT INTO iam_resource_epochs (resource_type, resource_id, epoch) VALUES ('test.resource', 'retained', 7)"
+        } else {
+            "INSERT INTO iam_product_actions (product_id, action_key) VALUES ('test', 'retained')"
+        };
+        backend.execute(insert, &[]).unwrap();
+        let receipt = backend.applied_versions("iam", "iam.authz").unwrap()[&8].clone();
+        if consumed {
+            // Fail after the private tables have been saved. The same migration
+            // transaction must roll back every rename/DDL and preserve the data.
+            backend
+                .execute(
+                    "CREATE TABLE iam_product_actions (product_id TEXT, action_key TEXT)",
+                    &[],
+                )
+                .unwrap();
+            assert!(backend.run_migrations("iam", &bundles()).is_err());
+            assert!(
+                !backend
+                    .applied_versions("iam", "iam.authz")
+                    .unwrap()
+                    .contains_key(&9)
+            );
+            assert!(
+                backend
+                    .query("SELECT * FROM iam_atomic_v8_resource_epochs", &[])
+                    .is_err()
+            );
+            assert_eq!(
+                backend
+                    .query(
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM iam_resource_epochs",
+                        &[]
+                    )
+                    .unwrap()[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+            backend
+                .execute("DROP TABLE iam_product_actions", &[])
+                .unwrap();
+        }
+        // M9: both published and consumed v8 histories must still execute
+        // exactly ONE canonical convergence step and preserve their v8 receipt.
+        let convergence = bundles()
+            .into_iter()
+            .map(|bundle| {
+                MigrationBundle::new(
+                    bundle.bundle_id(),
+                    bundle
+                        .migrations()
+                        .iter()
+                        .filter(|migration| {
+                            bundle.bundle_id() != "iam.authz" || migration.version() <= 9
+                        })
+                        .cloned()
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            backend.run_migrations("iam", &convergence).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            backend.applied_versions("iam", "iam.authz").unwrap()[&8],
+            receipt
+        );
+        // M10: append privacy migration after successful v9; it cannot rewrite
+        // either old receipt, and an exact retry below must apply no migration.
+        let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
+        let privacy = backend.run_migrations("iam", &bundles()).unwrap();
+        assert_eq!(privacy.len(), 1, "only appended privacy step applies");
+        let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
+        assert!(current_receipts.contains_key(&10));
+        for version in [8, 9] {
+            assert_eq!(
+                current_receipts[&version], converged_receipts[&version],
+                "M10 historical receipt preserved"
+            );
+        }
+        assert_eq!(
+            backend
+                .query(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM {table}"), &[])
+                .unwrap()[0][0]
+                .as_deref(),
+            Some("1")
+        );
+        for created in ["iam_resource_projection_streams", "iam_resource_provisions"] {
+            backend
+                .query(
+                    &format!("SELECT CAST(COUNT(*) AS TEXT) FROM {created}"),
+                    &[],
+                )
+                .unwrap();
+        }
+        assert!(
+            backend
+                .run_migrations("iam", &bundles())
+                .unwrap()
+                .is_empty()
+        );
+        backend
+            .execute(
+                "UPDATE iam_schema_migrations SET checksum = ? WHERE bundle_id = ? AND version = 8",
+                &[Some("f".repeat(64)), Some("iam.authz".into())],
+            )
+            .unwrap();
+        assert!(backend.run_migrations("iam", &bundles()).is_err());
+    }
 }

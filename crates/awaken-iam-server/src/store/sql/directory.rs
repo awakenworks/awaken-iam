@@ -53,6 +53,105 @@ fn decode_product_space_placement(row: &SqlRow) -> RepositoryResult<ProductSpace
 const DIRECTORY_NODE_COLUMNS: &str = "id, org_id, parent_id, name, slug, description, CAST(archived AS TEXT), created_at, updated_at";
 const JOINED_DIRECTORY_NODE_COLUMNS: &str = "node.id, node.org_id, node.parent_id, node.name, node.slug, node.description, CAST(node.archived AS TEXT), node.created_at, node.updated_at";
 
+impl<B: SqlConn> SqlStore<B> {
+    fn read_directory_node_with(
+        &self,
+        id: &DirectoryNodeId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<DirectoryNode>> {
+        let sql = format!(
+            "SELECT {DIRECTORY_NODE_COLUMNS} FROM {} WHERE id = ?",
+            self.table("directory_nodes")
+        );
+        query(&sql, &[p(id.0.clone())])?
+            .first()
+            .map(decode_directory_node)
+            .transpose()
+    }
+
+    fn read_directory_children_with(
+        &self,
+        org_id: &OrgId,
+        parent_id: Option<&DirectoryNodeId>,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<(u64, Vec<DirectoryNode>)> {
+        let params = [
+            p(org_id.0.clone()),
+            p(parent_id.map_or_else(String::new, |parent| parent.0.clone())),
+        ];
+        let sql = format!(
+            "SELECT {JOINED_DIRECTORY_NODE_COLUMNS}, CAST(fence.revision AS TEXT) \
+             FROM {} fence LEFT JOIN {} node \
+               ON node.org_id = fence.org_id AND node.parent_id = ? AND node.archived = 0 \
+             WHERE fence.org_id = ? ORDER BY node.slug",
+            self.table("directory_fence"),
+            self.table("directory_nodes")
+        );
+        let rows = query(&sql, &[params[1].clone(), params[0].clone()])?;
+        let revision = rows
+            .first()
+            .and_then(|row| row.get(9))
+            .and_then(Option::as_deref)
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| {
+                RepositoryError::Backend(format!("invalid directory revision: {error}"))
+            })?
+            .unwrap_or(1);
+        let nodes = rows
+            .iter()
+            .filter(|row| row.first().and_then(Option::as_deref).is_some())
+            .map(decode_directory_node)
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        Ok((revision, nodes))
+    }
+
+    fn read_placement_with(
+        &self,
+        org_id: &OrgId,
+        product_space: &ProductSpaceRef,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<Option<ProductSpacePlacement>> {
+        let sql = format!(
+            "SELECT product, space_id, org_id, node_id, status FROM {} \
+             WHERE org_id = ? AND product = ? AND space_id = ?",
+            self.table("product_space_bindings")
+        );
+        query(
+            &sql,
+            &[
+                p(org_id.0.clone()),
+                p(product_space.product_id.as_str().to_owned()),
+                p(product_space.space_id.clone()),
+            ],
+        )?
+        .first()
+        .map(decode_product_space_placement)
+        .transpose()
+    }
+
+    fn read_directory_revision_with(
+        &self,
+        org_id: &OrgId,
+        query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
+    ) -> RepositoryResult<u64> {
+        let sql = format!(
+            "SELECT CAST(revision AS TEXT) FROM {} WHERE org_id = ?",
+            self.table("directory_fence")
+        );
+        let rows = query(&sql, &[p(org_id.0.clone())])?;
+        let revision = rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Option::as_deref);
+        revision.map_or(Ok(1), |revision| {
+            revision.parse().map_err(|error| {
+                RepositoryError::Backend(format!("invalid directory revision: {error}"))
+            })
+        })
+    }
+}
+
 impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
     fn create_directory_node(
         &self,
@@ -60,30 +159,26 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         placement: Option<ProductSpacePlacement>,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
+        self.with_policy_transaction(|transaction,_| {
+
         node.validate()
             .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
         if let Some(placement) = &placement {
             node.validate_placement(placement)
                 .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
         }
-        let org_exists = self.backend.query(
-            &format!("SELECT id FROM {} WHERE id = ?", self.table("orgs")),
-            &[p(node.org_id.0.clone())],
-        )?;
-        if org_exists.is_empty() {
-            return Err(RepositoryError::NotFound(format!(
-                "organization {}",
-                node.org_id.0
-            )));
+        self.ensure_scope_admission(transaction,&[ScopeRef::Org { org_id: node.org_id.clone() }],&[])?;
+        if self.read_org_with(&node.org_id,|sql,params| transaction.query(sql,params))?.is_none() {
+            return Err(RepositoryError::NotFound(format!("organization {}",node.org_id.0)));
         }
-        if self.directory_node(&node.id)?.is_some() {
+        if self.read_directory_node_with(&node.id,|sql,params| transaction.query(sql,params))?.is_some() {
             return Err(RepositoryError::Conflict(format!(
                 "directory node {} already exists",
                 node.id.0
             )));
         }
         if let Some(parent_id) = &node.parent_id {
-            let parent = self.directory_node(parent_id)?.ok_or_else(|| {
+            let parent = self.read_directory_node_with(parent_id,|sql,params| transaction.query(sql,params))?.ok_or_else(|| {
                 RepositoryError::NotFound(format!("directory parent {}", parent_id.0))
             })?;
             if parent.archived || parent.org_id != node.org_id {
@@ -97,8 +192,7 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         // until this first command initializes it, and a pre-read would still
         // race another writer before the command mutex is acquired.
         if let Some(placement) = &placement
-            && self
-                .product_space_placement(&placement.org_id, &placement.product_space)?
+            && self.read_placement_with(&placement.org_id, &placement.product_space,|sql,params| transaction.query(sql,params))?
                 .is_some()
         {
             return Err(RepositoryError::Conflict(format!(
@@ -213,21 +307,14 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         let required = (1..writes.len())
             .map(|index| (index, 1))
             .collect::<Vec<_>>();
-        self.backend
-            .execute_transaction_checked(&writes, &required)?;
-        self.directory_revision(&node.org_id)
+        transaction.execute_checked(&writes, &required)?;
+        self.read_directory_revision_with(&node.org_id,|sql,params| transaction.query(sql,params))
+
+        })
     }
 
     fn directory_node(&self, id: &DirectoryNodeId) -> RepositoryResult<Option<DirectoryNode>> {
-        let sql = format!(
-            "SELECT {DIRECTORY_NODE_COLUMNS} FROM {} WHERE id = ?",
-            self.table("directory_nodes")
-        );
-        self.backend
-            .query(&sql, &[p(id.0.clone())])?
-            .first()
-            .map(decode_directory_node)
-            .transpose()
+        self.read_directory_node_with(id, |sql, params| self.backend.query(sql, params))
     }
 
     fn directory_children(
@@ -235,37 +322,9 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         org_id: &OrgId,
         parent_id: Option<&DirectoryNodeId>,
     ) -> RepositoryResult<(u64, Vec<DirectoryNode>)> {
-        let params = [
-            p(org_id.0.clone()),
-            p(parent_id.map_or_else(String::new, |parent| parent.0.clone())),
-        ];
-        let sql = format!(
-            "SELECT {JOINED_DIRECTORY_NODE_COLUMNS}, CAST(fence.revision AS TEXT) \
-             FROM {} fence LEFT JOIN {} node \
-               ON node.org_id = fence.org_id AND node.parent_id = ? AND node.archived = 0 \
-             WHERE fence.org_id = ? ORDER BY node.slug",
-            self.table("directory_fence"),
-            self.table("directory_nodes")
-        );
-        let rows = self
-            .backend
-            .query(&sql, &[params[1].clone(), params[0].clone()])?;
-        let revision = rows
-            .first()
-            .and_then(|row| row.get(9))
-            .and_then(Option::as_deref)
-            .map(str::parse)
-            .transpose()
-            .map_err(|error| {
-                RepositoryError::Backend(format!("invalid directory revision: {error}"))
-            })?
-            .unwrap_or(1);
-        let nodes = rows
-            .iter()
-            .filter(|row| row.first().and_then(Option::as_deref).is_some())
-            .map(decode_directory_node)
-            .collect::<RepositoryResult<Vec<_>>>()?;
-        Ok((revision, nodes))
+        self.read_directory_children_with(org_id, parent_id, |sql, params| {
+            self.backend.query(sql, params)
+        })
     }
 
     fn move_directory_node(
@@ -275,67 +334,87 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
-        if parent_id == Some(id) {
-            return Err(RepositoryError::Conflict(
-                "a directory node cannot be its own parent".into(),
-            ));
-        }
-        let current = self
-            .directory_node(id)?
-            .filter(|node| !node.archived)
-            .ok_or_else(|| RepositoryError::NotFound(format!("live directory node {}", id.0)))?;
-        if current.parent_id.as_ref() == parent_id {
-            return self.directory_revision(&current.org_id);
-        }
-        if let Some(parent_id) = parent_id {
-            let parent = self
-                .directory_node(parent_id)?
-                .filter(|node| !node.archived)
-                .ok_or_else(|| {
-                    RepositoryError::NotFound(format!("directory parent {}", parent_id.0))
-                })?;
-            if parent.org_id != current.org_id {
+        self.with_policy_transaction(|transaction, _| {
+            if parent_id == Some(id) {
                 return Err(RepositoryError::Conflict(
-                    "directory parent must be in the same organization".into(),
+                    "a directory node cannot be its own parent".into(),
                 ));
             }
-            let mut cursor = Some(parent);
-            while let Some(candidate) = cursor {
-                if candidate.id == *id {
+            let current = self
+                .read_directory_node_with(id, |sql, params| transaction.query(sql, params))?
+                .filter(|node| !node.archived)
+                .ok_or_else(|| {
+                    RepositoryError::NotFound(format!("live directory node {}", id.0))
+                })?;
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: current.org_id.clone(),
+                }],
+                &[],
+            )?;
+            if current.parent_id.as_ref() == parent_id {
+                return self.read_directory_revision_with(&current.org_id, |sql, params| {
+                    transaction.query(sql, params)
+                });
+            }
+            if let Some(parent_id) = parent_id {
+                let parent = self
+                    .read_directory_node_with(parent_id, |sql, params| {
+                        transaction.query(sql, params)
+                    })?
+                    .filter(|node| !node.archived)
+                    .ok_or_else(|| {
+                        RepositoryError::NotFound(format!("directory parent {}", parent_id.0))
+                    })?;
+                if parent.org_id != current.org_id {
                     return Err(RepositoryError::Conflict(
-                        "directory move would create a cycle".into(),
+                        "directory parent must be in the same organization".into(),
                     ));
                 }
-                cursor = candidate
-                    .parent_id
-                    .as_ref()
-                    .map(|ancestor| self.directory_node(ancestor))
-                    .transpose()?
-                    .flatten();
+                let mut cursor = Some(parent);
+                while let Some(candidate) = cursor {
+                    if candidate.id == *id {
+                        return Err(RepositoryError::Conflict(
+                            "directory move would create a cycle".into(),
+                        ));
+                    }
+                    cursor = candidate
+                        .parent_id
+                        .as_ref()
+                        .map(|ancestor| {
+                            self.read_directory_node_with(ancestor, |sql, params| {
+                                transaction.query(sql, params)
+                            })
+                        })
+                        .transpose()?
+                        .flatten();
+                }
             }
-        }
-        if self
-            .directory_children(&current.org_id, parent_id)?
-            .1
-            .iter()
-            .any(|sibling| sibling.id != current.id && sibling.slug == current.slug)
-        {
-            return Err(RepositoryError::Conflict(format!(
-                "directory slug {} already exists under the target parent",
-                current.slug
-            )));
-        }
-        let nodes = self.table("directory_nodes");
-        let fence = self.table("directory_fence");
-        let parent_key = parent_id.map_or_else(String::new, |parent| parent.0.clone());
-        let writes = [
-            SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
-                params: vec![p(current.org_id.0.clone())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "WITH RECURSIVE ancestry(id, parent_id) AS (\
+            if self
+                .read_directory_children_with(&current.org_id, parent_id, |sql, params| {
+                    transaction.query(sql, params)
+                })?
+                .1
+                .iter()
+                .any(|sibling| sibling.id != current.id && sibling.slug == current.slug)
+            {
+                return Err(RepositoryError::Conflict(format!(
+                    "directory slug {} already exists under the target parent",
+                    current.slug
+                )));
+            }
+            let nodes = self.table("directory_nodes");
+            let fence = self.table("directory_fence");
+            let parent_key = parent_id.map_or_else(String::new, |parent| parent.0.clone());
+            let writes = [
+                SqlWrite {
+                    sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                    params: vec![p(current.org_id.0.clone())],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "WITH RECURSIVE ancestry(id, parent_id) AS (\
                        SELECT id, parent_id FROM {nodes} WHERE id = ? \
                        UNION ALL \
                        SELECT node.id, node.parent_id FROM {nodes} node \
@@ -350,45 +429,47 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
                        AND NOT EXISTS (SELECT 1 FROM {nodes} sibling \
                            WHERE sibling.org_id = ? AND sibling.parent_id = ? \
                              AND sibling.slug = ? AND sibling.id <> ?)"
-                ),
-                params: vec![
-                    p(parent_key.clone()),
-                    p(parent_key.clone()),
-                    p(updated_at.0.clone()),
-                    p(id.0.clone()),
-                    p(parent_key.clone()),
-                    p(parent_key.clone()),
-                    p(current.org_id.0.clone()),
-                    p(id.0.clone()),
-                    p(current.org_id.0.clone()),
-                    p(parent_key),
-                    p(current.slug),
-                    p(id.0.clone()),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
-                    self.table("audit_events")
-                ),
-                params: vec![
-                    p(updated_at.0.clone()),
-                    p(json_encode(actor, "directory actor")?),
-                    p("directory.node.move"),
-                    p(format!("directory node {}", id.0)),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
-                    self.table("directory_fence")
-                ),
-                params: vec![p(current.org_id.0.clone())],
-            },
-        ];
-        self.backend
-            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision(&current.org_id)
+                    ),
+                    params: vec![
+                        p(parent_key.clone()),
+                        p(parent_key.clone()),
+                        p(updated_at.0.clone()),
+                        p(id.0.clone()),
+                        p(parent_key.clone()),
+                        p(parent_key.clone()),
+                        p(current.org_id.0.clone()),
+                        p(id.0.clone()),
+                        p(current.org_id.0.clone()),
+                        p(parent_key),
+                        p(current.slug),
+                        p(id.0.clone()),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                        self.table("audit_events")
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(json_encode(actor, "directory actor")?),
+                        p("directory.node.move"),
+                        p(format!("directory node {}", id.0)),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
+                        self.table("directory_fence")
+                    ),
+                    params: vec![p(current.org_id.0.clone())],
+                },
+            ];
+            transaction.execute_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
+            self.read_directory_revision_with(&current.org_id, |sql, params| {
+                transaction.query(sql, params)
+            })
+        })
     }
 
     fn archive_directory_node(
@@ -397,57 +478,73 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
-        let node = self
-            .directory_node(id)?
-            .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
-        if node.archived {
-            return self.directory_revision(&node.org_id);
-        }
-        let live_children = self.directory_children(&node.org_id, Some(id))?.1;
-        if !live_children.is_empty() {
-            return Err(RepositoryError::Conflict(
-                "a directory node with live children cannot be archived".into(),
-            ));
-        }
-        let nodes = self.table("directory_nodes");
-        let fence = self.table("directory_fence");
-        let writes = [
-            SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
-                params: vec![p(node.org_id.0.clone())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {nodes} SET archived = 1, updated_at = ? \
+        self.with_policy_transaction(|transaction, _| {
+            let node = self
+                .read_directory_node_with(id, |sql, params| transaction.query(sql, params))?
+                .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: node.org_id.clone(),
+                }],
+                &[],
+            )?;
+            if node.archived {
+                return self.read_directory_revision_with(&node.org_id, |sql, params| {
+                    transaction.query(sql, params)
+                });
+            }
+            let live_children = self
+                .read_directory_children_with(&node.org_id, Some(id), |sql, params| {
+                    transaction.query(sql, params)
+                })?
+                .1;
+            if !live_children.is_empty() {
+                return Err(RepositoryError::Conflict(
+                    "a directory node with live children cannot be archived".into(),
+                ));
+            }
+            let nodes = self.table("directory_nodes");
+            let fence = self.table("directory_fence");
+            let writes = [
+                SqlWrite {
+                    sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                    params: vec![p(node.org_id.0.clone())],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {nodes} SET archived = 1, updated_at = ? \
                      WHERE id = ? AND archived = 0 \
                        AND NOT EXISTS (SELECT 1 FROM {nodes} child \
                            WHERE child.parent_id = ? AND child.archived = 0)"
-                ),
-                params: vec![p(updated_at.0.clone()), p(id.0.clone()), p(id.0.clone())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
-                    self.table("audit_events")
-                ),
-                params: vec![
-                    p(updated_at.0.clone()),
-                    p(json_encode(actor, "directory actor")?),
-                    p("directory.node.archive"),
-                    p(format!("directory node {}", id.0)),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
-                    self.table("directory_fence")
-                ),
-                params: vec![p(node.org_id.0.clone())],
-            },
-        ];
-        self.backend
-            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision(&node.org_id)
+                    ),
+                    params: vec![p(updated_at.0.clone()), p(id.0.clone()), p(id.0.clone())],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                        self.table("audit_events")
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(json_encode(actor, "directory actor")?),
+                        p("directory.node.archive"),
+                        p(format!("directory node {}", id.0)),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
+                        self.table("directory_fence")
+                    ),
+                    params: vec![p(node.org_id.0.clone())],
+                },
+            ];
+            transaction.execute_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
+            self.read_directory_revision_with(&node.org_id, |sql, params| {
+                transaction.query(sql, params)
+            })
+        })
     }
 
     fn restore_directory_node(
@@ -456,53 +553,65 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
-        let node = self
-            .directory_node(id)?
-            .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
-        if !node.archived {
-            return self.directory_revision(&node.org_id);
-        }
-        let nodes = self.table("directory_nodes");
-        let fence = self.table("directory_fence");
-        let writes = [
-            SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
-                params: vec![p(node.org_id.0.clone())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {nodes} SET archived = 0, updated_at = ? \
+        self.with_policy_transaction(|transaction, _| {
+            let node = self
+                .read_directory_node_with(id, |sql, params| transaction.query(sql, params))?
+                .ok_or_else(|| RepositoryError::NotFound(format!("directory node {}", id.0)))?;
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: node.org_id.clone(),
+                }],
+                &[],
+            )?;
+            if !node.archived {
+                return self.read_directory_revision_with(&node.org_id, |sql, params| {
+                    transaction.query(sql, params)
+                });
+            }
+            let nodes = self.table("directory_nodes");
+            let fence = self.table("directory_fence");
+            let writes = [
+                SqlWrite {
+                    sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                    params: vec![p(node.org_id.0.clone())],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {nodes} SET archived = 0, updated_at = ? \
                      WHERE id = ? AND archived = 1 \
                        AND (parent_id = '' OR EXISTS (SELECT 1 FROM {nodes} parent \
                          WHERE parent.id = {nodes}.parent_id \
                            AND parent.org_id = ? AND parent.archived = 0))"
-                ),
-                params: vec![
-                    p(updated_at.0.clone()),
-                    p(id.0.clone()),
-                    p(node.org_id.0.clone()),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
-                    self.table("audit_events")
-                ),
-                params: vec![
-                    p(updated_at.0.clone()),
-                    p(json_encode(actor, "directory actor")?),
-                    p("directory.node.restore"),
-                    p(format!("directory node {}", id.0)),
-                ],
-            },
-            SqlWrite {
-                sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
-                params: vec![p(node.org_id.0.clone())],
-            },
-        ];
-        self.backend
-            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision(&node.org_id)
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(id.0.clone()),
+                        p(node.org_id.0.clone()),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                        self.table("audit_events")
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(json_encode(actor, "directory actor")?),
+                        p("directory.node.restore"),
+                        p(format!("directory node {}", id.0)),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
+                    params: vec![p(node.org_id.0.clone())],
+                },
+            ];
+            transaction.execute_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
+            self.read_directory_revision_with(&node.org_id, |sql, params| {
+                transaction.query(sql, params)
+            })
+        })
     }
 
     fn update_directory_node(
@@ -514,79 +623,93 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
-        let current = self
-            .directory_node(id)?
-            .filter(|node| !node.archived)
-            .ok_or_else(|| RepositoryError::NotFound(format!("live directory node {}", id.0)))?;
-        let mut updated = current.clone();
-        updated.name = name.to_owned();
-        updated.slug = slug.to_owned();
-        updated.description = description.map(str::to_owned);
-        updated.updated_at = updated_at.clone();
-        updated
-            .validate()
-            .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
-        if updated.name == current.name
-            && updated.slug == current.slug
-            && updated.description == current.description
-        {
-            return self.directory_revision(&current.org_id);
-        }
+        self.with_policy_transaction(|transaction, _| {
+            let current = self
+                .read_directory_node_with(id, |sql, params| transaction.query(sql, params))?
+                .filter(|node| !node.archived)
+                .ok_or_else(|| {
+                    RepositoryError::NotFound(format!("live directory node {}", id.0))
+                })?;
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: current.org_id.clone(),
+                }],
+                &[],
+            )?;
+            let mut updated = current.clone();
+            updated.name = name.to_owned();
+            updated.slug = slug.to_owned();
+            updated.description = description.map(str::to_owned);
+            updated.updated_at = updated_at.clone();
+            updated
+                .validate()
+                .map_err(|error| RepositoryError::Conflict(error.to_string()))?;
+            if updated.name == current.name
+                && updated.slug == current.slug
+                && updated.description == current.description
+            {
+                return self.read_directory_revision_with(&current.org_id, |sql, params| {
+                    transaction.query(sql, params)
+                });
+            }
 
-        let nodes = self.table("directory_nodes");
-        let writes = [
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET revision = revision WHERE org_id = ?",
-                    self.table("directory_fence")
-                ),
-                params: vec![p(current.org_id.0.clone())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {nodes} SET name = ?, slug = ?, description = ?, updated_at = ? \
+            let nodes = self.table("directory_nodes");
+            let writes = [
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {} SET revision = revision WHERE org_id = ?",
+                        self.table("directory_fence")
+                    ),
+                    params: vec![p(current.org_id.0.clone())],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {nodes} SET name = ?, slug = ?, description = ?, updated_at = ? \
                      WHERE id = ? AND archived = 0 \
                        AND NOT EXISTS (SELECT 1 FROM {nodes} sibling \
                          WHERE sibling.org_id = ? AND sibling.parent_id = ? \
                            AND sibling.slug = ? AND sibling.id <> ?)"
-                ),
-                params: vec![
-                    p(name.to_owned()),
-                    p(slug.to_owned()),
-                    description.map(str::to_owned),
-                    p(updated_at.0.clone()),
-                    p(id.0.clone()),
-                    p(current.org_id.0.clone()),
-                    p(current
-                        .parent_id
-                        .map_or_else(String::new, |parent| parent.0)),
-                    p(slug.to_owned()),
-                    p(id.0.clone()),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
-                    self.table("audit_events")
-                ),
-                params: vec![
-                    p(updated_at.0.clone()),
-                    p(json_encode(actor, "directory actor")?),
-                    p("directory.node.update"),
-                    p(format!("directory node {}", id.0)),
-                ],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
-                    self.table("directory_fence")
-                ),
-                params: vec![p(current.org_id.0.clone())],
-            },
-        ];
-        self.backend
-            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
-        self.directory_revision(&current.org_id)
+                    ),
+                    params: vec![
+                        p(name.to_owned()),
+                        p(slug.to_owned()),
+                        description.map(str::to_owned),
+                        p(updated_at.0.clone()),
+                        p(id.0.clone()),
+                        p(current.org_id.0.clone()),
+                        p(current
+                            .parent_id
+                            .map_or_else(String::new, |parent| parent.0)),
+                        p(slug.to_owned()),
+                        p(id.0.clone()),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                        self.table("audit_events")
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(json_encode(actor, "directory actor")?),
+                        p("directory.node.update"),
+                        p(format!("directory node {}", id.0)),
+                    ],
+                },
+                SqlWrite {
+                    sql: format!(
+                        "UPDATE {} SET revision = revision + 1 WHERE org_id = ?",
+                        self.table("directory_fence")
+                    ),
+                    params: vec![p(current.org_id.0.clone())],
+                },
+            ];
+            transaction.execute_checked(&writes, &[(0, 1), (1, 1), (2, 1), (3, 1)])?;
+            self.read_directory_revision_with(&current.org_id, |sql, params| {
+                transaction.query(sql, params)
+            })
+        })
     }
 
     fn set_product_space_placement_status(
@@ -597,110 +720,146 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         updated_at: &Timestamp,
         actor: &PrincipalRef,
     ) -> RepositoryResult<u64> {
-        let placement = self
-            .product_space_placement(org_id, product_space)?
-            .ok_or_else(|| RepositoryError::NotFound("product-space placement".into()))?;
-        let node = self
-            .directory_node(&placement.node_id)?
-            .ok_or_else(|| RepositoryError::Backend("placement points to a missing node".into()))?;
-        let restore_node = status == ProductSpacePlacementStatus::Active && node.archived;
-        if placement.status == status && !restore_node {
-            return self.directory_revision(org_id);
-        }
+        let result = self.with_policy_transaction(|transaction, _| {
+            self.ensure_scope_admission(
+                transaction,
+                &[ScopeRef::Org {
+                    org_id: org_id.clone(),
+                }],
+                &[],
+            )?;
 
-        let desired = match status {
-            ProductSpacePlacementStatus::Active => "active",
-            ProductSpacePlacementStatus::Retired => "retired",
-        };
-        let current = match placement.status {
-            ProductSpacePlacementStatus::Active => "active",
-            ProductSpacePlacementStatus::Retired => "retired",
-        };
-        let bindings = self.table("product_space_bindings");
-        let nodes = self.table("directory_nodes");
-        let fence = self.table("directory_fence");
-        let mut writes = vec![SqlWrite {
-            sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
-            params: vec![p(org_id.0.clone())],
-        }];
-        if placement.status != status {
-            writes.push(SqlWrite {
-                sql: format!(
-                    "UPDATE {bindings} SET status = ? \
+            let placement = self
+                .read_placement_with(org_id, product_space, |sql, params| {
+                    transaction.query(sql, params)
+                })?
+                .ok_or_else(|| RepositoryError::NotFound("product-space placement".into()))?;
+            let node = self
+                .read_directory_node_with(&placement.node_id, |sql, params| {
+                    transaction.query(sql, params)
+                })?
+                .ok_or_else(|| {
+                    RepositoryError::Backend("placement points to a missing node".into())
+                })?;
+            let restore_node = status == ProductSpacePlacementStatus::Active && node.archived;
+            if placement.status == status && !restore_node {
+                return self.read_directory_revision_with(org_id, |sql, params| {
+                    transaction.query(sql, params)
+                });
+            }
+
+            let desired = match status {
+                ProductSpacePlacementStatus::Active => "active",
+                ProductSpacePlacementStatus::Retired => "retired",
+            };
+            let current = match placement.status {
+                ProductSpacePlacementStatus::Active => "active",
+                ProductSpacePlacementStatus::Retired => "retired",
+            };
+            let bindings = self.table("product_space_bindings");
+            let nodes = self.table("directory_nodes");
+            let fence = self.table("directory_fence");
+            let mut writes = vec![SqlWrite {
+                sql: format!("UPDATE {fence} SET revision = revision WHERE org_id = ?"),
+                params: vec![p(org_id.0.clone())],
+            }];
+            if placement.status != status {
+                writes.push(SqlWrite {
+                    sql: format!(
+                        "UPDATE {bindings} SET status = ? \
                      WHERE org_id = ? AND product = ? AND space_id = ? AND status = ?"
-                ),
-                params: vec![
-                    p(desired.to_owned()),
-                    p(org_id.0.clone()),
-                    p(product_space.product_id.as_str().to_owned()),
-                    p(product_space.space_id.clone()),
-                    p(current.to_owned()),
-                ],
-            });
-        }
-        if restore_node {
-            writes.push(SqlWrite {
-                sql: format!(
-                    "UPDATE {nodes} SET archived = 0, updated_at = ? \
+                    ),
+                    params: vec![
+                        p(desired.to_owned()),
+                        p(org_id.0.clone()),
+                        p(product_space.product_id.as_str().to_owned()),
+                        p(product_space.space_id.clone()),
+                        p(current.to_owned()),
+                    ],
+                });
+            }
+            if restore_node {
+                writes.push(SqlWrite {
+                    sql: format!(
+                        "UPDATE {nodes} SET archived = 0, updated_at = ? \
                      WHERE id = ? AND org_id = ? AND archived = 1 \
                        AND (parent_id = '' OR EXISTS (SELECT 1 FROM {nodes} parent \
                          WHERE parent.id = {nodes}.parent_id \
                            AND parent.org_id = ? AND parent.archived = 0))"
+                    ),
+                    params: vec![
+                        p(updated_at.0.clone()),
+                        p(node.id.0.clone()),
+                        p(org_id.0.clone()),
+                        p(org_id.0.clone()),
+                    ],
+                });
+            }
+            writes.push(SqlWrite {
+                sql: format!(
+                    "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
+                    self.table("audit_events")
                 ),
                 params: vec![
                     p(updated_at.0.clone()),
-                    p(node.id.0.clone()),
-                    p(org_id.0.clone()),
-                    p(org_id.0.clone()),
+                    p(json_encode(actor, "directory actor")?),
+                    p(match status {
+                        ProductSpacePlacementStatus::Active => "directory.product-space.activate",
+                        ProductSpacePlacementStatus::Retired => "directory.product-space.retire",
+                    }),
+                    p(format!(
+                        "product space {}/{}",
+                        product_space.product_id, product_space.space_id
+                    )),
                 ],
             });
-        }
-        writes.push(SqlWrite {
-            sql: format!(
-                "INSERT INTO {} (at, actor, action, detail) VALUES (?, ?j, ?, ?)",
-                self.table("audit_events")
-            ),
-            params: vec![
-                p(updated_at.0.clone()),
-                p(json_encode(actor, "directory actor")?),
-                p(match status {
-                    ProductSpacePlacementStatus::Active => "directory.product-space.activate",
-                    ProductSpacePlacementStatus::Retired => "directory.product-space.retire",
-                }),
-                p(format!(
-                    "product space {}/{}",
-                    product_space.product_id, product_space.space_id
-                )),
-            ],
+            writes.push(SqlWrite {
+                sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
+                params: vec![p(org_id.0.clone())],
+            });
+            let required = (0..writes.len())
+                .map(|index| (index, 1))
+                .collect::<Vec<_>>();
+            transaction.execute_checked(&writes, &required)?;
+            self.read_directory_revision_with(org_id, |sql, params| transaction.query(sql, params))
         });
-        writes.push(SqlWrite {
-            sql: format!("UPDATE {fence} SET revision = revision + 1 WHERE org_id = ?"),
-            params: vec![p(org_id.0.clone())],
-        });
-        let required = (0..writes.len())
-            .map(|index| (index, 1))
-            .collect::<Vec<_>>();
-        match self.backend.execute_transaction_checked(&writes, &required) {
-            Ok(_) => self.directory_revision(org_id),
+        match result {
             Err(error @ RepositoryError::Conflict(_)) => {
-                // Another process may have won the identical lifecycle
-                // transition after our read but before the Org-fenced write.
-                // Re-read durable truth and converge only when every requested
-                // effect is already present; unrelated conflicts still fail.
-                let converged = self
-                    .product_space_placement(org_id, product_space)?
-                    .is_some_and(|current| current.status == status)
-                    && (status == ProductSpacePlacementStatus::Retired
-                        || self
-                            .directory_node(&placement.node_id)?
-                            .is_some_and(|current| !current.archived));
-                if converged {
-                    self.directory_revision(org_id)
-                } else {
-                    Err(error)
-                }
+                self.with_policy_transaction(|transaction, _| {
+                    self.ensure_scope_admission(
+                        transaction,
+                        &[ScopeRef::Org {
+                            org_id: org_id.clone(),
+                        }],
+                        &[],
+                    )?;
+                    // The original identical-transition recovery re-reads durable
+                    // facts in a NEW transaction after the failed one rolled back.
+                    let placement =
+                        self.read_placement_with(org_id, product_space, |sql, params| {
+                            transaction.query(sql, params)
+                        })?;
+                    let converged = if let Some(placement) = placement {
+                        placement.status == status
+                            && (status == ProductSpacePlacementStatus::Retired
+                                || self
+                                    .read_directory_node_with(&placement.node_id, |sql, params| {
+                                        transaction.query(sql, params)
+                                    })?
+                                    .is_some_and(|node| !node.archived))
+                    } else {
+                        false
+                    };
+                    if converged {
+                        self.read_directory_revision_with(org_id, |sql, params| {
+                            transaction.query(sql, params)
+                        })
+                    } else {
+                        Err(error)
+                    }
+                })
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 
@@ -709,46 +868,20 @@ impl<B: SqlConn> DirectoryRepository for SqlStore<B> {
         org_id: &OrgId,
         product_space: &ProductSpaceRef,
     ) -> RepositoryResult<Option<ProductSpacePlacement>> {
-        let sql = format!(
-            "SELECT product, space_id, org_id, node_id, status FROM {} \
-             WHERE org_id = ? AND product = ? AND space_id = ?",
-            self.table("product_space_bindings")
-        );
-        self.backend
-            .query(
-                &sql,
-                &[
-                    p(org_id.0.clone()),
-                    p(product_space.product_id.as_str().to_owned()),
-                    p(product_space.space_id.clone()),
-                ],
-            )?
-            .first()
-            .map(decode_product_space_placement)
-            .transpose()
+        self.read_placement_with(org_id, product_space, |sql, params| {
+            self.backend.query(sql, params)
+        })
     }
 
     fn directory_revision(&self, org_id: &OrgId) -> RepositoryResult<u64> {
-        let sql = format!(
-            "SELECT CAST(revision AS TEXT) FROM {} WHERE org_id = ?",
-            self.table("directory_fence")
-        );
-        let rows = self.backend.query(&sql, &[p(org_id.0.clone())])?;
-        let revision = rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(Option::as_deref);
-        revision.map_or(Ok(1), |revision| {
-            revision.parse().map_err(|error| {
-                RepositoryError::Backend(format!("invalid directory revision: {error}"))
-            })
-        })
+        self.read_directory_revision_with(org_id, |sql, params| self.backend.query(sql, params))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqlTransaction;
     use awaken_iam_core::{AuditSink, OrgRepository, Organization};
 
     #[derive(Debug, Clone)]
@@ -770,18 +903,38 @@ mod tests {
             self.inner.query(sql, params)
         }
 
-        fn execute_transaction(&self, writes: &[SqlWrite]) -> RepositoryResult<Vec<u64>> {
-            self.inner.execute_transaction(writes)
-        }
-
-        fn execute_transaction_checked(
+        fn with_transaction(
             &self,
+            operation: &mut (dyn FnMut(&mut dyn SqlTransaction) -> RepositoryResult<()> + Send),
+        ) -> RepositoryResult<()> {
+            self.inner.with_transaction(&mut |transaction| {
+                operation(&mut FailingCheckedWrites {
+                    transaction,
+                    fail_at: self.fail_at,
+                })
+            })
+        }
+    }
+
+    struct FailingCheckedWrites<'a> {
+        transaction: &'a mut dyn SqlTransaction,
+        fail_at: usize,
+    }
+    impl SqlTransaction for FailingCheckedWrites<'_> {
+        fn execute(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
+            self.transaction.execute(sql, params)
+        }
+        fn query(&mut self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
+            self.transaction.query(sql, params)
+        }
+        fn execute_checked(
+            &mut self,
             writes: &[SqlWrite],
             required: &[(usize, u64)],
         ) -> RepositoryResult<Vec<u64>> {
             let mut writes = writes.to_vec();
             writes[self.fail_at].sql = "invalid SQL injected by Directory rollback test".into();
-            self.inner.execute_transaction_checked(&writes, required)
+            self.transaction.execute_checked(&writes, required)
         }
     }
 
@@ -801,6 +954,9 @@ mod tests {
         // W2 Org mutex, W3 node, W4 placement, W5 audit, W6 revision, inject one
         // backend failure -> no node, placement or Directory audit survives.
         // This traces the repository's all-or-nothing effect at every boundary.
+        // The injected checked-write context preserves EXACTLY W1–W6 after
+        // scoped admission moved into the same original native transaction;
+        // no old case/index/assertion is skipped or replaced.
         for fail_at in 0..6 {
             let backend = crate::SqliteBackend::open_in_memory().unwrap();
             let authoritative =

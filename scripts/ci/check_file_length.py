@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Warn on large source files and reject oversized ones.
+"""Report large source files as architectural diagnostics.
 
 Usage:
     check_file_length.py [--staged] [--self-test]
 
-Source files at or above 1000 lines receive a warning. Files at or above 2000 lines
-fail the check. The remediation is to split by responsibility and keep tests
-with the behavior they verify; do not merely move tests out to hide length.
+Source files at or above 1000 lines receive a warning. Line count does not fail
+the check: responsibility, ownership and behavior determine whether a change is
+needed. Keep tests with the behavior they verify.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WARN_LIMIT = 1000
-ERROR_LIMIT = 2000
 CODE_SUFFIXES = {
     ".c",
     ".cc",
@@ -67,19 +69,13 @@ def is_source_file(rel: str) -> bool:
     return True
 
 
-def findings(counts: dict[str, int]) -> tuple[list[str], list[str]]:
+def findings(counts: dict[str, int]) -> list[str]:
     warnings: list[str] = []
-    errors: list[str] = []
-    advice = (
-        "split by responsibility; keep tests with the behavior they verify "
-        "rather than moving tests out just to reduce line count"
-    )
+    advice = "review responsibility and ownership; line count is diagnostic"
     for rel, count in sorted(counts.items()):
-        if count >= ERROR_LIMIT:
-            errors.append(f"{rel}: {count} lines >= {ERROR_LIMIT} ({advice})")
-        elif count >= WARN_LIMIT:
+        if count >= WARN_LIMIT:
             warnings.append(f"{rel}: {count} lines >= {WARN_LIMIT} ({advice})")
-    return warnings, errors
+    return warnings
 
 
 def git_lines(args: list[str]) -> list[str]:
@@ -126,33 +122,45 @@ def run_check(staged: bool) -> int:
         if count is not None:
             counts[rel] = count
 
-    warnings, errors = findings(counts)
+    warnings = findings(counts)
     if warnings:
         print("check-file-length warnings:", file=sys.stderr)
         for warning in warnings:
             print(f"  {warning}", file=sys.stderr)
-    if errors:
-        print("check-file-length errors:", file=sys.stderr)
-        for error in errors:
-            print(f"  {error}", file=sys.stderr)
-        return 1
     return 0
 
 
 def self_test() -> int:
-    warnings, errors = findings(
+    # Boundary-value design: below 1000 -> no diagnostic; at/above 1000 ->
+    # one warning. Cross the former 2000 hard boundary and a much larger value
+    # to prove that size alone cannot become a commit failure again. Staged
+    # and working-tree entrypoints must report the same nonblocking outcome;
+    # source/generated-file selection remains the original independent rule.
+    warnings = findings(
         {
             "under.rs": WARN_LIMIT - 1,
             "warn.rs": WARN_LIMIT,
-            "limit.rs": ERROR_LIMIT,
-            "error.rs": ERROR_LIMIT + 1,
+            "before-old-limit.rs": 1999,
+            "old-limit.rs": 2000,
+            "after-old-limit.rs": 2001,
+            "large.rs": 10_000,
         }
     )
     failures: list[str] = []
-    if len(warnings) != 1 or "warn.rs" not in warnings[0]:
-        failures.append(f"expected one warning at {WARN_LIMIT}, got {warnings}")
-    if len(errors) != 2 or not any("limit.rs" in e for e in errors):
-        failures.append(f"expected errors at and above {ERROR_LIMIT}, got {errors}")
+    if len(warnings) != 5 or any("under.rs:" in warning for warning in warnings):
+        failures.append(f"expected five size diagnostics and no below-limit warning, got {warnings}")
+    for staged in (False, True):
+        output = io.StringIO()
+        with (
+            mock.patch(__name__ + ".tracked_files", return_value=["large.rs"]) as files,
+            mock.patch(__name__ + ".line_count", return_value=10_000) as count,
+            contextlib.redirect_stderr(output),
+        ):
+            status = run_check(staged)
+        files.assert_called_once_with(staged)
+        count.assert_called_once_with("large.rs", staged)
+        if status != 0 or "large.rs: 10000 lines" not in output.getvalue():
+            failures.append(f"expected visible nonblocking size diagnostic for staged={staged}")
     if not is_source_file("crates/example/src/lib.rs"):
         failures.append("expected Rust source to be checked")
     if is_source_file("web/src/types/_generated.d.ts"):

@@ -317,6 +317,35 @@ fn grant_at_registered_resource_parent_covers_the_resource() {
 }
 
 #[test]
+fn retired_resource_denies_even_an_exact_manual_grant_after_snapshot_reload() {
+    let mut policy = PolicySet::new();
+    policy.add_grant(Grant {
+        id: GrantId("manual".into()),
+        subject: GrantSubject::Principal(account("ada")),
+        action_pattern: ActionPattern("issue.read".into()),
+        scope: resource_scope("issue", "42"),
+        effect: Effect::Allow,
+    });
+    let before = request(account("ada"), "issue.read", resource_scope("issue", "42"));
+    assert_eq!(
+        policy.evaluate(&before).decision,
+        AuthorizationDecision::Allow
+    );
+    policy
+        .scope_graph_mut()
+        .retire_resource(ResourceType("issue".into()), ResourceId("42".into()));
+    assert_eq!(
+        policy.evaluate(&before).decision,
+        AuthorizationDecision::Deny
+    );
+    let restored = PolicySet::from_snapshot(&policy.snapshot(7));
+    assert_eq!(
+        restored.evaluate(&before).decision,
+        AuthorizationDecision::Deny
+    );
+}
+
+#[test]
 fn arbitrarily_deep_resource_chain_resolves_to_root() {
     let mut policy = PolicySet::new();
     // comment:7 -> issue:42 -> project:web -> workspace:ws_main -> org:acme -> global
