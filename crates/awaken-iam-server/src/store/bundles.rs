@@ -164,6 +164,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "terminal organization privacy admission and exact receipts",
                     AUTHZ_0010,
                 ),
+                (
+                    11,
+                    "per-principal fences for atomic team access replacement",
+                    AUTHZ_0011,
+                ),
             ],
         ),
         bundle(
@@ -559,6 +564,15 @@ INSERT INTO {prefix}_orgs_erasure_upgrade (id,display_name,owner,created_at,upda
 DROP TABLE {prefix}_orgs;\n\
 ALTER TABLE {prefix}_orgs_erasure_upgrade RENAME TO {prefix}_orgs;";
 
+// One fence row per (Workspace, principal) team access owner (ADR-0018). The
+// key is a digest of both coordinates; the fenced command writes it in the
+// same policy transaction as the rosters it orders.
+const AUTHZ_0011: &str = "\
+CREATE TABLE {prefix}_principal_access_fences (\
+ fence_key TEXT PRIMARY KEY, \
+ generation BIGINT NOT NULL, \
+ plan_id TEXT NOT NULL);";
+
 // User-visible placement is independent from both the fixed compatibility
 // ScopeRef shapes and product business tables. An empty `parent_id` is the
 // portable SQL root sentinel, allowing any number of roots inside one immutable
@@ -773,7 +787,13 @@ mod tests {
             // either old receipt, and an exact retry below must apply no migration.
             let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             let privacy = backend.run_migrations("iam", &super::bundles()).unwrap();
-            assert_eq!(privacy.len(), 1, "only appended privacy step applies");
+            // migration-allow-edit: only this test count changes because authz
+            // 11 is appended after privacy; no shipped SQL body is edited.
+            assert_eq!(
+                privacy.len(),
+                2,
+                "only the appended privacy and principal-access steps apply"
+            );
             let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             assert!(current_receipts.contains_key(&10));
             for version in [8, 9] {

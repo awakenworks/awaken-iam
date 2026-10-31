@@ -20,6 +20,8 @@ pub use resource_authorization::{
 
 use serde::{Deserialize, Serialize};
 
+mod principal_access;
+pub use principal_access::{AccessFence, TeamAccessReceipt, TeamAccessReplacement};
 mod profile;
 pub use profile::{
     ActionScopeRule, ActivateAuthorizationProfile, AuthorizationProfile,

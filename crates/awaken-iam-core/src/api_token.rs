@@ -418,6 +418,30 @@ fn render_token(prefix: &str, secret: &str) -> String {
 ///
 /// Accepts both `sk-awaken-` (current) and `sk-ant-` (legacy deprecation window)
 /// so operators can rotate existing tokens without a hard cutover.
+/// Authenticate a presented token against a durable repository with the same
+/// rules as [`ApiTokenDirectory::authenticate`]. `Ok(None)` covers every
+/// refusal (unparseable, unknown, wrong secret, revoked, expired) so callers
+/// cannot probe which tokens exist; only storage failures are errors.
+pub fn authenticate_stored_api_token<R: crate::ApiTokenRepository + ?Sized>(
+    repository: &R,
+    presented: &str,
+    now: &Timestamp,
+) -> crate::RepositoryResult<Option<ApiToken>> {
+    let Some((prefix, secret)) = parse_presented_token(presented) else {
+        return Ok(None);
+    };
+    let Some(token) = repository.get_by_prefix(&prefix)? else {
+        return Ok(None);
+    };
+    let live = verify_secret_argon2(&secret, &token.secret_hash)
+        && token.revoked_at.is_none()
+        && token
+            .expires_at
+            .as_ref()
+            .is_none_or(|expires_at| now.0 < expires_at.0);
+    Ok(live.then_some(token))
+}
+
 pub fn parse_presented_token(presented: &str) -> Option<(ApiTokenPrefix, String)> {
     let body = presented
         .strip_prefix(TOKEN_SCHEME)

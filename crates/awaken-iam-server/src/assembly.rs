@@ -198,6 +198,8 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/admin/authz/profiles"),
     RouteSpec::get("/v1/admin/authz/profiles/{namespace}"),
     RouteSpec::get("/v1/admin/authz/profiles/{namespace}/active"),
+    RouteSpec::post("/v1/admin/principal-access/team-replacements"),
+    RouteSpec::get("/v1/admin/principal-access/profiles/{namespace}"),
     RouteSpec::get("/v1/admin/authz/profiles/{namespace}/{revision}"),
     RouteSpec::post("/v1/admin/authz/profiles/{namespace}/{revision}/validate"),
     RouteSpec::post("/v1/admin/authz/profiles/{namespace}/{revision}/activate"),

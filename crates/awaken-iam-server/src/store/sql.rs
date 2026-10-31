@@ -43,6 +43,7 @@ mod admission;
 mod directory;
 mod identity_rows;
 mod invitations;
+mod principal_access;
 mod privacy;
 mod profiles;
 mod projections;

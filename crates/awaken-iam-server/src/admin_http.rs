@@ -44,11 +44,13 @@
 //! seam is exposed over HTTP only by the standalone daemon.
 
 mod oauth_clients;
+mod principal_access;
 mod resource_provisioning;
 use oauth_clients::{
     deregister_oauth_client, get_oauth_client, list_oauth_clients, register_oauth_client,
     replace_oauth_client_token_exchange, rotate_oauth_client_secret,
 };
+pub use principal_access::principal_access_router;
 pub use resource_provisioning::projection_router;
 use resource_provisioning::provision_resource;
 

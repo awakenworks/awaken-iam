@@ -31,7 +31,8 @@ use std::collections::hash_map::Entry;
 
 pub use api_token::{
     ApiTokenDirectory, ApiTokenMinter, IssuedApiToken, IssuedServiceAccountToken, MintApiToken,
-    ServiceAccountTokenError, parse_presented_token, revoke_api_tokens_for_principal,
+    ServiceAccountTokenError, authenticate_stored_api_token, parse_presented_token,
+    revoke_api_tokens_for_principal,
 };
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,

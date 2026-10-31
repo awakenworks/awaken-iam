@@ -33,9 +33,13 @@ pub use access_token::{
     ed25519_public_jwk, verify_access_token, verify_active_access_token,
     verify_delegated_access_token, verify_signed_claims,
 };
-pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi, PolicyStore};
+pub use admin_api::{
+    ACTION_AUTHZ_PROFILE_READ, ACTION_PRINCIPAL_ACCESS_REPLACE, AdminError, AdminResult,
+    DomainEvent, PolicyAdminApi, PolicyStore, PrincipalAccessStore, TEAM_ACCESS_REPLACED,
+};
 pub use admin_http::{
-    AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router, projection_router,
+    AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router, principal_access_router,
+    projection_router,
 };
 pub use anthropic_admin::{
     ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,

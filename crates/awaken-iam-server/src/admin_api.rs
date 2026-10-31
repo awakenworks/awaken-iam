@@ -34,8 +34,17 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
+mod principal_access;
 mod privacy;
 mod provisioning;
+pub use principal_access::{
+    ACTION_AUTHZ_PROFILE_READ, ACTION_PRINCIPAL_ACCESS_REPLACE, PrincipalAccessStore,
+    TEAM_ACCESS_REPLACED,
+};
+pub(crate) use principal_access::{
+    TeamAccessCurrent, fence_key, plan_team_access, receipt as team_access_receipt,
+    suspension_grant, workspace_scope,
+};
 pub(crate) use privacy::organization_erasure_audit;
 pub use provisioning::ResourceProvisioningStore;
 

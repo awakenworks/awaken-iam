@@ -77,6 +77,7 @@ struct Authz {
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
+    principal_access_fences: BTreeMap<String, awaken_iam_contract::AccessFence>,
 }
 
 #[derive(Default)]
@@ -1177,6 +1178,67 @@ impl PlanRepository for InMemoryStore {
             .subscriptions
             .get(&key)
             .cloned())
+    }
+}
+
+impl crate::PrincipalAccessStore for InMemoryStore {
+    fn replace_team_access(
+        &self,
+        command: &awaken_iam_contract::TeamAccessReplacement,
+        at: &Timestamp,
+        audit: AuditEvent,
+    ) -> RepositoryResult<awaken_iam_contract::TeamAccessReceipt> {
+        let key = crate::admin_api::fence_key(command)?;
+        let deny = crate::admin_api::suspension_grant(command)?;
+        let mut authz = checked_lock(&self.authz, "authz")?;
+        let workspace_org = authz
+            .workspace_orgs
+            .get(&command.workspace_id.0)
+            .map(|edge| edge.org_id.clone());
+        let mut scopes = vec![crate::admin_api::workspace_scope(command)];
+        scopes.extend(workspace_org.clone().map(|org_id| ScopeRef::Org { org_id }));
+        let existing: Vec<String> = command
+            .managed
+            .iter()
+            .filter(|id| authz.groups.contains_key(*id))
+            .cloned()
+            .collect();
+        ensure_admitted(&authz, &scopes, &existing)?;
+        let current = crate::admin_api::TeamAccessCurrent {
+            groups: command
+                .managed
+                .iter()
+                .map(|id| (id.clone(), authz.groups.get(id).cloned()))
+                .collect(),
+            suspended: authz.grants.contains_key(&deny.id.0),
+            fence: authz.principal_access_fences.get(&key).cloned(),
+            workspace_org,
+        };
+        let plan = crate::admin_api::plan_team_access(command, &current, at)?;
+        let mut audits = checked_lock(&self.audit, "audit")?;
+        let mut fence = checked_lock(&self.fence, "fence")?;
+        for group in &plan.groups {
+            authz.groups.insert(group.id.0.clone(), group.clone());
+        }
+        match plan.suspension {
+            Some(true) => {
+                authz.grants.insert(deny.id.0.clone(), deny);
+            }
+            Some(false) => {
+                authz.grants.remove(&deny.id.0);
+            }
+            None => {}
+        }
+        authz
+            .principal_access_fences
+            .insert(key, command.fence.clone());
+        audits.push(audit);
+        fence.version += 1;
+        Ok(crate::admin_api::team_access_receipt(
+            command,
+            &plan,
+            fence.version,
+        ))
     }
 }
 
