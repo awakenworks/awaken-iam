@@ -1,0 +1,7 @@
+# Check out every text file with LF, independent of core.autocrlf.
+#
+# rustfmt.toml pins newline_style = "Unix", and migration checksums are
+# computed over exact bytes: `include_str!` embeds a SQL fixture verbatim, so a
+# CRLF checkout would change a recorded migration checksum on Windows.
+* text=auto eol=lf
+*.sql text eol=lf
