@@ -34,13 +34,13 @@ mod remote;
 mod time;
 
 pub use config::{HostConfig, HostConfigError, HostMode};
-pub use gate::{AuthReject, IamGate, LocalIamState};
+pub use gate::{AuthReject, IamGate, LocalIamState, VerifiedBearer};
 pub use local::{EmbedError, LocalHandle, embed_local};
 pub use local_browser::{
     LocalBrowserAuth, LocalBrowserAuthError, LocalSetupHandoff, local_browser_router,
 };
 pub use middleware::{
-    AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenWorkspace, auth_layer,
+    AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenActor, TokenWorkspace, auth_layer,
 };
 pub use remote::{ConnectError, RemoteHandle, connect_remote};
 
@@ -49,6 +49,7 @@ pub use awaken_iam_client::{IamClient, IamClientMode, RemoteIamClient};
 pub use awaken_iam_contract::{ActionKey, JsonWebKey, Jwks, PrincipalRef, ScopeRef, WorkspaceId};
 pub use awaken_iam_server::AuthzApi;
 pub use awaken_iam_server::{
-    AccessTokenAuthority, AccessTokenClaims, AccessTokenError, AccessTokenRevocations,
-    AccessTokenSubjectKind, LocalSeedSigner, verify_access_token, verify_active_access_token,
+    AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
+    AccessTokenRevocations, AccessTokenSubjectKind, LocalSeedSigner, verify_access_token,
+    verify_active_access_token,
 };

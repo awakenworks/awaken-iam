@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use awaken_iam_contract::{JsonWebKey, Jwks};
+use awaken_iam_contract::{AccountId, JsonWebKey, Jwks, PrincipalRef};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, VerifyingKey};
@@ -164,6 +164,39 @@ impl AccessTokenSubjectKind {
     fn is_account(&self) -> bool {
         *self == Self::Account
     }
+
+    /// Project an identifier of this kind into the contract principal shape.
+    pub fn principal(self, id: impl Into<String>) -> PrincipalRef {
+        match self {
+            Self::Account => PrincipalRef::Account {
+                account_id: AccountId(id.into()),
+            },
+            Self::Service => PrincipalRef::Service {
+                service_id: id.into(),
+            },
+        }
+    }
+}
+
+/// RFC 8693 §4.1 `act` claim: the party currently acting on behalf of `sub`.
+///
+/// IAM issues exactly one delegation level. Unknown members — in particular a
+/// nested `act` chain — are refused at decode time, so a verifier can never
+/// silently drop a prior actor it does not understand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessTokenActor {
+    /// Identifier of the acting principal.
+    pub sub: String,
+    /// Principal category of the actor; always explicit on the wire.
+    pub subject_kind: AccessTokenSubjectKind,
+}
+
+impl AccessTokenActor {
+    /// The acting principal in contract form.
+    pub fn principal(&self) -> PrincipalRef {
+        self.subject_kind.principal(self.sub.clone())
+    }
 }
 
 /// Claims carried in an access-token JWT payload (a subset of RFC 7519).
@@ -187,6 +220,22 @@ pub struct AccessTokenClaims {
     /// Granted scopes; omitted from the wire form when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
+    /// RFC 8693 actor for a delegated token; absent for a direct credential,
+    /// so every token minted before delegation existed decodes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<AccessTokenActor>,
+}
+
+impl AccessTokenClaims {
+    /// The subject (`sub` + `subject_kind`) in contract principal form.
+    pub fn principal(&self) -> PrincipalRef {
+        self.subject_kind.principal(self.sub.clone())
+    }
+
+    /// The delegated actor in contract principal form, when present.
+    pub fn actor_principal(&self) -> Option<PrincipalRef> {
+        self.act.as_ref().map(AccessTokenActor::principal)
+    }
 }
 
 /// Errors raised while minting or verifying access tokens.
@@ -642,7 +691,64 @@ mod tests {
             iat: 1_899_996_400,
             jti: jti.into(),
             scope: vec!["pack.read".into()],
+            act: None,
         }
+    }
+
+    /// Wire compatibility decision table for the RFC 8693 `act` claim:
+    ///
+    /// | act on claims | encoded payload | decoded by verifier |
+    /// |---|---|---|
+    /// | none | no `act` member (byte-compatible with older tokens) | `act == None` |
+    /// | single service actor | `act: {sub, subject_kind: "service"}` | same actor |
+    /// | nested `act` inside the actor | n/a (IAM never mints it) | `Malformed`, fail closed |
+    #[tokio::test]
+    async fn act_claim_is_optional_single_level_and_round_trips() {
+        let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(4)));
+        let jwks = authority.jwks();
+
+        let direct = authority.mint(&claims("jti-direct")).await.unwrap();
+        let payload = String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(direct.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!payload.contains("\"act\""));
+        assert_eq!(verify_access_token(&direct, &jwks).unwrap().act, None);
+
+        let mut delegated = claims("jti-delegated");
+        delegated.act = Some(AccessTokenActor {
+            sub: "business-service".into(),
+            subject_kind: AccessTokenSubjectKind::Service,
+        });
+        let token = authority.mint(&delegated).await.unwrap();
+        let recovered = verify_access_token(&token, &jwks).unwrap();
+        assert_eq!(recovered, delegated);
+        assert_eq!(
+            recovered.actor_principal(),
+            Some(PrincipalRef::Service {
+                service_id: "business-service".into()
+            })
+        );
+        assert_eq!(
+            recovered.principal(),
+            PrincipalRef::Account {
+                account_id: AccountId("acct_1".into())
+            }
+        );
+
+        let nested = serde_json::json!({
+            "iss": "https://iam.example", "sub": "acct_1", "aud": "flow",
+            "exp": 1_900_000_000, "iat": 1_899_999_000, "jti": "jti-nested",
+            "act": {"sub": "svc-a", "subject_kind": "service",
+                    "act": {"sub": "svc-b", "subject_kind": "service"}}
+        });
+        let forged = authority.sign_jwt(ACCESS_TOKEN_TYP, &nested).await.unwrap();
+        assert_eq!(
+            verify_access_token(&forged, &jwks).unwrap_err(),
+            AccessTokenError::Malformed
+        );
     }
 
     /// A [`Signer`] defined outside the `access_token` module's own machinery,

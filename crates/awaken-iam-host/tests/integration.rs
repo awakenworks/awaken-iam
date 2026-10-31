@@ -9,8 +9,9 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{MintApiToken, RoleId};
 use awaken_iam_host::{
-    AccessTokenAuthority, AccessTokenClaims, AccessTokenSubjectKind, HostConfig, IamGate,
-    LocalSeedSigner, RouteActions, auth_layer, embed_local, verify_access_token,
+    AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenSubjectKind, HostConfig,
+    IamGate, LocalSeedSigner, RouteActions, TokenActor, auth_layer, embed_local,
+    verify_access_token,
 };
 use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
 use tower::ServiceExt;
@@ -224,6 +225,7 @@ fn make_claims(exp: i64) -> AccessTokenClaims {
         iat: NOW_UNIX - 60,
         jti: "jti_test_1".into(),
         scope: vec![],
+        act: None,
     }
 }
 
@@ -510,6 +512,7 @@ async fn middleware_expired_jwt_returns_401_with_real_clock() {
         iat: 0,
         jti: "jti_expired".into(),
         scope: vec![],
+        act: None,
     };
     let expired_token = authority.mint(&claims).await.expect("mint");
 
@@ -884,4 +887,133 @@ fn authenticate_detailed_surfaces_reject_reasons() {
             .is_ok(),
         "the bootstrap admin authenticates"
     );
+}
+
+// ── RFC 8693 delegation: `act` exposure and conjunctive authorization ────────
+
+/// Cause/effect decision table for delegated JWTs at the gate:
+///
+/// | token `act` | gate audience | effect |
+/// |---|---|---|
+/// | none | matching | principal = sub, actor = None, direct authorization request |
+/// | service actor | matching | principal = sub, actor = service, request = actor on_behalf_of [sub] |
+/// | service actor | different | Invalid (exact audience, act grants nothing extra) |
+#[tokio::test]
+async fn gate_exposes_the_delegation_actor_and_authorizes_conjunctively() {
+    let cfg = HostConfig::local_in_memory()
+        .with_seal_key(JWT_SEED)
+        .with_audience("https://api.example.com");
+    let handle = embed_local(&cfg).expect("embed_local");
+    let authority = handle.jwt_authority.as_ref().expect("jwt_authority");
+    let ts = now_ts();
+
+    let direct = authority
+        .mint(&make_claims(NOW_UNIX + 300))
+        .await
+        .expect("mint");
+    let verified = handle
+        .gate
+        .authenticate_verified(&direct, &ts, NOW_UNIX)
+        .expect("direct token verifies");
+    assert_eq!(verified.actor, None);
+    let action = ActionKey("flow.write".into());
+    assert!(
+        verified
+            .authorization_request(action.clone(), ScopeRef::Global)
+            .on_behalf_of
+            .is_empty()
+    );
+
+    let mut delegated = make_claims(NOW_UNIX + 300);
+    delegated.act = Some(AccessTokenActor {
+        sub: "business-service".into(),
+        subject_kind: AccessTokenSubjectKind::Service,
+    });
+    let token = authority.mint(&delegated).await.expect("mint");
+    let verified = handle
+        .gate
+        .authenticate_verified(&token, &ts, NOW_UNIX)
+        .expect("delegated token verifies");
+    let user = PrincipalRef::Account {
+        account_id: AccountId("acct_test_1".into()),
+    };
+    assert_eq!(verified.principal, user);
+    assert_eq!(verified.actor, Some(svc("business-service")));
+    assert_eq!(
+        verified
+            .access_token
+            .as_ref()
+            .map(|claims| claims.act.clone()),
+        Some(delegated.act.clone())
+    );
+    let request = verified.authorization_request(action, ScopeRef::Global);
+    assert_eq!(request.principal, svc("business-service"));
+    assert_eq!(request.on_behalf_of, vec![user.clone()]);
+    // Existing projections keep their shapes and report the subject.
+    assert_eq!(
+        handle.gate.authenticate_bearer(&token, &ts, NOW_UNIX),
+        Some(user)
+    );
+
+    let mut foreign = delegated.clone();
+    foreign.aud = "https://other.example.com".into();
+    let foreign = authority.mint(&foreign).await.expect("mint");
+    assert_eq!(
+        handle
+            .gate
+            .authenticate_verified(&foreign, &ts, NOW_UNIX)
+            .unwrap_err(),
+        awaken_iam_host::AuthReject::Invalid
+    );
+}
+
+#[derive(Clone)]
+struct ActorEcho;
+
+impl RouteActions for ActorEcho {
+    fn action_for(&self, _method: &axum::http::Method, _path: &str) -> Option<ActionKey> {
+        None
+    }
+}
+
+/// The middleware stashes the subject principal and, for a delegated token,
+/// the [`TokenActor`] so downstream handlers can attribute the request to both.
+#[tokio::test]
+async fn middleware_inserts_the_token_actor_extension() {
+    let cfg = HostConfig::local_in_memory().with_seal_key(JWT_SEED);
+    let handle = embed_local(&cfg).expect("embed_local");
+    let authority = handle.jwt_authority.as_ref().expect("jwt_authority");
+    let far_future = 4_102_444_800; // 2100-01-01
+    let mut delegated = make_claims(far_future);
+    delegated.act = Some(AccessTokenActor {
+        sub: "business-service".into(),
+        subject_kind: AccessTokenSubjectKind::Service,
+    });
+    let token = authority.mint(&delegated).await.expect("mint");
+    let app = Router::new()
+        .route(
+            "/whoami",
+            get(
+                |principal: axum::Extension<PrincipalRef>,
+                 actor: Option<axum::Extension<TokenActor>>| async move {
+                    let actor = actor.map(|axum::Extension(TokenActor(actor))| actor);
+                    axum::Json(serde_json::json!({
+                        "principal": principal.0,
+                        "actor": actor,
+                    }))
+                },
+            ),
+        )
+        .layer(auth_layer(handle.gate.clone(), ActorEcho));
+    let response = app
+        .oneshot(bearer_request("/whoami", &token))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["principal"]["account_id"], "acct_test_1");
+    assert_eq!(json["actor"]["service_id"], "business-service");
 }

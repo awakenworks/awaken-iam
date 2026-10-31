@@ -27,7 +27,7 @@ mod upstream_http;
 mod wechat_miniapp;
 
 pub use access_token::{
-    ACCESS_TOKEN_ALG, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
+    ACCESS_TOKEN_ALG, AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
     AccessTokenRevocations, AccessTokenSubjectKind, LocalSeedSigner, Signer, SignerError,
     decode_unverified_claims, ed25519_public_jwk, verify_access_token, verify_active_access_token,
     verify_signed_claims,

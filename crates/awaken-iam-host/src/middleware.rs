@@ -16,9 +16,11 @@
 //!    - On failure: `401 Unauthorized`.
 //! 5. Look up the action for `(method, path)` via `actions.action_for`.
 //!    When `None`, no action is required and the request passes through.
-//! 6. Authorize `(principal, action, ScopeRef::Global)` via `gate.authorize`.
+//! 6. Authorize `(principal, action, scope)` via `gate.authorize`; a delegated
+//!    token authorizes its `act` service with the subject as `on_behalf_of`.
 //!    `Deny` or `RequireApproval` → `403 Forbidden`.
-//! 7. Insert the resolved [`PrincipalRef`] into the request extensions.
+//! 7. Insert the resolved [`PrincipalRef`] (and any [`TokenActor`]) into the
+//!    request extensions.
 //! 8. Call `next`.
 
 use std::future::Future;
@@ -36,7 +38,7 @@ use tower::{Layer, Service};
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{ActionKey, AuthorizationDecision, ScopeRef};
 
-use crate::gate::IamGate;
+use crate::gate::{IamGate, VerifiedBearer};
 use crate::time::wall_clock_now;
 
 /// Map a route's HTTP method and path to an [`ActionKey`].
@@ -103,6 +105,13 @@ pub trait RouteActions: Send + Sync + 'static {
 /// JWT (account-scoped) credentials.
 #[derive(Debug, Clone)]
 pub struct TokenWorkspace(pub awaken_iam_contract::WorkspaceId);
+
+/// The RFC 8693 actor of a delegated access token (`act`), inserted into the
+/// request extensions beside the subject [`PrincipalRef`](awaken_iam_contract::PrincipalRef).
+/// Absent for direct credentials. When present, the middleware authorizes the
+/// actor with the subject as its `on_behalf_of` link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenActor(pub awaken_iam_contract::PrincipalRef);
 
 /// Error variants surfaced by the auth middleware as HTTP responses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,7 +244,8 @@ where
             {
                 state
                     .gate
-                    .authenticate_scoped(&token, &now, now_unix as i64)
+                    .authenticate_verified(&token, &now, now_unix as i64)
+                    .ok()
             } else if let Some(cookie) = req
                 .headers()
                 .get(axum::http::header::COOKIE)
@@ -245,22 +255,30 @@ where
                     .gate
                     .authenticate_session_cookie(cookie, now.clone())
                     .ok()
-                    .map(|principal| (principal, None))
+                    .map(|principal| VerifiedBearer {
+                        principal,
+                        workspace: None,
+                        actor: None,
+                        access_token: None,
+                    })
             } else {
                 return Ok(state.actions.render_auth_error(&AuthError::MissingToken));
             };
-            let (principal, token_workspace) = match authenticated {
-                Some(pair) => pair,
-                None => return Ok(state.actions.render_auth_error(&AuthError::InvalidToken)),
+            let Some(verified) = authenticated else {
+                return Ok(state.actions.render_auth_error(&AuthError::InvalidToken));
             };
 
             // Stash the resolved identity BEFORE scope derivation so `scope_for`
-            // (and downstream handlers) can read it: the principal, and — for API
-            // tokens — the token's home workspace, which a product uses to scope
-            // a workspace-less route at the token's own workspace.
+            // (and downstream handlers) can read it: the principal, the RFC 8693
+            // actor of a delegated token, and — for API tokens — the token's
+            // home workspace, which a product uses to scope a workspace-less
+            // route at the token's own workspace.
             let mut req = req;
-            req.extensions_mut().insert(principal.clone());
-            if let Some(workspace) = token_workspace {
+            req.extensions_mut().insert(verified.principal.clone());
+            if let Some(actor) = verified.actor.clone() {
+                req.extensions_mut().insert(TokenActor(actor));
+            }
+            if let Some(workspace) = verified.workspace.clone() {
                 req.extensions_mut().insert(TokenWorkspace(workspace));
             }
 
@@ -275,12 +293,7 @@ where
                     .scope_for(&method, req.uri(), req.extensions());
                 let decision = state
                     .gate
-                    .authorize(awaken_iam_contract::AuthorizationRequest {
-                        principal: principal.clone(),
-                        on_behalf_of: Vec::new(),
-                        action,
-                        scope,
-                    });
+                    .authorize(verified.authorization_request(action, scope));
                 if decision != AuthorizationDecision::Allow {
                     return Ok(state.actions.render_auth_error(&AuthError::Forbidden));
                 }

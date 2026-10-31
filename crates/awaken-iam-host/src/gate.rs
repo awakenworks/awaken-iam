@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_client::{HttpAuthzTransport, IamClient, IamDecisionError, RemoteIamClient};
 use awaken_iam_contract::{
-    AccountId, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     EntitlementDecision, EntitlementRequest, Jwks, PrincipalRef, ResourceAuthorizationRequest,
-    Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceId,
+    ScopeRef, Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
-use awaken_iam_server::{AccessTokenSubjectKind, AuthzApi, SessionGateway, verify_access_token};
+use awaken_iam_server::{AccessTokenClaims, AuthzApi, SessionGateway, verify_access_token};
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
 type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
@@ -51,6 +51,58 @@ pub enum AuthReject {
     Revoked,
     /// The credential does not exist, does not verify, or is malformed.
     Invalid,
+}
+
+/// Every coordinate of a successfully authenticated bearer credential.
+///
+/// Returned by [`IamGate::authenticate_verified`] and [`IamGate::verify_jwt`].
+/// Older accessors ([`IamGate::authenticate_bearer`],
+/// [`IamGate::authenticate_scoped`], [`IamGate::authenticate_detailed`]) are
+/// projections of this value and keep their shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBearer {
+    /// The authenticated subject. For a delegated token this is the end-user.
+    pub principal: PrincipalRef,
+    /// Home workspace of an API token; `None` for JWT access tokens.
+    pub workspace: Option<WorkspaceId>,
+    /// RFC 8693 `act`: the service acting on behalf of `principal`, if any.
+    pub actor: Option<PrincipalRef>,
+    /// Verified access-token claims (audience, scope, `jti`, expiry); `None`
+    /// for API tokens, which carry no JWT claims.
+    pub access_token: Option<AccessTokenClaims>,
+}
+
+impl VerifiedBearer {
+    fn api_token(principal: PrincipalRef, workspace: WorkspaceId) -> Self {
+        Self {
+            principal,
+            workspace: Some(workspace),
+            actor: None,
+            access_token: None,
+        }
+    }
+
+    /// Build the authorization request for this credential.
+    ///
+    /// A direct credential authorizes its principal alone. A delegated
+    /// credential authorizes the acting service with the end-user as its
+    /// conjunctive `on_behalf_of` link, so the effective permission is the
+    /// intersection of what both principals hold.
+    pub fn authorization_request(
+        &self,
+        action: ActionKey,
+        scope: ScopeRef,
+    ) -> AuthorizationRequest {
+        match &self.actor {
+            Some(actor) => AuthorizationRequest {
+                principal: actor.clone(),
+                on_behalf_of: vec![self.principal.clone()],
+                action,
+                scope,
+            },
+            None => AuthorizationRequest::direct(self.principal.clone(), action, scope),
+        }
+    }
 }
 
 /// Product-owned local IAM state: the authorization engine and the API-token
@@ -244,19 +296,41 @@ impl IamGate {
         now: &Timestamp,
         now_unix: i64,
     ) -> Result<(PrincipalRef, Option<WorkspaceId>), AuthReject> {
+        self.authenticate_verified(token, now, now_unix)
+            .map(|verified| (verified.principal, verified.workspace))
+    }
+
+    /// Authenticate a bearer credential and return every verified coordinate a
+    /// relying party may act on, including the RFC 8693 delegation actor.
+    ///
+    /// For a delegated IAM access token, [`VerifiedBearer::principal`] is the
+    /// end-user (`sub`) and [`VerifiedBearer::actor`] is the service acting for
+    /// them (`act`). A relying party that authorizes such a request must
+    /// evaluate both principals — see
+    /// [`authorization_request`](VerifiedBearer::authorization_request).
+    /// Failure reasons match [`authenticate_detailed`](Self::authenticate_detailed).
+    pub fn authenticate_verified(
+        &self,
+        token: &str,
+        now: &Timestamp,
+        now_unix: i64,
+    ) -> Result<VerifiedBearer, AuthReject> {
         match self.inner.as_ref() {
             GateInner::Open => Err(AuthReject::Invalid),
             GateInner::Local { state, jwks } => {
                 if is_api_token(token) {
                     let guard = state.lock().expect("local state lock");
                     match guard.directory.authenticate(token, now) {
-                        Ok(t) => Ok((t.principal.clone(), Some(t.workspace.clone()))),
+                        Ok(t) => Ok(VerifiedBearer::api_token(
+                            t.principal.clone(),
+                            t.workspace.clone(),
+                        )),
                         Err(IamError::ApiTokenExpired { .. }) => Err(AuthReject::Expired),
                         Err(IamError::ApiTokenRevoked { .. }) => Err(AuthReject::Revoked),
                         Err(_) => Err(AuthReject::Invalid),
                     }
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
+                    self.verify_jwt(token, jwks, now_unix)
                 } else {
                     Err(AuthReject::Invalid)
                 }
@@ -270,9 +344,15 @@ impl IamGate {
                         .introspect_token(&req)
                         .ok()
                         .map(introspected_identity)
+                        .map(|(principal, workspace)| VerifiedBearer {
+                            principal,
+                            workspace,
+                            actor: None,
+                            access_token: None,
+                        })
                         .ok_or(AuthReject::Invalid)
                 } else if let Some(jwks) = jwks {
-                    self.verify_jwt(token, jwks, now_unix).map(|p| (p, None))
+                    self.verify_jwt(token, jwks, now_unix)
                 } else {
                     Err(AuthReject::Invalid)
                 }
@@ -280,12 +360,14 @@ impl IamGate {
         }
     }
 
-    fn verify_jwt(
+    /// Verify an IAM access-token JWT against `jwks` and this gate's exact
+    /// issuer/audience policy.
+    pub fn verify_jwt(
         &self,
         token: &str,
         jwks: &Jwks,
         now_unix: i64,
-    ) -> Result<PrincipalRef, AuthReject> {
+    ) -> Result<VerifiedBearer, AuthReject> {
         let claims = verify_access_token(token, jwks).map_err(|_| AuthReject::Invalid)?;
 
         if claims.exp <= now_unix {
@@ -301,13 +383,11 @@ impl IamGate {
         {
             return Err(AuthReject::Invalid);
         }
-        Ok(match claims.subject_kind {
-            AccessTokenSubjectKind::Account => PrincipalRef::Account {
-                account_id: AccountId(claims.sub),
-            },
-            AccessTokenSubjectKind::Service => PrincipalRef::Service {
-                service_id: claims.sub,
-            },
+        Ok(VerifiedBearer {
+            principal: claims.principal(),
+            workspace: None,
+            actor: claims.actor_principal(),
+            access_token: Some(claims),
         })
     }
 
