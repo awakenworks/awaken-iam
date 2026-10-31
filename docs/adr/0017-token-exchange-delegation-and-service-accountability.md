@@ -100,9 +100,30 @@ stamps are kept. The embedded host's bootstrap admin token is minted through
 the explicit `mint_host_bootstrap` exemption because no accountable account
 exists before the first administrator.
 
+**Token-endpoint client authentication.** Delegation relies on confidential
+client authentication, so `/v1/oauth/token` accepts `client_secret_basic`
+(RFC 6749 §2.3.1), `client_secret_post` and `none` for every grant, and
+discovery advertises `token_endpoint_auth_methods_supported`. Presenting two
+methods, or a body `client_id` that differs from the Basic one, is
+`invalid_request`; a malformed or failed Basic authentication is
+`invalid_client` with a `WWW-Authenticate: Basic` challenge. Malformed bodies
+answer `invalid_request`, never a framework 422.
+
+**Stable signing keys.** Relying parties cache the JWKS by `kid`, so a key
+must never change under a kid. Generated keys take
+`iam-ed25519-<first 128 bits of base64url SHA-256(public key)>`. The
+standalone daemon persists its seed in the configured store (identity
+migration 8); restarts and replicas load the oldest stored key and refuse to
+start when its stored kid does not match the key. The stored seed has the
+same protection requirements as the database credentials; managed
+deployments inject a KMS signer instead.
+
 ## Migration
 
-Both migrations only add nullable columns. Existing OAuth clients admit no
+Migrations 6 and 7 only add nullable columns; migration 8 adds the signing
+key table, populated on the daemon's next start. That start publishes a new
+kid, so tokens signed by the previous, unpersisted key stop verifying once it
+is gone, as they already did on every restart. Existing OAuth clients admit no
 exchange until an administrator sets a policy. Existing service-account tokens
 have no recorded owner and, when minted without expiry, never expire; they
 stay valid until revoked. Operators should list each service account's tokens,
@@ -122,3 +143,6 @@ policy validation, persistence, replacement and rotation over SQLite. Host
 tests cover actor exposure, conjunctive authorization requests and the
 middleware extension. Core and SQL tests cover owner/expiry enforcement, the
 bootstrap exemption, legacy owner-less rows and bulk revocation.
+Token-endpoint tests cover every client-authentication row above and the
+discovery document; SQLite restart tests cover key persistence, a stable kid
+and refusal of a tampered kid.
