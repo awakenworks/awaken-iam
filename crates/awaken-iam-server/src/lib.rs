@@ -39,8 +39,8 @@ pub use admin_api::{
     TEAM_ACCESS_REPLACED,
 };
 pub use admin_http::{
-    AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router, principal_access_router,
-    projection_router,
+    AdminAuthPolicy, DEFAULT_PROFILE_BODY_LIMIT, DaemonState, SharedDaemonState, daemon_router,
+    principal_access_router, projection_router,
 };
 pub use anthropic_admin::{
     ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,

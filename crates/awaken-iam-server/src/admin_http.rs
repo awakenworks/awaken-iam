@@ -82,7 +82,7 @@ use awaken_iam_core::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -171,7 +171,15 @@ pub struct DaemonState<S> {
     auth: AdminAuthPolicy,
     observed_store_version: u64,
     composed: Option<ComposedPolicy>,
+    profile_body_limit: usize,
 }
+
+/// Default body limit for `POST /v1/admin/authz/profiles`.
+///
+/// A realistic enterprise profile (thousands of grants plus its resource
+/// model) is several MiB of JSON, far above axum's 2 MiB default that every
+/// other route keeps. 16 MiB leaves headroom while still bounding one request.
+pub const DEFAULT_PROFILE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 impl<S> std::fmt::Debug for DaemonState<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -214,9 +222,20 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
             auth,
             observed_store_version: version,
             composed: None,
+            profile_body_limit: DEFAULT_PROFILE_BODY_LIMIT,
         };
         state.ensure_fresh()?;
         Ok(state)
+    }
+}
+
+impl<S> DaemonState<S> {
+    /// Accept profile publication bodies up to `bytes` (see
+    /// [`DEFAULT_PROFILE_BODY_LIMIT`]); every other route keeps its own limit.
+    #[must_use]
+    pub fn with_profile_body_limit(mut self, bytes: usize) -> Self {
+        self.profile_body_limit = bytes;
+        self
     }
 }
 
@@ -312,6 +331,7 @@ pub fn daemon_router<S>(state: SharedDaemonState<S>) -> Router
 where
     S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientRepository + Clone + 'static,
 {
+    let profile_body_limit = lock(&state).profile_body_limit;
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/authorize", post(authorize))
@@ -412,7 +432,10 @@ where
         .route("/v1/admin/invitations/{id}/resend", post(resend_invitation))
         .route("/v1/admin/invitations/{id}/accept", post(accept_invitation))
         .route("/v1/admin/scope/workspace-orgs", post(assign_workspace_org))
-        .route("/v1/admin/authz/profiles", post(create_profile))
+        .route(
+            "/v1/admin/authz/profiles",
+            post(create_profile).layer(DefaultBodyLimit::max(profile_body_limit)),
+        )
         .route("/v1/admin/authz/profiles/{namespace}", get(list_profiles))
         .route(
             "/v1/admin/authz/profiles/{namespace}/active",

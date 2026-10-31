@@ -250,3 +250,65 @@ async fn profile_pap_replaces_scope_rules_and_rolls_back_over_http() {
     assert_eq!(rolled_back.status(), StatusCode::OK);
     assert_eq!(body_json(rolled_back).await["active_revision"], 1);
 }
+
+/// A profile body of `grants` grants, each padded so the JSON exceeds axum's
+/// 2 MiB default like a real enterprise profile does.
+fn large_profile_body(grants: usize) -> serde_json::Value {
+    let mut body = profile_body("workspace");
+    let padding = "x".repeat(800);
+    body["document"]["grants"] = (0..grants)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("awaken.runtime:g_{index:05}_{padding}"),
+                "subject": {"kind":"principal","principal":{"kind":"service","service_id":"runtime"}},
+                "action_pattern": "awaken.runtime::memory.*",
+                "scope": {"kind":"global"},
+                "effect": "allow"
+            })
+        })
+        .collect();
+    body
+}
+
+fn daemon_with_profile_limit(bytes: usize) -> Router {
+    let state = test_daemon_state(
+        AuthzApi::new(),
+        AdminAuthPolicy::new([ADMIN_TOKEN.to_owned()]),
+    )
+    .with_profile_body_limit(bytes);
+    daemon_router(Arc::new(Mutex::new(state)))
+}
+
+#[tokio::test]
+async fn profile_publication_body_limit_is_explicit_and_configurable() {
+    // L1 a 2,673-grant profile above 2 MiB -> accepted under the 16 MiB
+    // default; L2 the same body over a configured 1 MiB limit -> 413; L3 every
+    // other route keeps axum's 2 MiB default (grant batch -> 413).
+    let body = large_profile_body(2_673);
+    let size = body.to_string().len();
+    assert!(size > 2 * 1024 * 1024, "fixture is {size} bytes");
+    assert!(size < awaken_iam_server::DEFAULT_PROFILE_BODY_LIMIT);
+
+    let created = daemon()
+        .oneshot(authed_post("/v1/admin/authz/profiles", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK, "L1");
+    assert_eq!(body_json(created).await["revision"], 1, "L1");
+
+    let limited = daemon_with_profile_limit(1024 * 1024)
+        .oneshot(authed_post("/v1/admin/authz/profiles", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::PAYLOAD_TOO_LARGE, "L2");
+
+    let grants = body["document"]["grants"].clone();
+    let other_route = daemon()
+        .oneshot(authed_post(
+            "/v1/admin/grants/batch",
+            serde_json::json!({ "grants": grants }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_route.status(), StatusCode::PAYLOAD_TOO_LARGE, "L3");
+}

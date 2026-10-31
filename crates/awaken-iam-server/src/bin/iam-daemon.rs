@@ -30,6 +30,9 @@
 //! - `IAM_OIDC_PROVIDERS_FILE` — owner-controlled JSON registration of upstream
 //!   OIDC issuers and their client-secret file paths. Callback URLs derive from
 //!   `IAM_ISSUER` and each provider key; no duplicate callback setting exists.
+//! - `IAM_PROFILE_BODY_LIMIT_BYTES` — largest accepted
+//!   `POST /v1/admin/authz/profiles` body (default 16 MiB, see
+//!   [`DEFAULT_PROFILE_BODY_LIMIT`]); every other route keeps its own limit.
 
 #[path = "iam-daemon/oidc_providers.rs"]
 mod oidc_providers;
@@ -43,11 +46,11 @@ use awaken_iam_core::{
     SessionRepository,
 };
 use awaken_iam_server::{
-    AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor,
-    ReqwestWechatMiniProgramExchange, SessionCookieConfig, SharedAuthApi, SqlConn, SqlStore,
-    SqliteBackend, WechatMiniProgramRegistration, daemon_router, http, jwks_router, op_router,
-    postgres_migrated_store, principal_access_router, projection_router, sqlite_migrated_store,
-    wechat_mini_program_router,
+    AdminAuthPolicy, AuthApi, AuthzApi, DEFAULT_PROFILE_BODY_LIMIT, DaemonState, IamDaemon,
+    RecordingExecutor, ReqwestWechatMiniProgramExchange, SessionCookieConfig, SharedAuthApi,
+    SqlConn, SqlStore, SqliteBackend, WechatMiniProgramRegistration, daemon_router, http,
+    jwks_router, op_router, postgres_migrated_store, principal_access_router, projection_router,
+    sqlite_migrated_store, wechat_mini_program_router,
 };
 use serde::Deserialize;
 
@@ -149,13 +152,22 @@ async fn serve<B: SqlConn + Clone + 'static>(
     // The standalone daemon additionally serves the policy-administration seam:
     // the remote console administers orgs/groups/roles/grants/memberships over
     // `/v1/admin/*`, guarded by the configured admin credential(s).
-    let state = Arc::new(Mutex::new(DaemonState::with_policy_store(
-        authz,
-        admin_auth,
-        profile_store.clone(),
-        (*profile_store).clone(),
-        capability_tokens,
-    )?));
+    let profile_body_limit = profile_body_limit(
+        std::env::var("IAM_PROFILE_BODY_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
+    let state = Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            authz,
+            admin_auth,
+            profile_store.clone(),
+            (*profile_store).clone(),
+            capability_tokens,
+        )?
+        .with_profile_body_limit(profile_body_limit),
+    ));
     let router = daemon_router(state.clone())
         .merge(principal_access_router(state.clone()))
         .merge(projection_router(state))
@@ -175,6 +187,20 @@ async fn serve<B: SqlConn + Clone + 'static>(
     eprintln!("iam-daemon: serving /v1 (incl. /v1/admin/*) on http://{bind_addr}");
     http::serve(listener, router).await?;
     Ok(())
+}
+
+/// Resolve `IAM_PROFILE_BODY_LIMIT_BYTES`; unset or blank keeps the default.
+fn profile_body_limit(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(DEFAULT_PROFILE_BODY_LIMIT),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                format!("IAM_PROFILE_BODY_LIMIT_BYTES must be a positive byte count, got {value:?}")
+            }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +320,22 @@ mod tests {
     // `tests/daemon_boot_e2e.rs` over a real socket; the unit tests here only
     // need to prove the parser does not panic and yields a usable policy for
     // every input shape the binary may encounter at boot.
+
+    #[test]
+    fn profile_body_limit_defaults_and_rejects_non_positive_values() {
+        // C1 unset/blank -> E1 16 MiB default; C2 positive bytes -> E2 used;
+        // C3 zero, negative or text -> E3 boot error naming the variable.
+        assert_eq!(profile_body_limit(None), Ok(DEFAULT_PROFILE_BODY_LIMIT));
+        assert_eq!(
+            profile_body_limit(Some("  ")),
+            Ok(DEFAULT_PROFILE_BODY_LIMIT)
+        );
+        assert_eq!(profile_body_limit(Some("33554432")), Ok(33_554_432));
+        for invalid in ["0", "-1", "16MiB"] {
+            let error = profile_body_limit(Some(invalid)).unwrap_err();
+            assert!(error.contains("IAM_PROFILE_BODY_LIMIT_BYTES"), "{error}");
+        }
+    }
 
     #[test]
     fn unset_returns_a_deny_all_policy() {
