@@ -1,0 +1,124 @@
+# ADR-0017 - Token exchange, delegation and service-account accountability
+
+- **Status:** Proposed
+- **Implementation:** done
+- **Date:** 2026-10-31
+- **Related:** ADR-0008, ADR-0010
+
+## Context
+
+An enterprise web app (a public browser client using Authorization Code +
+PKCE) and a stateless business command service use IAM. The browser needs
+separate access tokens for Flow (reads) and for the business service
+(commands), and the business service must call Flow on behalf of the signed-in
+user so Flow can see both who asked and which service acted. Relying parties
+verify IAM JWTs with `IamGate::verify_jwt`, which requires an exact `aud`.
+
+Before this decision `/v1/oauth/token` admitted only `authorization_code` and
+`refresh_token`. `AuthApi::exchange_token` was a library-only RFC 8693
+federation path that mints Service tokens from foreign issuers' assertions.
+`AccessTokenClaims` carried no actor. Public OAuth clients skipped the
+HTTPS-or-loopback redirect check confidential clients had. Service-account API
+tokens could be minted without an accountable human or an expiry, and could be
+revoked only one by one.
+
+## Decision
+
+**I1 - Exchange between IAM access tokens.** `POST /v1/oauth/token` accepts
+`grant_type=urn:ietf:params:oauth:grant-type:token-exchange` with
+`subject_token_type=urn:ietf:params:oauth:token-type:access_token`. Each
+registered client carries an administrator-owned `token_exchange` policy
+(empty by default) that admits two uses, both issuing an ordinary IAM access
+token with the same `typ`, signer and JWKS:
+
+- *Audience exchange.* Any registered client may re-target a token IAM issued
+  to it (`aud` = its client id) onto an audience in `token_exchange.audiences`.
+  `sub` and `subject_kind` (Account) are unchanged, no actor is recorded, the
+  scope is the requested subset (default: the subject scope narrowed to the
+  client's registered scopes), and `exp` is at most one hour and never later
+  than the subject token.
+- *Delegation.* A confidential client with `token_exchange.delegation`
+  authenticates with its secret and is the actor: the issued token keeps the
+  user as `sub` and records `act = {sub: delegation.service_id, subject_kind:
+  service}`, `aud` is one of `delegation.audiences`, scope is a subset as
+  above, and `exp` is at most 300 seconds and never later than the subject.
+  The subject token must be issued to that client itself or to one of
+  `delegation.subject_audiences` (for example the browser client).
+
+The actor is the authenticated confidential client, which RFC 8693 §1.1
+permits. `actor_token` is refused: IAM has no service credential a command
+service could hold other than its client secret (workload federation requires
+an external issuer), and a second proof would duplicate client
+authentication. Delegation is single-level: a subject token that already
+carries `act` is refused, and a nested `act` fails decoding.
+
+The target audience alone selects the use, so exchange and delegation audience
+sets must be disjoint; delegation requires a confidential client; identifiers
+must be non-empty and unpadded; a client cannot target its own id. The policy
+is validated on registration and on `PUT
+/v1/admin/oauth-clients/{id}/token-exchange`, is preserved across secret
+rotation, and is stored in identity migration 6 (`NULL` = empty policy).
+
+Refusals use RFC 6749/8693 codes: `invalid_client` (401) for unknown clients
+or failed authentication; `invalid_request` for a missing subject token or
+audience, foreign token types and any `actor_token`; `invalid_target` for an
+audience outside the allowlists and for `resource`; `unauthorized_client` for a
+client without a policy; `invalid_scope` for widened scope; `invalid_grant` for
+a subject token that is malformed, foreign-issued, expired, revoked (IAM's own
+`jti` denylist), a Service principal, already delegated, issued to an
+unaccepted audience, or whose account is missing or disabled;
+`temporarily_unavailable` (503) when storage fails. Every outcome appends
+`AccessTokenExchanged` (client, subject, actor, audience, scope, issued `jti`,
+subject `jti`) or `AccessTokenExchangeRejected` (client, reason) to the
+existing `AuthApi` audit trail. Discovery advertises the grant.
+
+Revoking a subject token does not revoke tokens already derived from it; their
+lifetime is bounded by the subject expiry and, for delegation, 300 seconds.
+
+**I2 - One redirect rule.** Public and confidential clients share the rule in
+`OAuthClientAdminApi::register`: every redirect URI is HTTPS, or HTTP on
+`127.0.0.1`, `[::1]` or `localhost`, with no fragment or embedded credentials.
+
+**I3 - Actor claim.** `AccessTokenClaims.act: Option<AccessTokenActor>` is
+skipped when absent, so earlier tokens are unchanged and still verify.
+`IamGate::authenticate_verified` and `IamGate::verify_jwt` return
+`VerifiedBearer {principal, workspace, actor, access_token}`; existing
+accessors keep their shapes. The host middleware inserts a `TokenActor`
+extension and authorizes a delegated request as the actor with the user as the
+conjunctive `on_behalf_of` link, so the effective permission is the
+intersection of the user's and the service's.
+
+**I4 - Service-account accountability.** `ApiTokenMinter::mint` refuses a
+`PrincipalRef::Service` token without both an `owner` account and an
+`expires_at`. `ApiToken` and `ApiTokenView` carry the optional `owner`
+(identity migration 7, nullable). All live tokens of one principal are revoked
+together by `ApiTokenDirectory::revoke_principal`,
+`AuthzApi::revoke_api_tokens_for_principal`,
+`LocalHandle::revoke_service_account_tokens` and, durably,
+`revoke_api_tokens_for_principal` over the repository; earlier revocation
+stamps are kept. The embedded host's bootstrap admin token is minted through
+the explicit `mint_host_bootstrap` exemption because no accountable account
+exists before the first administrator.
+
+## Migration
+
+Both migrations only add nullable columns. Existing OAuth clients admit no
+exchange until an administrator sets a policy. Existing service-account tokens
+have no recorded owner and, when minted without expiry, never expire; they
+stay valid until revoked. Operators should list each service account's tokens,
+mint owned and expiring replacements, and revoke the account's legacy tokens
+with the bulk revocation. Existing public clients whose redirect URIs are plain
+HTTP on a network host keep working, but cannot be registered again until the
+URI is HTTPS or loopback.
+
+## Validation
+
+HTTP tests through the real OP router cover each admitted use and every
+refusal above, including scope widening, foreign audience, expired, revoked
+and disabled subjects, a Service subject, a nested actor, `actor_token`,
+missing or wrong client secrets, the 300-second and subject-expiry bounds and
+the audit records. Admin HTTP tests cover the public-client redirect rule and
+policy validation, persistence, replacement and rotation over SQLite. Host
+tests cover actor exposure, conjunctive authorization requests and the
+middleware extension. Core and SQL tests cover owner/expiry enforcement, the
+bootstrap exemption, legacy owner-less rows and bulk revocation.

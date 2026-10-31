@@ -18,3 +18,4 @@
 | [0014](0014-permission-bundles-and-trusted-resource-constraints.md) | Permission bundles and trusted resource constraints | Proposed |
 | [0015](0015-reconcile-published-and-consumed-provisioning.md) | Reconcile published and consumed provisioning boundaries | Accepted |
 | [0016](0016-organization-erasure-admission.md) | Organization erasure admission and atomic publication | Accepted |
+| [0017](0017-token-exchange-delegation-and-service-accountability.md) | Token exchange, delegation and service-account accountability | Proposed |
