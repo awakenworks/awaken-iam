@@ -110,6 +110,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "single-use downstream OAuth authorization codes",
                     IDENTITY_0005,
                 ),
+                (
+                    6,
+                    "per-client RFC 8693 token-exchange admission",
+                    IDENTITY_0006,
+                ),
             ],
         ),
         bundle(
@@ -323,6 +328,12 @@ CREATE TABLE {prefix}_oauth_authorization_codes (\
  consumed_at TEXT);\n\
 CREATE INDEX {prefix}_oauth_authorization_codes_expiry_idx \
  ON {prefix}_oauth_authorization_codes (expires_at);";
+
+// Administrator-configured RFC 8693 token-exchange admission per downstream
+// client (ADR-0017). The JSON contract form is owned by the domain; NULL is the
+// empty policy, so every client registered before this step keeps admitting no
+// exchange without a backfill.
+const IDENTITY_0006: &str = "ALTER TABLE {prefix}_oauth_clients ADD COLUMN token_exchange {json};";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //

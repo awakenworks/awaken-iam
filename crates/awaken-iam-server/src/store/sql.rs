@@ -868,11 +868,15 @@ impl<B: SqlConn> OAuthClientRepository for SqlStore<B> {
     fn upsert(&self, client: RegisteredClient) -> RepositoryResult<()> {
         let redirect_uris = json_encode(&client.redirect_uris, "oauth redirect URIs")?;
         let allowed_scopes = json_encode(&client.allowed_scopes, "oauth allowed scopes")?;
+        let token_exchange = (!client.token_exchange.is_empty())
+            .then(|| json_encode(&client.token_exchange, "oauth token exchange"))
+            .transpose()?;
         let sql = format!(
-            "INSERT INTO {t} (client_id, redirect_uris, allowed_scopes, secret_hash) \
-             VALUES (?, ?j, ?j, ?) ON CONFLICT (client_id) DO UPDATE SET \
+            "INSERT INTO {t} (client_id, redirect_uris, allowed_scopes, secret_hash, \
+             token_exchange) VALUES (?, ?j, ?j, ?, ?j) ON CONFLICT (client_id) DO UPDATE SET \
              redirect_uris = excluded.redirect_uris, \
-             allowed_scopes = excluded.allowed_scopes, secret_hash = excluded.secret_hash",
+             allowed_scopes = excluded.allowed_scopes, secret_hash = excluded.secret_hash, \
+             token_exchange = excluded.token_exchange",
             t = self.table("oauth_clients")
         );
         self.backend.execute(
@@ -882,6 +886,7 @@ impl<B: SqlConn> OAuthClientRepository for SqlStore<B> {
                 p(redirect_uris),
                 p(allowed_scopes),
                 client.secret_hash,
+                token_exchange,
             ],
         )?;
         Ok(())
@@ -890,7 +895,8 @@ impl<B: SqlConn> OAuthClientRepository for SqlStore<B> {
     fn get(&self, client_id: &str) -> RepositoryResult<Option<RegisteredClient>> {
         let sql = format!(
             "SELECT client_id, CAST(redirect_uris AS TEXT), \
-             CAST(allowed_scopes AS TEXT), secret_hash FROM {} WHERE client_id = ?",
+             CAST(allowed_scopes AS TEXT), secret_hash, \
+             CAST(token_exchange AS TEXT) FROM {} WHERE client_id = ?",
             self.table("oauth_clients")
         );
         let rows = self.backend.query(&sql, &[p(client_id)])?;
@@ -900,7 +906,8 @@ impl<B: SqlConn> OAuthClientRepository for SqlStore<B> {
     fn list(&self) -> RepositoryResult<Vec<RegisteredClient>> {
         let sql = format!(
             "SELECT client_id, CAST(redirect_uris AS TEXT), \
-             CAST(allowed_scopes AS TEXT), secret_hash FROM {} ORDER BY client_id",
+             CAST(allowed_scopes AS TEXT), secret_hash, \
+             CAST(token_exchange AS TEXT) FROM {} ORDER BY client_id",
             self.table("oauth_clients")
         );
         self.backend

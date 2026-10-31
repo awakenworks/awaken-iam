@@ -25,7 +25,8 @@
 
 use awaken_iam_contract::Timestamp;
 use awaken_iam_core::{
-    AuditEvent, AuditSink, EntropySource, OAuthClientRepository, RegisteredClient,
+    AuditEvent, AuditSink, ClientTokenExchangePolicy, EntropySource, OAuthClientRepository,
+    RegisteredClient,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -48,6 +49,8 @@ pub enum OAuthClientEvent {
     SecretRotated(String),
     /// A client was deregistered.
     Deregistered(String),
+    /// A client's RFC 8693 token-exchange admission was replaced.
+    TokenExchangeReplaced(String),
 }
 
 impl OAuthClientEvent {
@@ -57,6 +60,7 @@ impl OAuthClientEvent {
             OAuthClientEvent::Registered(_) => "oauth_client.register",
             OAuthClientEvent::SecretRotated(_) => "oauth_client.rotate_secret",
             OAuthClientEvent::Deregistered(_) => "oauth_client.deregister",
+            OAuthClientEvent::TokenExchangeReplaced(_) => "oauth_client.replace_token_exchange",
         }
     }
 
@@ -65,7 +69,8 @@ impl OAuthClientEvent {
         match self {
             OAuthClientEvent::Registered(id)
             | OAuthClientEvent::SecretRotated(id)
-            | OAuthClientEvent::Deregistered(id) => format!("oauth client {id}"),
+            | OAuthClientEvent::Deregistered(id)
+            | OAuthClientEvent::TokenExchangeReplaced(id) => format!("oauth client {id}"),
         }
     }
 }
@@ -154,22 +159,19 @@ where
             || client.client_id != client.client_id.trim()
             || client.redirect_uris.is_empty()
             || client.allowed_scopes.is_empty()
-            || client
-                .redirect_uris
-                .iter()
-                .any(|uri| match url::Url::parse(uri) {
-                    Ok(parsed) => {
-                        parsed.fragment().is_some()
-                            || matches!(parsed.scheme(), "javascript" | "data" | "file")
-                    }
-                    Err(_) => true,
-                })
         {
             return Err(AdminError::Invalid(
-                "oauth client requires an id, exact redirect URIs without fragments, and scopes"
+                "oauth client requires an id, exact redirect URIs, and scopes".into(),
+            ));
+        }
+        if !redirect_uris_are_safe(&client.redirect_uris) {
+            return Err(AdminError::Invalid(
+                "oauth client redirect URIs require HTTPS or a loopback HTTP origin, \
+                 without fragments or credentials"
                     .into(),
             ));
         }
+        validate_token_exchange(&client)?;
         if OAuthClientRepository::get(&self.store, &client.client_id)?.is_some() {
             return Err(AdminError::AlreadyExists(format!(
                 "oauth client {}",
@@ -195,12 +197,61 @@ where
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
+        self.register_confidential_with_exchange(
+            client_id,
+            redirect_uris,
+            scopes,
+            ClientTokenExchangePolicy::default(),
+            entropy,
+            at,
+        )
+    }
+
+    /// Register a confidential client together with its RFC 8693
+    /// token-exchange admission in one audited mutation; the fresh secret is
+    /// returned exactly once.
+    pub fn register_confidential_with_exchange<I, T>(
+        &mut self,
+        client_id: impl Into<String>,
+        redirect_uris: Vec<String>,
+        scopes: I,
+        token_exchange: ClientTokenExchangePolicy,
+        entropy: &mut impl EntropySource,
+        at: Timestamp,
+    ) -> AdminResult<(u64, IssuedClientSecret)>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
         let client_id = client_id.into();
         let secret = mint_secret(entropy);
         let client =
-            RegisteredClient::confidential(client_id.clone(), &secret, redirect_uris, scopes);
+            RegisteredClient::confidential(client_id.clone(), &secret, redirect_uris, scopes)
+                .with_token_exchange(token_exchange);
         let version = self.register(client, at)?;
         Ok((version, IssuedClientSecret { client_id, secret }))
+    }
+
+    /// Replace a registered client's RFC 8693 token-exchange admission.
+    ///
+    /// The policy is validated against the client's kind exactly as at
+    /// registration; redirect URIs, scopes and any secret hash are preserved.
+    pub fn replace_token_exchange(
+        &mut self,
+        client_id: &str,
+        token_exchange: ClientTokenExchangePolicy,
+        at: Timestamp,
+    ) -> AdminResult<RegisteredClient> {
+        let existing = OAuthClientRepository::get(&self.store, client_id)?
+            .ok_or_else(|| AdminError::NotFound(format!("oauth client {client_id}")))?;
+        let updated = existing.with_token_exchange(token_exchange);
+        validate_token_exchange(&updated)?;
+        OAuthClientRepository::upsert(&self.store, updated.clone())?;
+        self.commit(
+            OAuthClientEvent::TokenExchangeReplaced(client_id.to_owned()),
+            at,
+        )?;
+        Ok(updated)
     }
 
     /// Rotate a confidential client's secret, returning the fresh cleartext
@@ -230,7 +281,8 @@ where
             &secret,
             existing.redirect_uris.clone(),
             existing.allowed_scopes.clone(),
-        );
+        )
+        .with_token_exchange(existing.token_exchange.clone());
         OAuthClientRepository::upsert(&self.store, rotated)?;
         self.commit(OAuthClientEvent::SecretRotated(client_id.to_owned()), at)?;
         Ok(IssuedClientSecret {
@@ -254,6 +306,33 @@ where
     pub fn list_clients(&self) -> AdminResult<Vec<RegisteredClient>> {
         Ok(OAuthClientRepository::list(&self.store)?)
     }
+}
+
+/// Whether every redirect URI is an exact HTTPS URI or an HTTP URI on a
+/// loopback host, with no fragment or embedded credentials.
+///
+/// The rule is identical for public and confidential clients: a public
+/// client's PKCE binding protects the code exchange, but not a code delivered
+/// in clear text to a network-reachable host.
+pub(crate) fn redirect_uris_are_safe(uris: &[String]) -> bool {
+    !uris.is_empty()
+        && uris.iter().all(|uri| {
+            let Ok(parsed) = url::Url::parse(uri) else {
+                return false;
+            };
+            let loopback = parsed.scheme() == "http"
+                && matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
+            (parsed.scheme() == "https" || loopback)
+                && parsed.fragment().is_none()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        })
+}
+
+fn validate_token_exchange(client: &RegisteredClient) -> AdminResult<()> {
+    client
+        .validate_token_exchange()
+        .map_err(|error| AdminError::Invalid(format!("oauth client token exchange: {error}")))
 }
 
 /// Mint a fresh URL-safe base64 client secret from `entropy`.

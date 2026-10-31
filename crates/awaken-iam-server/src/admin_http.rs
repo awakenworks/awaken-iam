@@ -43,7 +43,12 @@
 //! host never mounts this router — it administers the model in-process — so the
 //! seam is exposed over HTTP only by the standalone daemon.
 
+mod oauth_clients;
 mod resource_provisioning;
+use oauth_clients::{
+    deregister_oauth_client, get_oauth_client, list_oauth_clients, register_oauth_client,
+    replace_oauth_client_token_exchange, rotate_oauth_client_secret,
+};
 pub use resource_provisioning::projection_router;
 use resource_provisioning::provision_resource;
 
@@ -290,6 +295,10 @@ where
         .route(
             "/v1/admin/oauth-clients/{id}/rotate-secret",
             post(rotate_oauth_client_secret),
+        )
+        .route(
+            "/v1/admin/oauth-clients/{id}/token-exchange",
+            put(replace_oauth_client_token_exchange),
         )
         .route("/v1/admin/orgs/provision", post(provision_org))
         .route("/v1/admin/orgs/privacy-erasure", post(erase_org_privacy))
@@ -722,174 +731,6 @@ async fn snapshot(
 }
 
 // -- policy-administration seam (shared state, mutating) ----------------------
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum OAuthClientRegistration {
-    Public {
-        client_id: String,
-        redirect_uris: Vec<String>,
-        allowed_scopes: Vec<String>,
-    },
-    Confidential {
-        client_id: String,
-        redirect_uris: Vec<String>,
-        allowed_scopes: Vec<String>,
-    },
-}
-
-fn oauth_client_view(client: RegisteredClient) -> serde_json::Value {
-    serde_json::json!({
-        "client_id": client.client_id,
-        "kind": if client.secret_hash.is_some() { "confidential" } else { "public" },
-        "redirect_uris": client.redirect_uris,
-        "allowed_scopes": client.allowed_scopes,
-    })
-}
-
-fn confidential_redirects_are_safe(uris: &[String]) -> bool {
-    !uris.is_empty()
-        && uris.iter().all(|uri| {
-            let Ok(parsed) = url::Url::parse(uri) else {
-                return false;
-            };
-            let loopback = parsed.scheme() == "http"
-                && matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
-            (parsed.scheme() == "https" || loopback)
-                && parsed.fragment().is_none()
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-        })
-}
-
-async fn register_oauth_client(
-    State(state): State<SharedDaemonState<impl PolicyStore + OAuthClientRepository>>,
-    headers: HeaderMap,
-    Json(request): Json<OAuthClientRegistration>,
-) -> Response {
-    let mut guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
-    }
-    let now = now_timestamp();
-    match request {
-        OAuthClientRegistration::Public {
-            client_id,
-            redirect_uris,
-            allowed_scopes,
-        } => {
-            let client = RegisteredClient::public(client_id, redirect_uris, allowed_scopes);
-            match guard.oauth_clients.register(client.clone(), now) {
-                Ok(_) => (
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "client": oauth_client_view(client),
-                    })),
-                )
-                    .into_response(),
-                Err(error) => admin_error_response(&error),
-            }
-        }
-        OAuthClientRegistration::Confidential {
-            client_id,
-            redirect_uris,
-            allowed_scopes,
-        } => {
-            if !confidential_redirects_are_safe(&redirect_uris) {
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid",
-                    "confidential client redirect URIs require HTTPS or a loopback HTTP origin",
-                );
-            }
-            match guard.oauth_clients.register_confidential(
-                client_id,
-                redirect_uris,
-                allowed_scopes,
-                &mut OsEntropy,
-                now,
-            ) {
-                Ok((_, issued)) => (
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "client_id": issued.client_id, "client_secret": issued.secret,
-                    })),
-                )
-                    .into_response(),
-                Err(error) => admin_error_response(&error),
-            }
-        }
-    }
-}
-
-async fn list_oauth_clients(
-    State(state): State<SharedDaemonState<impl PolicyStore + OAuthClientRepository>>,
-    headers: HeaderMap,
-) -> Response {
-    let guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
-    }
-    match guard.oauth_clients.list_clients() {
-        Ok(clients) => Json(serde_json::json!({
-            "clients": clients.into_iter().map(oauth_client_view).collect::<Vec<_>>()
-        }))
-        .into_response(),
-        Err(error) => admin_error_response(&error),
-    }
-}
-
-async fn get_oauth_client(
-    State(state): State<SharedDaemonState<impl PolicyStore + OAuthClientRepository>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    let guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
-    }
-    match guard.oauth_clients.get_client(&id) {
-        Ok(Some(client)) => Json(oauth_client_view(client)).into_response(),
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "not_found", "oauth client not found"),
-        Err(error) => admin_error_response(&error),
-    }
-}
-
-async fn rotate_oauth_client_secret(
-    State(state): State<SharedDaemonState<impl PolicyStore + OAuthClientRepository>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    let mut guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
-    }
-    match guard
-        .oauth_clients
-        .rotate_secret(&id, &mut OsEntropy, now_timestamp())
-    {
-        Ok(issued) => Json(serde_json::json!({
-            "client_id": issued.client_id, "client_secret": issued.secret,
-        }))
-        .into_response(),
-        Err(error) => admin_error_response(&error),
-    }
-}
-
-async fn deregister_oauth_client(
-    State(state): State<SharedDaemonState<impl PolicyStore + OAuthClientRepository>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    let mut guard = lock(&state);
-    if let Some(rejection) = authorize_admin(&guard.auth, &headers) {
-        return rejection;
-    }
-    match guard.oauth_clients.deregister(&id, now_timestamp()) {
-        Ok(_) => Json(serde_json::json!({ "deleted": true })).into_response(),
-        Err(error) => admin_error_response(&error),
-    }
-}
 
 async fn create_org(
     State(state): State<SharedDaemonState<impl PolicyStore>>,

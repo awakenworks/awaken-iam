@@ -76,6 +76,10 @@ pub(super) fn decode_oauth_client(row: &SqlRow) -> RepositoryResult<RegisteredCl
             "oauth allowed scopes",
         )?,
         secret_hash: opt(row, 3),
+        token_exchange: opt(row, 4)
+            .map(|policy| json_decode(&policy, "oauth token exchange"))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 

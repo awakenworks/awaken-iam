@@ -49,12 +49,13 @@ pub use approval_discharge::{
 };
 pub use assembly::{Deployment, HttpMethod, IAM_TABLE_PREFIX, IamAssembly, IamDaemon, RouteSpec};
 pub use auth_api::{
-    AuthApi, AuthApiError, AuthAuditEvent, CallbackOutcome, CallbackRequest,
-    DEFAULT_LOGIN_COOKIE_NAME, DEFAULT_LOGIN_PROOF_COOKIE_NAME, DownstreamAuthorizeOutcome,
-    DownstreamAuthorizeRequest, IssueTokenGrant, LinkIdentity, LogoutOutcome, MintAccessToken,
-    ProviderRegistration, RedeemAuthorizationCode, RefreshGrant, ReturnToDecision, ReturnToPolicy,
-    RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin, StartLoginOutcome, TokenGrant,
-    UnlinkIdentity,
+    AUDIENCE_EXCHANGE_MAX_LIFETIME_SECS, AccessTokenExchange, AccessTokenExchangeError, AuthApi,
+    AuthApiError, AuthAuditEvent, CallbackOutcome, CallbackRequest, DEFAULT_LOGIN_COOKIE_NAME,
+    DEFAULT_LOGIN_PROOF_COOKIE_NAME, DELEGATED_TOKEN_MAX_LIFETIME_SECS, DownstreamAuthorizeOutcome,
+    DownstreamAuthorizeRequest, ExchangedAccessToken, IssueTokenGrant, LinkIdentity, LogoutOutcome,
+    MintAccessToken, ProviderRegistration, RedeemAuthorizationCode, RefreshGrant, ReturnToDecision,
+    ReturnToPolicy, RevokeOutcome, RevokeToken, RevokeTokenHint, StartLogin, StartLoginOutcome,
+    TokenGrant, UnlinkIdentity,
 };
 pub use auth_types::{
     AuthFailureReason, ExternalLoginResolution, PrincipalResolutionFailure, ProviderSummary,

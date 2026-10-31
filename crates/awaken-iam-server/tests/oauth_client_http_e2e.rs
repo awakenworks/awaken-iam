@@ -258,3 +258,189 @@ async fn public_loopback_client_has_no_secret_to_issue_or_rotate() {
         "P1/E2"
     );
 }
+
+#[tokio::test]
+async fn every_client_kind_requires_https_or_loopback_redirects() {
+    // Decision table (I2): the redirect rule no longer depends on client kind.
+    // | kind | redirect | result |
+    // | public | http on a network host | 422, nothing stored |
+    // | public | https / http loopback | 201 |
+    // | public | https with credentials or fragment | 422 |
+    // | confidential | http on a network host | 422 (unchanged) |
+    let (app, store) = fixture();
+    let path = "/v1/admin/oauth-clients";
+    for (kind, uri, expected) in [
+        (
+            "public",
+            "http://app.example/callback",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "public",
+            "http://user@127.0.0.1:9000/cb",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "public",
+            "https://app.example/cb#frag",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "confidential",
+            "http://app.example/callback",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "public",
+            "https://app.example/callback",
+            StatusCode::CREATED,
+        ),
+        (
+            "public",
+            "http://localhost:5173/callback",
+            StatusCode::CREATED,
+        ),
+    ] {
+        let client_id = format!("{kind}-{}", uri.len());
+        let body = serde_json::json!({
+            "kind": kind, "client_id": client_id,
+            "redirect_uris": [uri], "allowed_scopes": ["openid"],
+        });
+        let response = app
+            .clone()
+            .oneshot(request("POST", path, Some(body), Some(ADMIN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{kind} {uri}");
+        assert_eq!(
+            OAuthClientRepository::get(&store, &client_id)
+                .unwrap()
+                .is_some(),
+            expected == StatusCode::CREATED,
+            "{kind} {uri} storage"
+        );
+    }
+}
+
+#[tokio::test]
+async fn token_exchange_policy_is_validated_persisted_replaced_and_survives_rotation() {
+    // Decision table (I1 admission):
+    // | request | result |
+    // | public client with delegation | 422, not stored |
+    // | delegation and exchange sharing an audience | 422 |
+    // | confidential client with delegation | 201, persisted in SQL, visible in view |
+    // | PUT a new policy | 200, persisted, audited |
+    // | rotate secret | policy preserved |
+    // | PUT a policy invalid for the client kind | 422, previous policy kept |
+    let (app, store) = fixture();
+    let path = "/v1/admin/oauth-clients";
+    let delegation = serde_json::json!({
+        "delegation": {"service_id": "svc-business", "audiences": ["flow"]}
+    });
+    let public = serde_json::json!({
+        "kind": "public", "client_id": "spa",
+        "redirect_uris": ["https://app.example/cb"], "allowed_scopes": ["openid"],
+        "token_exchange": delegation,
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(request("POST", path, Some(public), Some(ADMIN)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert!(OAuthClientRepository::get(&store, "spa").unwrap().is_none());
+    let overlapping = serde_json::json!({
+        "kind": "confidential", "client_id": "business",
+        "redirect_uris": ["https://business.example/cb"], "allowed_scopes": ["flow.read"],
+        "token_exchange": {
+            "audiences": ["flow"],
+            "delegation": {"service_id": "svc-business", "audiences": ["flow"]}
+        },
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(request("POST", path, Some(overlapping), Some(ADMIN)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let confidential = serde_json::json!({
+        "kind": "confidential", "client_id": "business",
+        "redirect_uris": ["https://business.example/cb"], "allowed_scopes": ["flow.read"],
+        "token_exchange": delegation,
+    });
+    let created = app
+        .clone()
+        .oneshot(request("POST", path, Some(confidential), Some(ADMIN)))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let stored = OAuthClientRepository::get(&store, "business")
+        .unwrap()
+        .unwrap();
+    let delegated = stored.token_exchange.delegation.clone().unwrap();
+    assert_eq!(delegated.service_id, "svc-business");
+    assert!(delegated.audiences.contains("flow"));
+
+    let policy_path = format!("{path}/business/token-exchange");
+    let replacement = serde_json::json!({
+        "delegation": {
+            "service_id": "svc-business", "audiences": ["flow", "reports"],
+            "subject_audiences": ["enterprise-web"]
+        }
+    });
+    let replaced = app
+        .clone()
+        .oneshot(request("PUT", &policy_path, Some(replacement), Some(ADMIN)))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let view = json(replaced).await;
+    assert_eq!(
+        view["token_exchange"]["delegation"]["subject_audiences"][0],
+        "enterprise-web"
+    );
+    app.clone()
+        .oneshot(request(
+            "POST",
+            &format!("{path}/business/rotate-secret"),
+            None,
+            Some(ADMIN),
+        ))
+        .await
+        .unwrap();
+    let rotated = OAuthClientRepository::get(&store, "business")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rotated.token_exchange.delegation.unwrap().audiences.len(),
+        2,
+        "rotation keeps the admission"
+    );
+    let invalid = serde_json::json!({"audiences": [" padded"]});
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", &policy_path, Some(invalid), Some(ADMIN)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert!(
+        OAuthClientRepository::get(&store, "business")
+            .unwrap()
+            .unwrap()
+            .token_exchange
+            .delegation
+            .is_some()
+    );
+    assert!(
+        AuditSink::events(&store)
+            .unwrap()
+            .iter()
+            .any(|event| event.action == "oauth_client.replace_token_exchange")
+    );
+}

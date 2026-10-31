@@ -85,9 +85,127 @@ pub struct RegisteredClient {
     /// Hashed secret for a confidential client; `None` for a public client,
     /// which must therefore use PKCE.
     pub secret_hash: Option<String>,
+    /// RFC 8693 token-exchange admission. Empty (the default, and the decoded
+    /// value of every row stored before exchange existed) admits nothing.
+    #[serde(default, skip_serializing_if = "ClientTokenExchangePolicy::is_empty")]
+    pub token_exchange: ClientTokenExchangePolicy,
+}
+
+/// Administrator-configured RFC 8693 token-exchange admission for one client.
+///
+/// Two disjoint uses are admitted, both issuing an ordinary IAM access token:
+///
+/// * **Audience exchange** — the client re-targets an access token IAM issued
+///   *to it* for a user onto one of [`audiences`](Self::audiences). `sub` is
+///   unchanged and no actor is recorded.
+/// * **Delegation** — a confidential client authenticates as the service
+///   principal named in [`delegation`](Self::delegation) and obtains a short
+///   token for one of the delegation audiences that carries the user as `sub`
+///   and itself as `act`.
+///
+/// The two audience sets must be disjoint so a request's target audience alone
+/// selects exactly one use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTokenExchangePolicy {
+    /// Audiences this client may re-target its own users' tokens to.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub audiences: BTreeSet<String>,
+    /// Delegation admission; `None` forbids acting on behalf of users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<ClientDelegation>,
+}
+
+/// Delegation admission for a confidential client (its service identity).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDelegation {
+    /// Service principal id stamped into the issued token's `act.sub`.
+    pub service_id: String,
+    /// Audiences a delegated token may be issued for.
+    pub audiences: BTreeSet<String>,
+    /// Additional audiences a presented user token may carry. A user token
+    /// issued to this client itself is always accepted.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub subject_audiences: BTreeSet<String>,
+}
+
+impl ClientTokenExchangePolicy {
+    /// Whether the policy admits no exchange at all.
+    pub fn is_empty(&self) -> bool {
+        self.audiences.is_empty() && self.delegation.is_none()
+    }
+}
+
+/// Why a client's token-exchange policy was refused at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TokenExchangePolicyError {
+    /// An audience, subject audience or service id was blank or padded.
+    #[error("token-exchange identifiers must be non-empty and unpadded")]
+    InvalidIdentifier,
+    /// The client listed its own id as an exchange target.
+    #[error("a client cannot exchange tokens for its own audience")]
+    SelfAudience,
+    /// Delegation was configured for a public client, which cannot
+    /// authenticate as a service principal.
+    #[error("delegation requires a confidential client")]
+    DelegationRequiresConfidentialClient,
+    /// Delegation was configured without any target audience.
+    #[error("delegation requires at least one target audience")]
+    EmptyDelegationAudiences,
+    /// An audience appears in both the exchange and delegation sets.
+    #[error("audience exchange and delegation targets must be disjoint")]
+    OverlappingAudiences,
 }
 
 impl RegisteredClient {
+    /// Attach a token-exchange policy, returning the updated client.
+    pub fn with_token_exchange(mut self, policy: ClientTokenExchangePolicy) -> Self {
+        self.token_exchange = policy;
+        self
+    }
+
+    /// Whether this is a confidential client (holds a secret).
+    pub fn is_confidential(&self) -> bool {
+        self.secret_hash.is_some()
+    }
+
+    /// Validate the token-exchange policy against this client's kind and id.
+    pub fn validate_token_exchange(&self) -> Result<(), TokenExchangePolicyError> {
+        let policy = &self.token_exchange;
+        let valid = |value: &String| !value.is_empty() && value.trim() == value;
+        let delegation_audiences = policy
+            .delegation
+            .iter()
+            .flat_map(|delegation| delegation.audiences.iter());
+        if !policy.audiences.iter().all(valid)
+            || !delegation_audiences.clone().all(valid)
+            || policy.delegation.as_ref().is_some_and(|delegation| {
+                !valid(&delegation.service_id) || !delegation.subject_audiences.iter().all(valid)
+            })
+        {
+            return Err(TokenExchangePolicyError::InvalidIdentifier);
+        }
+        if policy.audiences.contains(&self.client_id)
+            || delegation_audiences
+                .clone()
+                .any(|audience| audience == &self.client_id)
+        {
+            return Err(TokenExchangePolicyError::SelfAudience);
+        }
+        if let Some(delegation) = &policy.delegation {
+            if !self.is_confidential() {
+                return Err(TokenExchangePolicyError::DelegationRequiresConfidentialClient);
+            }
+            if delegation.audiences.is_empty() {
+                return Err(TokenExchangePolicyError::EmptyDelegationAudiences);
+            }
+            if !delegation.audiences.is_disjoint(&policy.audiences) {
+                return Err(TokenExchangePolicyError::OverlappingAudiences);
+            }
+        }
+        Ok(())
+    }
     /// Register a public client (no secret); it must use PKCE.
     pub fn public<I, S>(client_id: impl Into<String>, redirect_uris: Vec<String>, scopes: I) -> Self
     where
@@ -99,6 +217,7 @@ impl RegisteredClient {
             redirect_uris,
             allowed_scopes: scopes.into_iter().map(Into::into).collect(),
             secret_hash: None,
+            token_exchange: ClientTokenExchangePolicy::default(),
         }
     }
 
@@ -118,6 +237,7 @@ impl RegisteredClient {
             redirect_uris,
             allowed_scopes: scopes.into_iter().map(Into::into).collect(),
             secret_hash: Some(hash_session_token(client_secret)),
+            token_exchange: ClientTokenExchangePolicy::default(),
         }
     }
 
@@ -1148,6 +1268,120 @@ mod tests {
                 soon()
             ),
             Err(OAuthProviderError::StorageUnavailable)
+        );
+    }
+
+    /// Registration decision table for token-exchange admission:
+    ///
+    /// | client | policy | result |
+    /// |---|---|---|
+    /// | any | empty | Ok (legacy rows decode to this) |
+    /// | public | audience exchange only | Ok |
+    /// | public | delegation | DelegationRequiresConfidentialClient |
+    /// | confidential | delegation with targets disjoint from exchange | Ok |
+    /// | confidential | delegation without targets | EmptyDelegationAudiences |
+    /// | confidential | same audience in both sets | OverlappingAudiences |
+    /// | any | own client id as target | SelfAudience |
+    /// | any | blank or padded identifier | InvalidIdentifier |
+    #[test]
+    fn token_exchange_policy_validation_matches_the_decision_table() {
+        let set = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+        let delegation = |targets: &[&str]| ClientDelegation {
+            service_id: "svc-business".into(),
+            audiences: set(targets),
+            subject_audiences: BTreeSet::new(),
+        };
+        let spa =
+            RegisteredClient::public("spa", vec!["https://spa.example/cb".into()], ["openid"]);
+        let service = RegisteredClient::confidential(
+            "business",
+            "secret",
+            vec!["https://business.example/cb".into()],
+            ["openid"],
+        );
+        assert_eq!(spa.validate_token_exchange(), Ok(()));
+        let exchange_only = ClientTokenExchangePolicy {
+            audiences: set(&["flow", "business"]),
+            delegation: None,
+        };
+        assert_eq!(
+            spa.clone()
+                .with_token_exchange(exchange_only)
+                .validate_token_exchange(),
+            Ok(())
+        );
+        let delegating = ClientTokenExchangePolicy {
+            audiences: BTreeSet::new(),
+            delegation: Some(delegation(&["flow"])),
+        };
+        assert_eq!(
+            spa.clone()
+                .with_token_exchange(delegating.clone())
+                .validate_token_exchange(),
+            Err(TokenExchangePolicyError::DelegationRequiresConfidentialClient)
+        );
+        assert_eq!(
+            service
+                .clone()
+                .with_token_exchange(delegating)
+                .validate_token_exchange(),
+            Ok(())
+        );
+        for (policy, expected) in [
+            (
+                ClientTokenExchangePolicy {
+                    audiences: BTreeSet::new(),
+                    delegation: Some(delegation(&[])),
+                },
+                TokenExchangePolicyError::EmptyDelegationAudiences,
+            ),
+            (
+                ClientTokenExchangePolicy {
+                    audiences: set(&["flow"]),
+                    delegation: Some(delegation(&["flow"])),
+                },
+                TokenExchangePolicyError::OverlappingAudiences,
+            ),
+            (
+                ClientTokenExchangePolicy {
+                    audiences: set(&["business"]),
+                    delegation: None,
+                },
+                TokenExchangePolicyError::SelfAudience,
+            ),
+            (
+                ClientTokenExchangePolicy {
+                    audiences: set(&[" flow"]),
+                    delegation: None,
+                },
+                TokenExchangePolicyError::InvalidIdentifier,
+            ),
+        ] {
+            assert_eq!(
+                service
+                    .clone()
+                    .with_token_exchange(policy)
+                    .validate_token_exchange(),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_client_rows_decode_with_an_empty_exchange_policy() {
+        let legacy = serde_json::json!({
+            "client_id": "legacy",
+            "redirect_uris": ["https://legacy.example/cb"],
+            "allowed_scopes": ["openid"],
+            "secret_hash": null,
+        });
+        let client: RegisteredClient = serde_json::from_value(legacy).unwrap();
+        assert!(client.token_exchange.is_empty());
+        assert!(
+            serde_json::to_value(&client)
+                .unwrap()
+                .get("token_exchange")
+                .is_none()
         );
     }
 }

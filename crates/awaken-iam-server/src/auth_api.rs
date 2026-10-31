@@ -20,6 +20,7 @@
 //! | `POST /v1/oauth/token` (initial grant) | [`AuthApi::issue_token_grant`] |
 //! | `POST /v1/oauth/token` (`refresh_token`) | [`AuthApi::refresh_token_grant`] |
 //! | `POST /v1/oauth/token` (`refresh_token`, OP client) | [`AuthApi::refresh_registered_client`] |
+//! | `POST /v1/oauth/token` (token exchange, IAM access token) | [`AuthApi::exchange_access_token`] |
 //! | `POST /v1/oauth/revoke` (RFC 7009) | [`AuthApi::revoke_token`] |
 //! | `GET /v1/auth/providers` | [`AuthApi::list_providers`] |
 //! | `GET /v1/auth/login/{provider}` | [`AuthApi::start_login`] |
@@ -87,6 +88,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 mod builder;
+mod delegation;
+
+pub use delegation::{
+    AUDIENCE_EXCHANGE_MAX_LIFETIME_SECS, AccessTokenExchange, AccessTokenExchangeError,
+    DELEGATED_TOKEN_MAX_LIFETIME_SECS, ExchangedAccessToken,
+};
 
 /// Default key id minted for the bootstrap access-token signing key.
 const DEFAULT_SIGNING_KID: &str = "iam-access-key-1";
@@ -358,6 +365,35 @@ pub enum AuthAuditEvent {
         /// Stable machine-readable reason the exchange failed.
         reason: TokenExchangeError,
         /// When the failure was observed, as unix seconds.
+        at: i64,
+    },
+    /// An IAM access token was exchanged for another IAM access token
+    /// (RFC 8693 audience exchange or delegation, ADR-0017).
+    AccessTokenExchanged {
+        /// Authenticated client that performed the exchange.
+        client_id: String,
+        /// Unchanged end-user subject of both tokens.
+        subject: String,
+        /// Service principal recorded as `act`, for a delegation.
+        actor: Option<String>,
+        /// Audience of the issued token.
+        audience: String,
+        /// Scopes of the issued token.
+        scope: Vec<String>,
+        /// `jti` of the issued token.
+        jti: String,
+        /// `jti` of the presented subject token.
+        subject_jti: String,
+        /// When the exchange happened, as unix seconds.
+        at: i64,
+    },
+    /// An access-token exchange was refused before a token was issued.
+    AccessTokenExchangeRejected {
+        /// Client id presented with the request (possibly unauthenticated).
+        client_id: String,
+        /// Stable machine-readable refusal reason.
+        reason: AccessTokenExchangeError,
+        /// When the refusal happened, as unix seconds.
         at: i64,
     },
     /// IAM (as the downstream OpenID Provider) issued an authorization code to a

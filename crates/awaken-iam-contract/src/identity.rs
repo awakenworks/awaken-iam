@@ -244,7 +244,8 @@ pub struct OpenIdProviderMetadata {
     pub issuer: String,
     /// Authorization endpoint that begins a federated login.
     pub authorization_endpoint: String,
-    /// Token endpoint for the `authorization_code` and `refresh_token` grants.
+    /// Token endpoint for the `authorization_code`, `refresh_token` and RFC 8693
+    /// token-exchange grants.
     pub token_endpoint: String,
     /// UserInfo endpoint returning the authenticated subject's claims.
     pub userinfo_endpoint: String,
@@ -288,6 +289,7 @@ impl OpenIdProviderMetadata {
             grant_types_supported: vec![
                 "authorization_code".to_owned(),
                 "refresh_token".to_owned(),
+                "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
             ],
         }
     }

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
-    AuthApi, AuthApiError, DownstreamAuthorizeRequest, RedeemAuthorizationCode, RefreshGrant,
-    RevokeToken, RevokeTokenHint,
+    AccessTokenExchange, AuthApi, AuthApiError, DownstreamAuthorizeRequest,
+    RedeemAuthorizationCode, RefreshGrant, RevokeToken, RevokeTokenHint,
 };
 
 const ACCESS_TOKEN_TTL_SECS: u64 = 3_600;
@@ -121,6 +121,24 @@ struct TokenForm {
     redirect_uri: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    subject_token: Option<String>,
+    subject_token_type: Option<String>,
+    actor_token: Option<String>,
+    actor_token_type: Option<String>,
+    requested_token_type: Option<String>,
+    audience: Option<String>,
+    resource: Option<String>,
+    scope: Option<String>,
+}
+
+/// RFC 8693 §2.2.1 response: a bearer access token with no refresh token.
+#[derive(Debug, Serialize)]
+struct TokenExchangeHttpResponse {
+    access_token: String,
+    issued_token_type: &'static str,
+    token_type: &'static str,
+    expires_in: i64,
+    scope: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +520,41 @@ async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) ->
                 },
             )
             .await
+        }
+        crate::TOKEN_EXCHANGE_GRANT_TYPE => {
+            let Some(subject_token) = form.subject_token else {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+            };
+            let exchanged = auth
+                .exchange_access_token(AccessTokenExchange {
+                    issuer: state.issuer.to_string(),
+                    client_id: form.client_id,
+                    client_secret: form.client_secret,
+                    subject_token,
+                    subject_token_type: form.subject_token_type.unwrap_or_default(),
+                    actor_token: form.actor_token,
+                    actor_token_type: form.actor_token_type,
+                    requested_token_type: form.requested_token_type,
+                    audience: form.audience,
+                    resource: form.resource,
+                    scope: form.scope.as_deref().map(split_scope),
+                    now: now as i64,
+                })
+                .await;
+            return match exchanged {
+                Ok(issued) => Json(TokenExchangeHttpResponse {
+                    access_token: issued.access_token,
+                    issued_token_type: issued.issued_token_type,
+                    token_type: issued.token_type,
+                    expires_in: issued.expires_in,
+                    scope: issued.scope.join(" "),
+                })
+                .into_response(),
+                Err(error) => oauth_error(
+                    StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+                    error.oauth_error_code(),
+                ),
+            };
         }
         _ => return oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
     };

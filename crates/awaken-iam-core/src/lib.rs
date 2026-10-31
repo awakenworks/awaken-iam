@@ -69,9 +69,10 @@ pub use login::{
     OsEntropy, PkceChallenge, PkceMethod,
 };
 pub use oauth_provider::{
-    AuthorizationRequest as OAuthAuthorizationRequest, AuthorizedGrant, IssuedAuthorizationCode,
-    OAuthAuthorizationServer, OAuthClientRegistry, OAuthProviderError, RegisteredClient,
-    StoredAuthorizationCode, TokenRedemption,
+    AuthorizationRequest as OAuthAuthorizationRequest, AuthorizedGrant, ClientDelegation,
+    ClientTokenExchangePolicy, IssuedAuthorizationCode, OAuthAuthorizationServer,
+    OAuthClientRegistry, OAuthProviderError, RegisteredClient, StoredAuthorizationCode,
+    TokenExchangePolicyError, TokenRedemption,
 };
 pub use privacy::{
     OrgPrivacyCommitPlan, OrgPrivacyTerminal, OrganizationPrivacyScope, plan_org_privacy_commit,
