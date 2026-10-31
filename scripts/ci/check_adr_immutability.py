@@ -8,7 +8,7 @@ that supersedes it.
 
 Modes:
   --staged       compare the index against HEAD (pre-commit)
-  --base REF     compare REF...HEAD (pre-push / CI)
+  --base REF     compare REF...HEAD, confirmed per commit (pre-push / CI)
   --self-test    run the enforcer logic against synthetic fixtures
 
 What stays editable on a locked ADR:
@@ -20,6 +20,15 @@ What stays editable on a locked ADR:
 
 Status transitions are also gated: a decision may not slide backwards
 (e.g. Accepted -> Proposed).
+
+``--base`` first compares the merge base of REF and HEAD with HEAD. A path
+whose net change looks illegal is then replayed commit by commit: an ADR added
+as Proposed and accepted by a later commit is a legal lifecycle even when both
+commits are new relative to REF, so the path is reported only when some commit
+in the range made an illegal change to it. A merge commit's change is legal
+when it is legal from at least one parent, so content one side already carried
+through its own commits is not re-judged as new, while an ADR edit that only
+the merge resolution introduces is still checked.
 """
 
 from __future__ import annotations
@@ -157,21 +166,64 @@ def show(ref_path: str) -> str | None:
     return out if code == 0 else None
 
 
-def run_diff(mode_args: list[str], old_ref: str | None) -> int:
-    errors: list[str] = []
-    for path in changed_adrs(mode_args):
-        old_blob = show(f"{old_ref}:{path}") if old_ref is not None else None
-        # In --staged mode old_ref is None but old content is HEAD's version.
-        if old_ref is None:
-            old_blob = show(f"HEAD:{path}")
-        new_blob = show(f":{path}") if old_ref is None else show("HEAD:" + path)
+def change_errors(
+    diff_args: list[str], old_ref: str, new_ref: str | None
+) -> list[tuple[str, str]]:
+    """``(path, error)`` ADR violations from ``old_ref`` to ``new_ref`` (None = index)."""
+    errors: list[tuple[str, str]] = []
+    for path in changed_adrs(diff_args):
+        old_blob = show(f"{old_ref}:{path}")
+        new_blob = show(f":{path}") if new_ref is None else show(f"{new_ref}:{path}")
         old_status = status_of(old_blob) if old_blob is not None else None
         new_status = status_of(new_blob) if new_blob else None
-        removed, override = removed_lines(mode_args, path)
+        removed, override = removed_lines(diff_args, path)
         errors.extend(
-            check_change(path, old_status, new_status, removed, override)
+            (path, error)
+            for error in check_change(path, old_status, new_status, removed, override)
         )
+    return errors
 
+
+def commit_errors(per_parent: list[list[tuple[str, str]]]) -> list[tuple[str, str]]:
+    """A commit's ADR change is legal when it is legal from at least one parent."""
+    if not per_parent or any(not errors for errors in per_parent):
+        return []
+    return per_parent[0]
+
+
+def confirmed(
+    net: list[tuple[str, str]], per_commit: list[tuple[str, str]]
+) -> list[str]:
+    """Net violations that some commit in the range really introduced."""
+    suspects = {path for path, _ in net}
+    return [error for path, error in per_commit if path in suspects]
+
+
+def range_errors(ref: str) -> list[str]:
+    code, out = git(["merge-base", ref, "HEAD"])
+    if code != 0:
+        return [f"no merge base between {ref} and HEAD"]
+    base = out.strip()
+    net = change_errors([base, "HEAD"], base, "HEAD")
+    if not net:
+        return []
+    code, out = git(["rev-list", "--reverse", "--parents", f"{ref}..HEAD"])
+    if code != 0:
+        return [f"cannot list commits in {ref}..HEAD"]
+    per_commit: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        commit, *parents = line.split()
+        per_parent = [
+            change_errors([parent, commit], parent, commit) for parent in parents
+        ]
+        per_commit.extend(
+            (path, f"{commit[:12]}: {error}")
+            for path, error in commit_errors(per_parent)
+        )
+    return confirmed(net, per_commit)
+
+
+def report(errors: list[str]) -> int:
     if errors:
         print("check-adr-immutability:", file=sys.stderr)
         for e in errors:
@@ -204,8 +256,44 @@ def self_test() -> int:
         ("new proposed ok", None, "Proposed", [], False, False),
     ]
     failures = 0
+    merge_cases = [
+        # (desc, errors per parent, expect_errors)
+        ("ordinary commit clean", [[]], False),
+        ("ordinary commit violation", [["x"]], True),
+        ("merge carries a side's checked ADR", [[], ["new Accepted"]], False),
+        ("merge resolution edits locked body", [["edit"], ["edit"]], True),
+    ]
+    merge_cases = [
+        (desc, [[("t.md", e) for e in errors] for errors in per_parent], expect)
+        for desc, per_parent, expect in merge_cases
+    ]
+    for desc, per_parent, expect in merge_cases:
+        errs = commit_errors(per_parent)
+        if bool(errs) != expect:
+            failures += 1
+            print(
+                f"self-test FAILED [{desc}]: expected errors={expect}, got {errs}",
+                file=sys.stderr,
+            )
     for desc, old, new, removed, override, expect in cases:
         errs = check_change("t.md", old, new, removed, override)
+        if bool(errs) != expect:
+            failures += 1
+            print(
+                f"self-test FAILED [{desc}]: expected errors={expect}, got {errs}",
+                file=sys.stderr,
+            )
+    lifecycle_cases = [
+        # (desc, net violations, per-commit violations, expect_errors)
+        ("net change legal", [], [("t.md", "c1: edit")], False),
+        ("proposed then accepted in range", [("t.md", "new Accepted")], [], False),
+        ("commit really added it accepted", [("t.md", "new Accepted")],
+         [("t.md", "c1: new Accepted")], True),
+        ("other path's commit violation", [("t.md", "new Accepted")],
+         [("u.md", "c1: edit")], False),
+    ]
+    for desc, net, per_commit, expect in lifecycle_cases:
+        errs = confirmed(net, per_commit)
         if bool(errs) != expect:
             failures += 1
             print(
@@ -226,7 +314,7 @@ def main(argv: list[str]) -> int:
     if argv[0] == "--self-test":
         return self_test()
     if argv[0] == "--staged":
-        return run_diff(["--cached"], None)
+        return report([error for _, error in change_errors(["--cached"], "HEAD", None)])
     if argv[0] == "--base":
         if len(argv) < 2:
             print("--base requires a ref", file=sys.stderr)
@@ -236,7 +324,7 @@ def main(argv: list[str]) -> int:
         if code != 0:
             print(f"check-adr-immutability: base ref {ref!r} not found; skipping")
             return 0
-        return run_diff([f"{ref}...HEAD"], ref)
+        return report(range_errors(ref))
     print(f"unknown mode: {argv[0]}", file=sys.stderr)
     return 2
 
