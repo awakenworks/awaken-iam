@@ -28,6 +28,9 @@ const ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const BUSINESS_SECRET: &str = "business-secret";
 
+/// One refused request: field overrides, expected status and OAuth error code.
+type Refusal<'a> = (Vec<(&'a str, &'a str)>, StatusCode, &'static str);
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -249,7 +252,7 @@ async fn audience_exchange_narrows_and_refuses_every_other_shape() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["scope"], "openid flow.read business.command");
 
-    let refusals: Vec<(Vec<(&str, &str)>, StatusCode, &str)> = vec![
+    let refusals: Vec<Refusal> = vec![
         (
             vec![("scope", "flow.read flow.write")],
             StatusCode::BAD_REQUEST,
@@ -496,7 +499,7 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_grant");
 
-    let refusals: Vec<(Vec<(&str, &str)>, StatusCode, &str)> = vec![
+    let refusals: Vec<Refusal> = vec![
         (
             vec![("client_secret", "wrong")],
             StatusCode::UNAUTHORIZED,
