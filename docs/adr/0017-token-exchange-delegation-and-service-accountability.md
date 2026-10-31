@@ -79,8 +79,15 @@ lifetime is bounded by the subject expiry and, for delegation, 300 seconds.
 `OAuthClientAdminApi::register`: every redirect URI is HTTPS, or HTTP on
 `127.0.0.1`, `[::1]` or `localhost`, with no fragment or embedded credentials.
 
-**I3 - Actor claim.** `AccessTokenClaims.act: Option<AccessTokenActor>` is
-skipped when absent, so earlier tokens are unchanged and still verify.
+**I3 - Actor claim.** The optional `act` claim travels beside, not inside,
+`AccessTokenClaims`: `DelegatedAccessTokenClaims {claims, act}` flattens both
+into one JWT payload, is minted with `AccessTokenAuthority::mint_delegated`
+and read with `verify_delegated_access_token`. `AccessTokenClaims` keeps its
+exact shape, so library callers that build it with struct literals (Awaken,
+Flow test fixtures) compile unchanged. `act` is omitted when absent, so direct
+tokens are byte-identical to before. The plain `verify_access_token` ignores
+`act`; delegated tokens are only issued for audiences whose relying parties
+verify through `IamGate` or `verify_delegated_access_token`.
 `IamGate::authenticate_verified` and `IamGate::verify_jwt` return
 `VerifiedBearer {principal, workspace, actor, access_token}`; existing
 accessors keep their shapes. The host middleware inserts a `TokenActor`
@@ -88,17 +95,25 @@ extension and authorizes a delegated request as the actor with the user as the
 conjunctive `on_behalf_of` link, so the effective permission is the
 intersection of the user's and the service's.
 
-**I4 - Service-account accountability.** `ApiTokenMinter::mint` refuses a
-`PrincipalRef::Service` token without both an `owner` account and an
-`expires_at`. `ApiToken` and `ApiTokenView` carry the optional `owner`
-(identity migration 7, nullable). All live tokens of one principal are revoked
+**I4 - Service-account accountability.** The rule is enforced at the
+administrative service-account mint path, not in the shared types:
+`ApiTokenMinter::mint_service_account(directory, policy, request, owner)` and
+`LocalHandle::mint_service_account_token` refuse a non-service principal or a
+missing expiry (`ServiceAccountTokenError`) and record the accountable owner
+beside the token (`ApiTokenDirectory::owner`; durably
+`ApiTokenOwnerRepository`, identity migration 7's nullable `owner` column).
+IAM serves no HTTP endpoint that mints API tokens, so this method is the
+boundary every administrative surface must use. `MintApiToken`, `ApiToken`,
+`ApiTokenView`, `IamError` and the generic `ApiTokenMinter::mint` are
+unchanged, so existing library callers compile and behave exactly as before;
+they are outside the accountability guarantee. All live tokens of one principal are revoked
 together by `ApiTokenDirectory::revoke_principal`,
 `AuthzApi::revoke_api_tokens_for_principal`,
 `LocalHandle::revoke_service_account_tokens` and, durably,
 `revoke_api_tokens_for_principal` over the repository; earlier revocation
-stamps are kept. The embedded host's bootstrap admin token is minted through
-the explicit `mint_host_bootstrap` exemption because no accountable account
-exists before the first administrator.
+stamps are kept. The embedded host's bootstrap admin token keeps using the
+generic mint because no accountable account exists before the first
+administrator.
 
 **Token-endpoint client authentication.** Delegation relies on confidential
 client authentication, so `/v1/oauth/token` accepts `client_secret_basic`
@@ -141,8 +156,9 @@ missing or wrong client secrets, the 300-second and subject-expiry bounds and
 the audit records. Admin HTTP tests cover the public-client redirect rule and
 policy validation, persistence, replacement and rotation over SQLite. Host
 tests cover actor exposure, conjunctive authorization requests and the
-middleware extension. Core and SQL tests cover owner/expiry enforcement, the
-bootstrap exemption, legacy owner-less rows and bulk revocation.
+middleware extension. Core, host and SQL tests cover the service-account
+mint path, the unchanged generic mint, owner persistence, legacy owner-less
+rows and bulk revocation.
 Token-endpoint tests cover every client-authentication row above and the
 discovery document; SQLite restart tests cover key persistence, a stable kid
 and refusal of a tampered kid.
