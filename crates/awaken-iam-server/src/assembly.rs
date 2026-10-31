@@ -187,6 +187,7 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::put("/v1/admin/roles/{id}"),
     RouteSpec::delete("/v1/admin/roles/{id}"),
     RouteSpec::post("/v1/admin/grants"),
+    RouteSpec::post("/v1/admin/grants/batch"),
     RouteSpec::get("/v1/admin/grants/{id}"),
     RouteSpec::delete("/v1/admin/grants/{id}"),
     RouteSpec::post("/v1/admin/capabilities"),

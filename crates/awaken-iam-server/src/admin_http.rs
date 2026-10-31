@@ -31,6 +31,7 @@
 //! | `PUT /v1/admin/roles/{id}` | [`PolicyAdminApi::update_role`] |
 //! | `DELETE /v1/admin/roles/{id}` | [`PolicyAdminApi::delete_role`] |
 //! | `POST /v1/admin/grants` | [`PolicyAdminApi::issue_grant`] |
+//! | `POST /v1/admin/grants/batch` | [`PolicyAdminApi::issue_grants`] |
 //! | `GET /v1/admin/grants/{id}` | [`PolicyAdminApi::get_grant`] |
 //! | `DELETE /v1/admin/grants/{id}` | [`PolicyAdminApi::revoke_grant`] |
 //! | `POST /v1/admin/memberships` | [`PolicyAdminApi::grant_membership`] |
@@ -43,13 +44,17 @@
 //! host never mounts this router — it administers the model in-process — so the
 //! seam is exposed over HTTP only by the standalone daemon.
 
+mod grants;
 mod oauth_clients;
+mod policy_cache;
 mod principal_access;
 mod resource_provisioning;
+use grants::issue_grants;
 use oauth_clients::{
     deregister_oauth_client, get_oauth_client, list_oauth_clients, register_oauth_client,
     replace_oauth_client_token_exchange, rotate_oauth_client_secret,
 };
+use policy_cache::{ComposedPolicy, PolicyDelta};
 pub use principal_access::principal_access_router;
 pub use resource_provisioning::projection_router;
 use resource_provisioning::provision_resource;
@@ -72,8 +77,8 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{
     ActionPattern, AuditEvent, AuditSink, AuthorizationProfileRepository, Effect, Grant, GrantId,
-    GrantSubject, Group, GroupId, OAuthClientRepository, Organization, OsEntropy, PolicySet,
-    RegisteredClient, RoleBinding, RoleDef, RoleId,
+    GrantSubject, Group, GroupId, OAuthClientRepository, Organization, OsEntropy, RegisteredClient,
+    RoleBinding, RoleDef, RoleId,
 };
 use axum::{
     Json, Router,
@@ -165,6 +170,7 @@ pub struct DaemonState<S> {
     capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
     observed_store_version: u64,
+    composed: Option<ComposedPolicy>,
 }
 
 impl<S> std::fmt::Debug for DaemonState<S> {
@@ -207,6 +213,7 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
             capability_tokens,
             auth,
             observed_store_version: version,
+            composed: None,
         };
         state.ensure_fresh()?;
         Ok(state)
@@ -217,15 +224,47 @@ impl<S: PolicyStore> DaemonState<S> {
     /// Refresh the live PDP from the same repositories the PAP just committed.
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;
-        let base_snapshot = base.snapshot(version);
         let active_profiles = self
             .profiles
             .durable_active_profiles()
             .map_err(|error| AdminError::Backend(error.to_string()))?;
-        let policy = PolicySet::from_snapshot_and_profiles(&base_snapshot, &active_profiles);
+        let (composed, policy) = ComposedPolicy::compose(base, active_profiles, version);
         self.authz.replace_policy_at_version(policy, version);
+        self.composed = Some(composed);
         self.observed_store_version = version;
         Ok(())
+    }
+
+    /// Refresh the live PDP after this node committed one admin mutation at
+    /// `version`, applying `delta` in memory when the
+    /// [policy cache rules](policy_cache) allow and fully otherwise.
+    fn refresh_after_commit(
+        &mut self,
+        version: u64,
+        delta: Option<PolicyDelta>,
+    ) -> Result<(), AdminError> {
+        let observed = self.observed_store_version;
+        let served = self.authz.policy_version();
+        let advanced = self
+            .composed
+            .as_mut()
+            .and_then(|composed| composed.advance(observed, served, version, delta));
+        match advanced {
+            Some(policy) => {
+                self.authz.replace_policy_at_version(policy, version);
+                self.observed_store_version = version;
+                Ok(())
+            }
+            None => self.refresh_authorization(version),
+        }
+    }
+
+    /// Drop the remembered composition after a failed mutation. Not every PAP
+    /// mutation is one transaction, so a failure may leave a row without its
+    /// version advance; the next commit then re-reads the whole policy as it
+    /// did before incremental refresh existed.
+    fn forget_composed_policy(&mut self) {
+        self.composed = None;
     }
 
     /// One HTTP projection of the existing shared-fence refresh decision.
@@ -351,6 +390,7 @@ where
             get(get_role).put(update_role).delete(delete_role),
         )
         .route("/v1/admin/grants", post(issue_grant))
+        .route("/v1/admin/grants/batch", post(issue_grants))
         .route("/v1/admin/grants/{id}", get(get_grant).delete(revoke_grant))
         .route("/v1/admin/capabilities", post(issue_capability))
         .route(
@@ -739,9 +779,12 @@ async fn create_org(
     headers: HeaderMap,
     Json(dto): Json<OrgView>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.create_org(org_from_dto(dto), at)
-    })
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.create_org(org_from_dto(dto), at),
+        Some(PolicyDelta::Unchanged),
+    )
 }
 
 async fn provision_org(
@@ -781,9 +824,12 @@ async fn update_org(
     Json(mut dto): Json<OrgView>,
 ) -> Response {
     dto.id = OrgId(id);
-    apply(&state, &headers, move |admin, at| {
-        admin.update_org(org_from_dto(dto), at)
-    })
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.update_org(org_from_dto(dto), at),
+        Some(PolicyDelta::Unchanged),
+    )
 }
 
 async fn delete_org(
@@ -965,9 +1011,14 @@ async fn create_group(
     headers: HeaderMap,
     Json(dto): Json<GroupView>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.create_group(group_from_dto(dto), at)
-    })
+    let group = group_from_dto(dto);
+    let delta = PolicyDelta::SetGroupRoster(group.id.clone(), group.members.clone());
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.create_group(group, at),
+        Some(delta),
+    )
 }
 
 async fn update_group(
@@ -977,9 +1028,14 @@ async fn update_group(
     Json(mut dto): Json<GroupView>,
 ) -> Response {
     dto.id = id;
-    apply(&state, &headers, move |admin, at| {
-        admin.update_group(group_from_dto(dto), at)
-    })
+    let group = group_from_dto(dto);
+    let delta = PolicyDelta::SetGroupRoster(group.id.clone(), group.members.clone());
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.update_group(group, at),
+        Some(delta),
+    )
 }
 
 async fn delete_group(
@@ -997,9 +1053,12 @@ async fn define_role(
     headers: HeaderMap,
     Json(dto): Json<RoleView>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.define_role(role_from_dto(dto), at)
-    })
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.define_role(role_from_dto(dto), at),
+        Some(PolicyDelta::Unchanged),
+    )
 }
 
 async fn get_role(
@@ -1025,9 +1084,12 @@ async fn update_role(
     Json(mut dto): Json<RoleView>,
 ) -> Response {
     dto.id = id;
-    apply(&state, &headers, move |admin, at| {
-        admin.update_role(role_from_dto(dto), at)
-    })
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.update_role(role_from_dto(dto), at),
+        Some(PolicyDelta::Unchanged),
+    )
 }
 
 async fn delete_role(
@@ -1045,9 +1107,14 @@ async fn issue_grant(
     headers: HeaderMap,
     Json(dto): Json<GrantSnapshot>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.issue_grant(grant_from_dto(dto), at)
-    })
+    let grant = grant_from_dto(dto);
+    let delta = PolicyDelta::UpsertGrants(vec![grant.clone()]);
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.issue_grant(grant, at),
+        Some(delta),
+    )
 }
 
 async fn get_grant(
@@ -1071,9 +1138,14 @@ async fn revoke_grant(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.revoke_grant(&GrantId(id), at)
-    })
+    let id = GrantId(id);
+    let delta = PolicyDelta::RemoveGrant(id.clone());
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.revoke_grant(&id, at),
+        Some(delta),
+    )
 }
 
 async fn grant_membership(
@@ -1081,9 +1153,14 @@ async fn grant_membership(
     headers: HeaderMap,
     Json(dto): Json<RoleBindingSnapshot>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.grant_membership(role_binding_from_dto(dto), at)
-    })
+    let binding = role_binding_from_dto(dto);
+    let delta = PolicyDelta::BindRole(binding.clone());
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.grant_membership(binding, at),
+        Some(delta),
+    )
 }
 
 async fn revoke_membership(
@@ -1091,9 +1168,14 @@ async fn revoke_membership(
     headers: HeaderMap,
     Json(dto): Json<RoleBindingSnapshot>,
 ) -> Response {
-    apply(&state, &headers, move |admin, at| {
-        admin.revoke_membership(&role_binding_from_dto(dto), at)
-    })
+    let binding = role_binding_from_dto(dto);
+    let delta = PolicyDelta::UnbindRole(binding.clone());
+    apply_delta(
+        &state,
+        &headers,
+        move |admin, at| admin.revoke_membership(&binding, at),
+        Some(delta),
+    )
 }
 
 async fn replace_scoped_memberships(
@@ -1235,16 +1317,34 @@ where
     S: PolicyStore,
     F: FnOnce(&mut PolicyAdminApi<S>, Timestamp) -> Result<u64, AdminError>,
 {
+    apply_delta(state, headers, op, None)
+}
+
+/// [`apply`] for a mutation whose committed effect on the evaluator inputs is
+/// exactly `delta`, so the PDP may refresh incrementally (see [`policy_cache`]).
+fn apply_delta<S, F>(
+    state: &SharedDaemonState<S>,
+    headers: &HeaderMap,
+    op: F,
+    delta: Option<PolicyDelta>,
+) -> Response
+where
+    S: PolicyStore,
+    F: FnOnce(&mut PolicyAdminApi<S>, Timestamp) -> Result<u64, AdminError>,
+{
     let mut guard = lock(state);
     if let Some(rejection) = authorize_admin(&guard.auth, headers) {
         return rejection;
     }
     match op(&mut guard.admin, now_timestamp()) {
-        Ok(version) => match guard.refresh_authorization(version) {
+        Ok(version) => match guard.refresh_after_commit(version, delta) {
             Ok(()) => (StatusCode::OK, Json(AdminMutationAck { version })).into_response(),
             Err(error) => admin_error_response(&error),
         },
-        Err(error) => admin_error_response(&error),
+        Err(error) => {
+            guard.forget_composed_policy();
+            admin_error_response(&error)
+        }
     }
 }
 
@@ -1269,7 +1369,10 @@ where
             Ok(()) => (StatusCode::OK, Json(value)).into_response(),
             Err(error) => admin_error_response(&error),
         },
-        Err(error) => admin_error_response(&error),
+        Err(error) => {
+            guard.forget_composed_policy();
+            admin_error_response(&error)
+        }
     }
 }
 

@@ -143,6 +143,14 @@ request, and a disconnected store produced `503 policy_unavailable` rather than
 a stale allow. The portable migration bundles and PostgreSQL single-applier
 guard are implemented.
 
+After its own admin write, a daemon updates its local PDP from the write itself
+instead of re-reading the whole policy, but only when that write is the next
+`version` after the one it already serves. If any other writer committed in
+between, or a profile change replaced the policy, the daemon re-reads the whole
+policy as before, so the fence rule above is unchanged. `POST
+/v1/admin/grants/batch` stores many grants, one audit event per grant, and a
+single `version` advance in one transaction.
+
 Production still requires credential provisioning, rolling replacement of old
 daemon binaries before profile changes resume, multi-replica rollout rehearsal,
 and verification of readiness and alerting in the deployment environment.

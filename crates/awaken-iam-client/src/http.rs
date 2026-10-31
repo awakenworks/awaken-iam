@@ -28,16 +28,16 @@ use awaken_iam_contract::{
     BatchAuthorizationResponse, CreateAuthorizationProfile, CreateDirectoryNode, CreateInvitation,
     DirectoryChildrenQuery, DirectoryChildrenView, DirectoryMutationAck, DirectoryNodeId,
     DirectoryNodeMutationResult, DirectoryNodeView, DirectoryRevisionQuery,
-    EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementRequest, GrantSnapshot,
-    InvitationId, InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery,
-    MoveDirectoryNode, NamespaceId, OrgId, OrgPrivacyCommitReceipt, OrgView, PolicySnapshot,
-    ProductResourceModelRequest, ProductSpaceLifecycleResult, ProductSpacePlacement,
-    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
-    ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered, ResourceProvision,
-    ResourceProvisionReceipt, RetireAuthorizationProfile, RetireProductSpacePlacement,
-    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
-    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
-    WorkspaceOrgEdge,
+    EnsureProductSpacePlacement, EntitlementCheckResponse, EntitlementRequest, GrantBatch,
+    GrantSnapshot, InvitationId, InvitationQuery, InvitationView, IssuedInvitation,
+    MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId, OrgPrivacyCommitReceipt, OrgView,
+    PolicySnapshot, ProductResourceModelRequest, ProductSpaceLifecycleResult,
+    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
+    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, ResourceModelRegistered,
+    ResourceProvision, ResourceProvisionReceipt, RetireAuthorizationProfile,
+    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
+    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
+    UserInfo, WorkspaceOrgEdge,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -429,6 +429,15 @@ impl AuthzTransport for HttpAuthzTransport {
     fn issue_grant(&self, grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
         let response =
             self.send_with_retry(|| self.client.post(self.url("/v1/admin/grants")).json(grant))?;
+        Self::decode(response)
+    }
+
+    fn issue_grants(&self, batch: &GrantBatch) -> Result<AdminMutationAck, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/grants/batch"))
+                .json(batch)
+        })?;
         Self::decode(response)
     }
 
@@ -1360,6 +1369,7 @@ mod tests {
         let server = StubServer::start(vec![
             Reply::Ok(r#"{"version":6}"#.into()),
             Reply::Ok(grant_json.into()),
+            Reply::Ok(r#"{"version":7}"#.into()),
         ]);
         let grant = GrantSnapshot {
             id: "tenant-admin-console".into(),
@@ -1372,11 +1382,16 @@ mod tests {
         };
         let transport = transport(&server);
         transport.issue_grant(&grant).unwrap();
-        assert_eq!(transport.get_grant(&grant.id).unwrap(), Some(grant));
+        assert_eq!(transport.get_grant(&grant.id).unwrap(), Some(grant.clone()));
+        let batch = GrantBatch {
+            grants: vec![grant],
+        };
+        assert_eq!(transport.issue_grants(&batch).unwrap().version, 7);
 
         let requests = server.requests();
         assert!(requests[0].starts_with("POST /v1/admin/grants "));
         assert!(requests[1].starts_with("GET /v1/admin/grants/tenant-admin-console "));
+        assert!(requests[2].starts_with("POST /v1/admin/grants/batch "));
     }
 
     #[test]

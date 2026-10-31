@@ -41,6 +41,7 @@ use super::{Fence, FenceStore};
 
 mod admission;
 mod directory;
+mod grants;
 mod identity_rows;
 mod invitations;
 mod principal_access;
@@ -1332,49 +1333,7 @@ impl<B: SqlConn> RoleRepository for SqlStore<B> {
 
 impl<B: SqlConn> GrantRepository for SqlStore<B> {
     fn put(&self, grant: Grant) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
-            let groups = if let GrantSubject::Group(group) = &grant.subject {
-                vec![group.0.clone()]
-            } else {
-                vec![]
-            };
-            self.grant_admission(
-                transaction,
-                &[grant.id.0.clone()],
-                &[grant.scope.clone()],
-                &groups,
-            )?;
-            self.require_raw_grant_effect(transaction, &grant.id.0, &grant.scope)?;
-
-            let subject = encode_grant_subject(&grant.subject)?;
-            let scope = json_encode(&grant.scope, "grant scope")?;
-            let sql = format!(
-                "INSERT INTO {t} (id, subject, action_pattern, scope, effect) \
-             VALUES (?, ?j, ?, ?j, ?) \
-             ON CONFLICT (id) DO UPDATE SET subject = excluded.subject, \
-             action_pattern = excluded.action_pattern, scope = excluded.scope, \
-             effect = excluded.effect \
-             WHERE NOT EXISTS (SELECT 1 FROM {owners} WHERE grant_id = excluded.id)",
-                t = self.table("grants"),
-                owners = self.table("resource_projection_grant_owners")
-            );
-            if transaction.execute(
-                &sql,
-                &[
-                    p(grant.id.0),
-                    p(subject),
-                    p(grant.action_pattern.0),
-                    p(scope),
-                    p(encode_effect(grant.effect)),
-                ],
-            )? == 0
-            {
-                return Err(RepositoryError::Conflict(
-                    "grant belongs to a product projection".into(),
-                ));
-            }
-            Ok(())
-        })
+        self.with_policy_transaction(|transaction, _| self.write_grant(transaction, &grant))
     }
 
     fn get(&self, id: &GrantId) -> RepositoryResult<Option<Grant>> {

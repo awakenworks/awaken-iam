@@ -30,6 +30,7 @@ use awaken_iam_core::{
 use super::fence::{Fence, FenceStore};
 use crate::admin_api::{OrganizationProvisioningStore, ResourceProvisioningStore};
 
+mod grants;
 mod privacy;
 mod profiles;
 use privacy::{edge_admission, ensure_admitted, invitation_admission, provision_admission};
@@ -802,18 +803,7 @@ impl RoleRepository for InMemoryStore {
 impl GrantRepository for InMemoryStore {
     fn put(&self, grant: Grant) -> RepositoryResult<()> {
         let mut authz = checked_lock(&self.authz, "authz")?;
-        let mut scopes = vec![grant.scope.clone()];
-        let mut groups = Vec::new();
-        if let GrantSubject::Group(group) = &grant.subject {
-            groups.push(group.0.clone());
-        }
-        if let Some(previous) = authz.grants.get(&grant.id.0) {
-            scopes.push(previous.scope.clone());
-            if let GrantSubject::Group(group) = &previous.subject {
-                groups.push(group.0.clone());
-            }
-        }
-        ensure_admitted(&authz, &scopes, &groups)?;
+        grants::admit_grant(&authz, &grant)?;
         authz.grants.insert(grant.id.0.clone(), grant);
         Ok(())
     }

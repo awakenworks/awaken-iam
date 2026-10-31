@@ -57,8 +57,8 @@ pub use license::{
 };
 pub use protocol::{
     ApiTokenStatus, ApprovalAuthority, ApprovalObligation, AuthorizationOutcome,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantEffect,
-    GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
+    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantBatch,
+    GrantEffect, GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
     NamespaceOrgEdge, PolicySnapshot, ProductResourceModelRequest, ResourceModelRegistered,
     ResourceModelRegistration, ResourceParentEdge, ResourceProjectionBatch,
     ResourceProjectionDisposition, ResourceProjectionReceipt, ResourceProvision,

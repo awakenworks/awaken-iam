@@ -35,7 +35,8 @@ pub use access_token::{
 };
 pub use admin_api::{
     ACTION_AUTHZ_PROFILE_READ, ACTION_PRINCIPAL_ACCESS_REPLACE, AdminError, AdminResult,
-    DomainEvent, PolicyAdminApi, PolicyStore, PrincipalAccessStore, TEAM_ACCESS_REPLACED,
+    DomainEvent, GrantBatchStore, PolicyAdminApi, PolicyStore, PrincipalAccessStore,
+    TEAM_ACCESS_REPLACED,
 };
 pub use admin_http::{
     AdminAuthPolicy, DaemonState, SharedDaemonState, daemon_router, principal_access_router,

@@ -22,15 +22,16 @@ use awaken_iam_contract::{
     CreateDirectoryNode, CreateInvitation, DirectoryChildrenQuery, DirectoryChildrenView,
     DirectoryMutationAck, DirectoryNodeId, DirectoryNodeMutationResult, DirectoryNodeView,
     DirectoryRevisionQuery, EnsureProductSpacePlacement, EntitlementCheckResponse,
-    EntitlementDecision, EntitlementRequest, GrantSnapshot, InvitationId, InvitationQuery,
-    InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode, NamespaceId, OrgId,
-    OrgPrivacyCommitReceipt, OrgView, PolicySnapshot, ProductResourceModelRequest,
-    ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
-    ProductSpacePlacementResult, ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation,
-    ResourceAuthorizationRequest, ResourceModelRegistered, RetireAuthorizationProfile,
-    RetireProductSpacePlacement, RoleBindingSnapshot, RoleView, ScopeMembershipQuery,
-    SignerSetSnapshot, TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode,
-    UserInfo, WorkspaceOrgEdge,
+    EntitlementDecision, EntitlementRequest, GrantBatch, GrantSnapshot, InvitationId,
+    InvitationQuery, InvitationView, IssuedInvitation, MembershipQuery, MoveDirectoryNode,
+    NamespaceId, OrgId, OrgPrivacyCommitReceipt, OrgView, PolicySnapshot,
+    ProductResourceModelRequest, ProductSpaceLifecycleResult, ProductSpacePlacement,
+    ProductSpacePlacementQuery, ProductSpacePlacementResult, ProvisionOrganization,
+    ReplaceScopedMemberships, ResendInvitation, ResourceAuthorizationRequest,
+    ResourceModelRegistered, RetireAuthorizationProfile, RetireProductSpacePlacement,
+    RoleBindingSnapshot, RoleView, ScopeMembershipQuery, SignerSetSnapshot,
+    TokenIntrospectionRequest, TokenIntrospectionResponse, UpdateDirectoryNode, UserInfo,
+    WorkspaceOrgEdge,
 };
 
 use crate::{IamClient, IamDecisionError};
@@ -172,6 +173,11 @@ pub trait AuthzTransport {
     }
 
     fn issue_grant(&self, _grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
+        Err(RemoteError("grant PAP is not supported".into()))
+    }
+
+    /// Issue every grant in `batch` atomically under one policy version.
+    fn issue_grants(&self, _batch: &GrantBatch) -> Result<AdminMutationAck, RemoteError> {
         Err(RemoteError("grant PAP is not supported".into()))
     }
 
@@ -516,6 +522,11 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
 
     pub fn issue_grant(&self, grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
         self.transport.issue_grant(grant)
+    }
+
+    /// Issue every grant in `batch` atomically under one policy version.
+    pub fn issue_grants(&self, batch: &GrantBatch) -> Result<AdminMutationAck, RemoteError> {
+        self.transport.issue_grants(batch)
     }
 
     pub fn get_grant(&self, grant_id: &str) -> Result<Option<GrantSnapshot>, RemoteError> {

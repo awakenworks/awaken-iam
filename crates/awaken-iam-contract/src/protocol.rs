@@ -197,6 +197,17 @@ pub struct GrantSnapshot {
     pub effect: GrantEffect,
 }
 
+/// Body of `POST /v1/admin/grants/batch`.
+///
+/// Every grant is validated and audited exactly as `POST /v1/admin/grants`
+/// would; the whole batch commits in one transaction and advances the policy
+/// version once, or nothing changes. Grant ids must be unique in the batch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantBatch {
+    /// Grants to insert or replace by id.
+    pub grants: Vec<GrantSnapshot>,
+}
+
 /// Wire shape of a role binding in a policy snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleBindingSnapshot {

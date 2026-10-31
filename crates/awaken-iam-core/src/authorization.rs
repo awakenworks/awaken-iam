@@ -470,10 +470,54 @@ impl PolicySet {
         self
     }
 
+    /// Insert `grant`, or replace the grant that has the same id.
+    ///
+    /// A replacement keeps its position. A new grant goes before the first
+    /// grant whose id sorts after it, so a policy hydrated in id order stays in
+    /// id order. Decisions never depend on grant order; only the order of
+    /// matched grant ids in a trace does.
+    pub fn upsert_grant(&mut self, grant: Grant) -> &mut Self {
+        if let Some(existing) = self.grants.iter_mut().find(|held| held.id == grant.id) {
+            *existing = grant;
+        } else {
+            let at = self
+                .grants
+                .iter()
+                .position(|held| held.id.0 > grant.id.0)
+                .unwrap_or(self.grants.len());
+            self.grants.insert(at, grant);
+        }
+        self
+    }
+
+    /// Remove the grant with `id`, returning whether it was present.
+    pub fn remove_grant(&mut self, id: &GrantId) -> bool {
+        let before = self.grants.len();
+        self.grants.retain(|grant| &grant.id != id);
+        self.grants.len() != before
+    }
+
     /// Bind a principal to a role at a scope.
     pub fn bind_role(&mut self, binding: RoleBinding) -> &mut Self {
         self.role_bindings.push(binding);
         self
+    }
+
+    /// Bind a principal to a role at a scope unless that exact binding is
+    /// already held, returning whether it was newly bound.
+    pub fn bind_role_once(&mut self, binding: RoleBinding) -> bool {
+        if self.role_bindings.contains(&binding) {
+            return false;
+        }
+        self.role_bindings.push(binding);
+        true
+    }
+
+    /// Remove an exact role binding, returning whether it was held.
+    pub fn unbind_role(&mut self, binding: &RoleBinding) -> bool {
+        let before = self.role_bindings.len();
+        self.role_bindings.retain(|held| held != binding);
+        self.role_bindings.len() != before
     }
 
     /// Replace a group's live roster with `members`, deduplicated in insertion

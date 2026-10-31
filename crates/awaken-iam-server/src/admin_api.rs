@@ -34,9 +34,11 @@
 //! re-fetches whenever the version advances, so an administrative change made
 //! here propagates to in-process evaluators on their next poll.
 
+mod grants;
 mod principal_access;
 mod privacy;
 mod provisioning;
+pub use grants::GrantBatchStore;
 pub use principal_access::{
     ACTION_AUTHZ_PROFILE_READ, ACTION_PRINCIPAL_ACCESS_REPLACE, PrincipalAccessStore,
     TEAM_ACCESS_REPLACED,
@@ -82,6 +84,7 @@ pub trait PolicyStore:
     + GroupRepository
     + RoleRepository
     + GrantRepository
+    + GrantBatchStore
     + RoleBindingRepository
     + InvitationRepository
     + ResourceModelRepository
@@ -98,6 +101,7 @@ impl<T> PolicyStore for T where
         + GroupRepository
         + RoleRepository
         + GrantRepository
+        + GrantBatchStore
         + RoleBindingRepository
         + InvitationRepository
         + ResourceModelRepository
@@ -613,10 +617,11 @@ where
     // -- grants -------------------------------------------------------------
 
     /// Issue a grant, inserting or replacing it by id.
+    ///
+    /// The grant, its audit event and the version advance commit together,
+    /// exactly as a one-grant [`issue_grants`](Self::issue_grants) batch.
     pub fn issue_grant(&mut self, grant: Grant, at: Timestamp) -> AdminResult<u64> {
-        let id = grant.id.clone();
-        GrantRepository::put(&self.store, grant)?;
-        self.commit(DomainEvent::GrantIssued(id), at)
+        self.issue_grants(vec![grant], at)
     }
 
     /// Revoke a grant, failing closed when it is absent.

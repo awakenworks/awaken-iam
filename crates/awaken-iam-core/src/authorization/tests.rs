@@ -936,3 +936,49 @@ fn synced_snapshot_resolves_group_membership_identically() {
         );
     }
 }
+
+fn global_grant(id: &str, principal: &str, effect: Effect) -> Grant {
+    Grant {
+        id: GrantId(id.into()),
+        subject: GrantSubject::Principal(account(principal)),
+        action_pattern: ActionPattern("pack.read".into()),
+        scope: ScopeRef::Global,
+        effect,
+    }
+}
+
+#[test]
+fn grant_deltas_keep_id_order_and_match_a_rebuilt_policy() {
+    // C1 new id -> E1 inserted in id order; C2 existing id -> E2 replaced in
+    // place; C3 remove -> E3 gone and reported; C4 absent remove -> E4 false.
+    let mut incremental = PolicySet::new();
+    incremental.add_grant(global_grant("a", "ada", Effect::Allow));
+    incremental.add_grant(global_grant("c", "ada", Effect::Allow));
+    incremental.upsert_grant(global_grant("b", "bob", Effect::Allow));
+    incremental.upsert_grant(global_grant("a", "ada", Effect::Deny));
+    assert!(incremental.remove_grant(&GrantId("c".into())));
+    assert!(!incremental.remove_grant(&GrantId("c".into())));
+
+    let mut rebuilt = PolicySet::new();
+    rebuilt.add_grant(global_grant("a", "ada", Effect::Deny));
+    rebuilt.add_grant(global_grant("b", "bob", Effect::Allow));
+    assert_eq!(incremental.snapshot(7), rebuilt.snapshot(7));
+    let trace = incremental.evaluate(&request(account("ada"), "pack.read", ScopeRef::Global));
+    assert_eq!(trace.decision, AuthorizationDecision::Deny);
+}
+
+#[test]
+fn role_binding_deltas_are_exact_and_idempotent() {
+    let binding = RoleBinding {
+        principal: account("ada"),
+        role: RoleId("reader".into()),
+        scope: ScopeRef::Global,
+    };
+    let mut policy = PolicySet::new();
+    assert!(policy.bind_role_once(binding.clone()));
+    assert!(!policy.bind_role_once(binding.clone()));
+    assert_eq!(policy.snapshot(1).role_bindings.len(), 1);
+    assert!(policy.unbind_role(&binding));
+    assert!(!policy.unbind_role(&binding));
+    assert!(policy.snapshot(1).role_bindings.is_empty());
+}
