@@ -24,11 +24,12 @@
 
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{
-    ApiToken, ApiTokenStatus, AuthorizationContext, AuthorizationDecision, AuthorizationOutcome,
-    AuthorizationRequest, BatchAuthorizationRequest, BatchAuthorizationResponse,
-    EntitlementCheckResponse, EntitlementDecision, EntitlementRequest, NamespaceId, PolicySnapshot,
-    ResourceAuthorizationRequest, ResourceModelRegistered, ResourceModelRegistration,
-    SignerSetSnapshot, Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse,
+    ApiToken, ApiTokenId, ApiTokenStatus, AuthorizationContext, AuthorizationDecision,
+    AuthorizationOutcome, AuthorizationRequest, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, EntitlementCheckResponse, EntitlementDecision, EntitlementRequest,
+    NamespaceId, PolicySnapshot, ResourceAuthorizationRequest, ResourceModelRegistered,
+    ResourceModelRegistration, SignerSetSnapshot, Timestamp, TokenIntrospectionRequest,
+    TokenIntrospectionResponse,
 };
 use awaken_iam_core::{
     ApiTokenDirectory, EntitlementEngine, EntitlementProvider, IamCore, IamError,
@@ -299,6 +300,18 @@ impl AuthzApi {
     /// replay the load without failing.
     pub fn register_api_token(&mut self, token: ApiToken) {
         let _ = self.api_tokens.create(token);
+    }
+
+    /// Revoke every live API token held by `principal` (for example all keys
+    /// of one service account) in the introspection directory, returning the
+    /// ids newly revoked. Persisted rows are revoked through
+    /// [`revoke_api_tokens_for_principal`](awaken_iam_core::revoke_api_tokens_for_principal).
+    pub fn revoke_api_tokens_for_principal(
+        &mut self,
+        principal: &awaken_iam_contract::PrincipalRef,
+        now: Timestamp,
+    ) -> Vec<ApiTokenId> {
+        self.api_tokens.revoke_principal(principal, now)
     }
 
     /// `POST /v1/tokens/introspect`: verify a bearer API token and resolve its
@@ -663,7 +676,8 @@ mod tests {
     #[test]
     fn introspect_token_resolves_principal_and_workspace_for_a_live_token() {
         use awaken_iam_contract::{
-            ApiTokenId, ApiTokenStatus, Timestamp, TokenIntrospectionRequest, WorkspaceId,
+            AccountId, ApiTokenId, ApiTokenStatus, Timestamp, TokenIntrospectionRequest,
+            WorkspaceId,
         };
         use awaken_iam_core::{
             ApiTokenDirectory, ApiTokenMinter, EntropySource, MintApiToken, PolicySet, RoleId,
@@ -697,7 +711,8 @@ mod tests {
                     workspace: workspace.clone(),
                     role: RoleId("workspace_developer".into()),
                     created_at: Timestamp("2026-06-19T00:00:00Z".into()),
-                    expires_at: None,
+                    expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
+                    owner: Some(AccountId("acct_owner".into())),
                 },
             )
             .unwrap();
@@ -744,6 +759,7 @@ mod tests {
         use awaken_iam_contract::{ApiToken, ApiTokenId, ApiTokenPrefix, Timestamp, WorkspaceId};
 
         let token = ApiToken {
+            owner: None,
             id: ApiTokenId("tok_idem".into()),
             prefix: ApiTokenPrefix("pfx_idem".into()),
             principal: PrincipalRef::Service {

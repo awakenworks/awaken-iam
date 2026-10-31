@@ -115,6 +115,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "per-client RFC 8693 token-exchange admission",
                     IDENTITY_0006,
                 ),
+                (
+                    7,
+                    "accountable owner of service-account API tokens",
+                    IDENTITY_0007,
+                ),
             ],
         ),
         bundle(
@@ -334,6 +339,13 @@ CREATE INDEX {prefix}_oauth_authorization_codes_expiry_idx \
 // empty policy, so every client registered before this step keeps admitting no
 // exchange without a backfill.
 const IDENTITY_0006: &str = "ALTER TABLE {prefix}_oauth_clients ADD COLUMN token_exchange {json};";
+
+// Accountable human owner of a service-account API token (ADR-0017). The
+// column is nullable: tokens minted before this step keep NULL (no recorded
+// owner) and stay valid until they expire or are revoked; every new
+// service-account token is minted with an owner and an expiry by the domain.
+const IDENTITY_0007: &str = "\
+ALTER TABLE {prefix}_api_tokens ADD COLUMN owner TEXT;";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //

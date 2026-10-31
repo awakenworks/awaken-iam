@@ -306,6 +306,7 @@ where
         ApiTokenRepository::create(
             store,
             ApiToken {
+                owner: None,
                 id: ApiTokenId(id.into()),
                 prefix: ApiTokenPrefix(format!("prefix-{id}")),
                 principal: owner.clone(),
@@ -1199,7 +1200,7 @@ fn privacy_rows<B: SqlConn>(store: &SqlStore<B>, prefix: &str) -> Vec<(&'static 
         ("role_bindings", "principal,role,scope"),
         ("workspace_org_edges", "workspace_id,org_id"),
         ("resource_edges", "resource_type,resource_id,parent"),
-        ("api_tokens", "id,prefix,principal,secret_hash,workspace,created_at,expires_at,revoked_at"),
+        ("api_tokens", "id,prefix,principal,secret_hash,workspace,created_at,expires_at,revoked_at,owner"),
         ("invitations", "id,idempotency_key,org_id,email,bindings,invited_by,token_hash,status,expires_at,created_at,updated_at,accepted_by_account_id"),
         ("directory_nodes", "id,org_id,parent_id,name,slug,description,archived,created_at,updated_at"),
         ("product_space_bindings", "product,space_id,org_id,node_id,status"),

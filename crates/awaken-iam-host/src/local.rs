@@ -53,6 +53,25 @@ impl LocalHandle {
             .map_err(EmbedError::from)
     }
 
+    /// Revoke every live API token of one service account, returning the ids
+    /// newly revoked. Already-revoked tokens keep their original stamp.
+    pub fn revoke_service_account_tokens(
+        &self,
+        service_id: &str,
+        now: Timestamp,
+    ) -> Vec<ApiTokenId> {
+        self.state
+            .lock()
+            .expect("local state lock")
+            .directory
+            .revoke_principal(
+                &PrincipalRef::Service {
+                    service_id: service_id.to_owned(),
+                },
+                now,
+            )
+    }
+
     /// Revoke an API token by id.
     pub fn revoke_api_token(&self, id: &ApiTokenId, now: Timestamp) -> Result<(), EmbedError> {
         self.state
@@ -79,8 +98,10 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
 
     let mut authz = AuthzApi::with_entitlements(EntitlementEngine::unlicensed());
 
+    // The host's break-glass credential precedes any accountable account, so
+    // it is the one documented exemption from the service-account owner rule.
     let issued = minter
-        .mint(
+        .mint_host_bootstrap(
             &mut directory,
             authz.policy_mut(),
             MintApiToken {
@@ -92,6 +113,7 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
                 role: RoleId("admin".into()),
                 created_at: Timestamp("2026-01-01T00:00:00Z".into()),
                 expires_at: None,
+                owner: None,
             },
         )
         .map_err(EmbedError::from)?;

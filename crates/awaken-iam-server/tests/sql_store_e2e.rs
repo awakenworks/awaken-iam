@@ -509,6 +509,7 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
 
     // --- api tokens: unique id + prefix, prefix lookup, in-place revoke ---
     let token = ApiToken {
+        owner: None,
         id: ApiTokenId("tok_1".into()),
         prefix: ApiTokenPrefix("pfx_1".into()),
         principal: service("ci"),

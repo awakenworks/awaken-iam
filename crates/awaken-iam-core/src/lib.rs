@@ -31,6 +31,7 @@ use std::collections::hash_map::Entry;
 
 pub use api_token::{
     ApiTokenDirectory, ApiTokenMinter, IssuedApiToken, MintApiToken, parse_presented_token,
+    revoke_api_tokens_for_principal,
 };
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
@@ -264,6 +265,13 @@ pub enum IamError {
     #[error("api token window is invalid")]
     InvalidApiTokenWindow {
         /// API-token id with the rejected window.
+        id: ApiTokenId,
+    },
+    /// A service-account API token was requested without an accountable
+    /// owner account or without an expiry.
+    #[error("service account api tokens require an owner and an expiry")]
+    ApiTokenAccountabilityRequired {
+        /// API-token id with the rejected request.
         id: ApiTokenId,
     },
     /// An API token with this id already exists.

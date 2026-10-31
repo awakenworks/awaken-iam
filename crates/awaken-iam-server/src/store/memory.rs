@@ -1330,6 +1330,7 @@ mod tests {
     fn api_tokens_resolve_by_id_and_prefix_and_revoke_in_place() {
         let store = InMemoryStore::new();
         let token = ApiToken {
+            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx".into()),
             principal: PrincipalRef::Service {
@@ -1640,6 +1641,7 @@ mod tests {
     fn api_token_prefix_conflict_and_missing_update_fail_closed() {
         let store = InMemoryStore::new();
         let base = ApiToken {
+            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx".into()),
             principal: PrincipalRef::Service {

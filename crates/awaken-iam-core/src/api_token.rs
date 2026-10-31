@@ -28,10 +28,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use awaken_iam_contract::{
-    ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, ScopeRef, Timestamp, WorkspaceId,
+    AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, ScopeRef, Timestamp, WorkspaceId,
 };
 
-use crate::{EntropySource, IamError, PolicySet, RoleBinding, RoleId};
+use crate::{
+    ApiTokenRepository, EntropySource, IamError, PolicySet, RepositoryResult, RoleBinding, RoleId,
+};
 
 /// Scheme marker every newly-minted token carries, before the `<prefix>.<secret>`
 /// body, so a presented credential is recognizable and unambiguously parsed.
@@ -68,9 +70,13 @@ const SALT_BYTES: usize = 16;
 /// role — and that defaulting lives with the caller.
 ///
 /// `created_at`/`expires_at` follow the rest of the contract: time math lives
-/// with the caller as canonical RFC 3339 strings. `expires_at` is optional — a
-/// token without one never expires and lives until revoked — but when present it
+/// with the caller as canonical RFC 3339 strings. When present, `expires_at`
 /// must be strictly after `created_at`.
+///
+/// A token whose principal is a [`PrincipalRef::Service`] (a service account)
+/// must name an accountable human [`owner`](Self::owner) **and** an expiry
+/// (ADR-0017); [`ApiTokenMinter::mint`] refuses it otherwise. Tokens for other
+/// principals may omit both, as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintApiToken {
     /// Row id assigned to the persisted token.
@@ -85,8 +91,11 @@ pub struct MintApiToken {
     pub role: RoleId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
-    /// Optional expiration timestamp; must be strictly after `created_at`.
+    /// Expiration timestamp; must be strictly after `created_at`. Required
+    /// for service-account tokens.
     pub expires_at: Option<Timestamp>,
+    /// Accountable human owner. Required for service-account tokens.
+    pub owner: Option<AccountId>,
 }
 
 /// Result of minting a token: the persisted row plus its one-time cleartext.
@@ -125,10 +134,46 @@ impl<E: EntropySource> ApiTokenMinter<E> {
     /// written once the credential persists, so a rejected mint leaves no
     /// dangling authority.
     ///
-    /// Fails with [`IamError::InvalidApiTokenWindow`] when an expiry is not
-    /// strictly after creation, or with the duplicate errors from
+    /// Fails with [`IamError::ApiTokenAccountabilityRequired`] when a
+    /// service-account token lacks an owner or an expiry, with
+    /// [`IamError::InvalidApiTokenWindow`] when an expiry is not strictly after
+    /// creation, or with the duplicate errors from
     /// [`ApiTokenDirectory::create`] when the id or prefix is reused.
     pub fn mint(
+        &mut self,
+        directory: &mut ApiTokenDirectory,
+        policy: &mut PolicySet,
+        request: MintApiToken,
+    ) -> Result<IssuedApiToken, IamError> {
+        if matches!(request.principal, PrincipalRef::Service { .. })
+            && (request.owner.is_none() || request.expires_at.is_none())
+        {
+            return Err(IamError::ApiTokenAccountabilityRequired { id: request.id });
+        }
+        self.mint_unchecked(directory, policy, request)
+    }
+
+    /// Mint an embedding host's own bootstrap credential.
+    ///
+    /// The single documented exemption from the service-account owner/expiry
+    /// rule: a freshly embedded IAM has no accountable account yet, so the
+    /// host's first administrative credential cannot name one. It must be a
+    /// [`PrincipalRef::Service`] token and is otherwise minted exactly like
+    /// [`mint`](Self::mint). Hosts persist it owner-only and replace it with
+    /// owned, expiring credentials once an administrator exists.
+    pub fn mint_host_bootstrap(
+        &mut self,
+        directory: &mut ApiTokenDirectory,
+        policy: &mut PolicySet,
+        request: MintApiToken,
+    ) -> Result<IssuedApiToken, IamError> {
+        if !matches!(request.principal, PrincipalRef::Service { .. }) {
+            return Err(IamError::ApiTokenAccountabilityRequired { id: request.id });
+        }
+        self.mint_unchecked(directory, policy, request)
+    }
+
+    fn mint_unchecked(
         &mut self,
         directory: &mut ApiTokenDirectory,
         policy: &mut PolicySet,
@@ -156,6 +201,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
             created_at: request.created_at,
             expires_at: request.expires_at,
             revoked_at: None,
+            owner: request.owner,
         };
 
         directory.create(token.clone())?;
@@ -275,6 +321,29 @@ impl ApiTokenDirectory {
         Ok(token)
     }
 
+    /// Revoke every unrevoked token held by `principal` — e.g. all keys of one
+    /// service account — returning the ids newly revoked, ordered by id.
+    ///
+    /// Idempotent: already-revoked tokens keep their first stamp and are not
+    /// reported again. A principal without tokens yields an empty list.
+    pub fn revoke_principal(
+        &mut self,
+        principal: &PrincipalRef,
+        now: Timestamp,
+    ) -> Vec<ApiTokenId> {
+        let mut revoked: Vec<ApiTokenId> = self
+            .by_prefix
+            .values_mut()
+            .filter(|token| &token.principal == principal && token.revoked_at.is_none())
+            .map(|token| {
+                token.revoked_at = Some(now.clone());
+                token.id.clone()
+            })
+            .collect();
+        revoked.sort_by(|left, right| left.0.cmp(&right.0));
+        revoked
+    }
+
     /// Revoke a token by id so it can no longer authenticate.
     ///
     /// Revocation is idempotent: the first `revoked_at` stamp is preserved. An
@@ -292,6 +361,34 @@ impl ApiTokenDirectory {
         token.revoked_at.get_or_insert(now);
         Ok(())
     }
+}
+
+/// Revoke every live persisted token held by `principal` — the durable
+/// counterpart of [`ApiTokenDirectory::revoke_principal`] used to retire all
+/// keys of one service account at once.
+///
+/// Each row is revoked through [`ApiTokenRepository::update`], so the store's
+/// own admission rules apply exactly as for a single revoke. Already-revoked
+/// rows are left untouched; the ids newly revoked are returned in id order. A
+/// failure stops at that row and is returned; rows revoked before it stay
+/// revoked, and a retry revokes only the remainder.
+pub fn revoke_api_tokens_for_principal(
+    repository: &dyn ApiTokenRepository,
+    principal: &PrincipalRef,
+    now: &Timestamp,
+) -> RepositoryResult<Vec<ApiTokenId>> {
+    let mut revoked = Vec::new();
+    for mut token in repository.list_for_principal(principal)? {
+        if token.revoked_at.is_some() {
+            continue;
+        }
+        token.revoked_at = Some(now.clone());
+        let id = token.id.clone();
+        repository.update(token)?;
+        revoked.push(id);
+    }
+    revoked.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(revoked)
 }
 
 /// Render the one-time cleartext credential from its prefix and secret halves.
@@ -362,6 +459,8 @@ mod tests {
         }
     }
 
+    /// A service-account mint request owned by `acct_owner`. `None` expiry
+    /// selects the default one-year window.
     fn mint_request(id: &str, expires_at: Option<&str>) -> MintApiToken {
         MintApiToken {
             id: ApiTokenId(id.into()),
@@ -371,8 +470,108 @@ mod tests {
             workspace: WorkspaceId("wrkspc_default".into()),
             role: RoleId("workspace_developer".into()),
             created_at: Timestamp("2026-06-19T00:00:00Z".into()),
-            expires_at: expires_at.map(|value| Timestamp(value.into())),
+            expires_at: Some(Timestamp(
+                expires_at.unwrap_or("2027-06-19T00:00:00Z").into(),
+            )),
+            owner: Some(AccountId("acct_owner".into())),
         }
+    }
+
+    /// Accountability decision table (I4):
+    ///
+    /// | principal | owner | expiry | mint | host bootstrap |
+    /// |---|---|---|---|---|
+    /// | service | yes | yes | ok, owner persisted | ok |
+    /// | service | no | yes | AccountabilityRequired | ok |
+    /// | service | yes | no | AccountabilityRequired | ok |
+    /// | account | no | no | ok (unchanged rule) | AccountabilityRequired |
+    #[test]
+    fn service_account_tokens_require_an_owner_and_an_expiry() {
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+        let issued = minter
+            .mint(&mut directory, &mut policy, mint_request("tok_ok", None))
+            .unwrap();
+        assert_eq!(issued.token.owner, Some(AccountId("acct_owner".into())));
+
+        let mut unowned = mint_request("tok_unowned", None);
+        unowned.owner = None;
+        let mut unbounded = mint_request("tok_unbounded", None);
+        unbounded.expires_at = None;
+        for request in [unowned, unbounded.clone()] {
+            let id = request.id.clone();
+            assert_eq!(
+                minter.mint(&mut directory, &mut policy, request),
+                Err(IamError::ApiTokenAccountabilityRequired { id: id.clone() })
+            );
+            assert!(directory.token(&id).is_none());
+        }
+        minter
+            .mint_host_bootstrap(&mut directory, &mut policy, unbounded)
+            .unwrap();
+
+        let mut account = mint_request("tok_account", None);
+        account.principal = PrincipalRef::Account {
+            account_id: AccountId("acct_ada".into()),
+        };
+        account.owner = None;
+        account.expires_at = None;
+        minter
+            .mint(&mut directory, &mut policy, account.clone())
+            .unwrap();
+        account.id = ApiTokenId("tok_account_bootstrap".into());
+        assert!(matches!(
+            minter.mint_host_bootstrap(&mut directory, &mut policy, account),
+            Err(IamError::ApiTokenAccountabilityRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn revoke_principal_retires_every_live_token_of_one_service_account_only() {
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+        let first = minter
+            .mint(&mut directory, &mut policy, mint_request("tok_a", None))
+            .unwrap();
+        let second = minter
+            .mint(&mut directory, &mut policy, mint_request("tok_b", None))
+            .unwrap();
+        let mut other = mint_request("tok_other", None);
+        other.principal = PrincipalRef::Service {
+            service_id: "other".into(),
+        };
+        let other = minter.mint(&mut directory, &mut policy, other).unwrap();
+        let earlier = Timestamp("2026-06-19T01:00:00Z".into());
+        directory
+            .revoke(&ApiTokenId("tok_a".into()), earlier.clone())
+            .unwrap();
+
+        let now = Timestamp("2026-06-19T02:00:00Z".into());
+        let ci = PrincipalRef::Service {
+            service_id: "ci".into(),
+        };
+        assert_eq!(
+            directory.revoke_principal(&ci, now.clone()),
+            vec![ApiTokenId("tok_b".into())]
+        );
+        assert!(directory.revoke_principal(&ci, now.clone()).is_empty());
+        assert_eq!(
+            directory
+                .token(&ApiTokenId("tok_a".into()))
+                .unwrap()
+                .revoked_at,
+            Some(earlier),
+            "first stamp preserved"
+        );
+        for secret in [&first.secret, &second.secret] {
+            assert!(matches!(
+                directory.authenticate(secret, &now),
+                Err(IamError::ApiTokenRevoked { .. })
+            ));
+        }
+        assert!(directory.authenticate(&other.secret, &now).is_ok());
     }
 
     #[test]

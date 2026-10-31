@@ -26,6 +26,7 @@ fn api_token_update_on_absent_token_yields_not_found() {
     // reporting success.
     let store = sqlite_in_memory_store("iam").expect("migrate");
     let absent = ApiToken {
+        owner: None,
         id: ApiTokenId("tok_ghost".into()),
         prefix: ApiTokenPrefix("pfx_ghost".into()),
         principal: PrincipalRef::Account {
@@ -326,4 +327,67 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
         };
         assert_eq!(loaded.effect, expected);
     }
+}
+
+/// I4 persistence: the owner round-trips through SQL, legacy rows decode with
+/// no owner, and revoking a service account retires only its live rows.
+#[test]
+fn service_account_owner_persists_and_bulk_revocation_is_durable() {
+    use awaken_iam_core::revoke_api_tokens_for_principal;
+
+    let store = sqlite_in_memory_store("api_token_owner").unwrap();
+    let service = PrincipalRef::Service {
+        service_id: "svc-import".into(),
+    };
+    let token = |id: &str, prefix: &str, owner: Option<&str>| ApiToken {
+        owner: owner.map(|owner| AccountId(owner.into())),
+        id: ApiTokenId(id.into()),
+        prefix: ApiTokenPrefix(prefix.into()),
+        principal: service.clone(),
+        secret_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+        workspace: WorkspaceId("wrkspc_ops".into()),
+        created_at: Timestamp("2026-01-01T00:00:00Z".into()),
+        expires_at: Some(Timestamp("2027-01-01T00:00:00Z".into())),
+        revoked_at: None,
+    };
+    ApiTokenRepository::create(&store, token("tok_a", "pfx_a", Some("acct_owner"))).unwrap();
+    ApiTokenRepository::create(&store, token("tok_legacy", "pfx_l", None)).unwrap();
+    let mut already = token("tok_old", "pfx_o", Some("acct_owner"));
+    already.revoked_at = Some(Timestamp("2026-02-01T00:00:00Z".into()));
+    ApiTokenRepository::create(&store, already).unwrap();
+
+    let stored = ApiTokenRepository::get(&store, &ApiTokenId("tok_a".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.owner, Some(AccountId("acct_owner".into())));
+    assert_eq!(
+        ApiTokenRepository::get(&store, &ApiTokenId("tok_legacy".into()))
+            .unwrap()
+            .unwrap()
+            .owner,
+        None
+    );
+
+    let now = Timestamp("2026-03-01T00:00:00Z".into());
+    let revoked = revoke_api_tokens_for_principal(&store, &service, &now).unwrap();
+    assert_eq!(
+        revoked,
+        vec![ApiTokenId("tok_a".into()), ApiTokenId("tok_legacy".into())]
+    );
+    for token in ApiTokenRepository::list_for_principal(&store, &service).unwrap() {
+        assert!(token.revoked_at.is_some(), "{:?}", token.id);
+    }
+    assert_eq!(
+        ApiTokenRepository::get(&store, &ApiTokenId("tok_old".into()))
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        Some(Timestamp("2026-02-01T00:00:00Z".into())),
+        "first revocation stamp preserved"
+    );
+    assert!(
+        revoke_api_tokens_for_principal(&store, &service, &now)
+            .unwrap()
+            .is_empty()
+    );
 }
