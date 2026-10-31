@@ -845,6 +845,21 @@ async fn minted_access_token_is_asymmetric_and_verifies_against_published_jwks()
     assert_ne!(claims.jti, other_claims.jti);
 }
 
+/// Two independently generated bootstrap keys (e.g. a daemon restart
+/// without a durable key) never publish the same kid.
+#[test]
+fn generated_bootstrap_keys_publish_distinct_derived_kids() {
+    let first = AuthApi::new();
+    let second = AuthApi::new();
+    assert!(
+        first
+            .active_signing_kid()
+            .starts_with(crate::DERIVED_KID_PREFIX)
+    );
+    assert_ne!(first.active_signing_kid(), second.active_signing_kid());
+    assert_ne!(first.jwks(), second.jwks());
+}
+
 #[tokio::test]
 async fn rotating_the_signing_key_keeps_old_tokens_verifiable_until_pruned() {
     let mut api = api();

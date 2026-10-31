@@ -38,8 +38,9 @@ use std::sync::{Arc, Mutex};
 
 use awaken_iam_contract::{IdentityProviderKey, ProductId};
 use awaken_iam_core::{
-    AccountIdentityRepository, AccountRepository, AuthCodeRepository, ExternalIdentityRepository,
-    LoginFlowRepository, OAuthClientRepository, SessionRepository,
+    AccountIdentityRepository, AccountRepository, AuthCodeRepository, EntropySource,
+    ExternalIdentityRepository, LoginFlowRepository, OAuthClientRepository, OsEntropy,
+    SessionRepository,
 };
 use awaken_iam_server::{
     AdminAuthPolicy, AuthApi, AuthzApi, DaemonState, IamDaemon, RecordingExecutor,
@@ -117,6 +118,12 @@ async fn serve<B: SqlConn + Clone + 'static>(
         .with_login_repository(login_flows)
         .with_session_repository(sessions)
         .with_oauth_repositories(oauth_clients, oauth_codes);
+    // Sign with the store's persisted key so restarts and replicas publish one
+    // stable JWKS entry; the first start persists a freshly generated seed.
+    let mut candidate_seed = [0u8; 32];
+    OsEntropy.fill_bytes(&mut candidate_seed);
+    let signing = profile_store.durable_access_token_authority(candidate_seed)?;
+    auth.set_access_token_authority(signing);
     let provider_file = std::env::var("IAM_OIDC_PROVIDERS_FILE").ok();
     let provider_issuer = issuer.clone();
     auth = tokio::task::spawn_blocking(move || {

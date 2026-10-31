@@ -130,6 +130,30 @@ impl LocalSeedSigner {
             signing: SigningKey::from_bytes(&seed),
         }
     }
+
+    /// Build a signer whose `kid` is derived from its public key (see
+    /// [`derived_kid`]), so two different generated keys never share a `kid`
+    /// and a relying party's kid-keyed JWKS cache can never confuse them.
+    pub fn with_derived_kid(seed: [u8; KEY_BYTES]) -> Self {
+        Self::new(derived_kid(&seed), seed)
+    }
+}
+
+/// Prefix of `kid`s derived from an Ed25519 public key.
+pub const DERIVED_KID_PREFIX: &str = "iam-ed25519-";
+
+/// Stable, collision-resistant `kid` for an Ed25519 seed: the prefix plus the
+/// first 128 bits of the base64url SHA-256 of the **public** key. The value is
+/// identical across restarts for the same key and differs for every other
+/// key; it reveals nothing about the private seed.
+pub fn derived_kid(seed: &[u8; KEY_BYTES]) -> String {
+    use sha2::{Digest, Sha256};
+    let public = SigningKey::from_bytes(seed).verifying_key().to_bytes();
+    let digest = Sha256::digest(public);
+    format!(
+        "{DERIVED_KID_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(&digest[..16])
+    )
 }
 
 #[async_trait]
@@ -795,6 +819,18 @@ mod tests {
             }
             Ok(self.backing.sign(message).to_bytes().to_vec())
         }
+    }
+
+    /// Every generated key gets its own kid, stable for that key: a
+    /// regenerated key can never be confused with a cached predecessor.
+    #[test]
+    fn derived_kids_are_stable_per_key_and_distinct_across_keys() {
+        let first = LocalSeedSigner::with_derived_kid(seed(1));
+        assert_eq!(first.kid(), derived_kid(&seed(1)));
+        assert!(first.kid().starts_with(DERIVED_KID_PREFIX));
+        assert_eq!(derived_kid(&seed(1)), derived_kid(&seed(1)));
+        assert_ne!(derived_kid(&seed(1)), derived_kid(&seed(2)));
+        assert_eq!(first.public_jwk().kid, first.kid());
     }
 
     #[tokio::test]

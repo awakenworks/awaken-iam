@@ -47,6 +47,7 @@ mod privacy;
 mod profiles;
 mod projections;
 mod provisioning;
+mod signing_keys;
 
 use identity_rows::*;
 

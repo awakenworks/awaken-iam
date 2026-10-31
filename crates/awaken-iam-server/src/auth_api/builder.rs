@@ -34,7 +34,9 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let mut bootstrap = entropy.clone();
         let mut seed = [0u8; 32];
         bootstrap.fill_bytes(&mut seed);
-        let tokens = AccessTokenAuthority::new(LocalSeedSigner::new(DEFAULT_SIGNING_KID, seed));
+        // The kid is derived from the public key, so a key regenerated on a
+        // later start never reuses a kid a relying party may have cached.
+        let tokens = AccessTokenAuthority::new(LocalSeedSigner::with_derived_kid(seed));
         let identity_store = crate::store::InMemoryStore::new();
         Self {
             providers: Vec::new(),

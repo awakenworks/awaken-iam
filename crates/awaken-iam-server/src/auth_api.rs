@@ -95,8 +95,6 @@ pub use delegation::{
     DELEGATED_TOKEN_MAX_LIFETIME_SECS, ExchangedAccessToken,
 };
 
-/// Default key id minted for the bootstrap access-token signing key.
-const DEFAULT_SIGNING_KID: &str = "iam-access-key-1";
 /// Number of random bytes drawn for each generated id (256 bits).
 const ID_BYTES: usize = 32;
 

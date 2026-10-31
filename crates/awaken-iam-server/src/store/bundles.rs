@@ -120,6 +120,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "accountable owner of service-account API tokens",
                     IDENTITY_0007,
                 ),
+                (
+                    8,
+                    "durable self-hosted access-token signing key",
+                    IDENTITY_0008,
+                ),
             ],
         ),
         bundle(
@@ -346,6 +351,16 @@ const IDENTITY_0006: &str = "ALTER TABLE {prefix}_oauth_clients ADD COLUMN token
 // service-account token is minted with an owner and an expiry by the domain.
 const IDENTITY_0007: &str = "\
 ALTER TABLE {prefix}_api_tokens ADD COLUMN owner TEXT;";
+
+// The self-hosted daemon's Ed25519 signing seed (ADR-0017), so restarts and
+// replicas keep one key and one public-key-derived kid. The seed is a secret
+// with the same protection requirements as the database credentials; managed
+// deployments inject a KMS signer and leave this table empty.
+const IDENTITY_0008: &str = "\
+CREATE TABLE {prefix}_signing_keys (\
+ kid TEXT PRIMARY KEY, \
+ seed TEXT NOT NULL, \
+ created_at TEXT NOT NULL);";
 
 // --- iam.authz DDL ---------------------------------------------------------
 //
