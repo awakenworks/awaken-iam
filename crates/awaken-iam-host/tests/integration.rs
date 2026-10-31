@@ -9,9 +9,9 @@ use awaken_iam_contract::{
 };
 use awaken_iam_core::{MintApiToken, RoleId};
 use awaken_iam_host::{
-    AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenSubjectKind, HostConfig,
-    IamGate, LocalSeedSigner, RouteActions, TokenActor, auth_layer, embed_local,
-    verify_access_token,
+    AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenSubjectKind,
+    DelegatedAccessTokenClaims, HostConfig, IamGate, LocalSeedSigner, RouteActions, TokenActor,
+    auth_layer, embed_local, verify_access_token,
 };
 use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
 use tower::ServiceExt;
@@ -225,7 +225,6 @@ fn make_claims(exp: i64) -> AccessTokenClaims {
         iat: NOW_UNIX - 60,
         jti: "jti_test_1".into(),
         scope: vec![],
-        act: None,
     }
 }
 
@@ -512,7 +511,6 @@ async fn middleware_expired_jwt_returns_401_with_real_clock() {
         iat: 0,
         jti: "jti_expired".into(),
         scope: vec![],
-        act: None,
     };
     let expired_token = authority.mint(&claims).await.expect("mint");
 
@@ -924,12 +922,14 @@ async fn gate_exposes_the_delegation_actor_and_authorizes_conjunctively() {
             .is_empty()
     );
 
-    let mut delegated = make_claims(NOW_UNIX + 300);
-    delegated.act = Some(AccessTokenActor {
-        sub: "business-service".into(),
-        subject_kind: AccessTokenSubjectKind::Service,
-    });
-    let token = authority.mint(&delegated).await.expect("mint");
+    let delegated = DelegatedAccessTokenClaims {
+        claims: make_claims(NOW_UNIX + 300),
+        act: Some(AccessTokenActor {
+            sub: "business-service".into(),
+            subject_kind: AccessTokenSubjectKind::Service,
+        }),
+    };
+    let token = authority.mint_delegated(&delegated).await.expect("mint");
     let verified = handle
         .gate
         .authenticate_verified(&token, &ts, NOW_UNIX)
@@ -939,13 +939,7 @@ async fn gate_exposes_the_delegation_actor_and_authorizes_conjunctively() {
     };
     assert_eq!(verified.principal, user);
     assert_eq!(verified.actor, Some(svc("business-service")));
-    assert_eq!(
-        verified
-            .access_token
-            .as_ref()
-            .map(|claims| claims.act.clone()),
-        Some(delegated.act.clone())
-    );
+    assert_eq!(verified.access_token.as_ref(), Some(&delegated.claims));
     let request = verified.authorization_request(action, ScopeRef::Global);
     assert_eq!(request.principal, svc("business-service"));
     assert_eq!(request.on_behalf_of, vec![user.clone()]);
@@ -956,8 +950,8 @@ async fn gate_exposes_the_delegation_actor_and_authorizes_conjunctively() {
     );
 
     let mut foreign = delegated.clone();
-    foreign.aud = "https://other.example.com".into();
-    let foreign = authority.mint(&foreign).await.expect("mint");
+    foreign.claims.aud = "https://other.example.com".into();
+    let foreign = authority.mint_delegated(&foreign).await.expect("mint");
     assert_eq!(
         handle
             .gate
@@ -984,12 +978,14 @@ async fn middleware_inserts_the_token_actor_extension() {
     let handle = embed_local(&cfg).expect("embed_local");
     let authority = handle.jwt_authority.as_ref().expect("jwt_authority");
     let far_future = 4_102_444_800; // 2100-01-01
-    let mut delegated = make_claims(far_future);
-    delegated.act = Some(AccessTokenActor {
-        sub: "business-service".into(),
-        subject_kind: AccessTokenSubjectKind::Service,
-    });
-    let token = authority.mint(&delegated).await.expect("mint");
+    let delegated = DelegatedAccessTokenClaims {
+        claims: make_claims(far_future),
+        act: Some(AccessTokenActor {
+            sub: "business-service".into(),
+            subject_kind: AccessTokenSubjectKind::Service,
+        }),
+    };
+    let token = authority.mint_delegated(&delegated).await.expect("mint");
     let app = Router::new()
         .route(
             "/whoami",

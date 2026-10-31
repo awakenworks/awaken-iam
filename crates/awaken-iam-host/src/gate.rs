@@ -15,7 +15,9 @@ use awaken_iam_contract::{
     ScopeRef, Timestamp, TokenIntrospectionRequest, TokenIntrospectionResponse, WorkspaceId,
 };
 use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
-use awaken_iam_server::{AccessTokenClaims, AuthzApi, SessionGateway, verify_access_token};
+use awaken_iam_server::{
+    AccessTokenClaims, AuthzApi, SessionGateway, verify_delegated_access_token,
+};
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
 type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
@@ -368,7 +370,10 @@ impl IamGate {
         jwks: &Jwks,
         now_unix: i64,
     ) -> Result<VerifiedBearer, AuthReject> {
-        let claims = verify_access_token(token, jwks).map_err(|_| AuthReject::Invalid)?;
+        let verified =
+            verify_delegated_access_token(token, jwks).map_err(|_| AuthReject::Invalid)?;
+        let actor = verified.actor_principal();
+        let claims = verified.claims;
 
         if claims.exp <= now_unix {
             return Err(AuthReject::Expired);
@@ -386,7 +391,7 @@ impl IamGate {
         Ok(VerifiedBearer {
             principal: claims.principal(),
             workspace: None,
-            actor: claims.actor_principal(),
+            actor,
             access_token: Some(claims),
         })
     }

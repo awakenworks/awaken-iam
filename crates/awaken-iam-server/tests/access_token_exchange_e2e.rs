@@ -12,8 +12,9 @@ use awaken_iam_contract::{Account, AccountId, AccountStatus, Timestamp};
 use awaken_iam_core::{ClientDelegation, ClientTokenExchangePolicy, RegisteredClient};
 use awaken_iam_server::{
     AccessTokenActor, AccessTokenClaims, AccessTokenExchangeError, AccessTokenSubjectKind, AuthApi,
-    AuthAuditEvent, DELEGATED_TOKEN_MAX_LIFETIME_SECS, MintAccessToken, ProviderLoginRouteOwner,
-    RevokeToken, RevokeTokenHint, SharedAuthApi, op_router, verify_access_token,
+    AuthAuditEvent, DELEGATED_TOKEN_MAX_LIFETIME_SECS, DelegatedAccessTokenClaims, MintAccessToken,
+    ProviderLoginRouteOwner, RevokeToken, RevokeTokenHint, SharedAuthApi, op_router,
+    verify_delegated_access_token,
 };
 use axum::{
     Router,
@@ -134,7 +135,6 @@ fn claims(sub: &str, kind: AccessTokenSubjectKind, aud: &str) -> AccessTokenClai
         iat: now() - 5,
         jti: format!("jti-raw-{sub}-{aud}"),
         scope: vec!["flow.read".into()],
-        act: None,
     }
 }
 
@@ -171,8 +171,9 @@ async fn exchange(app: &Router, fields: &[(&str, &str)]) -> (StatusCode, serde_j
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn verified(shared: &SharedAuthApi, token: &str) -> AccessTokenClaims {
-    verify_access_token(token, &shared.lock().await.jwks()).unwrap()
+/// Verify like a relying party: claims plus the RFC 8693 actor.
+async fn verified(shared: &SharedAuthApi, token: &str) -> DelegatedAccessTokenClaims {
+    verify_delegated_access_token(token, &shared.lock().await.jwks()).unwrap()
 }
 
 /// Audience exchange decision table (browser SPA, public client + PKCE):
@@ -231,13 +232,13 @@ async fn audience_exchange_narrows_and_refuses_every_other_shape() {
     assert!(body.get("refresh_token").is_none());
     let issued = verified(&shared, body["access_token"].as_str().unwrap()).await;
     let subject = verified(&shared, &spa_token).await;
-    assert_eq!(issued.sub, "acct_ada");
-    assert_eq!(issued.subject_kind, AccessTokenSubjectKind::Account);
-    assert_eq!(issued.aud, "flow");
-    assert_eq!(issued.scope, vec!["flow.read".to_owned()]);
+    assert_eq!(issued.claims.sub, "acct_ada");
+    assert_eq!(issued.claims.subject_kind, AccessTokenSubjectKind::Account);
+    assert_eq!(issued.claims.aud, "flow");
+    assert_eq!(issued.claims.scope, vec!["flow.read".to_owned()]);
     assert_eq!(issued.act, None);
-    assert!(issued.exp <= subject.exp);
-    assert_ne!(issued.jti, subject.jti);
+    assert!(issued.claims.exp <= subject.claims.exp);
+    assert_ne!(issued.claims.jti, subject.claims.jti);
 
     let (status, body) = exchange(
         &app,
@@ -408,12 +409,17 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
     )
     .await;
     let short = user_token(&mut api, "acct_ada", "business", &["flow.read"], 120).await;
-    let mut nested = claims("acct_ada", AccessTokenSubjectKind::Account, "business");
-    nested.act = Some(AccessTokenActor {
-        sub: "svc-other".into(),
-        subject_kind: AccessTokenSubjectKind::Service,
-    });
-    let nested = raw_token(&api, nested).await;
+    let nested = api
+        .token_authority()
+        .mint_delegated(&DelegatedAccessTokenClaims {
+            claims: claims("acct_ada", AccessTokenSubjectKind::Account, "business"),
+            act: Some(AccessTokenActor {
+                sub: "svc-other".into(),
+                subject_kind: AccessTokenSubjectKind::Service,
+            }),
+        })
+        .await
+        .unwrap();
     let service_subject = raw_token(
         &api,
         claims("svc-batch", AccessTokenSubjectKind::Service, "business"),
@@ -453,10 +459,13 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["expires_in"].as_i64().unwrap() <= DELEGATED_TOKEN_MAX_LIFETIME_SECS);
     let delegated = verified(&shared, body["access_token"].as_str().unwrap()).await;
-    assert_eq!(delegated.sub, "acct_ada");
-    assert_eq!(delegated.subject_kind, AccessTokenSubjectKind::Account);
-    assert_eq!(delegated.aud, "flow");
-    assert_eq!(delegated.scope, vec!["flow.read".to_owned()]);
+    assert_eq!(delegated.claims.sub, "acct_ada");
+    assert_eq!(
+        delegated.claims.subject_kind,
+        AccessTokenSubjectKind::Account
+    );
+    assert_eq!(delegated.claims.aud, "flow");
+    assert_eq!(delegated.claims.scope, vec!["flow.read".to_owned()]);
     assert_eq!(
         delegated.act,
         Some(AccessTokenActor {
@@ -464,9 +473,9 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
             subject_kind: AccessTokenSubjectKind::Service,
         })
     );
-    assert!(delegated.exp <= now() + DELEGATED_TOKEN_MAX_LIFETIME_SECS);
-    assert!(delegated.exp >= started + DELEGATED_TOKEN_MAX_LIFETIME_SECS - 1);
-    assert!(delegated.exp <= verified(&shared, &business_token).await.exp);
+    assert!(delegated.claims.exp <= now() + DELEGATED_TOKEN_MAX_LIFETIME_SECS);
+    assert!(delegated.claims.exp >= started + DELEGATED_TOKEN_MAX_LIFETIME_SECS - 1);
+    assert!(delegated.claims.exp <= verified(&shared, &business_token).await.claims.exp);
 
     let (status, body) = exchange(
         &app,
@@ -481,7 +490,10 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let bounded = verified(&shared, body["access_token"].as_str().unwrap()).await;
-    assert_eq!(bounded.exp, verified(&shared, &short).await.exp);
+    assert_eq!(
+        bounded.claims.exp,
+        verified(&shared, &short).await.claims.exp
+    );
 
     // A delegated token cannot be exchanged again: delegation is single-level.
     let redelegated = body["access_token"].as_str().unwrap().to_owned();
@@ -580,7 +592,7 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
         AuthAuditEvent::AccessTokenExchanged {
             client_id, subject, actor: Some(actor), audience, subject_jti, jti, ..
         } if client_id == "business" && subject == "acct_ada" && actor == "svc-business"
-            && audience == "flow" && subject_jti == &business_jti && jti == &delegated.jti
+            && audience == "flow" && subject_jti == &business_jti && jti == &delegated.claims.jti
     )));
     for reason in [
         AccessTokenExchangeError::InvalidClient,

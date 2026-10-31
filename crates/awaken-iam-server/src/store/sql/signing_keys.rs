@@ -75,7 +75,6 @@ mod tests {
             iat: 1_700_000_000,
             jti: "jti-restart".into(),
             scope: Vec::new(),
-            act: None,
         }
     }
 

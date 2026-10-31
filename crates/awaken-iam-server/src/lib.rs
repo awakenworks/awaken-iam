@@ -28,9 +28,10 @@ mod wechat_miniapp;
 
 pub use access_token::{
     ACCESS_TOKEN_ALG, AccessTokenActor, AccessTokenAuthority, AccessTokenClaims, AccessTokenError,
-    AccessTokenRevocations, AccessTokenSubjectKind, DERIVED_KID_PREFIX, LocalSeedSigner, Signer,
-    SignerError, decode_unverified_claims, derived_kid, ed25519_public_jwk, verify_access_token,
-    verify_active_access_token, verify_signed_claims,
+    AccessTokenRevocations, AccessTokenSubjectKind, DERIVED_KID_PREFIX, DelegatedAccessTokenClaims,
+    LocalSeedSigner, Signer, SignerError, decode_unverified_claims, derived_kid,
+    ed25519_public_jwk, verify_access_token, verify_active_access_token,
+    verify_delegated_access_token, verify_signed_claims,
 };
 pub use admin_api::{AdminError, AdminResult, DomainEvent, PolicyAdminApi, PolicyStore};
 pub use admin_http::{

@@ -209,7 +209,6 @@ mod tests {
                 iat: 1_899_996_400,
                 jti: "jti-1".into(),
                 scope: vec!["pack.read".into()],
-                act: None,
             })
             .await
             .expect("mint access");

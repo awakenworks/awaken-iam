@@ -29,6 +29,7 @@ use awaken_iam_core::{
 use super::{AuthApi, AuthAuditEvent};
 use crate::access_token::{
     AccessTokenActor, AccessTokenClaims, AccessTokenError, AccessTokenSubjectKind,
+    DelegatedAccessTokenClaims,
 };
 use crate::token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, SUBJECT_TOKEN_TYPE_ACCESS_TOKEN,
@@ -350,20 +351,22 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let exp = subject.exp.min(request.now + exchange.max_lifetime());
         let jti = self.mint_id("jti");
         let act = exchange.actor();
-        let claims = AccessTokenClaims {
-            iss: request.issuer,
-            sub: subject.sub.clone(),
-            subject_kind: AccessTokenSubjectKind::Account,
-            aud: audience.clone(),
-            exp,
-            iat: request.now,
-            jti: jti.clone(),
-            scope: scope.clone(),
+        let claims = DelegatedAccessTokenClaims {
+            claims: AccessTokenClaims {
+                iss: request.issuer,
+                sub: subject.sub.clone(),
+                subject_kind: AccessTokenSubjectKind::Account,
+                aud: audience.clone(),
+                exp,
+                iat: request.now,
+                jti: jti.clone(),
+                scope: scope.clone(),
+            },
             act: act.clone(),
         };
         let access_token = self
             .tokens
-            .mint(&claims)
+            .mint_delegated(&claims)
             .await
             .map_err(|_| AccessTokenExchangeError::SigningFailed)?;
         Ok((
@@ -390,12 +393,16 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         &self,
         request: &AccessTokenExchange,
     ) -> Result<AccessTokenClaims, AccessTokenExchangeError> {
-        let subject =
-            self.verify_access_token(&request.subject_token)
-                .map_err(|error| match error {
-                    AccessTokenError::Revoked(_) => AccessTokenExchangeError::SubjectTokenRevoked,
-                    _ => AccessTokenExchangeError::SubjectTokenInvalid,
-                })?;
+        let verified = self
+            .verify_delegated_access_token(&request.subject_token)
+            .map_err(|error| match error {
+                AccessTokenError::Revoked(_) => AccessTokenExchangeError::SubjectTokenRevoked,
+                _ => AccessTokenExchangeError::SubjectTokenInvalid,
+            })?;
+        if verified.act.is_some() {
+            return Err(AccessTokenExchangeError::NestedDelegation);
+        }
+        let subject = verified.claims;
         if subject.iss != request.issuer || subject.iat > request.now {
             return Err(AccessTokenExchangeError::SubjectTokenInvalid);
         }
@@ -404,9 +411,6 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         }
         if subject.subject_kind != AccessTokenSubjectKind::Account {
             return Err(AccessTokenExchangeError::SubjectNotAccount);
-        }
-        if subject.act.is_some() {
-            return Err(AccessTokenExchangeError::NestedDelegation);
         }
         Ok(subject)
     }

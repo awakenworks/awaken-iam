@@ -244,10 +244,6 @@ pub struct AccessTokenClaims {
     /// Granted scopes; omitted from the wire form when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
-    /// RFC 8693 actor for a delegated token; absent for a direct credential,
-    /// so every token minted before delegation existed decodes unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub act: Option<AccessTokenActor>,
 }
 
 impl AccessTokenClaims {
@@ -255,7 +251,28 @@ impl AccessTokenClaims {
     pub fn principal(&self) -> PrincipalRef {
         self.subject_kind.principal(self.sub.clone())
     }
+}
 
+/// An access-token payload together with its optional RFC 8693 `act` claim.
+///
+/// [`AccessTokenClaims`] keeps its exact shape so existing library callers
+/// that build it with struct literals compile unchanged; the actor travels
+/// beside it. On the wire both flatten into one JWT payload, and `act` is
+/// omitted for a direct credential, so a direct token is byte-identical to
+/// one minted with [`AccessTokenAuthority::mint`]. A verifier that must see
+/// delegation uses [`verify_delegated_access_token`]; the plain
+/// [`verify_access_token`] ignores `act`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DelegatedAccessTokenClaims {
+    /// The ordinary access-token claims.
+    #[serde(flatten)]
+    pub claims: AccessTokenClaims,
+    /// RFC 8693 actor for a delegated token; absent for a direct credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<AccessTokenActor>,
+}
+
+impl DelegatedAccessTokenClaims {
     /// The delegated actor in contract principal form, when present.
     pub fn actor_principal(&self) -> Option<PrincipalRef> {
         self.act.as_ref().map(AccessTokenActor::principal)
@@ -423,6 +440,15 @@ impl AccessTokenAuthority {
         self.sign_jwt(ACCESS_TOKEN_TYP, claims).await
     }
 
+    /// Mint an access token that may carry an RFC 8693 `act` claim. Same
+    /// token family (`typ`), key and JWKS as [`mint`](Self::mint).
+    pub async fn mint_delegated(
+        &self,
+        claims: &DelegatedAccessTokenClaims,
+    ) -> Result<String, AccessTokenError> {
+        self.sign_jwt(ACCESS_TOKEN_TYP, claims).await
+    }
+
     /// Sign an arbitrary claim set as a compact JWT under the active key.
     ///
     /// The `typ` header fences token families apart: a verifier that expects one
@@ -481,6 +507,16 @@ pub fn verify_access_token(
     token: &str,
     jwks: &Jwks,
 ) -> Result<AccessTokenClaims, AccessTokenError> {
+    verify_jwt(token, jwks, ACCESS_TOKEN_TYP)
+}
+
+/// Verify an access token against a published [`Jwks`], returning its claims
+/// **and** its RFC 8693 actor. A nested actor chain fails closed as
+/// [`AccessTokenError::Malformed`].
+pub fn verify_delegated_access_token(
+    token: &str,
+    jwks: &Jwks,
+) -> Result<DelegatedAccessTokenClaims, AccessTokenError> {
     verify_jwt(token, jwks, ACCESS_TOKEN_TYP)
 }
 
@@ -715,17 +751,16 @@ mod tests {
             iat: 1_899_996_400,
             jti: jti.into(),
             scope: vec!["pack.read".into()],
-            act: None,
         }
     }
 
     /// Wire compatibility decision table for the RFC 8693 `act` claim:
     ///
-    /// | act on claims | encoded payload | decoded by verifier |
-    /// |---|---|---|
-    /// | none | no `act` member (byte-compatible with older tokens) | `act == None` |
-    /// | single service actor | `act: {sub, subject_kind: "service"}` | same actor |
-    /// | nested `act` inside the actor | n/a (IAM never mints it) | `Malformed`, fail closed |
+    /// | minted with | encoded payload | `verify_access_token` | `verify_delegated_access_token` |
+    /// |---|---|---|---|
+    /// | `mint` | no `act` member | claims | claims, `act == None` |
+    /// | `mint_delegated`, service actor | `act: {sub, subject_kind: "service"}` | same claims (act ignored) | claims + actor |
+    /// | nested `act` inside the actor | n/a (IAM never mints it) | claims | `Malformed`, fail closed |
     #[tokio::test]
     async fn act_claim_is_optional_single_level_and_round_trips() {
         let authority = AccessTokenAuthority::new(LocalSeedSigner::new("key-1", seed(4)));
@@ -739,15 +774,20 @@ mod tests {
         )
         .unwrap();
         assert!(!payload.contains("\"act\""));
-        assert_eq!(verify_access_token(&direct, &jwks).unwrap().act, None);
+        assert_eq!(
+            verify_delegated_access_token(&direct, &jwks).unwrap().act,
+            None
+        );
 
-        let mut delegated = claims("jti-delegated");
-        delegated.act = Some(AccessTokenActor {
-            sub: "business-service".into(),
-            subject_kind: AccessTokenSubjectKind::Service,
-        });
-        let token = authority.mint(&delegated).await.unwrap();
-        let recovered = verify_access_token(&token, &jwks).unwrap();
+        let delegated = DelegatedAccessTokenClaims {
+            claims: claims("jti-delegated"),
+            act: Some(AccessTokenActor {
+                sub: "business-service".into(),
+                subject_kind: AccessTokenSubjectKind::Service,
+            }),
+        };
+        let token = authority.mint_delegated(&delegated).await.unwrap();
+        let recovered = verify_delegated_access_token(&token, &jwks).unwrap();
         assert_eq!(recovered, delegated);
         assert_eq!(
             recovered.actor_principal(),
@@ -756,10 +796,14 @@ mod tests {
             })
         );
         assert_eq!(
-            recovered.principal(),
+            recovered.claims.principal(),
             PrincipalRef::Account {
                 account_id: AccountId("acct_1".into())
             }
+        );
+        assert_eq!(
+            verify_access_token(&token, &jwks).unwrap(),
+            delegated.claims
         );
 
         let nested = serde_json::json!({
@@ -770,7 +814,7 @@ mod tests {
         });
         let forged = authority.sign_jwt(ACCESS_TOKEN_TYP, &nested).await.unwrap();
         assert_eq!(
-            verify_access_token(&forged, &jwks).unwrap_err(),
+            verify_delegated_access_token(&forged, &jwks).unwrap_err(),
             AccessTokenError::Malformed
         );
     }

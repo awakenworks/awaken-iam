@@ -1208,7 +1208,6 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             iat: request.issued_at,
             jti: self.mint_id("jti"),
             scope: request.scopes,
-            act: None,
         };
         Ok(self.tokens.mint(&claims).await?)
     }
@@ -1261,7 +1260,6 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             iat: request.now,
             jti: jti.clone(),
             scope: scopes.clone(),
-            act: None,
         };
         let access_token = match self.tokens.mint(&claims).await {
             Ok(token) => token,
@@ -1341,6 +1339,19 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             &self.tokens.jwks(),
             &self.access_revocations,
         )
+    }
+
+    /// [`verify_access_token`](Self::verify_access_token) that also returns
+    /// the RFC 8693 actor, with the same signature and revocation checks.
+    pub fn verify_delegated_access_token(
+        &self,
+        token: &str,
+    ) -> Result<crate::DelegatedAccessTokenClaims, AccessTokenError> {
+        let verified = crate::verify_delegated_access_token(token, &self.tokens.jwks())?;
+        if self.access_revocations.is_revoked(&verified.claims.jti) {
+            return Err(AccessTokenError::Revoked(verified.claims.jti));
+        }
+        Ok(verified)
     }
 
     /// `POST /v1/oauth/token` (initial grant): issue a fresh access token and a
@@ -1705,7 +1716,6 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             iat: issued_at,
             jti: jti.clone(),
             scope: scopes,
-            act: None,
         };
         let token = self.tokens.mint(&claims).await?;
         Ok((token, jti))
