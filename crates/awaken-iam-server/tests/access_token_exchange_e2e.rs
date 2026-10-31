@@ -599,7 +599,8 @@ async fn delegation_records_the_service_actor_and_refuses_every_other_shape() {
     }
 }
 
-/// Discovery advertises the token-exchange grant beside the existing grants.
+/// Discovery advertises the token-exchange grant beside the existing grants
+/// and every supported token-endpoint client authentication method.
 #[tokio::test]
 async fn discovery_advertises_token_exchange() {
     let (app, _) = router(configured());
@@ -623,4 +624,119 @@ async fn discovery_advertises_token_exchange() {
             .iter()
             .any(|grant| grant == EXCHANGE)
     );
+    assert_eq!(
+        metadata["token_endpoint_auth_methods_supported"],
+        serde_json::json!(["client_secret_basic", "client_secret_post", "none"])
+    );
+}
+
+async fn token_request(
+    app: &Router,
+    authorization: Option<&str>,
+    body: String,
+    content_type: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/oauth/token")
+        .header(header::CONTENT_TYPE, content_type);
+    if let Some(authorization) = authorization {
+        request = request.header(header::AUTHORIZATION, authorization);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, serde_json::from_slice(&bytes).unwrap())
+}
+
+fn basic(client_id: &str, secret: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+    )
+}
+
+/// RFC 6749 §2.3.1 client authentication decision table at the token
+/// endpoint (shared by every grant):
+///
+/// | Authorization header | body credentials | result |
+/// |---|---|---|
+/// | Basic, correct secret | none | 200 (client_secret_basic) |
+/// | Basic, correct secret | same client_id only | 200 |
+/// | Basic | client_secret too | 400 invalid_request (two methods) |
+/// | Basic | different client_id | 400 invalid_request |
+/// | Basic, wrong secret | none | 401 invalid_client + WWW-Authenticate: Basic |
+/// | malformed Basic | none | 401 invalid_client + challenge |
+/// | none | none | 400 invalid_request (never 422) |
+/// | any | non-form body | 400 invalid_request (never 422) |
+#[tokio::test]
+async fn token_endpoint_accepts_client_secret_basic_and_answers_oauth_errors() {
+    let mut api = configured();
+    let business_token = user_token(&mut api, "acct_ada", "business", &["flow.read"], 600).await;
+    let (app, shared) = router(api);
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    form.append_pair("grant_type", EXCHANGE)
+        .append_pair("subject_token", &business_token)
+        .append_pair("subject_token_type", ACCESS_TOKEN)
+        .append_pair("audience", "flow");
+    let body = form.finish();
+    let urlencoded = "application/x-www-form-urlencoded";
+    let good = basic("business", BUSINESS_SECRET);
+
+    let (status, _, json) = token_request(&app, Some(&good), body.clone(), urlencoded).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let issued = verified(&shared, json["access_token"].as_str().unwrap()).await;
+    assert_eq!(
+        issued.act.map(|actor| actor.sub),
+        Some("svc-business".into())
+    );
+    let (status, _, _) = token_request(
+        &app,
+        Some(&good),
+        format!("{body}&client_id=business"),
+        urlencoded,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (extra, authorization) in [
+        (format!("&client_secret={BUSINESS_SECRET}"), good.clone()),
+        ("&client_id=enterprise-web".to_owned(), good.clone()),
+    ] {
+        let (status, _, json) = token_request(
+            &app,
+            Some(&authorization),
+            format!("{body}{extra}"),
+            urlencoded,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}");
+        assert_eq!(json["error"], "invalid_request", "{extra}");
+    }
+    for authorization in [basic("business", "wrong"), "Basic !!!".to_owned()] {
+        let (status, headers, json) =
+            token_request(&app, Some(&authorization), body.clone(), urlencoded).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization}");
+        assert_eq!(json["error"], "invalid_client");
+        assert!(
+            headers[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .starts_with("Basic")
+        );
+    }
+    let (status, _, json) = token_request(&app, None, body.clone(), urlencoded).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "invalid_request");
+    let (status, _, json) = token_request(&app, Some(&good), "{}".into(), "application/json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "invalid_request");
 }

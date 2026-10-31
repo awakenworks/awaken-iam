@@ -11,6 +11,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+mod client_auth;
+
 use crate::{
     AccessTokenExchange, AuthApi, AuthApiError, DownstreamAuthorizeRequest,
     RedeemAuthorizationCode, RefreshGrant, RevokeToken, RevokeTokenHint,
@@ -115,7 +117,7 @@ struct BrowserStartQuery {
 #[derive(Debug, Deserialize)]
 struct TokenForm {
     grant_type: String,
-    client_id: String,
+    client_id: Option<String>,
     client_secret: Option<String>,
     code: Option<String>,
     redirect_uri: Option<String>,
@@ -477,7 +479,55 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) -> Response {
+/// `POST /v1/oauth/token`: resolve client credentials (`client_secret_basic`,
+/// `client_secret_post` or `none`), then dispatch the grant. Malformed bodies
+/// and credential conflicts answer OAuth errors, never framework rejections.
+async fn token(
+    State(state): State<OpHttpState>,
+    headers: HeaderMap,
+    form: Result<Form<TokenForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Ok(Form(mut form)) = form else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let credentials =
+        match client_auth::resolve(&headers, form.client_id.take(), form.client_secret.take()) {
+            Ok(credentials) => credentials,
+            Err(client_auth::CredentialError::InvalidRequest) => {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            Err(client_auth::CredentialError::InvalidClient) => {
+                return basic_challenge(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"));
+            }
+        };
+    let via_basic = credentials.via_basic;
+    let response = grant(state, form, credentials).await;
+    if via_basic && response.status() == StatusCode::UNAUTHORIZED {
+        basic_challenge(response)
+    } else {
+        response
+    }
+}
+
+/// RFC 6749 §5.2: a failed header authentication carries a Basic challenge.
+fn basic_challenge(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"awaken-iam\""),
+    );
+    response
+}
+
+async fn grant(
+    state: OpHttpState,
+    form: TokenForm,
+    credentials: client_auth::ClientCredentials,
+) -> Response {
+    let client_auth::ClientCredentials {
+        client_id,
+        client_secret,
+        ..
+    } = credentials;
     let now = crate::clock::unix_seconds();
     let now_timestamp = crate::clock::timestamp(now);
     let refresh_expires_at = crate::clock::timestamp(now + REFRESH_TOKEN_TTL_SECS);
@@ -489,8 +539,8 @@ async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) ->
             };
             auth.redeem_authorization_code(RedeemAuthorizationCode {
                 redemption: TokenRedemption {
-                    client_id: form.client_id,
-                    client_secret: form.client_secret,
+                    client_id,
+                    client_secret,
                     code,
                     redirect_uri,
                     code_verifier: form.code_verifier,
@@ -508,8 +558,8 @@ async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) ->
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
             };
             auth.refresh_registered_client(
-                &form.client_id,
-                form.client_secret.as_deref(),
+                &client_id,
+                client_secret.as_deref(),
                 RefreshGrant {
                     presented_refresh_token: refresh_token,
                     issuer: state.issuer.to_string(),
@@ -528,8 +578,8 @@ async fn token(State(state): State<OpHttpState>, Form(form): Form<TokenForm>) ->
             let exchanged = auth
                 .exchange_access_token(AccessTokenExchange {
                     issuer: state.issuer.to_string(),
-                    client_id: form.client_id,
-                    client_secret: form.client_secret,
+                    client_id,
+                    client_secret,
                     subject_token,
                     subject_token_type: form.subject_token_type.unwrap_or_default(),
                     actor_token: form.actor_token,

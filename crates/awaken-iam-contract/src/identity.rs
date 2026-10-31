@@ -261,6 +261,11 @@ pub struct OpenIdProviderMetadata {
     pub scopes_supported: Vec<String>,
     /// Grant types the token endpoint accepts.
     pub grant_types_supported: Vec<String>,
+    /// Client authentication methods the token endpoint accepts: HTTP Basic,
+    /// form-body secrets, and `none` for PKCE public clients. Absent in
+    /// documents published before it was advertised.
+    #[serde(default)]
+    pub token_endpoint_auth_methods_supported: Vec<String>,
 }
 
 impl OpenIdProviderMetadata {
@@ -290,6 +295,11 @@ impl OpenIdProviderMetadata {
                 "authorization_code".to_owned(),
                 "refresh_token".to_owned(),
                 "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
+            ],
+            token_endpoint_auth_methods_supported: vec![
+                "client_secret_basic".to_owned(),
+                "client_secret_post".to_owned(),
+                "none".to_owned(),
             ],
         }
     }
