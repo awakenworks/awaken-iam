@@ -345,10 +345,11 @@ CREATE INDEX {prefix}_oauth_authorization_codes_expiry_idx \
 // exchange without a backfill.
 const IDENTITY_0006: &str = "ALTER TABLE {prefix}_oauth_clients ADD COLUMN token_exchange {json};";
 
-// Accountable human owner of a service-account API token (ADR-0017). The
-// column is nullable: tokens minted before this step keep NULL (no recorded
-// owner) and stay valid until they expire or are revoked; every new
-// service-account token is minted with an owner and an expiry by the domain.
+// Accountable human owner of a service-account API token (ADR-0017), written
+// by the accountable admin mint path through ApiTokenOwnerRepository. The
+// column is nullable: tokens minted before this step, and tokens minted by the
+// generic library path, keep NULL and stay valid until they expire or are
+// revoked.
 const IDENTITY_0007: &str = "\
 ALTER TABLE {prefix}_api_tokens ADD COLUMN owner TEXT;";
 

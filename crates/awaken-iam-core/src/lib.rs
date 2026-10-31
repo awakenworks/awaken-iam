@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 pub use api_token::{
-    ApiTokenDirectory, ApiTokenMinter, IssuedApiToken, MintApiToken, parse_presented_token,
-    revoke_api_tokens_for_principal,
+    ApiTokenDirectory, ApiTokenMinter, IssuedApiToken, IssuedServiceAccountToken, MintApiToken,
+    ServiceAccountTokenError, parse_presented_token, revoke_api_tokens_for_principal,
 };
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
@@ -88,8 +88,8 @@ pub use refresh_token::{
     RotateRefreshToken, parse_presented_refresh_token,
 };
 pub use repositories::{
-    AccountIdentityRepository, AccountRepository, ApiTokenRepository, AuditEvent, AuditSink,
-    AuthCodeRepository, AuthorizationProfileRepository, DirectoryRepository,
+    AccountIdentityRepository, AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository,
+    AuditEvent, AuditSink, AuthCodeRepository, AuthorizationProfileRepository, DirectoryRepository,
     ExternalIdentityRepository, GrantRepository, GroupRepository, InvitationRepository,
     LoginFlowRepository, OAuthClientRepository, OrgPrivacyRepository, OrgRepository,
     PlanRepository, RepositoryError, RepositoryResult, ResourceModelRepository,
@@ -265,13 +265,6 @@ pub enum IamError {
     #[error("api token window is invalid")]
     InvalidApiTokenWindow {
         /// API-token id with the rejected window.
-        id: ApiTokenId,
-    },
-    /// A service-account API token was requested without an accountable
-    /// owner account or without an expiry.
-    #[error("service account api tokens require an owner and an expiry")]
-    ApiTokenAccountabilityRequired {
-        /// API-token id with the rejected request.
         id: ApiTokenId,
     },
     /// An API token with this id already exists.

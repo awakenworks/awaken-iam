@@ -384,7 +384,6 @@ fn sqlite_organization_privacy_command_erases_scope_closure_and_is_idempotent() 
         ApiTokenRepository::create(
             &store,
             ApiToken {
-                owner: None,
                 id: ApiTokenId(id.into()),
                 prefix: ApiTokenPrefix(format!("prefix-{id}")),
                 principal: principal.clone(),

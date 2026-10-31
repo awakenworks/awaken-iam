@@ -508,8 +508,9 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
     OAuthClientRepository::remove(store, "awaken-runtime").unwrap();
 
     // --- api tokens: unique id + prefix, prefix lookup, in-place revoke ---
+    // reviewed: migration-allow-edit — this test literal is not a migration; it
+    // returns to the unchanged ApiToken contract (ADR-0017 compatibility).
     let token = ApiToken {
-        owner: None,
         id: ApiTokenId("tok_1".into()),
         prefix: ApiTokenPrefix("pfx_1".into()),
         principal: service("ci"),

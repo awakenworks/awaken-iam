@@ -483,16 +483,10 @@ pub struct ApiToken {
     pub workspace: WorkspaceId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
-    /// Optional expiration timestamp; `None` never expires. Service-account
-    /// tokens minted since ADR-0017 always carry one.
+    /// Optional expiration timestamp; `None` never expires.
     pub expires_at: Option<Timestamp>,
     /// Revocation timestamp; once set the token can no longer authenticate.
     pub revoked_at: Option<Timestamp>,
-    /// Accountable human owner of a service-account token (ADR-0017).
-    /// Absent on tokens minted before ownership was recorded and on tokens
-    /// whose principal is itself an account.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<AccountId>,
 }
 
 impl ApiToken {
@@ -531,9 +525,6 @@ pub struct ApiTokenView {
     pub expires_at: Option<Timestamp>,
     /// Revocation timestamp, when revoked.
     pub revoked_at: Option<Timestamp>,
-    /// Accountable human owner of a service-account token, when recorded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<AccountId>,
 }
 
 impl ApiTokenView {
@@ -547,7 +538,6 @@ impl ApiTokenView {
             created_at: token.created_at.clone(),
             expires_at: token.expires_at.clone(),
             revoked_at: token.revoked_at.clone(),
-            owner: token.owner.clone(),
         }
     }
 }

@@ -25,12 +25,12 @@ use awaken_iam_contract::{
     ScopeRef, Session, SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
-    AuditSink, AuthCodeRepository, AuthorizationProfileRepository, DirectoryNode,
-    DirectoryRepository, Effect, ExternalIdentityRepository, Grant, GrantId, GrantRepository,
-    GrantSubject, Group, GroupId, GroupRepository, Invitation, InvitationRepository,
-    LoginFlowRepository, OAuthClientRepository, OrgRepository, Organization, Plan, PlanId,
-    PlanRepository, PlanTier, Quota, RateLimit, RegisteredClient, RepositoryError,
+    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenOwnerRepository,
+    ApiTokenRepository, AuditEvent, AuditSink, AuthCodeRepository, AuthorizationProfileRepository,
+    DirectoryNode, DirectoryRepository, Effect, ExternalIdentityRepository, Grant, GrantId,
+    GrantRepository, GrantSubject, Group, GroupId, GroupRepository, Invitation,
+    InvitationRepository, LoginFlowRepository, OAuthClientRepository, OrgRepository, Organization,
+    Plan, PlanId, PlanRepository, PlanTier, Quota, RateLimit, RegisteredClient, RepositoryError,
     RepositoryResult, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
     RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
 };
@@ -224,7 +224,7 @@ impl<B: SqlConn> SqlStore<B> {
         query: impl FnOnce(&str, &[SqlParam]) -> RepositoryResult<Vec<SqlRow>>,
     ) -> RepositoryResult<Option<ApiToken>> {
         let sql = format!(
-            "SELECT id,prefix,CAST(principal AS TEXT),secret_hash,workspace,created_at,expires_at,revoked_at,owner FROM {} WHERE id=?",
+            "SELECT id,prefix,CAST(principal AS TEXT),secret_hash,workspace,created_at,expires_at,revoked_at FROM {} WHERE id=?",
             self.table("api_tokens")
         );
         query(&sql, &[p(id.0.clone())])?
@@ -376,7 +376,6 @@ fn decode_api_token(row: &SqlRow) -> RepositoryResult<ApiToken> {
         created_at: Timestamp(req(row, 5, "api_token.created_at")?),
         expires_at: opt(row, 6).map(Timestamp),
         revoked_at: opt(row, 7).map(Timestamp),
-        owner: opt(row, 8).map(AccountId),
     })
 }
 
@@ -982,6 +981,36 @@ impl<B: SqlConn> AuthCodeRepository for SqlStore<B> {
     }
 }
 
+impl<B: SqlConn> ApiTokenOwnerRepository for SqlStore<B> {
+    fn record_api_token_owner(&self, id: &ApiTokenId, owner: &AccountId) -> RepositoryResult<()> {
+        let sql = format!(
+            "UPDATE {} SET owner = ? WHERE id = ?",
+            self.table("api_tokens")
+        );
+        if self
+            .backend
+            .execute(&sql, &[p(owner.0.clone()), p(id.0.clone())])?
+            == 0
+        {
+            return Err(RepositoryError::NotFound(format!("api token {}", id.0)));
+        }
+        Ok(())
+    }
+
+    fn api_token_owner(&self, id: &ApiTokenId) -> RepositoryResult<Option<AccountId>> {
+        let sql = format!(
+            "SELECT owner FROM {} WHERE id = ?",
+            self.table("api_tokens")
+        );
+        Ok(self
+            .backend
+            .query(&sql, &[p(id.0.clone())])?
+            .first()
+            .and_then(|row| opt(row, 0))
+            .map(AccountId))
+    }
+}
+
 impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     fn create(&self, token: ApiToken) -> RepositoryResult<()> {
         self.with_policy_transaction(|transaction, _| {
@@ -1000,8 +1029,8 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
             let principal = json_encode(&token.principal, "principal")?;
             let sql = format!(
                 "INSERT INTO {t} \
-             (id, prefix, principal, secret_hash, workspace, created_at, expires_at, revoked_at, \
-             owner) VALUES (?, ?, ?j, ?, ?, ?, ?, ?, ?)",
+             (id, prefix, principal, secret_hash, workspace, created_at, expires_at, revoked_at) \
+             VALUES (?, ?, ?j, ?, ?, ?, ?, ?)",
                 t = self.table("api_tokens")
             );
             transaction.execute(
@@ -1015,7 +1044,6 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
                     p(token.created_at.0),
                     token.expires_at.map(|t| t.0),
                     token.revoked_at.map(|t| t.0),
-                    token.owner.map(|owner| owner.0),
                 ],
             )?;
             Ok(())
@@ -1029,7 +1057,7 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepositoryResult<Option<ApiToken>> {
         let sql = format!(
             "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
-             created_at, expires_at, revoked_at, owner FROM {} WHERE prefix = ?",
+             created_at, expires_at, revoked_at FROM {} WHERE prefix = ?",
             self.table("api_tokens")
         );
         let rows = self.backend.query(&sql, &[p(prefix.0.clone())])?;
@@ -1040,7 +1068,7 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
         let principal_json = json_encode(principal, "principal")?;
         let sql = format!(
             "SELECT id, prefix, CAST(principal AS TEXT), secret_hash, workspace, \
-             created_at, expires_at, revoked_at, owner FROM {} WHERE principal = ?j ORDER BY id",
+             created_at, expires_at, revoked_at FROM {} WHERE principal = ?j ORDER BY id",
             self.table("api_tokens")
         );
         self.backend
@@ -1067,7 +1095,7 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
             let principal = json_encode(&token.principal, "principal")?;
             let sql = format!(
                 "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, workspace = ?, \
-             created_at = ?, expires_at = ?, revoked_at = ?, owner = ? WHERE id = ?",
+             created_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
                 t = self.table("api_tokens")
             );
             let affected = transaction.execute(
@@ -1080,7 +1108,6 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
                     p(token.created_at.0),
                     token.expires_at.map(|t| t.0),
                     token.revoked_at.map(|t| t.0),
-                    token.owner.map(|owner| owner.0),
                     p(token.id.0.clone()),
                 ],
             )?;

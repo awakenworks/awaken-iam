@@ -306,7 +306,6 @@ where
         ApiTokenRepository::create(
             store,
             ApiToken {
-                owner: None,
                 id: ApiTokenId(id.into()),
                 prefix: ApiTokenPrefix(format!("prefix-{id}")),
                 principal: owner.clone(),

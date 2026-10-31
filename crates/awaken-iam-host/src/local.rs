@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_contract::{ApiTokenId, PrincipalRef, Timestamp, WorkspaceId};
+use awaken_iam_contract::{AccountId, ApiTokenId, PrincipalRef, Timestamp, WorkspaceId};
 use awaken_iam_core::{
-    ApiTokenDirectory, ApiTokenMinter, EntitlementEngine, IamError, IssuedApiToken, MintApiToken,
-    OsEntropy, RoleId,
+    ApiTokenDirectory, ApiTokenMinter, EntitlementEngine, IamError, IssuedApiToken,
+    IssuedServiceAccountToken, MintApiToken, OsEntropy, RoleId,
 };
 use awaken_iam_preset::{seed_named_roles, seed_runtime_roles};
 use awaken_iam_server::{
@@ -53,6 +53,21 @@ impl LocalHandle {
             .map_err(EmbedError::from)
     }
 
+    /// Mint a service-account API token through the accountable admin path:
+    /// the principal must be a service, the request must carry an expiry, and
+    /// `owner` is recorded as the human accountable for the key (ADR-0017).
+    pub fn mint_service_account_token(
+        &mut self,
+        request: MintApiToken,
+        owner: AccountId,
+    ) -> Result<IssuedServiceAccountToken, EmbedError> {
+        let mut guard = self.state.lock().expect("local state lock");
+        let LocalIamState { authz, directory } = &mut *guard;
+        self.minter
+            .mint_service_account(directory, authz.policy_mut(), request, owner)
+            .map_err(|error| EmbedError::Token(error.to_string()))
+    }
+
     /// Revoke every live API token of one service account, returning the ids
     /// newly revoked. Already-revoked tokens keep their original stamp.
     pub fn revoke_service_account_tokens(
@@ -98,10 +113,8 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
 
     let mut authz = AuthzApi::with_entitlements(EntitlementEngine::unlicensed());
 
-    // The host's break-glass credential precedes any accountable account, so
-    // it is the one documented exemption from the service-account owner rule.
     let issued = minter
-        .mint_host_bootstrap(
+        .mint(
             &mut directory,
             authz.policy_mut(),
             MintApiToken {
@@ -113,7 +126,6 @@ pub fn embed_local(cfg: &HostConfig) -> Result<LocalHandle, EmbedError> {
                 role: RoleId("admin".into()),
                 created_at: Timestamp("2026-01-01T00:00:00Z".into()),
                 expires_at: None,
-                owner: None,
             },
         )
         .map_err(EmbedError::from)?;

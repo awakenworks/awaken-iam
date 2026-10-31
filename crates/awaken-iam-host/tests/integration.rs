@@ -72,8 +72,7 @@ fn local_mode_api_token_lifecycle() {
         workspace: workspace.clone(),
         role: RoleId("admin".into()),
         created_at: Timestamp("2026-01-01T00:00:00Z".into()),
-        expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
-        owner: Some(AccountId("acct_owner".into())),
+        expires_at: None,
     };
     let issued = handle.mint_api_token(req).expect("mint should succeed");
     assert!(
@@ -546,8 +545,7 @@ async fn middleware_revoked_token_returns_401() {
         workspace: workspace.clone(),
         role: RoleId("admin".into()),
         created_at: Timestamp("2026-01-01T00:00:00Z".into()),
-        expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
-        owner: Some(AccountId("acct_owner".into())),
+        expires_at: None,
     };
     let issued = handle.mint_api_token(req).expect("mint");
 
@@ -729,8 +727,7 @@ fn from_local_state_wraps_a_product_owned_embed() {
                 workspace: WorkspaceId("wrkspc_product".into()),
                 role: RoleId("admin".into()),
                 created_at: now_ts(),
-                expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
-                owner: Some(AccountId("acct_owner".into())),
+                expires_at: None,
             },
         )
         .expect("mint into the product-owned state");
@@ -862,7 +859,6 @@ fn authenticate_detailed_surfaces_reject_reasons() {
             role: RoleId("admin".into()),
             created_at: Timestamp("2020-01-01T00:00:00Z".into()),
             expires_at: Some(Timestamp("2020-01-02T00:00:00Z".into())),
-            owner: Some(AccountId("acct_owner".into())),
         })
         .expect("mint expired token");
 
@@ -1028,15 +1024,16 @@ async fn middleware_inserts_the_token_actor_extension() {
 ///
 /// | request | result |
 /// |---|---|
-/// | service token without owner or expiry | refused, nothing authenticates |
-/// | two owned, expiring tokens of one service account | both authenticate |
+/// | admin path, service token without expiry | refused, nothing authenticates |
+/// | admin path, two owned expiring tokens of one service account | both authenticate, owner recorded |
 /// | revoke the service account | both refused; another account's token survives |
-/// | bootstrap admin | still authenticates (documented host exemption) |
+/// | library `mint_api_token` without owner/expiry | unchanged behaviour (bootstrap admin) |
 #[test]
 fn service_account_tokens_are_owned_expiring_and_revocable_together() {
     let cfg = HostConfig::local_in_memory();
     let mut handle = embed_local(&cfg).expect("embed_local");
     let ts = now_ts();
+    let owner = AccountId("acct_owner".into());
     let request = |id: &str, service: &str| MintApiToken {
         id: ApiTokenId(id.into()),
         principal: svc(service),
@@ -1044,26 +1041,25 @@ fn service_account_tokens_are_owned_expiring_and_revocable_together() {
         role: RoleId("admin".into()),
         created_at: Timestamp("2026-01-01T00:00:00Z".into()),
         expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
-        owner: Some(AccountId("acct_owner".into())),
     };
-    let mut unowned = request("tok_unowned", "svc-import");
-    unowned.owner = None;
     let mut unbounded = request("tok_unbounded", "svc-import");
     unbounded.expires_at = None;
-    for rejected in [unowned, unbounded] {
-        assert!(handle.mint_api_token(rejected).is_err());
-    }
+    assert!(
+        handle
+            .mint_service_account_token(unbounded, owner.clone())
+            .is_err()
+    );
 
     let first = handle
-        .mint_api_token(request("tok_import_a", "svc-import"))
+        .mint_service_account_token(request("tok_import_a", "svc-import"), owner.clone())
         .expect("owned token");
     let second = handle
-        .mint_api_token(request("tok_import_b", "svc-import"))
+        .mint_service_account_token(request("tok_import_b", "svc-import"), owner.clone())
         .expect("owned token");
     let other = handle
-        .mint_api_token(request("tok_other", "svc-other"))
+        .mint_service_account_token(request("tok_other", "svc-other"), owner.clone())
         .expect("owned token");
-    assert_eq!(first.token.owner, Some(AccountId("acct_owner".into())));
+    assert_eq!(first.owner, owner);
 
     let revoked = handle.revoke_service_account_tokens("svc-import", ts.clone());
     assert_eq!(
@@ -1073,7 +1069,7 @@ fn service_account_tokens_are_owned_expiring_and_revocable_together() {
             ApiTokenId("tok_import_b".into())
         ]
     );
-    for secret in [&first.secret, &second.secret] {
+    for secret in [&first.issued.secret, &second.issued.secret] {
         assert_eq!(
             handle
                 .gate
@@ -1085,7 +1081,7 @@ fn service_account_tokens_are_owned_expiring_and_revocable_together() {
     assert!(
         handle
             .gate
-            .authenticate_bearer(&other.secret, &ts, NOW_UNIX)
+            .authenticate_bearer(&other.issued.secret, &ts, NOW_UNIX)
             .is_some()
     );
     assert!(

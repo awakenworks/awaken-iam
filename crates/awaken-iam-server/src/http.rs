@@ -446,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn introspect_route_resolves_a_registered_token() {
-        use awaken_iam_contract::{AccountId, ApiTokenId, Timestamp};
+        use awaken_iam_contract::{ApiTokenId, Timestamp};
         use awaken_iam_contract::{ApiTokenStatus, WorkspaceId};
         use awaken_iam_core::{
             ApiTokenDirectory, ApiTokenMinter, EntropySource, MintApiToken, PolicySet, RoleId,
@@ -477,8 +477,7 @@ mod tests {
                     workspace: WorkspaceId("ws_fen".into()),
                     role: RoleId("workspace_developer".into()),
                     created_at: Timestamp("2026-06-19T00:00:00Z".into()),
-                    expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
-                    owner: Some(AccountId("acct_owner".into())),
+                    expires_at: None,
                 },
             )
             .unwrap();

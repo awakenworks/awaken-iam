@@ -338,7 +338,6 @@ mod tests {
                 ApiTokenRepository::create(
                     &store,
                     ApiToken {
-                        owner: None,
                         id: ApiTokenId("poison-token".into()),
                         prefix: ApiTokenPrefix("poison-prefix".into()),
                         principal: PrincipalRef::Service {

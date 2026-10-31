@@ -26,7 +26,6 @@ fn api_token_update_on_absent_token_yields_not_found() {
     // reporting success.
     let store = sqlite_in_memory_store("iam").expect("migrate");
     let absent = ApiToken {
-        owner: None,
         id: ApiTokenId("tok_ghost".into()),
         prefix: ApiTokenPrefix("pfx_ghost".into()),
         principal: PrincipalRef::Account {
@@ -329,18 +328,18 @@ fn grant_subject_ref_round_trips_through_grant_storage() {
     }
 }
 
-/// I4 persistence: the owner round-trips through SQL, legacy rows decode with
-/// no owner, and revoking a service account retires only its live rows.
+/// I4 persistence: the accountable owner is recorded beside the unchanged
+/// token row, legacy rows report no owner, and revoking a service account
+/// retires only its live rows.
 #[test]
 fn service_account_owner_persists_and_bulk_revocation_is_durable() {
-    use awaken_iam_core::revoke_api_tokens_for_principal;
+    use awaken_iam_core::{ApiTokenOwnerRepository, revoke_api_tokens_for_principal};
 
     let store = sqlite_in_memory_store("api_token_owner").unwrap();
     let service = PrincipalRef::Service {
         service_id: "svc-import".into(),
     };
-    let token = |id: &str, prefix: &str, owner: Option<&str>| ApiToken {
-        owner: owner.map(|owner| AccountId(owner.into())),
+    let token = |id: &str, prefix: &str| ApiToken {
         id: ApiTokenId(id.into()),
         prefix: ApiTokenPrefix(prefix.into()),
         principal: service.clone(),
@@ -350,21 +349,28 @@ fn service_account_owner_persists_and_bulk_revocation_is_durable() {
         expires_at: Some(Timestamp("2027-01-01T00:00:00Z".into())),
         revoked_at: None,
     };
-    ApiTokenRepository::create(&store, token("tok_a", "pfx_a", Some("acct_owner"))).unwrap();
-    ApiTokenRepository::create(&store, token("tok_legacy", "pfx_l", None)).unwrap();
-    let mut already = token("tok_old", "pfx_o", Some("acct_owner"));
+    let owner = AccountId("acct_owner".into());
+    ApiTokenRepository::create(&store, token("tok_a", "pfx_a")).unwrap();
+    store
+        .record_api_token_owner(&ApiTokenId("tok_a".into()), &owner)
+        .unwrap();
+    ApiTokenRepository::create(&store, token("tok_legacy", "pfx_l")).unwrap();
+    let mut already = token("tok_old", "pfx_o");
     already.revoked_at = Some(Timestamp("2026-02-01T00:00:00Z".into()));
     ApiTokenRepository::create(&store, already).unwrap();
+    assert!(matches!(
+        store.record_api_token_owner(&ApiTokenId("ghost".into()), &owner),
+        Err(RepositoryError::NotFound(_))
+    ));
 
-    let stored = ApiTokenRepository::get(&store, &ApiTokenId("tok_a".into()))
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.owner, Some(AccountId("acct_owner".into())));
     assert_eq!(
-        ApiTokenRepository::get(&store, &ApiTokenId("tok_legacy".into()))
-            .unwrap()
-            .unwrap()
-            .owner,
+        store.api_token_owner(&ApiTokenId("tok_a".into())).unwrap(),
+        Some(owner.clone())
+    );
+    assert_eq!(
+        store
+            .api_token_owner(&ApiTokenId("tok_legacy".into()))
+            .unwrap(),
         None
     );
 
@@ -374,9 +380,11 @@ fn service_account_owner_persists_and_bulk_revocation_is_durable() {
         revoked,
         vec![ApiTokenId("tok_a".into()), ApiTokenId("tok_legacy".into())]
     );
-    for token in ApiTokenRepository::list_for_principal(&store, &service).unwrap() {
-        assert!(token.revoked_at.is_some(), "{:?}", token.id);
-    }
+    assert_eq!(
+        store.api_token_owner(&ApiTokenId("tok_a".into())).unwrap(),
+        Some(owner),
+        "revocation keeps the accountable owner"
+    );
     assert_eq!(
         ApiTokenRepository::get(&store, &ApiTokenId("tok_old".into()))
             .unwrap()

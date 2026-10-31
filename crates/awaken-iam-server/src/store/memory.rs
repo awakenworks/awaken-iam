@@ -16,15 +16,15 @@ use awaken_iam_contract::{
     SessionId, Timestamp, WorkspaceId, WorkspaceOrgEdge,
 };
 use awaken_iam_core::{
-    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenRepository, AuditEvent,
-    AuditSink, AuthCodeRepository, AuthorizationProfileRepository, Effect,
-    ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group, GroupId,
-    GroupRepository, Invitation, InvitationRepository, LoginFlowRepository, OAuthClientRepository,
-    OrgPrivacyCommitPlan, OrgPrivacyRepository, OrgPrivacyTerminal, OrgRepository, Organization,
-    OrganizationPrivacyScope, Plan, PlanId, PlanRepository, RegisteredClient, RepositoryError,
-    RepositoryResult, ResourceEdge, ResourceModelRepository, RoleBinding, RoleBindingRepository,
-    RoleDef, RoleId, RoleRepository, SessionRepository, StoredAuthorizationCode,
-    plan_org_privacy_commit,
+    AccountIdentityRepository, AccountRepository, ActionPattern, ApiTokenOwnerRepository,
+    ApiTokenRepository, AuditEvent, AuditSink, AuthCodeRepository, AuthorizationProfileRepository,
+    Effect, ExternalIdentityRepository, Grant, GrantId, GrantRepository, GrantSubject, Group,
+    GroupId, GroupRepository, Invitation, InvitationRepository, LoginFlowRepository,
+    OAuthClientRepository, OrgPrivacyCommitPlan, OrgPrivacyRepository, OrgPrivacyTerminal,
+    OrgRepository, Organization, OrganizationPrivacyScope, Plan, PlanId, PlanRepository,
+    RegisteredClient, RepositoryError, RepositoryResult, ResourceEdge, ResourceModelRepository,
+    RoleBinding, RoleBindingRepository, RoleDef, RoleId, RoleRepository, SessionRepository,
+    StoredAuthorizationCode, plan_org_privacy_commit,
 };
 
 use super::fence::{Fence, FenceStore};
@@ -52,6 +52,7 @@ struct Identity {
     login_flows: BTreeMap<String, OAuthLoginState>,
     api_tokens: BTreeMap<String, ApiToken>,
     api_tokens_by_prefix: BTreeMap<String, String>,
+    api_token_owners: BTreeMap<String, AccountId>,
     oauth_clients: BTreeMap<String, RegisteredClient>,
     oauth_codes: BTreeMap<String, StoredAuthorizationCode>,
 }
@@ -298,6 +299,27 @@ impl LoginFlowRepository for InMemoryStore {
         }
         flow.consumed_at = Some(at);
         Ok(())
+    }
+}
+
+impl ApiTokenOwnerRepository for InMemoryStore {
+    fn record_api_token_owner(&self, id: &ApiTokenId, owner: &AccountId) -> RepositoryResult<()> {
+        let mut guard = checked_lock(&self.identity, "identity")?;
+        if !guard.api_tokens.contains_key(&id.0) {
+            return Err(RepositoryError::NotFound(format!("api token {}", id.0)));
+        }
+        guard.api_token_owners.insert(id.0.clone(), owner.clone());
+        Ok(())
+    }
+
+    fn api_token_owner(&self, id: &ApiTokenId) -> RepositoryResult<Option<AccountId>> {
+        let guard = checked_lock(&self.identity, "identity")?;
+        // An erased token takes its ownership record with it.
+        Ok(guard
+            .api_tokens
+            .contains_key(&id.0)
+            .then(|| guard.api_token_owners.get(&id.0).cloned())
+            .flatten())
     }
 }
 
@@ -1330,7 +1352,6 @@ mod tests {
     fn api_tokens_resolve_by_id_and_prefix_and_revoke_in_place() {
         let store = InMemoryStore::new();
         let token = ApiToken {
-            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx".into()),
             principal: PrincipalRef::Service {
@@ -1641,7 +1662,6 @@ mod tests {
     fn api_token_prefix_conflict_and_missing_update_fail_closed() {
         let store = InMemoryStore::new();
         let base = ApiToken {
-            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx".into()),
             principal: PrincipalRef::Service {

@@ -342,7 +342,6 @@ mod tests {
     #[test]
     fn api_token_view_omits_the_secret_hash() {
         let token = ApiToken {
-            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx_abc".into()),
             principal: PrincipalRef::Service {
@@ -370,7 +369,6 @@ mod tests {
     #[test]
     fn api_token_liveness_tracks_revocation_and_expiry() {
         let mut token = ApiToken {
-            owner: None,
             id: ApiTokenId("tok_1".into()),
             prefix: ApiTokenPrefix("pfx_abc".into()),
             principal: PrincipalRef::Service {

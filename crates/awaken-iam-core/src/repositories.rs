@@ -125,6 +125,17 @@ pub trait ApiTokenRepository: Send + Sync {
     fn update(&self, token: ApiToken) -> RepositoryResult<()>;
 }
 
+/// Durable record of the accountable human owner of a service-account API
+/// token (ADR-0017). Kept beside, not inside, [`ApiToken`] so the token
+/// contract and its existing constructors are unchanged.
+pub trait ApiTokenOwnerRepository: Send + Sync {
+    /// Record `owner` for an existing token, failing with `NotFound` when the
+    /// token does not exist.
+    fn record_api_token_owner(&self, id: &ApiTokenId, owner: &AccountId) -> RepositoryResult<()>;
+    /// The recorded owner of a token; `None` for tokens minted without one.
+    fn api_token_owner(&self, id: &ApiTokenId) -> RepositoryResult<Option<AccountId>>;
+}
+
 /// Persistence for in-flight OAuth login-state challenges.
 pub trait LoginFlowRepository: Send + Sync {
     /// Record a freshly issued challenge, failing on a duplicate id.

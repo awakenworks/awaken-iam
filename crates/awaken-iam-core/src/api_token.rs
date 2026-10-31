@@ -70,13 +70,9 @@ const SALT_BYTES: usize = 16;
 /// role — and that defaulting lives with the caller.
 ///
 /// `created_at`/`expires_at` follow the rest of the contract: time math lives
-/// with the caller as canonical RFC 3339 strings. When present, `expires_at`
+/// with the caller as canonical RFC 3339 strings. `expires_at` is optional — a
+/// token without one never expires and lives until revoked — but when present it
 /// must be strictly after `created_at`.
-///
-/// A token whose principal is a [`PrincipalRef::Service`] (a service account)
-/// must name an accountable human [`owner`](Self::owner) **and** an expiry
-/// (ADR-0017); [`ApiTokenMinter::mint`] refuses it otherwise. Tokens for other
-/// principals may omit both, as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintApiToken {
     /// Row id assigned to the persisted token.
@@ -91,11 +87,8 @@ pub struct MintApiToken {
     pub role: RoleId,
     /// Token mint timestamp.
     pub created_at: Timestamp,
-    /// Expiration timestamp; must be strictly after `created_at`. Required
-    /// for service-account tokens.
+    /// Optional expiration timestamp; must be strictly after `created_at`.
     pub expires_at: Option<Timestamp>,
-    /// Accountable human owner. Required for service-account tokens.
-    pub owner: Option<AccountId>,
 }
 
 /// Result of minting a token: the persisted row plus its one-time cleartext.
@@ -109,6 +102,29 @@ pub struct IssuedApiToken {
     pub token: ApiToken,
     /// One-time cleartext token presented by the caller on later requests.
     pub secret: String,
+}
+
+/// A service-account token minted through the accountable admin path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedServiceAccountToken {
+    /// The issued token and its one-time cleartext.
+    pub issued: IssuedApiToken,
+    /// The accountable human owner recorded for the token.
+    pub owner: AccountId,
+}
+
+/// Why the accountable service-account mint path refused a request.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ServiceAccountTokenError {
+    /// The request's principal is not a [`PrincipalRef::Service`].
+    #[error("service account tokens must authenticate a service principal")]
+    NotAServiceAccount,
+    /// The request carried no expiry.
+    #[error("service account tokens require an expiry")]
+    ExpiryRequired,
+    /// The underlying mint failed (window, duplicate id or prefix, hashing).
+    #[error(transparent)]
+    Mint(#[from] IamError),
 }
 
 /// Mints argon2id-hashed API tokens and persists their rows.
@@ -134,46 +150,10 @@ impl<E: EntropySource> ApiTokenMinter<E> {
     /// written once the credential persists, so a rejected mint leaves no
     /// dangling authority.
     ///
-    /// Fails with [`IamError::ApiTokenAccountabilityRequired`] when a
-    /// service-account token lacks an owner or an expiry, with
-    /// [`IamError::InvalidApiTokenWindow`] when an expiry is not strictly after
-    /// creation, or with the duplicate errors from
+    /// Fails with [`IamError::InvalidApiTokenWindow`] when an expiry is not
+    /// strictly after creation, or with the duplicate errors from
     /// [`ApiTokenDirectory::create`] when the id or prefix is reused.
     pub fn mint(
-        &mut self,
-        directory: &mut ApiTokenDirectory,
-        policy: &mut PolicySet,
-        request: MintApiToken,
-    ) -> Result<IssuedApiToken, IamError> {
-        if matches!(request.principal, PrincipalRef::Service { .. })
-            && (request.owner.is_none() || request.expires_at.is_none())
-        {
-            return Err(IamError::ApiTokenAccountabilityRequired { id: request.id });
-        }
-        self.mint_unchecked(directory, policy, request)
-    }
-
-    /// Mint an embedding host's own bootstrap credential.
-    ///
-    /// The single documented exemption from the service-account owner/expiry
-    /// rule: a freshly embedded IAM has no accountable account yet, so the
-    /// host's first administrative credential cannot name one. It must be a
-    /// [`PrincipalRef::Service`] token and is otherwise minted exactly like
-    /// [`mint`](Self::mint). Hosts persist it owner-only and replace it with
-    /// owned, expiring credentials once an administrator exists.
-    pub fn mint_host_bootstrap(
-        &mut self,
-        directory: &mut ApiTokenDirectory,
-        policy: &mut PolicySet,
-        request: MintApiToken,
-    ) -> Result<IssuedApiToken, IamError> {
-        if !matches!(request.principal, PrincipalRef::Service { .. }) {
-            return Err(IamError::ApiTokenAccountabilityRequired { id: request.id });
-        }
-        self.mint_unchecked(directory, policy, request)
-    }
-
-    fn mint_unchecked(
         &mut self,
         directory: &mut ApiTokenDirectory,
         policy: &mut PolicySet,
@@ -201,7 +181,6 @@ impl<E: EntropySource> ApiTokenMinter<E> {
             created_at: request.created_at,
             expires_at: request.expires_at,
             revoked_at: None,
-            owner: request.owner,
         };
 
         directory.create(token.clone())?;
@@ -218,6 +197,34 @@ impl<E: EntropySource> ApiTokenMinter<E> {
             token,
             secret: render_token(&prefix, &secret),
         })
+    }
+
+    /// The accountable administrative mint path for service-account tokens
+    /// (ADR-0017): the principal must be a [`PrincipalRef::Service`], the
+    /// request must carry an expiry, and `owner` — the human accountable for
+    /// the key — is recorded beside the token in `directory`.
+    ///
+    /// [`mint`](Self::mint) keeps its original contract for library callers;
+    /// administrative surfaces that issue service-account keys use this
+    /// method so ownership and expiry are always present.
+    pub fn mint_service_account(
+        &mut self,
+        directory: &mut ApiTokenDirectory,
+        policy: &mut PolicySet,
+        request: MintApiToken,
+        owner: AccountId,
+    ) -> Result<IssuedServiceAccountToken, ServiceAccountTokenError> {
+        if !matches!(request.principal, PrincipalRef::Service { .. }) {
+            return Err(ServiceAccountTokenError::NotAServiceAccount);
+        }
+        if request.expires_at.is_none() {
+            return Err(ServiceAccountTokenError::ExpiryRequired);
+        }
+        let issued = self.mint(directory, policy, request)?;
+        directory
+            .owners
+            .insert(issued.token.id.clone(), owner.clone());
+        Ok(IssuedServiceAccountToken { issued, owner })
     }
 
     fn random_b64(&mut self, bytes: usize) -> String {
@@ -239,6 +246,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
 pub struct ApiTokenDirectory {
     by_prefix: HashMap<ApiTokenPrefix, ApiToken>,
     by_id: HashMap<ApiTokenId, ApiTokenPrefix>,
+    owners: HashMap<ApiTokenId, AccountId>,
 }
 
 impl ApiTokenDirectory {
@@ -319,6 +327,12 @@ impl ApiTokenDirectory {
             });
         }
         Ok(token)
+    }
+
+    /// The accountable owner recorded by
+    /// [`ApiTokenMinter::mint_service_account`], if any.
+    pub fn owner(&self, id: &ApiTokenId) -> Option<&AccountId> {
+        self.owners.get(id)
     }
 
     /// Revoke every unrevoked token held by `principal` — e.g. all keys of one
@@ -459,8 +473,6 @@ mod tests {
         }
     }
 
-    /// A service-account mint request owned by `acct_owner`. `None` expiry
-    /// selects the default one-year window.
     fn mint_request(id: &str, expires_at: Option<&str>) -> MintApiToken {
         MintApiToken {
             id: ApiTokenId(id.into()),
@@ -470,61 +482,70 @@ mod tests {
             workspace: WorkspaceId("wrkspc_default".into()),
             role: RoleId("workspace_developer".into()),
             created_at: Timestamp("2026-06-19T00:00:00Z".into()),
-            expires_at: Some(Timestamp(
-                expires_at.unwrap_or("2027-06-19T00:00:00Z").into(),
-            )),
-            owner: Some(AccountId("acct_owner".into())),
+            expires_at: expires_at.map(|value| Timestamp(value.into())),
         }
     }
 
-    /// Accountability decision table (I4):
+    /// Accountable service-account mint decision table (ADR-0017 I4):
     ///
-    /// | principal | owner | expiry | mint | host bootstrap |
-    /// |---|---|---|---|---|
-    /// | service | yes | yes | ok, owner persisted | ok |
-    /// | service | no | yes | AccountabilityRequired | ok |
-    /// | service | yes | no | AccountabilityRequired | ok |
-    /// | account | no | no | ok (unchanged rule) | AccountabilityRequired |
+    /// | path | principal | expiry | result |
+    /// |---|---|---|---|
+    /// | mint_service_account | service | yes | issued, owner recorded |
+    /// | mint_service_account | service | no | ExpiryRequired, nothing stored |
+    /// | mint_service_account | account | yes | NotAServiceAccount |
+    /// | mint (library) | service | no | issued unchanged, no owner |
     #[test]
-    fn service_account_tokens_require_an_owner_and_an_expiry() {
+    fn service_account_admin_path_requires_an_owner_and_an_expiry() {
         let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
         let mut directory = ApiTokenDirectory::new();
         let mut policy = PolicySet::new();
-        let issued = minter
-            .mint(&mut directory, &mut policy, mint_request("tok_ok", None))
+        let owner = AccountId("acct_owner".into());
+        let owned = minter
+            .mint_service_account(
+                &mut directory,
+                &mut policy,
+                mint_request("tok_owned", Some("2027-06-19T00:00:00Z")),
+                owner.clone(),
+            )
             .unwrap();
-        assert_eq!(issued.token.owner, Some(AccountId("acct_owner".into())));
+        assert_eq!(owned.owner, owner);
+        assert_eq!(
+            directory.owner(&ApiTokenId("tok_owned".into())),
+            Some(&owner)
+        );
 
-        let mut unowned = mint_request("tok_unowned", None);
-        unowned.owner = None;
-        let mut unbounded = mint_request("tok_unbounded", None);
-        unbounded.expires_at = None;
-        for request in [unowned, unbounded.clone()] {
-            let id = request.id.clone();
-            assert_eq!(
-                minter.mint(&mut directory, &mut policy, request),
-                Err(IamError::ApiTokenAccountabilityRequired { id: id.clone() })
-            );
-            assert!(directory.token(&id).is_none());
-        }
-        minter
-            .mint_host_bootstrap(&mut directory, &mut policy, unbounded)
-            .unwrap();
-
-        let mut account = mint_request("tok_account", None);
+        assert_eq!(
+            minter.mint_service_account(
+                &mut directory,
+                &mut policy,
+                mint_request("tok_unbounded", None),
+                owner.clone(),
+            ),
+            Err(ServiceAccountTokenError::ExpiryRequired)
+        );
+        assert!(
+            directory
+                .token(&ApiTokenId("tok_unbounded".into()))
+                .is_none()
+        );
+        let mut account = mint_request("tok_account", Some("2027-06-19T00:00:00Z"));
         account.principal = PrincipalRef::Account {
             account_id: AccountId("acct_ada".into()),
         };
-        account.owner = None;
-        account.expires_at = None;
-        minter
-            .mint(&mut directory, &mut policy, account.clone())
+        assert_eq!(
+            minter.mint_service_account(&mut directory, &mut policy, account, owner),
+            Err(ServiceAccountTokenError::NotAServiceAccount)
+        );
+
+        let legacy = minter
+            .mint(
+                &mut directory,
+                &mut policy,
+                mint_request("tok_legacy", None),
+            )
             .unwrap();
-        account.id = ApiTokenId("tok_account_bootstrap".into());
-        assert!(matches!(
-            minter.mint_host_bootstrap(&mut directory, &mut policy, account),
-            Err(IamError::ApiTokenAccountabilityRequired { .. })
-        ));
+        assert_eq!(legacy.token.expires_at, None);
+        assert_eq!(directory.owner(&legacy.token.id), None);
     }
 
     #[test]
