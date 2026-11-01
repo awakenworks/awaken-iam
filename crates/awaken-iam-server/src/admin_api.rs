@@ -616,10 +616,7 @@ where
 
     // -- grants -------------------------------------------------------------
 
-    /// Issue a grant, inserting or replacing it by id.
-    ///
-    /// The grant, its audit event and the version advance commit together,
-    /// exactly as a one-grant [`issue_grants`](Self::issue_grants) batch.
+    /// Issue (insert or replace) one grant as an atomic [`issue_grants`](Self::issue_grants) batch.
     pub fn issue_grant(&mut self, grant: Grant, at: Timestamp) -> AdminResult<u64> {
         self.issue_grants(vec![grant], at)
     }
