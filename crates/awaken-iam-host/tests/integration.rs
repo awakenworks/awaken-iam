@@ -43,6 +43,35 @@ fn open_mode_is_open_and_always_allows() {
         ScopeRef::Global,
     ));
     assert_eq!(decision, AuthorizationDecision::Allow);
+
+    // R1: Open is explicit, so all existing Result projections stay Allow;
+    // the new local availability boundary must not turn Open into an outage.
+    let request = AuthorizationRequest::direct(
+        svc("any-service"),
+        ActionKey("billing.read".into()),
+        ScopeRef::Global,
+    );
+    assert_eq!(
+        gate.authorize_result(request.clone()),
+        Ok(AuthorizationDecision::Allow)
+    );
+    assert_eq!(
+        gate.authorize_resource_result(awaken_iam_contract::ResourceAuthorizationRequest {
+            request,
+            context: Default::default(),
+        })
+        .unwrap()
+        .decision,
+        AuthorizationDecision::Allow,
+    );
+    assert_eq!(
+        gate.check_entitlement_result(EntitlementRequest {
+            principal: svc("any-service"),
+            entitlement: "ai.basic".into(),
+            resource: None,
+        }),
+        Ok(EntitlementDecision::Allow),
+    );
 }
 
 #[test]
@@ -730,7 +759,23 @@ fn from_local_state_wraps_a_product_owned_embed() {
         )
         .expect("mint into the product-owned state");
 
-    let gate = IamGate::from_local_state(Arc::new(Mutex::new(LocalIamState { authz, directory })));
+    // C1=the original shared state is healthy, C2=an explicit read grant,
+    // C3=the default-deny write/entitlement, C4=that same state is poisoned.
+    // Decision table: R1(C1,C2)->Ok(Allow); R2(C1,C3)->Ok(Deny);
+    // R3(C4)->Err(Unavailable) for all three Result methods, no policy/token
+    // mutation; R4(C4,legacy API)->Deny without panic. The token and policy
+    // stay behind one Arc/Mutex; no recovery into possibly inconsistent data.
+    use awaken_iam_client::IamDecisionError;
+    use awaken_iam_core::{ActionPattern, Effect, Grant, GrantId, GrantSubject};
+    authz.policy_mut().add_grant(Grant {
+        id: GrantId("product-read".into()),
+        subject: GrantSubject::Principal(principal.clone()),
+        action_pattern: ActionPattern("product.read".into()),
+        scope: ScopeRef::Global,
+        effect: Effect::Allow,
+    });
+    let state = Arc::new(Mutex::new(LocalIamState { authz, directory }));
+    let gate = IamGate::from_local_state(state.clone());
 
     assert!(!gate.is_open(), "a product-owned gate is not open mode");
     // authenticate_scoped recovers principal AND the token's workspace binding.
@@ -739,6 +784,80 @@ fn from_local_state_wraps_a_product_owned_embed() {
         .expect("the product's own token authenticates through the wrapped gate");
     assert_eq!(resolved, principal);
     assert_eq!(workspace, Some(WorkspaceId("wrkspc_product".into())));
+
+    let allowed = AuthorizationRequest::direct(
+        principal.clone(),
+        ActionKey("product.read".into()),
+        ScopeRef::Global,
+    );
+    let denied = AuthorizationRequest::direct(
+        principal.clone(),
+        ActionKey("product.write".into()),
+        ScopeRef::Global,
+    );
+    let resource = awaken_iam_contract::ResourceAuthorizationRequest {
+        request: allowed.clone(),
+        context: Default::default(),
+    };
+    let entitlement = EntitlementRequest {
+        principal,
+        entitlement: "ai.basic".into(),
+        resource: None,
+    };
+    assert_eq!(
+        gate.authorize_result(allowed.clone()),
+        Ok(AuthorizationDecision::Allow)
+    );
+    assert_eq!(
+        gate.authorize_result(denied),
+        Ok(AuthorizationDecision::Deny)
+    );
+    let outcome = gate.authorize_resource_result(resource.clone()).unwrap();
+    assert_eq!(outcome.decision, AuthorizationDecision::Allow);
+    assert_eq!(outcome.matched_grants, vec!["product-read".to_owned()]);
+    assert_eq!(
+        gate.check_entitlement_result(entitlement.clone()),
+        Ok(EntitlementDecision::Deny)
+    );
+    assert_eq!(
+        gate.authorize(allowed.clone()),
+        AuthorizationDecision::Allow
+    );
+    let before = state.lock().unwrap().authz.snapshot();
+
+    let poisoned = state.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("injected failure while the shared local state is locked");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(state.is_poisoned());
+    assert_eq!(
+        gate.authorize_result(allowed.clone()),
+        Err(IamDecisionError::Unavailable)
+    );
+    assert_eq!(
+        gate.authorize_resource_result(resource),
+        Err(IamDecisionError::Unavailable)
+    );
+    assert_eq!(
+        gate.check_entitlement_result(entitlement.clone()),
+        Err(IamDecisionError::Unavailable)
+    );
+    assert_eq!(gate.authorize(allowed), AuthorizationDecision::Deny);
+    assert_eq!(
+        gate.check_entitlement(entitlement),
+        EntitlementDecision::Deny
+    );
+    assert!(state.is_poisoned(), "decision calls must not clear poison");
+    // Test-only forensic inspection proves inertness; production never recovers
+    // the guard or treats these contents as a valid authorization decision.
+    let guard = state.lock().err().unwrap().into_inner();
+    assert_eq!(guard.authz.snapshot(), before);
+    assert_eq!(guard.directory.token(&issued.token.id), Some(&issued.token));
 }
 
 // ── ADR-0048: product-customizable PEP (credential extraction, error envelope,

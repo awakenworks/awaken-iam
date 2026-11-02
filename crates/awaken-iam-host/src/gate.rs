@@ -5,6 +5,8 @@
 //! open mode for development. It implements [`IamClient`] for authorization
 //! decisions and exposes [`IamGate::authenticate_bearer`] for credential
 //! resolution so the middleware has one handle for both steps.
+//! Decision Result methods preserve local poison or remote unavailability;
+//! legacy infallible decision methods project those failures to Deny.
 
 use std::sync::{Arc, Mutex};
 
@@ -414,6 +416,52 @@ mod tests {
     use awaken_iam_contract::ApiTokenStatus;
 
     #[test]
+    fn remote_decision_results_preserve_transport_unavailability() {
+        // C1=the real HTTP transport cannot build a request from its URL.
+        // R1(C1,Result)->Err(Unavailable), not Ok(Deny); R2(C1,legacy)->Deny.
+        // This uses the existing transport/client and Gate, with no fake PDP or
+        // network listener. Credential authentication is a separate boundary.
+        let transport = HttpAuthzTransport::new(awaken_iam_client::HttpTransportConfig::new(
+            "not a valid URL",
+        ))
+        .unwrap();
+        let gate = IamGate::remote(RemoteIamClient::new(transport), None);
+        let request = AuthorizationRequest::direct(
+            PrincipalRef::Service {
+                service_id: "remote-result".into(),
+            },
+            ActionKey("product.read".into()),
+            ScopeRef::Global,
+        );
+        let resource = ResourceAuthorizationRequest {
+            request: request.clone(),
+            context: Default::default(),
+        };
+        let entitlement = EntitlementRequest {
+            principal: request.principal.clone(),
+            entitlement: "ai.basic".into(),
+            resource: None,
+        };
+        assert_eq!(
+            gate.authorize_result(request.clone()),
+            Err(IamDecisionError::Unavailable)
+        );
+        assert_eq!(
+            gate.authorize_resource_result(resource),
+            Err(IamDecisionError::Unavailable)
+        );
+        assert_eq!(
+            gate.check_entitlement_result(entitlement.clone()),
+            Err(IamDecisionError::Unavailable)
+        );
+        assert_eq!(gate.authorize(request), AuthorizationDecision::Deny);
+        assert_eq!(
+            gate.check_entitlement(entitlement),
+            EntitlementDecision::Deny
+        );
+    }
+
+    #[test]
     fn remote_api_token_preserves_its_authoritative_workspace() {
         // Cause/effect graph: C1=IAM introspection succeeded; C2=response has
         // principal and mandatory workspace. Effect E1=the product receives
@@ -465,31 +513,47 @@ impl IamClient for IamGate {
                 obligation: None,
             }),
             GateInner::Local { state, .. } => {
-                let guard = state.lock().expect("local state lock");
+                let guard = state.lock().map_err(|_| IamDecisionError::Unavailable)?;
                 Ok(guard.authz.authorize_resource(&request))
             }
             GateInner::Remote { client, .. } => client.authorize_resource_result(request),
         }
     }
     fn authorize(&self, request: AuthorizationRequest) -> AuthorizationDecision {
+        self.authorize_result(request)
+            .unwrap_or(AuthorizationDecision::Deny)
+    }
+
+    fn authorize_result(
+        &self,
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizationDecision, IamDecisionError> {
         match self.inner.as_ref() {
-            GateInner::Open => AuthorizationDecision::Allow,
+            GateInner::Open => Ok(AuthorizationDecision::Allow),
             GateInner::Local { state, .. } => {
-                let guard = state.lock().expect("local state lock");
-                guard.authz.authorize(&request).decision
+                let guard = state.lock().map_err(|_| IamDecisionError::Unavailable)?;
+                Ok(guard.authz.authorize(&request).decision)
             }
-            GateInner::Remote { client, .. } => client.authorize(request),
+            GateInner::Remote { client, .. } => client.authorize_result(request),
         }
     }
 
     fn check_entitlement(&self, request: EntitlementRequest) -> EntitlementDecision {
+        self.check_entitlement_result(request)
+            .unwrap_or(EntitlementDecision::Deny)
+    }
+
+    fn check_entitlement_result(
+        &self,
+        request: EntitlementRequest,
+    ) -> Result<EntitlementDecision, IamDecisionError> {
         match self.inner.as_ref() {
-            GateInner::Open => EntitlementDecision::Allow,
+            GateInner::Open => Ok(EntitlementDecision::Allow),
             GateInner::Local { state, .. } => {
-                let guard = state.lock().expect("local state lock");
-                guard.authz.check_entitlement(&request).decision
+                let guard = state.lock().map_err(|_| IamDecisionError::Unavailable)?;
+                Ok(guard.authz.check_entitlement(&request).decision)
             }
-            GateInner::Remote { client, .. } => client.check_entitlement(request),
+            GateInner::Remote { client, .. } => client.check_entitlement_result(request),
         }
     }
 }
