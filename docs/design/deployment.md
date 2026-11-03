@@ -51,7 +51,12 @@ Remote introspection preserves the HTTP transport's typed response status in
 Neither the Host nor a product parses error prose to make that distinction.
 The fallible browser attachment and bulk-revocation methods retain their names;
 consumers propagate their `Result` instead of reporting a partial operation as
-success. See the 0.2 development migration notes in [the changelog](../../CHANGELOG.md).
+success. A durable product browser binding first reserves the gate's original
+attachment slot while holding its original IAM state guard, commits its existing
+SQL mutation, then publishes the fixed gateway without IO or a second lock. The
+short-lived reservation has private fields; dropping it without publication
+leaves the old attachment unchanged. No new pending map or state lock is added.
+See the 0.2 development migration notes in [the changelog](../../CHANGELOG.md).
 
 Downstream product OAuth uses that same adapter through `OAuthClientRepository` and
 `AuthCodeRepository`. Registered product clients and the single-use authorization

@@ -34,7 +34,7 @@ mod remote;
 mod time;
 
 pub use config::{HostConfig, HostConfigError, HostMode};
-pub use gate::{AuthReject, IamGate, LocalIamState, VerifiedBearer};
+pub use gate::{AuthReject, BrowserSessionAttachment, IamGate, LocalIamState, VerifiedBearer};
 pub use local::{EmbedError, LocalHandle, embed_local};
 pub use local_browser::{
     LocalBrowserAuth, LocalBrowserAuthError, LocalSetupHandoff, local_browser_router,

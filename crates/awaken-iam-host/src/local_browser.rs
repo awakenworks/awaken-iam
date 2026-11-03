@@ -22,8 +22,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::IamGate;
 use crate::time::{timestamp_after, wall_clock_now};
+use crate::{BrowserSessionAttachment, IamGate};
 
 const SETUP_LIFETIME_SECS: u64 = 5 * 60;
 const SESSION_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
@@ -106,7 +106,20 @@ impl LocalBrowserAuth {
 
     /// Attach this authority to an already-shared product gate.
     pub fn attach_to(&self, gate: &IamGate) -> Result<(), LocalBrowserAuthError> {
-        gate.attach_browser_sessions(Arc::clone(&self.sessions))
+        self.reserve_attachment(gate)?.publish();
+        Ok(())
+    }
+
+    /// Reserve the gate's original slot before persisting a browser binding.
+    ///
+    /// On durable failure, drop this value without publication. On ACK,
+    /// `publish` installs this same gateway without another fallible operation.
+    /// A caller holding LocalIamState must acquire State before Attachment.
+    pub fn reserve_attachment<'gate>(
+        &self,
+        gate: &'gate IamGate,
+    ) -> Result<BrowserSessionAttachment<'gate>, LocalBrowserAuthError> {
+        gate.reserve_browser_sessions(Arc::clone(&self.sessions))
     }
 }
 
@@ -609,6 +622,10 @@ mod tests {
             Err(LocalBrowserAuthError::Unavailable)
         );
         assert!(matches!(
+            auth.reserve_attachment(&gate),
+            Err(LocalBrowserAuthError::Unavailable)
+        ));
+        assert!(matches!(
             auth.gate(gate.clone()),
             Err(LocalBrowserAuthError::Unavailable)
         ));
@@ -736,5 +753,31 @@ mod tests {
             gate.authenticate_session_cookie(&cookie, now),
             Err(crate::AuthReject::Invalid)
         );
+    }
+
+    #[test]
+    fn attachment_reservation_keeps_the_old_slot_until_explicit_publication() {
+        // P1 actual slot reserved + durable refusal -> drop leaves old Arc.
+        // P2 same reservation + durable ACK -> publish installs the fixed new
+        // Arc with no IO/re-lock. try_lock proves this owns the ORIGINAL slot,
+        // so concurrent replacement cannot enter the guarded DB interval.
+        // Real SQL success/failure is owned by the Native publication tests;
+        // this test proves only the Host resource/selection and drop law.
+        let (old, _) = LocalBrowserAuth::begin(AccountId("old".into())).unwrap();
+        let (next, _) = LocalBrowserAuth::begin(AccountId("next".into())).unwrap();
+        let gate = old.gate(IamGate::open()).unwrap();
+        let reserved = next.reserve_attachment(&gate).unwrap();
+        assert!(matches!(
+            gate.browser_sessions.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(reserved);
+        {
+            let slot = gate.browser_sessions.lock().unwrap();
+            assert!(Arc::ptr_eq(slot.as_ref().unwrap(), &old.sessions));
+        }
+        next.reserve_attachment(&gate).unwrap().publish();
+        let slot = gate.browser_sessions.lock().unwrap();
+        assert!(Arc::ptr_eq(slot.as_ref().unwrap(), &next.sessions));
     }
 }

@@ -8,7 +8,7 @@
 //! Decision Result methods preserve local poison or remote unavailability;
 //! legacy infallible decision methods project those failures to Deny.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use awaken_iam_client::{
     HttpAuthzTransport, IamClient, IamDecisionError, RemoteError, RemoteIamClient,
@@ -26,7 +26,27 @@ use awaken_iam_server::{
 use crate::local_browser::LocalBrowserAuthError;
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
-type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
+type BrowserSessionAttachmentSlot = Arc<Mutex<Option<SharedBrowserSessions>>>;
+
+/// A short-lived reservation of the gate's existing browser attachment slot.
+///
+/// Hold this guard while the caller commits its original durable binding. The
+/// selected gateway is fixed at reservation; dropping without publication
+/// preserves the old attachment. No database, policy, or additional lock is
+/// owned by this value. Callers also holding local IAM state acquire that state
+/// guard before reserving this attachment and never reenter the gate's PDP.
+pub struct BrowserSessionAttachment<'gate> {
+    slot: MutexGuard<'gate, Option<SharedBrowserSessions>>,
+    sessions: SharedBrowserSessions,
+}
+
+impl BrowserSessionAttachment<'_> {
+    /// Publish the already-selected gateway after the durable operation ACK.
+    /// This performs no IO, policy evaluation, or second lock acquisition.
+    pub fn publish(mut self) {
+        *self.slot = Some(self.sessions);
+    }
+}
 
 /// Combined authentication + authorization gate.
 ///
@@ -44,7 +64,7 @@ pub struct IamGate {
     pub(crate) issuer: Option<String>,
     /// Browser sessions are opt-in and share the same authorization path as
     /// bearer credentials. Local hosts attach the canonical session gateway.
-    pub(crate) browser_sessions: BrowserSessionAttachment,
+    pub(crate) browser_sessions: BrowserSessionAttachmentSlot,
 }
 
 /// Why a credential failed to authenticate, or could not be evaluated.
@@ -233,11 +253,19 @@ impl IamGate {
         &self,
         sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
     ) -> Result<(), LocalBrowserAuthError> {
-        *self
+        self.reserve_browser_sessions(sessions)?.publish();
+        Ok(())
+    }
+
+    pub(crate) fn reserve_browser_sessions(
+        &self,
+        sessions: SharedBrowserSessions,
+    ) -> Result<BrowserSessionAttachment<'_>, LocalBrowserAuthError> {
+        let slot = self
             .browser_sessions
             .lock()
-            .map_err(|_| LocalBrowserAuthError::Unavailable)? = Some(sessions);
-        Ok(())
+            .map_err(|_| LocalBrowserAuthError::Unavailable)?;
+        Ok(BrowserSessionAttachment { slot, sessions })
     }
 
     /// Authenticate an HttpOnly browser session cookie.

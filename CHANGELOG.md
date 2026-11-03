@@ -4,6 +4,10 @@
 
 _(unreleased; no release or publication is implied)_
 
+- Browser publication can reserve the existing attachment slot before durable
+  binding commit and publish its fixed gateway after ACK without IO or re-lock.
+  Dropping the short-lived reservation preserves the prior attachment.
+
 - Breaking Rust API: `AuthReject` and `AuthError` include `Unavailable`.
   Credential rejection stays distinct from an unavailable authentication or
   authorization authority; the shared HTTP middleware maps the latter to 503.
