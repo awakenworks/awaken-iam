@@ -100,13 +100,13 @@ impl LocalBrowserAuth {
     }
 
     /// Attach browser-cookie authentication to a product's existing IAM gate.
-    pub fn gate(&self, gate: IamGate) -> IamGate {
+    pub fn gate(&self, gate: IamGate) -> Result<IamGate, LocalBrowserAuthError> {
         gate.with_browser_sessions(Arc::clone(&self.sessions))
     }
 
     /// Attach this authority to an already-shared product gate.
-    pub fn attach_to(&self, gate: &IamGate) {
-        gate.attach_browser_sessions(Arc::clone(&self.sessions));
+    pub fn attach_to(&self, gate: &IamGate) -> Result<(), LocalBrowserAuthError> {
+        gate.attach_browser_sessions(Arc::clone(&self.sessions))
     }
 }
 
@@ -144,11 +144,20 @@ async fn exchange(
 ) -> Result<Response, LocalBrowserAuthError> {
     require_same_origin(&headers)?;
     let (now_secs, now) = wall_clock_now();
-    let session_id = random_session_id(&mut *auth.session_ids.lock().expect("session id lock"));
-    let established = auth
+    let mut session_ids = auth
+        .session_ids
+        .lock()
+        .map_err(|_| LocalBrowserAuthError::Unavailable)?;
+    let mut setup = auth
         .setup
         .lock()
-        .expect("local setup lock")
+        .map_err(|_| LocalBrowserAuthError::Unavailable)?;
+    let mut sessions = auth
+        .sessions
+        .lock()
+        .map_err(|_| LocalBrowserAuthError::Unavailable)?;
+    let session_id = random_session_id(&mut *session_ids);
+    let established = setup
         .exchange(
             ExchangeLocalSetup {
                 id: auth.setup_id.clone(),
@@ -158,7 +167,7 @@ async fn exchange(
                 session_expires_at: timestamp_after(now_secs, SESSION_LIFETIME_SECS),
                 cookie_max_age_secs: Some(SESSION_LIFETIME_SECS),
             },
-            &mut auth.sessions.lock().expect("browser session lock"),
+            &mut sessions,
         )
         .map_err(LocalBrowserAuthError::from)?;
     let mut response = Json(SessionResponse {
@@ -193,7 +202,7 @@ async fn current_session(
     let session = auth
         .sessions
         .lock()
-        .expect("browser session lock")
+        .map_err(|_| LocalBrowserAuthError::Unavailable)?
         .current_session_from_cookie(cookie, now)
         .map_err(|error| match error {
             awaken_iam_core::IamError::SessionStorageUnavailable => {
@@ -209,7 +218,10 @@ async fn logout(
     headers: HeaderMap,
 ) -> Result<Response, LocalBrowserAuthError> {
     let (_, now) = wall_clock_now();
-    let mut sessions = auth.sessions.lock().expect("browser session lock");
+    let mut sessions = auth
+        .sessions
+        .lock()
+        .map_err(|_| LocalBrowserAuthError::Unavailable)?;
     let token = headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -377,6 +389,7 @@ mod tests {
         let (_, now) = wall_clock_now();
         assert_eq!(
             auth.gate(IamGate::open())
+                .unwrap()
                 .authenticate_session_cookie(cookie, now)
                 .unwrap(),
             awaken_iam_contract::PrincipalRef::Account {
@@ -479,5 +492,249 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn poison<T: Send + 'static>(state: Arc<Mutex<T>>) {
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = state.lock().unwrap();
+                panic!("injected failure while an original browser authority is locked");
+            })
+            .join()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_refuses_any_poison_before_consuming_the_challenge() {
+        // B1 entropy lock, B2 setup lock, B3 session lock poisoned ->503,
+        // no cookie, and poison remains. Acquire ALL original guards before
+        // drawing entropy/calling exchange: B3 must not consume the healthy
+        // setup challenge before finding the poisoned session authority.
+        // The final probe uses the SAME original setup kernel with a test-only
+        // healthy Gateway, not a production recovery or a mirrored oracle.
+        for poisoned in ["entropy", "setup", "sessions"] {
+            let (auth, handoff) = LocalBrowserAuth::begin(AccountId("local-admin".into())).unwrap();
+            match poisoned {
+                "entropy" => poison(auth.session_ids.clone()),
+                "setup" => poison(auth.setup.clone()),
+                "sessions" => poison(auth.sessions.clone()),
+                _ => unreachable!(),
+            }
+            let response = local_browser_router(auth.clone())
+                .oneshot(exchange_request(
+                    &handoff.setup_token,
+                    "http://127.0.0.1:8080",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.headers().get(SET_COOKIE).is_none());
+            assert_eq!(auth.session_ids.is_poisoned(), poisoned == "entropy");
+            assert_eq!(auth.setup.is_poisoned(), poisoned == "setup");
+            assert_eq!(auth.sessions.is_poisoned(), poisoned == "sessions");
+            if poisoned != "setup" {
+                let (seconds, now) = wall_clock_now();
+                let mut healthy_sessions =
+                    SessionGateway::with_entropy(OsEntropy, local_cookie_config());
+                assert!(
+                    auth.setup
+                        .lock()
+                        .unwrap()
+                        .exchange(
+                            ExchangeLocalSetup {
+                                id: auth.setup_id.clone(),
+                                setup_token: handoff.setup_token,
+                                session_id: SessionId("unchanged-challenge-probe".into()),
+                                now,
+                                session_expires_at: timestamp_after(seconds, SESSION_LIFETIME_SECS),
+                                cookie_max_age_secs: Some(SESSION_LIFETIME_SECS),
+                            },
+                            &mut healthy_sessions,
+                        )
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_session_and_attachment_preserve_unavailability_without_clearing() {
+        // B4 a real exchanged session then session poison -> current/logout503
+        // and no clear-cookie; Gate auth is Unavailable, not Invalid. B5 a
+        // poisoned attachment refuses both existing attachment APIs and cookie
+        // auth. Healthy unknown-cookie denial remains Invalid/401 elsewhere.
+        let (auth, handoff) = LocalBrowserAuth::begin(AccountId("local-admin".into())).unwrap();
+        let gate = auth.gate(IamGate::open()).unwrap();
+        let response = local_browser_router(auth.clone())
+            .oneshot(exchange_request(
+                &handoff.setup_token,
+                "http://127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        let cookie = response.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        poison(auth.sessions.clone());
+        let (_, now) = wall_clock_now();
+        assert_eq!(
+            gate.authenticate_session_cookie(&cookie, now),
+            Err(crate::AuthReject::Unavailable)
+        );
+        for method in ["GET", "DELETE"] {
+            let response = local_browser_router(auth.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/v1/session")
+                        .header(COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.headers().get(SET_COOKIE).is_none());
+            assert!(auth.sessions.is_poisoned());
+        }
+        let gate = IamGate::open();
+        poison(gate.browser_sessions.clone());
+        assert_eq!(
+            auth.attach_to(&gate),
+            Err(LocalBrowserAuthError::Unavailable)
+        );
+        assert!(matches!(
+            auth.gate(gate.clone()),
+            Err(LocalBrowserAuthError::Unavailable)
+        ));
+        let (_, now) = wall_clock_now();
+        assert_eq!(
+            gate.authenticate_session_cookie(&cookie, now),
+            Err(crate::AuthReject::Unavailable)
+        );
+        assert!(gate.browser_sessions.is_poisoned());
+    }
+
+    struct ReadFaultRepository {
+        inner: InMemoryStore,
+        fail_reads: std::sync::atomic::AtomicBool,
+    }
+
+    impl SessionRepository for ReadFaultRepository {
+        fn get(
+            &self,
+            id: &SessionId,
+        ) -> awaken_iam_core::RepositoryResult<Option<awaken_iam_contract::Session>> {
+            SessionRepository::get(&self.inner, id)
+        }
+        fn get_by_token_hash(
+            &self,
+            hash: &str,
+        ) -> awaken_iam_core::RepositoryResult<Option<awaken_iam_contract::Session>> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(awaken_iam_core::RepositoryError::Backend(
+                    "injected repository outage".into(),
+                ))
+            } else {
+                self.inner.get_by_token_hash(hash)
+            }
+        }
+        fn create(
+            &self,
+            session: awaken_iam_contract::Session,
+        ) -> awaken_iam_core::RepositoryResult<()> {
+            SessionRepository::create(&self.inner, session)
+        }
+        fn update(
+            &self,
+            session: awaken_iam_contract::Session,
+        ) -> awaken_iam_core::RepositoryResult<()> {
+            SessionRepository::update(&self.inner, session)
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_failure_is_not_an_invalid_cookie_or_successful_logout() {
+        // B6 same real session/repository, healthy ->200; read outage -> Gate
+        // Unavailable and GET/DELETE503 without Set-Cookie. Restored dependency
+        // -> same cookie still200; ordinary logout then keeps the original401.
+        // This fault adapter delegates all stored facts to the existing Memory
+        // repository. It injects only a typed IO refusal, no session evaluator.
+        let repository = Arc::new(ReadFaultRepository {
+            inner: InMemoryStore::new(),
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (auth, handoff) = LocalBrowserAuth::begin_with_session_repository(
+            AccountId("local-admin".into()),
+            repository.clone(),
+        )
+        .unwrap();
+        let gate = auth.gate(IamGate::open()).unwrap();
+        let app = local_browser_router(auth);
+        let exchanged = app
+            .clone()
+            .oneshot(exchange_request(
+                &handoff.setup_token,
+                "http://127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        let cookie = exchanged.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        repository
+            .fail_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, now) = wall_clock_now();
+        assert_eq!(
+            gate.authenticate_session_cookie(&cookie, now),
+            Err(crate::AuthReject::Unavailable)
+        );
+        for method in ["GET", "DELETE"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/v1/session")
+                        .header(COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.headers().get(SET_COOKIE).is_none());
+        }
+        repository
+            .fail_reads
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (_, now) = wall_clock_now();
+        assert!(gate.authenticate_session_cookie(&cookie, now).is_ok());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/v1/session")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (_, now) = wall_clock_now();
+        assert_eq!(
+            gate.authenticate_session_cookie(&cookie, now),
+            Err(crate::AuthReject::Invalid)
+        );
     }
 }

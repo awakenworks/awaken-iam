@@ -316,7 +316,7 @@ mod tests {
     impl ProvisionTransport for RecordingTransport {
         fn provision(&self, provision: &ResourceProvision) -> Result<(), RemoteError> {
             if self.fail.get() {
-                return Err(RemoteError("transport down".into()));
+                return Err(RemoteError::new("transport down".into()));
             }
             self.seen.borrow_mut().push(provision.clone());
             Ok(())
@@ -452,7 +452,7 @@ mod tests {
         fn provision(&self, _provision: &ResourceProvision) -> Result<(), RemoteError> {
             let left = self.budget.get();
             if left == 0 {
-                return Err(RemoteError("transport down".into()));
+                return Err(RemoteError::new("transport down".into()));
             }
             self.budget.set(left - 1);
             Ok(())

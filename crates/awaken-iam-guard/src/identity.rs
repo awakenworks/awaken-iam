@@ -183,7 +183,7 @@ mod tests {
             &self,
             _request: &TokenIntrospectionRequest,
         ) -> Result<TokenIntrospectionResponse, RemoteError> {
-            Err(RemoteError("token invalid".into()))
+            Err(RemoteError::new("token invalid".into()))
         }
     }
 

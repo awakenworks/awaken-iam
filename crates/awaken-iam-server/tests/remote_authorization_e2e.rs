@@ -54,11 +54,12 @@ impl JsonLoopbackTransport {
         handle: impl FnOnce(&AuthzApi, &str) -> String,
     ) -> Result<Resp, RemoteError> {
         if !self.online {
-            return Err(RemoteError("offline".into()));
+            return Err(RemoteError::new("offline".into()));
         }
-        let body = serde_json::to_string(request).map_err(|err| RemoteError(err.to_string()))?;
+        let body =
+            serde_json::to_string(request).map_err(|err| RemoteError::new(err.to_string()))?;
         let response = handle(&self.api.borrow(), &body);
-        serde_json::from_str(&response).map_err(|err| RemoteError(err.to_string()))
+        serde_json::from_str(&response).map_err(|err| RemoteError::new(err.to_string()))
     }
 }
 
@@ -98,12 +99,12 @@ impl AuthzTransport for JsonLoopbackTransport {
         registration: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
         if !self.online {
-            return Err(RemoteError("offline".into()));
+            return Err(RemoteError::new("offline".into()));
         }
         let body =
-            serde_json::to_string(registration).map_err(|err| RemoteError(err.to_string()))?;
+            serde_json::to_string(registration).map_err(|err| RemoteError::new(err.to_string()))?;
         let parsed: ProductResourceModelRequest =
-            serde_json::from_str(&body).map_err(|err| RemoteError(err.to_string()))?;
+            serde_json::from_str(&body).map_err(|err| RemoteError::new(err.to_string()))?;
         // Codec/embedded-kernel fixture only: this directly calls the existing
         // local model API. It does not simulate the guarded product HTTP route.
         let registered = self
@@ -111,25 +112,25 @@ impl AuthzTransport for JsonLoopbackTransport {
             .borrow_mut()
             .register_resource_model(&parsed.resource_model);
         serde_json::from_str(&serde_json::to_string(&registered).unwrap())
-            .map_err(|err| RemoteError(err.to_string()))
+            .map_err(|err| RemoteError::new(err.to_string()))
     }
 
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
         if !self.online {
-            return Err(RemoteError("offline".into()));
+            return Err(RemoteError::new("offline".into()));
         }
         serde_json::from_str(&serde_json::to_string(&self.api.borrow().snapshot()).unwrap())
-            .map_err(|err| RemoteError(err.to_string()))
+            .map_err(|err| RemoteError::new(err.to_string()))
     }
 
     fn fetch_signers(&self, namespace_id: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
         if !self.online {
-            return Err(RemoteError("offline".into()));
+            return Err(RemoteError::new("offline".into()));
         }
         serde_json::from_str(
             &serde_json::to_string(&self.api.borrow().signers(namespace_id)).unwrap(),
         )
-        .map_err(|err| RemoteError(err.to_string()))
+        .map_err(|err| RemoteError::new(err.to_string()))
     }
 }
 

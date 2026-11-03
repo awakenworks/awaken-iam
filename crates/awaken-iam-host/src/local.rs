@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use awaken_iam_contract::{AccountId, ApiTokenId, PrincipalRef, Timestamp, WorkspaceId};
 use awaken_iam_core::{
@@ -44,9 +44,17 @@ pub struct LocalHandle {
 }
 
 impl LocalHandle {
+    fn lock_state(
+        state: &Mutex<LocalIamState>,
+    ) -> Result<MutexGuard<'_, LocalIamState>, EmbedError> {
+        state
+            .lock()
+            .map_err(|_| EmbedError::Store("local IAM state is unavailable".into()))
+    }
+
     /// Mint a new API token and register it with the gate.
     pub fn mint_api_token(&mut self, request: MintApiToken) -> Result<IssuedApiToken, EmbedError> {
-        let mut guard = self.state.lock().expect("local state lock");
+        let mut guard = Self::lock_state(&self.state)?;
         let LocalIamState { authz, directory } = &mut *guard;
         self.minter
             .mint(directory, authz.policy_mut(), request)
@@ -61,7 +69,7 @@ impl LocalHandle {
         request: MintApiToken,
         owner: AccountId,
     ) -> Result<IssuedServiceAccountToken, EmbedError> {
-        let mut guard = self.state.lock().expect("local state lock");
+        let mut guard = Self::lock_state(&self.state)?;
         let LocalIamState { authz, directory } = &mut *guard;
         self.minter
             .mint_service_account(directory, authz.policy_mut(), request, owner)
@@ -74,24 +82,18 @@ impl LocalHandle {
         &self,
         service_id: &str,
         now: Timestamp,
-    ) -> Vec<ApiTokenId> {
-        self.state
-            .lock()
-            .expect("local state lock")
-            .directory
-            .revoke_principal(
-                &PrincipalRef::Service {
-                    service_id: service_id.to_owned(),
-                },
-                now,
-            )
+    ) -> Result<Vec<ApiTokenId>, EmbedError> {
+        Ok(Self::lock_state(&self.state)?.directory.revoke_principal(
+            &PrincipalRef::Service {
+                service_id: service_id.to_owned(),
+            },
+            now,
+        ))
     }
 
     /// Revoke an API token by id.
     pub fn revoke_api_token(&self, id: &ApiTokenId, now: Timestamp) -> Result<(), EmbedError> {
-        self.state
-            .lock()
-            .expect("local state lock")
+        Self::lock_state(&self.state)?
             .directory
             .revoke(id, now)
             .map_err(EmbedError::from)
@@ -186,4 +188,236 @@ fn write_admin_token(dir: &std::path::Path, token: &str) -> Result<(), EmbedErro
     file.write_all(token.as_bytes())
         .map_err(|e| EmbedError::Token(format!("cannot write admin token: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use awaken_iam_contract::{ActionKey, ScopeRef};
+    use awaken_iam_core::{ActionPattern, Effect, Grant, GrantId, GrantSubject};
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::{AuthReject, RouteActions, auth_layer};
+
+    fn poison(state: Arc<Mutex<LocalIamState>>) {
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = state.lock().unwrap();
+                panic!("injected failure in the original paired IAM state");
+            })
+            .join()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_local_handle_is_inert_and_jwt_keeps_its_independent_authority() {
+        // L1 healthy bootstrap state -> the original token authenticates.
+        // L2 poison that SAME directory+policy -> every mint/revoke Result
+        // refuses, no empty-success bulk revoke, no mutation or poison clear.
+        // L3 a signed JWT depends only on immutable JWKS, so auth-only still
+        // succeeds; the separate actual-PDP test below must refuse effects.
+        let mut handle =
+            embed_local(&HostConfig::local_in_memory().with_seal_key([7; 32])).unwrap();
+        let now = Timestamp("2030-01-01T00:00:00Z".into());
+        let claims = awaken_iam_server::AccessTokenClaims {
+            iss: "https://iam.example".into(),
+            sub: "account".into(),
+            subject_kind: awaken_iam_server::AccessTokenSubjectKind::Account,
+            aud: "https://product.example".into(),
+            exp: 2_000_000_100,
+            iat: 2_000_000_000,
+            jti: "jwt-independent".into(),
+            scope: vec![],
+        };
+        let jwt = handle
+            .jwt_authority
+            .as_ref()
+            .unwrap()
+            .mint(&claims)
+            .await
+            .unwrap();
+        assert!(
+            handle
+                .gate
+                .authenticate_verified(&handle.admin_token, &now, 2_000_000_000)
+                .is_ok()
+        );
+        let before = {
+            let state = handle.state.lock().unwrap();
+            (
+                state.authz.snapshot(),
+                state
+                    .directory
+                    .token(&ApiTokenId("tok_bootstrap_admin".into()))
+                    .cloned(),
+            )
+        };
+        poison(handle.state.clone());
+        assert_eq!(
+            handle
+                .gate
+                .authenticate_verified(&handle.admin_token, &now, 2_000_000_000),
+            Err(AuthReject::Unavailable)
+        );
+        assert!(
+            handle
+                .gate
+                .authenticate_verified(&jwt, &now, 2_000_000_000)
+                .is_ok()
+        );
+        let request = MintApiToken {
+            id: ApiTokenId("must-not-be-minted".into()),
+            principal: PrincipalRef::Service {
+                service_id: "service".into(),
+            },
+            workspace: WorkspaceId("workspace".into()),
+            role: RoleId("admin".into()),
+            created_at: now.clone(),
+            expires_at: Some(Timestamp("2031-01-01T00:00:00Z".into())),
+        };
+        assert!(matches!(
+            handle.mint_api_token(request.clone()),
+            Err(EmbedError::Store(_))
+        ));
+        assert!(matches!(
+            handle.mint_service_account_token(request, AccountId("owner".into())),
+            Err(EmbedError::Store(_))
+        ));
+        assert!(matches!(
+            handle.revoke_api_token(&ApiTokenId("tok_bootstrap_admin".into()), now.clone()),
+            Err(EmbedError::Store(_))
+        ));
+        assert!(matches!(
+            handle.revoke_service_account_tokens("iam-host-bootstrap", now),
+            Err(EmbedError::Store(_))
+        ));
+        assert!(handle.state.is_poisoned());
+        // Forensic test-only inspection is not production recovery. Verify the
+        // paired state is unchanged and unavailable after ALL refused paths.
+        let state = handle.state.lock().err().unwrap().into_inner();
+        assert_eq!(state.authz.snapshot(), before.0);
+        assert_eq!(
+            state
+                .directory
+                .token(&ApiTokenId("tok_bootstrap_admin".into())),
+            before.1.as_ref()
+        );
+        assert!(
+            state
+                .directory
+                .token(&ApiTokenId("must-not-be-minted".into()))
+                .is_none()
+        );
+    }
+
+    #[derive(Clone)]
+    struct PoisonDuringScope {
+        state: Arc<Mutex<LocalIamState>>,
+        poison_after_authentication: bool,
+    }
+
+    impl RouteActions for PoisonDuringScope {
+        fn action_for(&self, _: &axum::http::Method, _: &str) -> Option<ActionKey> {
+            Some(ActionKey("product.read".into()))
+        }
+
+        fn scope_for(
+            &self,
+            _: &axum::http::Method,
+            _: &axum::http::Uri,
+            _: &axum::http::Extensions,
+        ) -> ScopeRef {
+            if self.poison_after_authentication {
+                poison(self.state.clone());
+            }
+            ScopeRef::Global
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_preserves_availability_before_and_after_authentication() {
+        // C1=valid credential,C2=explicit grant,C3=poison before directory auth,
+        // C4=poison in the original scope hook AFTER successful authentication.
+        // M1(C1,C2,!C3,!C4)->200/one handler; M2(C3)->503/zero;
+        // M3(C4)->503/zero (a precheck-only patch would miss this row);
+        // M4(C1,!C2)->403/zero; M5(!C1)->401/zero. Same Gate/PDP/state per row,
+        // no substitute evaluator, catch-unwind or nested state-lock reentry.
+        for (before, after, grant, valid, expected) in [
+            (false, false, true, true, StatusCode::OK),
+            (true, false, true, true, StatusCode::SERVICE_UNAVAILABLE),
+            (false, true, true, true, StatusCode::SERVICE_UNAVAILABLE),
+            (false, false, false, true, StatusCode::FORBIDDEN),
+            (false, false, true, false, StatusCode::UNAUTHORIZED),
+        ] {
+            let handle = embed_local(&HostConfig::local_in_memory()).unwrap();
+            if grant {
+                handle
+                    .state
+                    .lock()
+                    .unwrap()
+                    .authz
+                    .policy_mut()
+                    .add_grant(Grant {
+                        id: GrantId("explicit-product-read".into()),
+                        subject: GrantSubject::Principal(PrincipalRef::Service {
+                            service_id: "iam-host-bootstrap".into(),
+                        }),
+                        action_pattern: ActionPattern("product.read".into()),
+                        scope: ScopeRef::Global,
+                        effect: Effect::Allow,
+                    });
+            }
+            if before {
+                poison(handle.state.clone());
+            }
+            let hits = Arc::new(AtomicUsize::new(0));
+            let called = hits.clone();
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(move || {
+                        let called = called.clone();
+                        async move {
+                            called.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .layer(auth_layer(
+                    handle.gate.clone(),
+                    PoisonDuringScope {
+                        state: handle.state.clone(),
+                        poison_after_authentication: after,
+                    },
+                ));
+            let token = if valid {
+                handle.admin_token.as_str()
+            } else {
+                "sk-awaken-invalid.secret"
+            };
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                usize::from(expected == StatusCode::OK)
+            );
+            assert_eq!(handle.state.is_poisoned(), before || after);
+        }
+    }
 }

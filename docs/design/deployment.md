@@ -34,6 +34,25 @@ composition injects the shared SQL adapter through IAM's canonical
 separate browser-session database. Repository failure rejects the request, so
 an unhealthy replica cannot silently mint or accept an unshared session.
 
+The host boundary keeps credential rejection separate from service availability.
+Unknown, expired, or revoked credentials remain rejected; poisoned directory/PDP
+or browser authority locks and session-repository failures return an unavailable
+error, and the shared HTTP middleware answers 503 without reaching the protected
+handler. It never clears poison, reads a recovered guard, or switches to another
+PDP. JWT signature/issuer/audience/expiry verification uses its immutable JWKS;
+only a route that needs mutable authorization consults the local PDP afterward.
+Browser exchange acquires all of its existing authority guards before drawing
+entropy or consuming its challenge. Once the original setup kernel is called,
+its existing single-use behavior on session-storage failure is unchanged.
+
+Remote introspection preserves the HTTP transport's typed response status in
+`RemoteError`. The canonical endpoint defines 401 as credential rejection;
+403, transport/5xx failure, and an undecodable response remain unavailable.
+Neither the Host nor a product parses error prose to make that distinction.
+The fallible browser attachment and bulk-revocation methods retain their names;
+consumers propagate their `Result` instead of reporting a partial operation as
+success. See the 0.2 development migration notes in [the changelog](../../CHANGELOG.md).
+
 Downstream product OAuth uses that same adapter through `OAuthClientRepository` and
 `AuthCodeRepository`. Registered product clients and the single-use authorization
 code transition are therefore shared across replicas and process replacement;

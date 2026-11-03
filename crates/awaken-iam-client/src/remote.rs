@@ -42,8 +42,40 @@ use crate::{IamClient, IamDecisionError};
 /// authorization/entitlement *decisions* themselves are carried in the response
 /// response contracts, not in this error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("iam remote transport failed: {0}")]
-pub struct RemoteError(pub String);
+#[error("iam remote transport failed: {message}")]
+pub struct RemoteError {
+    message: String,
+    status: Option<u16>,
+}
+
+impl RemoteError {
+    /// A failure for which no authoritative HTTP response is available.
+    pub fn new(message: String) -> Self {
+        Self {
+            message,
+            status: None,
+        }
+    }
+
+    /// Preserve the status observed by the canonical HTTP transport.
+    ///
+    /// The message remains diagnostic text; callers must not parse it to
+    /// distinguish a credential rejection from service unavailability.
+    pub fn response(status: u16, message: String) -> Self {
+        Self {
+            message,
+            status: Some(status),
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 /// Byte-transport seam for the remote authorization protocol.
 ///
@@ -57,7 +89,7 @@ pub trait AuthzTransport {
         &self,
         _namespace: &NamespaceId,
     ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "profile publication evidence is unsupported".into(),
         ))
     }
@@ -66,7 +98,9 @@ pub trait AuthzTransport {
         &self,
         _request: &ResourceAuthorizationRequest,
     ) -> Result<AuthorizationOutcome, RemoteError> {
-        Err(RemoteError("resource authorization is unsupported".into()))
+        Err(RemoteError::new(
+            "resource authorization is unsupported".into(),
+        ))
     }
     /// `POST /v1/authorize`.
     fn authorize(
@@ -126,116 +160,116 @@ pub trait AuthzTransport {
         request: &TokenIntrospectionRequest,
     ) -> Result<TokenIntrospectionResponse, RemoteError> {
         let _ = request;
-        Err(RemoteError(
+        Err(RemoteError::new(
             "introspect_token is not supported by this transport".into(),
         ))
     }
 
     fn create_org(&self, _org: &OrgView) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("organization PAP is not supported".into()))
+        Err(RemoteError::new("organization PAP is not supported".into()))
     }
 
     fn provision_organization(
         &self,
         _command: &ProvisionOrganization,
     ) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "organization provisioning is not supported".into(),
         ))
     }
 
     fn list_orgs(&self) -> Result<Vec<OrgView>, RemoteError> {
-        Err(RemoteError("organization PAP is not supported".into()))
+        Err(RemoteError::new("organization PAP is not supported".into()))
     }
 
     fn get_org(&self, _org_id: &str) -> Result<Option<OrgView>, RemoteError> {
-        Err(RemoteError("organization PAP is not supported".into()))
+        Err(RemoteError::new("organization PAP is not supported".into()))
     }
 
     fn delete_org(&self, _org_id: &str) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("organization PAP is not supported".into()))
+        Err(RemoteError::new("organization PAP is not supported".into()))
     }
 
     /// Strict participant operation; old transports cannot attest erasure from
     /// a policy-version acknowledgement and must fail closed without fallback.
     fn erase_org_privacy(&self, _org: &OrgId) -> Result<OrgPrivacyCommitReceipt, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "exact organization privacy receipt is unsupported".into(),
         ))
     }
 
     fn create_role(&self, _role: &RoleView) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("role PAP is not supported".into()))
+        Err(RemoteError::new("role PAP is not supported".into()))
     }
 
     fn get_role(&self, _role_id: &str) -> Result<Option<RoleView>, RemoteError> {
-        Err(RemoteError("role PAP is not supported".into()))
+        Err(RemoteError::new("role PAP is not supported".into()))
     }
 
     fn issue_grant(&self, _grant: &GrantSnapshot) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("grant PAP is not supported".into()))
+        Err(RemoteError::new("grant PAP is not supported".into()))
     }
 
     /// Issue every grant in `batch` atomically under one policy version.
     fn issue_grants(&self, _batch: &GrantBatch) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("grant PAP is not supported".into()))
+        Err(RemoteError::new("grant PAP is not supported".into()))
     }
 
     fn get_grant(&self, _grant_id: &str) -> Result<Option<GrantSnapshot>, RemoteError> {
-        Err(RemoteError("grant PAP is not supported".into()))
+        Err(RemoteError::new("grant PAP is not supported".into()))
     }
 
     fn grant_membership(
         &self,
         _binding: &RoleBindingSnapshot,
     ) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("membership PAP is not supported".into()))
+        Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
     fn revoke_membership(
         &self,
         _binding: &RoleBindingSnapshot,
     ) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("membership PAP is not supported".into()))
+        Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
     fn replace_scoped_memberships(
         &self,
         _request: &ReplaceScopedMemberships,
     ) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("membership PAP is not supported".into()))
+        Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
     fn memberships_for_principal(
         &self,
         _query: &MembershipQuery,
     ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
-        Err(RemoteError("membership PAP is not supported".into()))
+        Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
     fn memberships_for_scope(
         &self,
         _query: &ScopeMembershipQuery,
     ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
-        Err(RemoteError("membership PAP is not supported".into()))
+        Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
     fn create_invitation(
         &self,
         _request: &CreateInvitation,
     ) -> Result<IssuedInvitation, RemoteError> {
-        Err(RemoteError("invitation PAP is not supported".into()))
+        Err(RemoteError::new("invitation PAP is not supported".into()))
     }
 
     fn list_invitations(
         &self,
         _query: &InvitationQuery,
     ) -> Result<Vec<InvitationView>, RemoteError> {
-        Err(RemoteError("invitation PAP is not supported".into()))
+        Err(RemoteError::new("invitation PAP is not supported".into()))
     }
 
     fn revoke_invitation(&self, _id: &InvitationId) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("invitation PAP is not supported".into()))
+        Err(RemoteError::new("invitation PAP is not supported".into()))
     }
 
     fn resend_invitation(
@@ -243,7 +277,7 @@ pub trait AuthzTransport {
         _id: &InvitationId,
         _request: &ResendInvitation,
     ) -> Result<IssuedInvitation, RemoteError> {
-        Err(RemoteError("invitation PAP is not supported".into()))
+        Err(RemoteError::new("invitation PAP is not supported".into()))
     }
 
     fn accept_invitation(
@@ -251,26 +285,28 @@ pub trait AuthzTransport {
         _id: &InvitationId,
         _request: &AcceptInvitation,
     ) -> Result<AcceptedInvitation, RemoteError> {
-        Err(RemoteError("invitation PAP is not supported".into()))
+        Err(RemoteError::new("invitation PAP is not supported".into()))
     }
 
     /// Resolve verified OIDC claims from an end-user access token.
     fn userinfo(&self, _access_token: &str) -> Result<UserInfo, RemoteError> {
-        Err(RemoteError("userinfo is not supported".into()))
+        Err(RemoteError::new("userinfo is not supported".into()))
     }
 
     fn assign_workspace_org(
         &self,
         _edge: &WorkspaceOrgEdge,
     ) -> Result<AdminMutationAck, RemoteError> {
-        Err(RemoteError("scope projection PAP is not supported".into()))
+        Err(RemoteError::new(
+            "scope projection PAP is not supported".into(),
+        ))
     }
 
     fn create_profile(
         &self,
         _request: &CreateAuthorizationProfile,
     ) -> Result<AuthorizationProfile, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -280,7 +316,7 @@ pub trait AuthzTransport {
         _namespace: &NamespaceId,
         _revision: u64,
     ) -> Result<AuthorizationProfileValidation, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -291,7 +327,7 @@ pub trait AuthzTransport {
         _revision: u64,
         _request: &ActivateAuthorizationProfile,
     ) -> Result<AuthorizationProfileActivated, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -302,7 +338,7 @@ pub trait AuthzTransport {
         _revision: u64,
         _request: &ActivateAuthorizationProfile,
     ) -> Result<AuthorizationProfileActivated, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -312,7 +348,7 @@ pub trait AuthzTransport {
         _namespace: &NamespaceId,
         _request: &RetireAuthorizationProfile,
     ) -> Result<AuthorizationProfileRetired, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -321,7 +357,7 @@ pub trait AuthzTransport {
         &self,
         _namespace: &NamespaceId,
     ) -> Result<AuthorizationProfile, RemoteError> {
-        Err(RemoteError(
+        Err(RemoteError::new(
             "authorization profile PAP is not supported".into(),
         ))
     }
@@ -451,7 +487,9 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
     ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
         let state = self.transport.profile_publication_state(namespace)?;
         if state.namespace != *namespace {
-            return Err(RemoteError("profile publication namespace mismatch".into()));
+            return Err(RemoteError::new(
+                "profile publication namespace mismatch".into(),
+            ));
         }
         Ok(state)
     }
@@ -508,7 +546,7 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         let receipt = self.transport.erase_org_privacy(org)?;
         receipt
             .validate_for(org)
-            .map_err(|error| RemoteError(error.to_string()))?;
+            .map_err(|error| RemoteError::new(error.to_string()))?;
         Ok(receipt)
     }
 
@@ -912,7 +950,7 @@ mod tests {
             request: &AuthorizationRequest,
         ) -> Result<AuthorizationOutcome, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             let allow = request.action == ActionKey("pack.read".into());
             Ok(AuthorizationOutcome {
@@ -938,7 +976,7 @@ mod tests {
             request: &BatchAuthorizationRequest,
         ) -> Result<BatchAuthorizationResponse, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             let mut outcomes = Vec::new();
             for item in &request.requests {
@@ -952,7 +990,7 @@ mod tests {
             _request: &EntitlementRequest,
         ) -> Result<EntitlementCheckResponse, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             Ok(EntitlementCheckResponse {
                 decision: EntitlementDecision::Allow,
@@ -965,14 +1003,14 @@ mod tests {
             _registration: &ProductResourceModelRequest,
         ) -> Result<ResourceModelRegistered, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             Ok(ResourceModelRegistered { version: 5 })
         }
 
         fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             Ok(PolicySnapshot {
                 version: 4,
@@ -985,7 +1023,7 @@ mod tests {
             namespace_id: &NamespaceId,
         ) -> Result<SignerSetSnapshot, RemoteError> {
             if self.fail {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             Ok(SignerSetSnapshot {
                 namespace_id: namespace_id.clone(),
@@ -1037,7 +1075,7 @@ mod tests {
         let down = RemoteIamClient::new(StubTransport { fail: true });
         assert_eq!(
             down.register_resource_model(&request),
-            Err(RemoteError("boom".into()))
+            Err(RemoteError::new("boom".into()))
         );
     }
 
@@ -1077,12 +1115,12 @@ mod tests {
         // The reasoned accessor still surfaces the error for callers that care.
         assert_eq!(
             client.authorize_outcome(&auth_request("pack.read")),
-            Err(RemoteError("boom".into()))
+            Err(RemoteError::new("boom".into()))
         );
         // The signer fetch surfaces the transport error rather than a stale set.
         assert_eq!(
             client.fetch_signers(&NamespaceId("acme".into())),
-            Err(RemoteError("boom".into()))
+            Err(RemoteError::new("boom".into()))
         );
     }
 
@@ -1161,12 +1199,15 @@ mod tests {
             client.authorize_batch(&BatchAuthorizationRequest {
                 requests: vec![auth_request("pack.read")],
             }),
-            Err(RemoteError("boom".into()))
+            Err(RemoteError::new("boom".into()))
         );
-        assert_eq!(client.fetch_snapshot(), Err(RemoteError("boom".into())));
+        assert_eq!(
+            client.fetch_snapshot(),
+            Err(RemoteError::new("boom".into()))
+        );
         assert_eq!(
             client.check_entitlement_response(&ent_request()),
-            Err(RemoteError("boom".into()))
+            Err(RemoteError::new("boom".into()))
         );
     }
 
@@ -1182,9 +1223,9 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.0.contains("not supported"),
+            err.message().contains("not supported"),
             "unexpected error: {}",
-            err.0
+            err.message()
         );
     }
 

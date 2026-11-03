@@ -369,9 +369,9 @@ async fn typed_model_client_uses_the_guarded_product_contract_and_rejection_stut
         .await
         .unwrap();
         assert!(
-            error.0.contains(status),
+            error.message().contains(status),
             "RM4 original product/auth refusal: {}",
-            error.0
+            error.message()
         );
         let after: serde_json::Value = http
             .get(format!("{base}/v1/authz/snapshot"))

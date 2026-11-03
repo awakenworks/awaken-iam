@@ -333,7 +333,7 @@ mod tests {
 
         fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
             if self.fail.get() {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             self.full_fetches.set(self.full_fetches.get() + 1);
             Ok(snapshot(self.version.get()))
@@ -341,7 +341,7 @@ mod tests {
 
         fn fetch_snapshot_since(&self, since: u64) -> Result<Option<PolicySnapshot>, RemoteError> {
             if self.fail.get() {
-                return Err(RemoteError("boom".into()));
+                return Err(RemoteError::new("boom".into()));
             }
             self.since_fetches.set(self.since_fetches.get() + 1);
             let current = self.version.get();
@@ -560,7 +560,7 @@ mod tests {
         let transport = StubTransport::new(2);
         transport.fail.set(true);
         let mut cache = SnapshotCache::new(transport);
-        assert_eq!(cache.sync(), Err(RemoteError("boom".into())));
+        assert_eq!(cache.sync(), Err(RemoteError::new("boom".into())));
         assert!(!cache.is_synced());
         assert_eq!(
             cache.authorize(&request("pack.read")),

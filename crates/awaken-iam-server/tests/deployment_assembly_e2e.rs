@@ -57,8 +57,8 @@ impl AuthzTransport for DaemonTransport<'_> {
         &self,
         request: &AuthorizationRequest,
     ) -> Result<AuthorizationOutcome, RemoteError> {
-        let body = serde_json::to_string(request).map_err(|e| RemoteError(e.to_string()))?;
-        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError(e.to_string()))?;
+        let body = serde_json::to_string(request).map_err(|e| RemoteError::new(e.to_string()))?;
+        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError::new(e.to_string()))?;
         Ok(self.api.authorize(&parsed))
     }
 
@@ -66,8 +66,8 @@ impl AuthzTransport for DaemonTransport<'_> {
         &self,
         request: &BatchAuthorizationRequest,
     ) -> Result<BatchAuthorizationResponse, RemoteError> {
-        let body = serde_json::to_string(request).map_err(|e| RemoteError(e.to_string()))?;
-        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError(e.to_string()))?;
+        let body = serde_json::to_string(request).map_err(|e| RemoteError::new(e.to_string()))?;
+        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError::new(e.to_string()))?;
         Ok(self.api.authorize_batch(&parsed))
     }
 
@@ -75,8 +75,8 @@ impl AuthzTransport for DaemonTransport<'_> {
         &self,
         request: &EntitlementRequest,
     ) -> Result<EntitlementCheckResponse, RemoteError> {
-        let body = serde_json::to_string(request).map_err(|e| RemoteError(e.to_string()))?;
-        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError(e.to_string()))?;
+        let body = serde_json::to_string(request).map_err(|e| RemoteError::new(e.to_string()))?;
+        let parsed = serde_json::from_str(&body).map_err(|e| RemoteError::new(e.to_string()))?;
         Ok(self.api.check_entitlement(&parsed))
     }
 
@@ -87,7 +87,7 @@ impl AuthzTransport for DaemonTransport<'_> {
         // This parity fixture borrows the daemon's API immutably to compare
         // decisions; registration is a mutating endpoint exercised in the remote
         // protocol e2e instead.
-        Err(RemoteError(
+        Err(RemoteError::new(
             "registration not exercised by this fixture".into(),
         ))
     }

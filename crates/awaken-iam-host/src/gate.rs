@@ -10,7 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use awaken_iam_client::{HttpAuthzTransport, IamClient, IamDecisionError, RemoteIamClient};
+use awaken_iam_client::{
+    HttpAuthzTransport, IamClient, IamDecisionError, RemoteError, RemoteIamClient,
+};
 use awaken_iam_contract::{
     ActionKey, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
     EntitlementDecision, EntitlementRequest, Jwks, PrincipalRef, ResourceAuthorizationRequest,
@@ -20,6 +22,8 @@ use awaken_iam_core::{ApiTokenDirectory, IamError, OsEntropy};
 use awaken_iam_server::{
     AccessTokenClaims, AuthzApi, SessionGateway, verify_delegated_access_token,
 };
+
+use crate::local_browser::LocalBrowserAuthError;
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
 type BrowserSessionAttachment = Arc<Mutex<Option<SharedBrowserSessions>>>;
@@ -43,10 +47,11 @@ pub struct IamGate {
     pub(crate) browser_sessions: BrowserSessionAttachment,
 }
 
-/// Why a bearer credential failed to authenticate.
+/// Why a credential failed to authenticate, or could not be evaluated.
 ///
 /// Returned by [`IamGate::authenticate_detailed`] so a product can answer the
-/// distinct 401 reasons its API documents instead of one opaque failure.
+/// distinct rejection reasons or service unavailability instead of one opaque
+/// credential failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthReject {
     /// The credential is past its expiry.
@@ -55,6 +60,8 @@ pub enum AuthReject {
     Revoked,
     /// The credential does not exist, does not verify, or is malformed.
     Invalid,
+    /// The authority cannot currently verify this credential.
+    Unavailable,
 }
 
 /// Every coordinate of a successfully authenticated bearer credential.
@@ -213,17 +220,24 @@ impl IamGate {
     }
 
     /// Attach the canonical browser-session authority to this gate.
-    pub fn with_browser_sessions(self, sessions: Arc<Mutex<SessionGateway<OsEntropy>>>) -> Self {
-        self.attach_browser_sessions(sessions);
-        self
+    pub fn with_browser_sessions(
+        self,
+        sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
+    ) -> Result<Self, LocalBrowserAuthError> {
+        self.attach_browser_sessions(sessions)?;
+        Ok(self)
     }
 
     /// Attach browser sessions after a product has shared the gate.
-    pub fn attach_browser_sessions(&self, sessions: Arc<Mutex<SessionGateway<OsEntropy>>>) {
+    pub fn attach_browser_sessions(
+        &self,
+        sessions: Arc<Mutex<SessionGateway<OsEntropy>>>,
+    ) -> Result<(), LocalBrowserAuthError> {
         *self
             .browser_sessions
             .lock()
-            .expect("browser session attachment lock") = Some(sessions);
+            .map_err(|_| LocalBrowserAuthError::Unavailable)? = Some(sessions);
+        Ok(())
     }
 
     /// Authenticate an HttpOnly browser session cookie.
@@ -235,14 +249,17 @@ impl IamGate {
         let sessions = self
             .browser_sessions
             .lock()
-            .expect("browser session attachment lock")
+            .map_err(|_| AuthReject::Unavailable)?
             .clone()
             .ok_or(AuthReject::Invalid)?;
         let view = sessions
             .lock()
-            .expect("browser session lock")
+            .map_err(|_| AuthReject::Unavailable)?
             .current_session_from_cookie(cookie_header, now)
-            .map_err(|_| AuthReject::Invalid)?;
+            .map_err(|error| match error {
+                IamError::SessionStorageUnavailable => AuthReject::Unavailable,
+                _ => AuthReject::Invalid,
+            })?;
         Ok(PrincipalRef::Account {
             account_id: view.account_id,
         })
@@ -290,8 +307,8 @@ impl IamGate {
     ///
     /// Like [`authenticate_scoped`](Self::authenticate_scoped) on success, but on
     /// failure returns an [`AuthReject`] so a product can answer the distinct
-    /// 401s its API documents (expired vs revoked vs invalid) rather than one
-    /// opaque "invalid". A verified JWT keeps its explicit expiry reason;
+    /// rejection reasons its API documents (expired vs revoked vs invalid), or
+    /// unavailability, rather than one opaque "invalid". A verified JWT keeps its explicit expiry reason;
     /// introspection failures remain opaque because the remote protocol does not
     /// disclose whether an API token was invalid, expired, or revoked.
     pub fn authenticate_detailed(
@@ -323,7 +340,7 @@ impl IamGate {
             GateInner::Open => Err(AuthReject::Invalid),
             GateInner::Local { state, jwks } => {
                 if is_api_token(token) {
-                    let guard = state.lock().expect("local state lock");
+                    let guard = state.lock().map_err(|_| AuthReject::Unavailable)?;
                     match guard.directory.authenticate(token, now) {
                         Ok(t) => Ok(VerifiedBearer::api_token(
                             t.principal.clone(),
@@ -346,7 +363,7 @@ impl IamGate {
                     };
                     client
                         .introspect_token(&req)
-                        .ok()
+                        .map_err(remote_authentication_failure)
                         .map(introspected_identity)
                         .map(|(principal, workspace)| VerifiedBearer {
                             principal,
@@ -354,7 +371,6 @@ impl IamGate {
                             actor: None,
                             access_token: None,
                         })
-                        .ok_or(AuthReject::Invalid)
                 } else if let Some(jwks) = jwks {
                     self.verify_jwt(token, jwks, now_unix)
                 } else {
@@ -404,6 +420,15 @@ impl IamGate {
     }
 }
 
+fn remote_authentication_failure(error: RemoteError) -> AuthReject {
+    // Only the introspection owner's 401 attests credential rejection. A 403
+    // can be a service/proxy failure; diagnostic text never establishes it.
+    match error.status() {
+        Some(401) => AuthReject::Invalid,
+        _ => AuthReject::Unavailable,
+    }
+}
+
 fn introspected_identity(
     response: TokenIntrospectionResponse,
 ) -> (PrincipalRef, Option<WorkspaceId>) {
@@ -414,6 +439,38 @@ fn introspected_identity(
 mod tests {
     use super::*;
     use awaken_iam_contract::ApiTokenStatus;
+
+    #[test]
+    fn remote_authentication_uses_status_evidence_not_diagnostic_words() {
+        // A1 typed introspection401 -> Invalid. A2 403/503 or no response ->
+        // Unavailable. A3 words resembling401/expiry with no status cannot
+        // authenticate a rejection. The HTTP owner's real socket table below
+        // this boundary separately establishes where this metadata comes from.
+        for (error, expected) in [
+            (
+                RemoteError::response(401, "opaque".into()),
+                AuthReject::Invalid,
+            ),
+            (
+                RemoteError::response(403, "invalid".into()),
+                AuthReject::Unavailable,
+            ),
+            (
+                RemoteError::response(503, "expired".into()),
+                AuthReject::Unavailable,
+            ),
+            (
+                RemoteError::new("unexpected status 401 Unauthorized".into()),
+                AuthReject::Unavailable,
+            ),
+            (
+                RemoteError::new("expired or revoked".into()),
+                AuthReject::Unavailable,
+            ),
+        ] {
+            assert_eq!(remote_authentication_failure(error), expected);
+        }
+    }
 
     #[test]
     fn remote_decision_results_preserve_transport_unavailability() {

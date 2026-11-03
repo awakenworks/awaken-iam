@@ -172,36 +172,36 @@ struct AlwaysFailTransport;
 
 impl AuthzTransport for AlwaysFailTransport {
     fn authorize(&self, _: &AuthorizationRequest) -> Result<AuthorizationOutcome, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 
     fn authorize_batch(
         &self,
         _: &BatchAuthorizationRequest,
     ) -> Result<BatchAuthorizationResponse, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 
     fn check_entitlement(
         &self,
         _: &EntitlementRequest,
     ) -> Result<EntitlementCheckResponse, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 
     fn register_resource_model(
         &self,
         _: &ProductResourceModelRequest,
     ) -> Result<ResourceModelRegistered, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 
     fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 
     fn fetch_signers(&self, _: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
-        Err(RemoteError("simulated connection refused".into()))
+        Err(RemoteError::new("simulated connection refused".into()))
     }
 }
 
@@ -835,6 +835,16 @@ fn from_local_state_wraps_a_product_owned_embed() {
         .is_err()
     );
     assert!(state.is_poisoned());
+    // R5: authentication really uses this directory, so the same poisoned
+    // paired state is unavailable, not an invalid credential or a panic.
+    assert_eq!(
+        gate.authenticate_verified(&issued.secret, &now_ts(), NOW_UNIX),
+        Err(awaken_iam_host::AuthReject::Unavailable)
+    );
+    assert!(
+        gate.authenticate_scoped(&issued.secret, &now_ts(), NOW_UNIX)
+            .is_none()
+    );
     assert_eq!(
         gate.authorize_result(allowed.clone()),
         Err(IamDecisionError::Unavailable)
@@ -885,6 +895,7 @@ impl RouteActions for XApiKeyActions {
         use axum::response::IntoResponse;
         let status = match error {
             awaken_iam_host::AuthError::Forbidden => StatusCode::FORBIDDEN,
+            awaken_iam_host::AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
         (
@@ -1176,7 +1187,9 @@ fn service_account_tokens_are_owned_expiring_and_revocable_together() {
         .expect("owned token");
     assert_eq!(first.owner, owner);
 
-    let revoked = handle.revoke_service_account_tokens("svc-import", ts.clone());
+    let revoked = handle
+        .revoke_service_account_tokens("svc-import", ts.clone())
+        .unwrap();
     assert_eq!(
         revoked,
         vec![

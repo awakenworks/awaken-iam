@@ -144,7 +144,7 @@ impl HttpAuthzTransport {
         let client = Client::builder()
             .timeout(config.timeout)
             .build()
-            .map_err(|err| RemoteError(format!("build http client: {err}")))?;
+            .map_err(|err| RemoteError::new(format!("build http client: {err}")))?;
         Ok(Self::with_client(client, config))
     }
 
@@ -164,7 +164,7 @@ impl HttpAuthzTransport {
 
     fn validate_credential_source(config: &HttpTransportConfig) -> Result<(), RemoteError> {
         if config.service_token.is_some() && config.service_token_file.is_some() {
-            return Err(RemoteError(
+            return Err(RemoteError::new(
                 "service_token and service_token_file are mutually exclusive".to_owned(),
             ));
         }
@@ -179,7 +179,7 @@ impl HttpAuthzTransport {
     /// Attach the caller's audience and bearer headers to a request.
     fn with_headers(&self, mut builder: RequestBuilder) -> Result<RequestBuilder, RemoteError> {
         if self.service_token.is_some() && self.service_token_file.is_some() {
-            return Err(RemoteError(
+            return Err(RemoteError::new(
                 "service_token and service_token_file are mutually exclusive".to_owned(),
             ));
         }
@@ -192,7 +192,7 @@ impl HttpAuthzTransport {
             .map(|path| {
                 std::fs::read_to_string(path)
                     .map_err(|error| {
-                        RemoteError(format!(
+                        RemoteError::new(format!(
                             "read service token file {}: {error}",
                             path.display()
                         ))
@@ -200,7 +200,7 @@ impl HttpAuthzTransport {
                     .and_then(|token| {
                         let token = token.trim().to_owned();
                         if token.is_empty() {
-                            Err(RemoteError(format!(
+                            Err(RemoteError::new(format!(
                                 "service token file {} is empty",
                                 path.display()
                             )))
@@ -233,7 +233,7 @@ impl HttpAuthzTransport {
                 Ok(response) => response.status().is_server_error(),
             };
             if !transient || attempt >= self.max_retries {
-                return result.map_err(|err| RemoteError(format!("request failed: {err}")));
+                return result.map_err(|err| RemoteError::new(format!("request failed: {err}")));
             }
             attempt += 1;
         }
@@ -244,11 +244,14 @@ impl HttpAuthzTransport {
     fn decode<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, RemoteError> {
         let status = response.status();
         if status != StatusCode::OK {
-            return Err(RemoteError(format!("unexpected status {status}")));
+            return Err(RemoteError::response(
+                status.as_u16(),
+                format!("unexpected status {status}"),
+            ));
         }
         response
             .json::<T>()
-            .map_err(|err| RemoteError(format!("decode response: {err}")))
+            .map_err(|err| RemoteError::new(format!("decode response: {err}")))
     }
 }
 
@@ -258,9 +261,9 @@ impl AuthzTransport for HttpAuthzTransport {
         namespace: &NamespaceId,
     ) -> Result<AuthorizationProfilePublicationState, RemoteError> {
         let mut url = reqwest::Url::parse(&self.url("/v1/authz/profiles"))
-            .map_err(|error| RemoteError(error.to_string()))?;
+            .map_err(|error| RemoteError::new(error.to_string()))?;
         url.path_segments_mut()
-            .map_err(|_| RemoteError("IAM base URL cannot carry path segments".into()))?
+            .map_err(|_| RemoteError::new("IAM base URL cannot carry path segments".into()))?
             .push(&namespace.0)
             .push("publication");
         let response = self.send_with_retry(|| self.client.get(url.clone()))?;
@@ -388,7 +391,7 @@ impl AuthzTransport for HttpAuthzTransport {
                 .chars()
                 .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | '?' | '#' | '%'))
         {
-            return Err(RemoteError(
+            return Err(RemoteError::new(
                 "organization identity is not losslessly addressable by legacy DELETE".into(),
             ));
         }
@@ -407,7 +410,7 @@ impl AuthzTransport for HttpAuthzTransport {
         let receipt: OrgPrivacyCommitReceipt = Self::decode(response)?;
         receipt
             .validate_for(org)
-            .map_err(|error| RemoteError(error.to_string()))?;
+            .map_err(|error| RemoteError::new(error.to_string()))?;
         Ok(receipt)
     }
 
@@ -566,7 +569,7 @@ impl AuthzTransport for HttpAuthzTransport {
             .get(self.url("/v1/oauth/userinfo"))
             .bearer_auth(access_token)
             .send()
-            .map_err(|error| RemoteError(format!("request failed: {error}")))?;
+            .map_err(|error| RemoteError::new(format!("request failed: {error}")))?;
         Self::decode(response)
     }
 
@@ -1334,7 +1337,7 @@ mod tests {
                 transport
                     .delete_org(org)
                     .unwrap_err()
-                    .0
+                    .message()
                     .contains("not losslessly addressable")
             );
             assert!(
@@ -1432,7 +1435,11 @@ mod tests {
         let server = StubServer::start(vec![Reply::Status(403)]);
         let transport = transport(&server);
         let err = transport.authorize(&auth_request("pack.read")).unwrap_err();
-        assert!(err.0.contains("403"), "unexpected error: {}", err.0);
+        assert!(
+            err.message().contains("403"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 
     #[test]
@@ -1471,7 +1478,11 @@ mod tests {
         .unwrap();
 
         let err = transport.authorize(&auth_request("pack.read")).unwrap_err();
-        assert!(err.0.contains("500"), "unexpected error: {}", err.0);
+        assert!(
+            err.message().contains("500"),
+            "unexpected error: {}",
+            err.message()
+        );
 
         drop(transport);
         assert_eq!(
@@ -1555,11 +1566,11 @@ mod tests {
         )
         .unwrap();
         let error = transport.authorize(&auth_request("pack.read")).unwrap_err();
-        assert!(error.0.contains("read service token file"));
+        assert!(error.message().contains("read service token file"));
 
         std::fs::write(&missing, " \n").unwrap();
         let error = transport.authorize(&auth_request("pack.read")).unwrap_err();
-        assert!(error.0.contains("is empty"));
+        assert!(error.message().contains("is empty"));
         std::fs::remove_file(missing).unwrap();
     }
 
@@ -1571,7 +1582,7 @@ mod tests {
                 .with_service_token_file("/projected/token"),
         )
         .unwrap_err();
-        assert!(error.0.contains("mutually exclusive"));
+        assert!(error.message().contains("mutually exclusive"));
     }
 
     #[test]
@@ -1609,7 +1620,55 @@ mod tests {
                 token: String::from("sk-awaken-bad.token"),
             })
             .unwrap_err();
-        assert!(err.0.contains("401"), "unexpected error: {}", err.0);
+        assert!(
+            err.message().contains("401"),
+            "unexpected error: {}",
+            err.message()
+        );
+        assert_eq!(err.status(), Some(401));
+    }
+
+    #[test]
+    fn introspection_preserves_status_decode_and_retry_causes() {
+        use awaken_iam_contract::TokenIntrospectionRequest;
+        // Cause/effect table: I1 response401, I2 response403, I3 response503
+        // retain their ACTUAL typed status with one request (retry budget0).
+        // I4 malformed200 has no rejection evidence. I5 503 followed by200
+        // retries the SAME existing request exactly once under the original
+        // retry owner. Host decides credential401 versus unavailable, not this
+        // transport and never a string parser or a second authentication path.
+        // Fixed synthetic fixture, matching the original introspection test;
+        // no real bearer credential is stored or sent to an external endpoint.
+        let request = TokenIntrospectionRequest {
+            token: String::from("sk-awaken-pfx.secret"),
+        };
+        for status in [401, 403, 503] {
+            let server = StubServer::start(vec![Reply::Status(status)]);
+            let client = transport(&server);
+            let error = client.introspect_token(&request).unwrap_err();
+            assert_eq!(error.status(), Some(status));
+            assert_eq!(server.requests().len(), 1);
+        }
+        let malformed = StubServer::start(vec![Reply::Ok("not-json".into())]);
+        let error = transport(&malformed)
+            .introspect_token(&request)
+            .unwrap_err();
+        assert_eq!(error.status(), None);
+        assert_eq!(malformed.requests().len(), 1);
+
+        let body = r#"{"principal":{"kind":"service","service_id":"ci"},"workspace":"ws_1","status":"active"}"#;
+        let retry = StubServer::start(vec![Reply::Status(503), Reply::Ok(body.into())]);
+        let client = HttpAuthzTransport::new(
+            HttpTransportConfig::new(&retry.addr)
+                .with_max_retries(1)
+                .with_timeout(Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(client.introspect_token(&request).is_ok());
+        let requests = retry.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with("POST /v1/tokens/introspect "));
     }
 
     #[test]

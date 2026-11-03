@@ -13,12 +13,12 @@
 //! 4. Authenticate via [`IamGate::authenticate_bearer`]:
 //!    - `sk-awaken-`/`sk-ant-` prefix → API-token directory introspection.
 //!    - Everything else → EdDSA JWT verification against JWKS.
-//!    - On failure: `401 Unauthorized`.
+//!    - Credential rejection: `401 Unauthorized`; unavailable authority: `503`.
 //! 5. Look up the action for `(method, path)` via `actions.action_for`.
 //!    When `None`, no action is required and the request passes through.
-//! 6. Authorize `(principal, action, scope)` via `gate.authorize`; a delegated
+//! 6. Authorize `(principal, action, scope)` via `gate.authorize_result`; a delegated
 //!    token authorizes its `act` service with the subject as `on_behalf_of`.
-//!    `Deny` or `RequireApproval` → `403 Forbidden`.
+//!    `Deny` or `RequireApproval` → `403 Forbidden`; unavailable → `503`.
 //! 7. Insert the resolved [`PrincipalRef`] (and any [`TokenActor`]) into the
 //!    request extensions.
 //! 8. Call `next`.
@@ -38,7 +38,7 @@ use tower::{Layer, Service};
 use awaken_iam_client::IamClient;
 use awaken_iam_contract::{ActionKey, AuthorizationDecision, ScopeRef};
 
-use crate::gate::{IamGate, VerifiedBearer};
+use crate::gate::{AuthReject, IamGate, VerifiedBearer};
 use crate::time::wall_clock_now;
 
 /// Map a route's HTTP method and path to an [`ActionKey`].
@@ -93,7 +93,8 @@ pub trait RouteActions: Send + Sync + 'static {
     ///
     /// The default is host's problem+json shape. Override to answer in the
     /// product's own error envelope (keep 401 for missing/invalid credentials
-    /// and 403 for a denied action, per [`AuthError`]'s status mapping).
+    /// and 403 for a denied action, and 503 for an unavailable authority, per
+    /// [`AuthError`]'s status mapping).
     fn render_auth_error(&self, error: &AuthError) -> Response {
         error.clone().into_response()
     }
@@ -125,6 +126,9 @@ pub enum AuthError {
     /// The principal is not authorized for the requested action.
     #[error("the principal does not hold a grant for this action")]
     Forbidden,
+    /// Authentication or authorization cannot currently be evaluated.
+    #[error("the IAM authority is unavailable")]
+    Unavailable,
 }
 
 impl IntoResponse for AuthError {
@@ -132,6 +136,7 @@ impl IntoResponse for AuthError {
         let status = match self {
             AuthError::MissingToken | AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
             AuthError::Forbidden => StatusCode::FORBIDDEN,
+            AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
         let body = serde_json::json!({
             "type": "https://iam.awakenworks.io/problems/auth-error",
@@ -245,7 +250,6 @@ where
                 state
                     .gate
                     .authenticate_verified(&token, &now, now_unix as i64)
-                    .ok()
             } else if let Some(cookie) = req
                 .headers()
                 .get(axum::http::header::COOKIE)
@@ -254,7 +258,6 @@ where
                 state
                     .gate
                     .authenticate_session_cookie(cookie, now.clone())
-                    .ok()
                     .map(|principal| VerifiedBearer {
                         principal,
                         workspace: None,
@@ -264,8 +267,14 @@ where
             } else {
                 return Ok(state.actions.render_auth_error(&AuthError::MissingToken));
             };
-            let Some(verified) = authenticated else {
-                return Ok(state.actions.render_auth_error(&AuthError::InvalidToken));
+            let verified = match authenticated {
+                Ok(verified) => verified,
+                Err(AuthReject::Unavailable) => {
+                    return Ok(state.actions.render_auth_error(&AuthError::Unavailable));
+                }
+                Err(_) => {
+                    return Ok(state.actions.render_auth_error(&AuthError::InvalidToken));
+                }
             };
 
             // Stash the resolved identity BEFORE scope derivation so `scope_for`
@@ -293,7 +302,10 @@ where
                     .scope_for(&method, req.uri(), req.extensions());
                 let decision = state
                     .gate
-                    .authorize(verified.authorization_request(action, scope));
+                    .authorize_result(verified.authorization_request(action, scope));
+                let Ok(decision) = decision else {
+                    return Ok(state.actions.render_auth_error(&AuthError::Unavailable));
+                };
                 if decision != AuthorizationDecision::Allow {
                     return Ok(state.actions.render_auth_error(&AuthError::Forbidden));
                 }
