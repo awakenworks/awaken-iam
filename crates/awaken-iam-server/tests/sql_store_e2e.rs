@@ -41,6 +41,9 @@ use awaken_iam_server::{
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+#[path = "sql_store_e2e/token_mutations.rs"]
+mod token_mutations;
+
 fn ts(value: &str) -> Timestamp {
     Timestamp(value.into())
 }
@@ -911,6 +914,7 @@ fn exercise_every_repository<B: SqlConn>(store: &SqlStore<B>) {
     assert_eq!(tail[0].actor, Some(service("ci")));
     assert_eq!(tail[1].detail, "second");
     assert_eq!(tail[1].actor, None);
+    token_mutations::exercise(store);
 }
 
 #[test]
@@ -1566,4 +1570,115 @@ fn postgres_published_and_consumed_v8_upgrade_preserves_rows_and_receipts_when_c
             .unwrap();
         assert!(backend.run_migrations("iam", &bundles()).is_err());
     }
+}
+
+#[test]
+fn sqlite_prepared_token_failure_rows_leave_no_live_or_durable_half() {
+    // F1 first INSERT refusal; F2 second binding INSERT refusal; F3 both writes
+    // accepted but deferred-FK COMMIT refusal; F4 backend read-only refusal.
+    // Every error drops the SAME Core preparation without publishing, so token,
+    // binding and policy snapshot remain original. These are owned real SQLite
+    // schemas/triggers, not a mock store or an alternate transaction runner.
+    use awaken_iam_core::{ApiTokenDirectory, ApiTokenMinter, OsEntropy, PolicySet};
+    for cause in ["token", "binding", "commit", "readonly"] {
+        let store = sqlite_in_memory_store("iam").unwrap();
+        let backend = store.backend();
+        match cause {
+            "token" => {
+                backend.execute("CREATE TRIGGER reject_token BEFORE INSERT ON iam_api_tokens BEGIN SELECT RAISE(ABORT, 'token fixture refusal'); END", &[]).unwrap();
+            }
+            "binding" => {
+                backend.execute("CREATE TRIGGER reject_binding BEFORE INSERT ON iam_role_bindings BEGIN SELECT RAISE(ABORT, 'binding fixture refusal'); END", &[]).unwrap();
+            }
+            "commit" => {
+                backend.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+                backend
+                    .execute("CREATE TABLE commit_parent (id TEXT PRIMARY KEY)", &[])
+                    .unwrap();
+                backend.execute("CREATE TABLE commit_child (parent TEXT REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)", &[]).unwrap();
+                backend.execute("CREATE TRIGGER reject_commit AFTER INSERT ON iam_role_bindings BEGIN INSERT INTO commit_child(parent) VALUES ('absent'); END", &[]).unwrap();
+            }
+            _ => {
+                backend.execute("PRAGMA query_only = ON", &[]).unwrap();
+            }
+        }
+        let mut directory = ApiTokenDirectory::new();
+        let policy = PolicySet::new();
+        let before = policy.snapshot(1);
+        let mut minter = ApiTokenMinter::new(OsEntropy);
+        let pending = minter
+            .prepare(&mut directory, token_mutations::request("atomic-fault"))
+            .unwrap();
+        let outcome = store.commit_api_token_mint(pending.token(), pending.binding());
+        if cause == "readonly" {
+            assert!(matches!(outcome, Err(RepositoryError::Backend(_))), "F4");
+        } else {
+            assert!(
+                matches!(outcome, Err(RepositoryError::Conflict(_))),
+                "{cause}"
+            );
+        }
+        drop(pending);
+        assert!(
+            directory
+                .token(&ApiTokenId("atomic-fault".into()))
+                .is_none(),
+            "{cause}"
+        );
+        assert_eq!(policy.snapshot(1), before, "{cause}");
+        assert!(
+            ApiTokenRepository::get(&store, &ApiTokenId("atomic-fault".into()))
+                .unwrap()
+                .is_none(),
+            "{cause}"
+        );
+        assert!(
+            RoleBindingRepository::list(&store).unwrap().is_empty(),
+            "{cause}"
+        );
+    }
+
+    // F5 a refused revoke must leave the old bearer usable in both projections.
+    // Its later successful retry publishes only the store's original first stamp.
+    let store = sqlite_in_memory_store("iam").unwrap();
+    let mut directory = ApiTokenDirectory::new();
+    let mut policy = PolicySet::new();
+    let mut minter = ApiTokenMinter::new(OsEntropy);
+    let pending = minter
+        .prepare(&mut directory, token_mutations::request("revoke-fault"))
+        .unwrap();
+    store
+        .commit_api_token_mint(pending.token(), pending.binding())
+        .unwrap();
+    let issued = pending.publish(&mut policy);
+    let snapshot = policy.snapshot(1);
+    store.backend().execute("CREATE TRIGGER reject_revoke BEFORE UPDATE ON iam_api_tokens BEGIN SELECT RAISE(ABORT, 'revocation fixture refusal'); END", &[]).unwrap();
+    let pending = directory.prepare_revoke(&issued.token.id).unwrap();
+    assert!(matches!(
+        store.commit_api_token_revocation(pending.token(), &ts("2026-06-19T01:00:00Z")),
+        Err(RepositoryError::Conflict(_))
+    ));
+    drop(pending);
+    assert!(
+        directory
+            .authenticate(&issued.secret, &ts("2026-06-19T01:00:00Z"))
+            .is_ok()
+    );
+    assert_eq!(
+        ApiTokenRepository::get(&store, &issued.token.id).unwrap(),
+        Some(issued.token.clone())
+    );
+    assert_eq!(policy.snapshot(1), snapshot);
+    store
+        .backend()
+        .execute("DROP TRIGGER reject_revoke", &[])
+        .unwrap();
+    let pending = directory.prepare_revoke(&issued.token.id).unwrap();
+    let stamp = store
+        .commit_api_token_revocation(pending.token(), &ts("2026-06-19T02:00:00Z"))
+        .unwrap();
+    assert_eq!(
+        pending.publish(stamp).revoked_at,
+        Some(ts("2026-06-19T02:00:00Z"))
+    );
 }

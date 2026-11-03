@@ -13,7 +13,7 @@
 //! second connection.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, TransactionBehavior, params_from_iter};
@@ -42,6 +42,12 @@ impl std::fmt::Debug for SqliteBackend {
 }
 
 impl SqliteBackend {
+    fn lock_connection(&self) -> RepositoryResult<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| RepositoryError::Backend("SQLite connection lock is poisoned".into()))
+    }
+
     /// Wrap an already-open connection.
     pub fn new(conn: Connection) -> Self {
         Self {
@@ -176,12 +182,12 @@ impl SqlConn for SqliteBackend {
     }
 
     fn execute(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<u64> {
-        let connection = self.conn.lock().unwrap();
+        let connection = self.lock_connection()?;
         execute_sql(&connection, sql, params)
     }
 
     fn query(&self, sql: &str, params: &[SqlParam]) -> RepositoryResult<Vec<SqlRow>> {
-        let connection = self.conn.lock().unwrap();
+        let connection = self.lock_connection()?;
         query_sql(&connection, sql, params)
     }
 
@@ -189,7 +195,7 @@ impl SqlConn for SqliteBackend {
         &self,
         operation: &mut (dyn FnMut(&mut dyn SqlTransaction) -> RepositoryResult<()> + Send),
     ) -> RepositoryResult<()> {
-        let mut connection = self.conn.lock().unwrap();
+        let mut connection = self.lock_connection()?;
         let mut transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend_err)?;
@@ -247,7 +253,7 @@ impl MigrationExecutor for SqliteBackend {
         let dialect = Dialect::Sqlite;
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
         let ledger = schema.ledger_table();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection()?;
         Self::ensure_ledger(&mut conn, prefix)?;
 
         let mut applied = Vec::new();
@@ -314,7 +320,7 @@ impl MigrationExecutor for SqliteBackend {
         bundle_id: &str,
     ) -> RepositoryResult<BTreeMap<i64, String>> {
         let schema = LedgerSchema::with_prefix(prefix).map_err(migration_err)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection()?;
         read_applied(&conn, schema.ledger_table(), bundle_id)
     }
 }
@@ -349,6 +355,53 @@ fn read_applied(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    #[test]
+    fn poisoned_connection_refuses_every_existing_repository_entry() {
+        // L1 original connection healthy -> real SQL works. L2 same lock
+        // poisoned -> execute/query/transaction/migration all return Backend;
+        // no transaction callback or repair may inspect the guarded connection.
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        backend
+            .execute("CREATE TABLE lock_probe(value TEXT)", &[])
+            .unwrap();
+        let poisoned = backend.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.conn.lock().unwrap();
+                panic!("injected SQLite connection poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            backend.execute("INSERT INTO lock_probe VALUES ('forbidden')", &[]),
+            Err(RepositoryError::Backend(_))
+        ));
+        assert!(matches!(
+            backend.query("SELECT * FROM lock_probe", &[]),
+            Err(RepositoryError::Backend(_))
+        ));
+        let mut called = false;
+        assert!(matches!(
+            backend.with_transaction(&mut |_| {
+                called = true;
+                Ok(())
+            }),
+            Err(RepositoryError::Backend(_))
+        ));
+        assert!(!called);
+        let mut migration_backend = backend.clone();
+        assert!(matches!(
+            migration_backend.run_migrations("iam", &[]),
+            Err(RepositoryError::Backend(_))
+        ));
+        assert!(matches!(
+            backend.applied_versions("iam", "probe"),
+            Err(RepositoryError::Backend(_))
+        ));
+        assert!(backend.conn.is_poisoned());
+    }
 
     #[test]
     fn ledger_bootstrap_is_deterministic_and_fail_closed() {

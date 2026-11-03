@@ -50,6 +50,7 @@ mod profiles;
 mod projections;
 mod provisioning;
 mod signing_keys;
+mod token_mutations;
 
 use identity_rows::*;
 
@@ -1015,41 +1016,7 @@ impl<B: SqlConn> ApiTokenOwnerRepository for SqlStore<B> {
 
 impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     fn create(&self, token: ApiToken) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
-            let mut scopes = vec![ScopeRef::Workspace {
-                workspace_id: token.workspace.clone(),
-            }];
-            if let Some(previous) =
-                self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?
-            {
-                scopes.push(ScopeRef::Workspace {
-                    workspace_id: previous.workspace,
-                });
-            }
-            self.ensure_scope_admission(transaction, &scopes, &[])?;
-
-            let principal = json_encode(&token.principal, "principal")?;
-            let sql = format!(
-                "INSERT INTO {t} \
-             (id, prefix, principal, secret_hash, workspace, created_at, expires_at, revoked_at) \
-             VALUES (?, ?, ?j, ?, ?, ?, ?, ?)",
-                t = self.table("api_tokens")
-            );
-            transaction.execute(
-                &sql,
-                &[
-                    p(token.id.0),
-                    p(token.prefix.0),
-                    p(principal),
-                    p(token.secret_hash),
-                    p(token.workspace.0),
-                    p(token.created_at.0),
-                    token.expires_at.map(|t| t.0),
-                    token.revoked_at.map(|t| t.0),
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_policy_transaction(|transaction, _| self.insert_api_token_in(transaction, &token))
     }
 
     fn get(&self, id: &ApiTokenId) -> RepositoryResult<Option<ApiToken>> {
@@ -1082,44 +1049,9 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
 
     fn update(&self, token: ApiToken) -> RepositoryResult<()> {
         self.with_policy_transaction(|transaction, _| {
-            let mut scopes = vec![ScopeRef::Workspace {
-                workspace_id: token.workspace.clone(),
-            }];
-            if let Some(previous) =
-                self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?
-            {
-                scopes.push(ScopeRef::Workspace {
-                    workspace_id: previous.workspace,
-                });
-            }
-            self.ensure_scope_admission(transaction, &scopes, &[])?;
-
-            let principal = json_encode(&token.principal, "principal")?;
-            let sql = format!(
-                "UPDATE {t} SET prefix = ?, principal = ?j, secret_hash = ?, workspace = ?, \
-             created_at = ?, expires_at = ?, revoked_at = ? WHERE id = ?",
-                t = self.table("api_tokens")
-            );
-            let affected = transaction.execute(
-                &sql,
-                &[
-                    p(token.prefix.0),
-                    p(principal),
-                    p(token.secret_hash),
-                    p(token.workspace.0),
-                    p(token.created_at.0),
-                    token.expires_at.map(|t| t.0),
-                    token.revoked_at.map(|t| t.0),
-                    p(token.id.0.clone()),
-                ],
-            )?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(format!(
-                    "api token {} does not exist",
-                    token.id.0
-                )));
-            }
-            Ok(())
+            let previous =
+                self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?;
+            self.update_api_token_in(transaction, &token, previous.as_ref())
         })
     }
 }
@@ -1377,18 +1309,7 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
 impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
         self.with_policy_transaction(|transaction, _| {
-            self.ensure_scope_admission(transaction, &[binding.scope.clone()], &[])?;
-            self.require_live_effect_scopes(transaction, &[binding.scope.clone()])?;
-
-            let principal = json_encode(&binding.principal, "principal")?;
-            let scope = json_encode(&binding.scope, "binding scope")?;
-            let sql = format!(
-                "INSERT INTO {t} (principal, role, scope) VALUES (?j, ?, ?j) \
-             ON CONFLICT (principal, role, scope) DO NOTHING",
-                t = self.table("role_bindings")
-            );
-            transaction.execute(&sql, &[p(principal), p(binding.role.0), p(scope)])?;
-            Ok(())
+            self.insert_role_binding_in(transaction, &binding)
         })
     }
 

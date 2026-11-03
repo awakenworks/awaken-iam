@@ -133,9 +133,9 @@ impl PostgresBackend {
     ) -> RepositoryResult<T> {
         run_outside_tokio(component, || match self.client.get() {
             ConnectionOwner::Direct(client) => {
-                let mut client = client
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut client = client.lock().map_err(|_| {
+                    RepositoryError::Backend("Postgres connection lock is poisoned".into())
+                })?;
                 operation(&mut client)
             }
             ConnectionOwner::Reconnecting(pool) => {
@@ -641,6 +641,40 @@ mod tests {
             .get(0);
         assert!(effects <= 1, "T4 interrupted SQL is never replayed");
         admin.batch_execute(&format!("DROP TABLE {table}")).unwrap();
+
+        // T5 uses this SAME real TLS fixture with the original direct-client
+        // constructor. Poison must refuse execute/query/transaction without
+        // running a callback; recovering the client would pass SELECT 1 and
+        // violate this row. No fake Client or replacement manager is introduced.
+        let direct = PostgresBackend::new(postgres::Client::connect(&url, tls(true)).unwrap());
+        let poisoned = direct.clone();
+        assert!(
+            std::thread::spawn(move || {
+                if let super::ConnectionOwner::Direct(slot) = poisoned.client.get() {
+                    let _guard = slot.lock().unwrap();
+                    panic!("injected direct PostgreSQL client poison");
+                }
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            direct.execute("SET application_name = 'poison-must-not-run'", &[]),
+            Err(awaken_iam_core::RepositoryError::Backend(_))
+        ));
+        assert!(matches!(
+            direct.query("SELECT 1", &[]),
+            Err(awaken_iam_core::RepositoryError::Backend(_))
+        ));
+        let mut called = false;
+        assert!(matches!(
+            direct.with_transaction(&mut |_| {
+                called = true;
+                Ok(())
+            }),
+            Err(awaken_iam_core::RepositoryError::Backend(_))
+        ));
+        assert!(!called);
     }
 
     #[test]

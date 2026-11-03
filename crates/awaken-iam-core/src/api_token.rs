@@ -104,6 +104,87 @@ pub struct IssuedApiToken {
     pub secret: String,
 }
 
+/// A validated mint held exclusively against its original live directory.
+///
+/// Preparing has no live effect. Persist only `token()` and `binding()` through
+/// one atomic store command, then publish after its commit ACK. The value owns
+/// the one-time secret but deliberately implements neither Debug nor Serialize.
+///
+/// ```compile_fail,E0277
+/// use awaken_iam_core::PreparedApiTokenMint;
+/// fn requires_debug<T: std::fmt::Debug>() {}
+/// requires_debug::<PreparedApiTokenMint<'static>>();
+/// ```
+/// ```compile_fail,E0277
+/// use awaken_iam_core::PreparedApiTokenMint;
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<PreparedApiTokenMint<'static>>();
+/// ```
+#[must_use = "dropping a prepared mint leaves the live directory unchanged"]
+pub struct PreparedApiTokenMint<'a> {
+    directory: &'a mut ApiTokenDirectory,
+    issued: IssuedApiToken,
+    binding: RoleBinding,
+    owner: Option<AccountId>,
+}
+
+impl PreparedApiTokenMint<'_> {
+    pub fn token(&self) -> &ApiToken {
+        &self.issued.token
+    }
+    pub fn binding(&self) -> &RoleBinding {
+        &self.binding
+    }
+
+    /// Read the frozen one-time credential for an owner-only durable handoff
+    /// while the original state guard remains held. This neither publishes the
+    /// live token nor permits replacing/regenerating the secret.
+    pub fn secret(&self) -> &str {
+        &self.issued.secret
+    }
+
+    /// Publish only after durable commit, under the caller's same state guard.
+    /// This performs no IO or fallible lookup. Obtain `policy_mut()` only here,
+    /// after the commit, so a refused preparation cannot advance its version.
+    pub fn publish(self, policy: &mut PolicySet) -> IssuedApiToken {
+        self.directory.insert_validated(self.issued.token.clone());
+        if let Some(owner) = self.owner {
+            self.directory
+                .owners
+                .insert(self.issued.token.id.clone(), owner);
+        }
+        policy.bind_role(self.binding);
+        self.issued
+    }
+}
+
+/// An exclusive borrow of the original token slot before durable revocation.
+#[must_use = "dropping a prepared revocation leaves the live token unchanged"]
+pub struct PreparedApiTokenRevocation<'a> {
+    token: &'a mut ApiToken,
+}
+
+impl PreparedApiTokenRevocation<'_> {
+    pub fn token(&self) -> &ApiToken {
+        self.token
+    }
+
+    /// Install the store-acknowledged first stamp without another lookup or IO.
+    /// The store must have checked the frozen token identity before commit.
+    pub fn publish(self, committed_at: Timestamp) -> ApiToken {
+        self.token.revoked_at = Some(api_token_revocation_stamp(
+            self.token.revoked_at.as_ref(),
+            &committed_at,
+        ));
+        self.token.clone()
+    }
+}
+
+/// The single first-revocation-stamp law for live and durable token paths.
+pub fn api_token_revocation_stamp(existing: Option<&Timestamp>, now: &Timestamp) -> Timestamp {
+    existing.unwrap_or(now).clone()
+}
+
 /// A service-account token minted through the accountable admin path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedServiceAccountToken {
@@ -159,6 +240,16 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         policy: &mut PolicySet,
         request: MintApiToken,
     ) -> Result<IssuedApiToken, IamError> {
+        Ok(self.prepare(directory, request)?.publish(policy))
+    }
+
+    /// Prepare the original mint algorithm without changing its directory or
+    /// policy. The exclusive directory borrow prevents intervening live writes.
+    pub fn prepare<'a>(
+        &mut self,
+        directory: &'a mut ApiTokenDirectory,
+        request: MintApiToken,
+    ) -> Result<PreparedApiTokenMint<'a>, IamError> {
         if let Some(expires_at) = &request.expires_at
             && expires_at.0 <= request.created_at.0
         {
@@ -183,20 +274,42 @@ impl<E: EntropySource> ApiTokenMinter<E> {
             revoked_at: None,
         };
 
-        directory.create(token.clone())?;
-
-        policy.bind_role(RoleBinding {
+        directory.validate_create(&token)?;
+        let binding = RoleBinding {
             principal: request.principal,
             role: request.role,
             scope: ScopeRef::Workspace {
                 workspace_id: request.workspace,
             },
-        });
-
-        Ok(IssuedApiToken {
-            token,
-            secret: render_token(&prefix, &secret),
+        };
+        Ok(PreparedApiTokenMint {
+            directory,
+            issued: IssuedApiToken {
+                token,
+                secret: render_token(&prefix, &secret),
+            },
+            binding,
+            owner: None,
         })
+    }
+
+    /// Prepare the accountable path with the original service/expiry checks,
+    /// without obtaining the live policy or recording an owner before publish.
+    pub fn prepare_service_account<'a>(
+        &mut self,
+        directory: &'a mut ApiTokenDirectory,
+        request: MintApiToken,
+        owner: AccountId,
+    ) -> Result<PreparedApiTokenMint<'a>, ServiceAccountTokenError> {
+        if !matches!(request.principal, PrincipalRef::Service { .. }) {
+            return Err(ServiceAccountTokenError::NotAServiceAccount);
+        }
+        if request.expires_at.is_none() {
+            return Err(ServiceAccountTokenError::ExpiryRequired);
+        }
+        let mut pending = self.prepare(directory, request)?;
+        pending.owner = Some(owner);
+        Ok(pending)
     }
 
     /// The accountable administrative mint path for service-account tokens
@@ -214,16 +327,9 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         request: MintApiToken,
         owner: AccountId,
     ) -> Result<IssuedServiceAccountToken, ServiceAccountTokenError> {
-        if !matches!(request.principal, PrincipalRef::Service { .. }) {
-            return Err(ServiceAccountTokenError::NotAServiceAccount);
-        }
-        if request.expires_at.is_none() {
-            return Err(ServiceAccountTokenError::ExpiryRequired);
-        }
-        let issued = self.mint(directory, policy, request)?;
-        directory
-            .owners
-            .insert(issued.token.id.clone(), owner.clone());
+        let issued = self
+            .prepare_service_account(directory, request, owner.clone())?
+            .publish(policy);
         Ok(IssuedServiceAccountToken { issued, owner })
     }
 
@@ -260,17 +366,45 @@ impl ApiTokenDirectory {
     /// Each id and each prefix may be created only once, failing closed with
     /// [`IamError::DuplicateApiToken`] or [`IamError::DuplicateApiTokenPrefix`].
     pub fn create(&mut self, token: ApiToken) -> Result<(), IamError> {
+        self.validate_create(&token)?;
+        self.insert_validated(token);
+        Ok(())
+    }
+
+    fn validate_create(&self, token: &ApiToken) -> Result<(), IamError> {
         if self.by_id.contains_key(&token.id) {
-            return Err(IamError::DuplicateApiToken { id: token.id });
+            return Err(IamError::DuplicateApiToken {
+                id: token.id.clone(),
+            });
         }
         if self.by_prefix.contains_key(&token.prefix) {
             return Err(IamError::DuplicateApiTokenPrefix {
-                prefix: token.prefix,
+                prefix: token.prefix.clone(),
             });
         }
+        Ok(())
+    }
+
+    fn insert_validated(&mut self, token: ApiToken) {
         self.by_id.insert(token.id.clone(), token.prefix.clone());
         self.by_prefix.insert(token.prefix.clone(), token);
-        Ok(())
+    }
+
+    /// Borrow the original slot before persistence; a refused store operation
+    /// drops this value without changing the token or either directory index.
+    pub fn prepare_revoke(
+        &mut self,
+        id: &ApiTokenId,
+    ) -> Result<PreparedApiTokenRevocation<'_>, IamError> {
+        let prefix = self
+            .by_id
+            .get(id)
+            .ok_or_else(|| IamError::ApiTokenNotFound { id: id.clone() })?;
+        let token = self
+            .by_prefix
+            .get_mut(prefix)
+            .ok_or_else(|| IamError::ApiTokenNotFound { id: id.clone() })?;
+        Ok(PreparedApiTokenRevocation { token })
     }
 
     /// Resolve a token by id without checking liveness.
@@ -350,7 +484,8 @@ impl ApiTokenDirectory {
             .values_mut()
             .filter(|token| &token.principal == principal && token.revoked_at.is_none())
             .map(|token| {
-                token.revoked_at = Some(now.clone());
+                token.revoked_at =
+                    Some(api_token_revocation_stamp(token.revoked_at.as_ref(), &now));
                 token.id.clone()
             })
             .collect();
@@ -363,16 +498,7 @@ impl ApiTokenDirectory {
     /// Revocation is idempotent: the first `revoked_at` stamp is preserved. An
     /// unknown id fails closed with [`IamError::ApiTokenNotFound`].
     pub fn revoke(&mut self, id: &ApiTokenId, now: Timestamp) -> Result<(), IamError> {
-        let prefix = self
-            .by_id
-            .get(id)
-            .cloned()
-            .ok_or_else(|| IamError::ApiTokenNotFound { id: id.clone() })?;
-        let token = self
-            .by_prefix
-            .get_mut(&prefix)
-            .expect("prefix index points at a stored token");
-        token.revoked_at.get_or_insert(now);
+        self.prepare_revoke(id)?.publish(now);
         Ok(())
     }
 }
@@ -396,7 +522,7 @@ pub fn revoke_api_tokens_for_principal(
         if token.revoked_at.is_some() {
             continue;
         }
-        token.revoked_at = Some(now.clone());
+        token.revoked_at = Some(api_token_revocation_stamp(token.revoked_at.as_ref(), now));
         let id = token.id.clone();
         repository.update(token)?;
         revoked.push(id);
@@ -524,6 +650,29 @@ mod tests {
         let mut directory = ApiTokenDirectory::new();
         let mut policy = PolicySet::new();
         let owner = AccountId("acct_owner".into());
+        // Accountable preparation also has no live owner/binding effect on
+        // drop; the legacy path below then exercises that same publish law.
+        {
+            let pending = minter
+                .prepare_service_account(
+                    &mut directory,
+                    mint_request("tok_unpublished_owner", Some("2027-06-19T00:00:00Z")),
+                    owner.clone(),
+                )
+                .unwrap();
+            drop(pending);
+        }
+        assert!(
+            directory
+                .token(&ApiTokenId("tok_unpublished_owner".into()))
+                .is_none()
+        );
+        assert!(
+            directory
+                .owner(&ApiTokenId("tok_unpublished_owner".into()))
+                .is_none()
+        );
+        assert!(policy.snapshot(1).role_bindings.is_empty());
         let owned = minter
             .mint_service_account(
                 &mut directory,
@@ -617,6 +766,60 @@ mod tests {
             ));
         }
         assert!(directory.authenticate(&other.secret, &now).is_ok());
+    }
+
+    #[test]
+    fn prepared_token_mutations_publish_only_when_consumed() {
+        // P1 prepare/drop -> original empty directory/policy; P2 publish ->
+        // one exact token+binding and usable secret; P3 revoke prepare/drop ->
+        // still usable; P4 acknowledged publish/replay -> original first stamp.
+        // Core owns no SQL here. The real store tests inject failure between
+        // prepare and publish, using these same borrowed values.
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut directory = ApiTokenDirectory::new();
+        let mut policy = PolicySet::new();
+        let before = policy.snapshot(1);
+        {
+            let pending = minter
+                .prepare(&mut directory, mint_request("dropped", None))
+                .unwrap();
+            assert_eq!(pending.token().id, ApiTokenId("dropped".into()));
+            assert_eq!(pending.binding().principal, pending.token().principal);
+        }
+        assert!(directory.token(&ApiTokenId("dropped".into())).is_none());
+        assert_eq!(policy.snapshot(1), before);
+        let pending = minter
+            .prepare(&mut directory, mint_request("published", None))
+            .unwrap();
+        let binding = pending.binding().clone();
+        let handoff = pending.secret().to_owned();
+        let issued = pending.publish(&mut policy);
+        assert_eq!(issued.secret, handoff);
+        assert_eq!(directory.token(&issued.token.id), Some(&issued.token));
+        assert_eq!(policy.snapshot(1).role_bindings.len(), 1);
+        assert_eq!(
+            policy.snapshot(1).role_bindings[0].principal,
+            binding.principal
+        );
+        let now = Timestamp("2026-06-19T01:00:00Z".into());
+        assert!(directory.authenticate(&issued.secret, &now).is_ok());
+        {
+            let pending = directory.prepare_revoke(&issued.token.id).unwrap();
+            assert_eq!(pending.token().revoked_at, None);
+        }
+        assert!(directory.authenticate(&issued.secret, &now).is_ok());
+        let revoked = directory
+            .prepare_revoke(&issued.token.id)
+            .unwrap()
+            .publish(now.clone());
+        assert_eq!(revoked.revoked_at, Some(now.clone()));
+        directory
+            .revoke(&issued.token.id, Timestamp("2026-06-19T02:00:00Z".into()))
+            .unwrap();
+        assert_eq!(
+            directory.token(&issued.token.id).unwrap().revoked_at,
+            Some(now)
+        );
     }
 
     #[test]
