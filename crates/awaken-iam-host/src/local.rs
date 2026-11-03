@@ -56,9 +56,11 @@ impl LocalHandle {
     pub fn mint_api_token(&mut self, request: MintApiToken) -> Result<IssuedApiToken, EmbedError> {
         let mut guard = Self::lock_state(&self.state)?;
         let LocalIamState { authz, directory } = &mut *guard;
-        self.minter
-            .mint(directory, authz.policy_mut(), request)
-            .map_err(EmbedError::from)
+        let prepared = self
+            .minter
+            .prepare(directory, request)
+            .map_err(EmbedError::from)?;
+        Ok(prepared.publish(authz.policy_mut()))
     }
 
     /// Mint a service-account API token through the accountable admin path:
@@ -71,9 +73,12 @@ impl LocalHandle {
     ) -> Result<IssuedServiceAccountToken, EmbedError> {
         let mut guard = Self::lock_state(&self.state)?;
         let LocalIamState { authz, directory } = &mut *guard;
-        self.minter
-            .mint_service_account(directory, authz.policy_mut(), request, owner)
-            .map_err(|error| EmbedError::Token(error.to_string()))
+        let prepared = self
+            .minter
+            .prepare_service_account(directory, request, owner.clone())
+            .map_err(|error| EmbedError::Token(error.to_string()))?;
+        let issued = prepared.publish(authz.policy_mut());
+        Ok(IssuedServiceAccountToken { issued, owner })
     }
 
     /// Revoke every live API token of one service account, returning the ids
@@ -419,5 +424,52 @@ mod tests {
             );
             assert_eq!(handle.state.is_poisoned(), before || after);
         }
+    }
+
+    #[test]
+    fn rejected_prepared_mints_leave_the_original_policy_version_unchanged() {
+        // R1 invalid basic expiry, R2 non-service accountable mint, R3 missing
+        // accountable expiry all reject BEFORE policy_mut (which advances the
+        // live version). Same Core preparation laws choose every error; Host
+        // neither duplicates their checks nor constructs a temporary PDP/Dir.
+        let mut handle = embed_local(&HostConfig::local_in_memory()).unwrap();
+        let before = handle.state.lock().unwrap().authz.snapshot();
+        let mut request = MintApiToken {
+            id: ApiTokenId("rejected".into()),
+            principal: PrincipalRef::Service {
+                service_id: "service".into(),
+            },
+            workspace: WorkspaceId("workspace".into()),
+            role: RoleId("admin".into()),
+            created_at: Timestamp("2030-01-01T00:00:00Z".into()),
+            expires_at: Some(Timestamp("2029-01-01T00:00:00Z".into())),
+        };
+        assert!(handle.mint_api_token(request.clone()).is_err());
+        request.principal = PrincipalRef::Account {
+            account_id: AccountId("account".into()),
+        };
+        request.expires_at = Some(Timestamp("2031-01-01T00:00:00Z".into()));
+        assert!(
+            handle
+                .mint_service_account_token(request.clone(), AccountId("owner".into()))
+                .is_err()
+        );
+        request.principal = PrincipalRef::Service {
+            service_id: "service".into(),
+        };
+        request.expires_at = None;
+        assert!(
+            handle
+                .mint_service_account_token(request, AccountId("owner".into()))
+                .is_err()
+        );
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.authz.snapshot(), before);
+        assert!(
+            state
+                .directory
+                .token(&ApiTokenId("rejected".into()))
+                .is_none()
+        );
     }
 }
