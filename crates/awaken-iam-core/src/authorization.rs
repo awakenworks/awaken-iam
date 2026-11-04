@@ -627,6 +627,7 @@ impl PolicySet {
                     },
                     &binding.role,
                     &binding.scope,
+                    scope,
                     context,
                 )
             {
@@ -650,6 +651,7 @@ impl PolicySet {
                     },
                     &binding.role,
                     &binding.scope,
+                    scope,
                     context,
                 )
             {

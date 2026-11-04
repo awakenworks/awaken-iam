@@ -38,6 +38,7 @@ impl PolicySet {
         subject: &GrantSubjectRef,
         role: &RoleId,
         binding_scope: &ScopeRef,
+        target_scope: &ScopeRef,
         context: Option<&AuthorizationContext>,
     ) -> bool {
         self.binding_limits
@@ -57,8 +58,7 @@ impl PolicySet {
                 }
                 limit.resource_ids.as_ref().is_none_or(|allowed| {
                     context
-                        .and_then(|facts| facts.resource_id.as_ref())
-                        .is_some_and(|id| allowed.contains(id))
+                        .is_some_and(|facts| resource_limit_matches(allowed, facts, target_scope))
                 })
             })
     }
@@ -107,6 +107,7 @@ impl PolicySet {
                                 },
                                 role,
                                 &binding.scope,
+                                scope,
                                 context,
                             )
                     }),
@@ -168,4 +169,38 @@ impl PolicySet {
         }
         ConstraintMatch::Matches
     }
+}
+
+fn resource_limit_matches(
+    allowed: &[String],
+    facts: &AuthorizationContext,
+    scope: &ScopeRef,
+) -> bool {
+    let Some(id) = facts.resource_id.as_ref().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if allowed.contains(id) {
+        return true;
+    }
+    let predecessors = &facts.predecessors;
+    if predecessors.len() > 32
+        || predecessors.iter().any(|p| {
+            &p.scope != scope
+                || p.resource_id.is_empty()
+                || p.resource_id.len() > 512
+                || p.resource_id.chars().any(char::is_control)
+                || &p.resource_id == id
+        })
+        || predecessors
+            .iter()
+            .map(|p| &p.resource_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != predecessors.len()
+    {
+        return false;
+    }
+    predecessors
+        .iter()
+        .any(|p| allowed.contains(&p.resource_id))
 }

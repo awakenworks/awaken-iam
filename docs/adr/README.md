@@ -21,3 +21,4 @@
 | [0017](0017-token-exchange-delegation-and-service-accountability.md) | Token exchange, delegation and service-account accountability | Proposed |
 | [0018](0018-fenced-principal-team-access-replacement.md) | Fenced principal team access replacement | Proposed |
 | [0019](0019-durable-personal-consent-and-action-bound-credentials.md) | Durable personal consent and action-bound credentials | Proposed |
+| [0020](0020-trusted-migration-predecessors-preserve-resource-limits.md) | Trusted migration predecessors preserve exact resource limits | Proposed |

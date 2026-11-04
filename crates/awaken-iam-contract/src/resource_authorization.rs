@@ -30,6 +30,16 @@ pub struct AuthorizationAmount {
     pub currency: String,
 }
 
+/// An immutable predecessor proved by the operation owner during a qualified
+/// migration. Its scope must equal the actual operation's scope. This is not a
+/// grant and must never be copied from a caller's resource body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationPredecessor {
+    pub resource_id: String,
+    pub scope: ScopeRef,
+}
+
 /// Trusted facts resolved by an operation owner, never by a product's UI.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +51,10 @@ pub struct AuthorizationContext {
     pub resource_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
+    /// At most 32 distinct, same-scope immutable migration predecessors.
+    /// Existing actions, live bindings, denials, fields and expiry still apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessors: Vec<AuthorizationPredecessor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<PrincipalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -14,6 +14,83 @@ use awaken_iam_core::{GroupId, PolicySet};
 const ROLE: &str = "operations.business:role:sales";
 const TEAM: &str = "awaken.flow:team:sales";
 
+#[test]
+fn qualified_predecessors_preserve_exact_resource_limits_without_creating_permissions() {
+    use awaken_iam_contract::AuthorizationPredecessor;
+    let mut doc = document(
+        vec![grant("read", "customer.read", GrantEffect::Allow)],
+        vec![constraint("read", AuthorizationDataScope::Owner)],
+    );
+    doc.binding_limits.push(RoleBindingLimit {
+        subject: GrantSubjectRef::Principal {
+            principal: account("alice"),
+        },
+        role_id: ROLE.into(),
+        scope: project("p1"),
+        expires_at: Some(200),
+        resource_ids: Some(vec!["original-customer".into()]),
+    });
+    let policy = policy(doc.clone());
+    let mut request = request("customer.read", "alice");
+    request.context.resource_id = Some("migrated-customer".into());
+    assert_eq!(
+        policy.evaluate_resource(&request).decision,
+        AuthorizationDecision::Deny
+    );
+    let source = AuthorizationPredecessor {
+        resource_id: "original-customer".into(),
+        scope: project("p1"),
+    };
+    request.context.predecessors = vec![source.clone()];
+    assert_eq!(
+        policy.evaluate_resource(&request).decision,
+        AuthorizationDecision::Allow
+    );
+    for predecessors in [
+        vec![AuthorizationPredecessor {
+            scope: project("other"),
+            ..source.clone()
+        }],
+        vec![source.clone(), source.clone()],
+        vec![source.clone(); 33],
+        vec![AuthorizationPredecessor {
+            resource_id: "migrated-customer".into(),
+            ..source.clone()
+        }],
+    ] {
+        request.context.predecessors = predecessors;
+        assert_eq!(
+            policy.evaluate_resource(&request).decision,
+            AuthorizationDecision::Deny
+        );
+    }
+    request.context.predecessors = vec![source];
+    request.context.owner = Some(account("bob"));
+    assert_eq!(
+        policy.evaluate_resource(&request).decision,
+        AuthorizationDecision::Deny
+    );
+    request.context.owner = Some(account("alice"));
+    request.context.evaluated_at = Some(200);
+    assert_eq!(
+        policy.evaluate_resource(&request).decision,
+        AuthorizationDecision::Deny
+    );
+    request.context.evaluated_at = Some(100);
+    request.request.action = ActionKey("operations.business::customer.delete".into());
+    assert_eq!(
+        policy.evaluate_resource(&request).decision,
+        AuthorizationDecision::Deny
+    );
+    request.request.action = ActionKey("operations.business::customer.read".into());
+    doc.grants
+        .push(grant("deny", "customer.read", GrantEffect::Deny));
+    assert_eq!(
+        self::policy(doc).evaluate_resource(&request).decision,
+        AuthorizationDecision::Deny
+    );
+}
+
 fn account(id: &str) -> PrincipalRef {
     PrincipalRef::Account {
         account_id: AccountId(id.into()),

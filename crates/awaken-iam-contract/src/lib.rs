@@ -20,7 +20,7 @@ mod trust;
 
 pub use resource_authorization::{
     AuthorizationAccess, AuthorizationAmount, AuthorizationAmountRange, AuthorizationContext,
-    AuthorizationDataScope, GrantConstraint, PermissionBundleMetadata,
+    AuthorizationDataScope, AuthorizationPredecessor, GrantConstraint, PermissionBundleMetadata,
     ResourceAuthorizationRequest, RoleBindingLimit,
 };
 
