@@ -78,6 +78,8 @@ struct Authz {
     workspace_orgs: BTreeMap<String, WorkspaceOrgEdge>,
     profiles: BTreeMap<(String, u64), AuthorizationProfile>,
     active_profiles: BTreeMap<String, u64>,
+    profile_publications:
+        BTreeMap<(String, String), awaken_iam_contract::ScopedAuthorizationProfileIntent>,
     principal_access_fences: BTreeMap<String, awaken_iam_contract::AccessFence>,
 }
 

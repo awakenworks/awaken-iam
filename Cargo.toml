@@ -22,6 +22,7 @@ authors = ["The Awaken Authors"]
 publish = false
 
 [workspace.dependencies]
+tempfile = "3"
 awaken-iam = { path = "crates/awaken-iam", version = "0.2.0-dev" }
 awaken-iam-contract = { path = "crates/awaken-iam-contract", version = "0.2.0-dev" }
 awaken-iam-core = { path = "crates/awaken-iam-core", version = "0.2.0-dev" }

@@ -31,12 +31,18 @@ use serde::{Deserialize, Serialize};
 mod principal_access;
 pub use principal_access::{AccessFence, TeamAccessReceipt, TeamAccessReplacement};
 mod profile;
+mod profile_publication;
 pub use profile::{
     ActionScopeRule, ActivateAuthorizationProfile, AuthorizationProfile,
     AuthorizationProfileActivated, AuthorizationProfileDocument,
     AuthorizationProfilePublicationState, AuthorizationProfileRetired,
     AuthorizationProfileValidation, CreateAuthorizationProfile, ProfileLifecycle,
     RetireAuthorizationProfile, ScopeKind,
+};
+pub use profile_publication::{
+    PrepareScopedAuthorizationProfile, ScopedAuthorizationProfileBaseline,
+    ScopedAuthorizationProfileIntent, ScopedAuthorizationProfileReceipt,
+    ScopedAuthorizationProfileStatus,
 };
 
 pub use admin::{

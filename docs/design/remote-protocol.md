@@ -347,3 +347,31 @@ certificate completion. The static strict path carries the original `OrgId` in
 the body, preserving exact identities without raw URL-segment interpolation.
 The existing transport timeout, bounded retries and authenticated TLS policy are
 unchanged; a lost reply repeats the same terminal owner operation.
+
+### Scoped policy publication
+
+[ADR-0021](../adr/0021-scoped-profile-publication-and-original-intent-recovery.md)
+defines the finite service authority. The canonical
+[contracts](../../crates/awaken-iam-contract/src/profile_publication.rs) and
+[`ScopedProfilePublisher`](../../crates/awaken-iam-client/src/scoped_publication.rs)
+are separate from the decision-only `IamClient` interface. The HTTP client
+encodes every Workspace, namespace and original key as an individual URL segment.
+
+Under `/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}`:
+
+| Method and suffix | Result |
+| --- | --- |
+| `GET` | Exact scoped baseline: current profile and native publication history |
+| `POST /publications` | Persist one immutable original request and validated revision |
+| `GET /publications/{key}` | Recover its original intent, effect and current head |
+| `POST /publications/{key}/activate` | Activate using the original expected head, or read its terminal effect |
+
+Reads require `iam.authorization-profile.read:{namespace}` and writes require
+`iam.authorization-profile.publish:{namespace}` at the exact Workspace, with a
+deciding direct grant to the owned service principal. Its live token must also
+belong to that Workspace. Broad or separate grants cannot compose this pair.
+Global PAP keys are refused by this interface. Missing/invalid credentials yield
+401; insufficient capabilities or foreign subjects yield 403; unknown fields or
+scope violations yield 422; original-body or native-head conflicts yield 409.
+Transport failures retain the same serialized request, key and expected head.
+Superseded and retired receipts never reactivate their historical revision.

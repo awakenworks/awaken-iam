@@ -22,3 +22,4 @@
 | [0018](0018-fenced-principal-team-access-replacement.md) | Fenced principal team access replacement | Proposed |
 | [0019](0019-durable-personal-consent-and-action-bound-credentials.md) | Durable personal consent and action-bound credentials | Proposed |
 | [0020](0020-trusted-migration-predecessors-preserve-resource-limits.md) | Trusted migration predecessors preserve exact resource limits | Proposed |
+| [0021](0021-scoped-profile-publication-and-original-intent-recovery.md) | Scoped profile publication and original-intent recovery | Proposed |

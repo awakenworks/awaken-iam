@@ -48,6 +48,8 @@ mod grants;
 mod oauth_clients;
 mod policy_cache;
 mod principal_access;
+mod scoped_profiles;
+pub use scoped_profiles::scoped_profile_router;
 mod resource_provisioning;
 use grants::issue_grants;
 use oauth_clients::{

@@ -49,7 +49,7 @@ pub use admin_api::{
 };
 pub use admin_http::{
     AdminAuthPolicy, DEFAULT_PROFILE_BODY_LIMIT, DaemonState, SharedDaemonState, daemon_router,
-    principal_access_router, projection_router,
+    principal_access_router, projection_router, scoped_profile_router,
 };
 pub use anthropic_admin::{
     ADMIN_API_KEY_PREFIX, AdminApiError, AdminCredential, AnthropicAdminApi, ApiKey, ApiResult,
