@@ -39,7 +39,7 @@ where
 /// Admit the caller for one action at one scope, returning the audit actor.
 /// The refusal is the finished HTTP response, like the other admin guards.
 #[allow(clippy::result_large_err)]
-fn admit<S>(
+pub(super) fn admit<S>(
     guard: &mut DaemonState<S>,
     headers: &HeaderMap,
     action: &str,

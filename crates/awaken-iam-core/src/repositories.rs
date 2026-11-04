@@ -445,6 +445,37 @@ pub trait ResourceModelRepository: Send + Sync {
 /// Persistence for immutable authorization-profile revisions and the atomic
 /// active-head pointer of each consumer namespace.
 pub trait AuthorizationProfileRepository: Send + Sync {
+    /// Immutable Workspace owner recorded by the first scoped publication.
+    fn profile_publication_workspace(
+        &self,
+        _namespace: &NamespaceId,
+    ) -> RepositoryResult<Option<WorkspaceId>> {
+        Err(RepositoryError::Backend(
+            "scoped profile ownership is unavailable".into(),
+        ))
+    }
+    /// Atomically preserve an original scoped intent with one validated draft.
+    /// Implementations without durable support must fail closed.
+    fn prepare_profile_publication(
+        &self,
+        _request: awaken_iam_contract::PrepareScopedAuthorizationProfile,
+        _publisher: PrincipalRef,
+        _request_digest: String,
+        _checksum: String,
+    ) -> RepositoryResult<awaken_iam_contract::ScopedAuthorizationProfileIntent> {
+        Err(RepositoryError::Backend(
+            "scoped profile publication is unavailable".into(),
+        ))
+    }
+    fn profile_publication(
+        &self,
+        _namespace: &NamespaceId,
+        _request_key: &str,
+    ) -> RepositoryResult<Option<awaken_iam_contract::ScopedAuthorizationProfileIntent>> {
+        Err(RepositoryError::Backend(
+            "scoped profile publication is unavailable".into(),
+        ))
+    }
     /// Store a new draft revision. Namespace/revision is unique and immutable.
     fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()>;
     /// Resolve one revision, projecting the active-head state when applicable.

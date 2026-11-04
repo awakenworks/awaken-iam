@@ -50,7 +50,7 @@ use awaken_iam_server::{
     RecordingExecutor, ReqwestWechatMiniProgramExchange, SessionCookieConfig, SharedAuthApi,
     SqlConn, SqlStore, SqliteBackend, WechatMiniProgramRegistration, daemon_router, http,
     jwks_router, op_router, postgres_migrated_store, principal_access_router, projection_router,
-    sqlite_migrated_store, wechat_mini_program_router,
+    scoped_profile_router, sqlite_migrated_store, wechat_mini_program_router,
 };
 use serde::Deserialize;
 
@@ -176,6 +176,7 @@ async fn serve<B: SqlConn + Clone + 'static>(
             issuer.clone(),
         ))
         .merge(principal_access_router(state.clone()))
+        .merge(scoped_profile_router(state.clone()))
         .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))
         .merge(op_router(

@@ -3,7 +3,7 @@
 pub use awaken_iam_client::{
     AuthzTransport, DrainReport, IamClient, IamClientMode, IamDecisionError, InMemoryOutbox,
     OutboxError, OutboxRecord, OutboxRelay, OutboxStatus, OutboxStore, ProvisionTransport,
-    RemoteError, RemoteIamClient,
+    RemoteError, RemoteIamClient, ScopedProfilePublisher,
 };
 #[cfg(feature = "http")]
 pub use awaken_iam_client::{

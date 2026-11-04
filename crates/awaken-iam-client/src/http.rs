@@ -44,6 +44,8 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 
 use crate::{AuthzTransport, DirectoryClient, ProvisionTransport, RemoteError};
 
+mod scoped_publication;
+
 /// Default per-request timeout when the caller does not specify one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 

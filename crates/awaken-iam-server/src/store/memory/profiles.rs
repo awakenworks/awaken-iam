@@ -3,6 +3,101 @@
 use super::*;
 
 impl AuthorizationProfileRepository for InMemoryStore {
+    fn profile_publication_workspace(
+        &self,
+        namespace: &NamespaceId,
+    ) -> RepositoryResult<Option<WorkspaceId>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .profile_publications
+            .values()
+            .find(|intent| intent.namespace == *namespace)
+            .map(|intent| intent.workspace_id.clone()))
+    }
+    fn prepare_profile_publication(
+        &self,
+        request: awaken_iam_contract::PrepareScopedAuthorizationProfile,
+        publisher: PrincipalRef,
+        request_digest: String,
+        checksum: String,
+    ) -> RepositoryResult<awaken_iam_contract::ScopedAuthorizationProfileIntent> {
+        use awaken_iam_contract::ScopedAuthorizationProfileIntent;
+        let mut authz = self.authz.lock().unwrap();
+        let namespace = request.profile.namespace.clone();
+        let key = (namespace.0.clone(), request.request_key.clone());
+        if let Some(original) = authz.profile_publications.get(&key) {
+            if original.request_digest != request_digest
+                || original.publisher != publisher
+                || original.workspace_id != request.workspace_id
+            {
+                return Err(RepositoryError::Conflict(
+                    "original profile publication has different content".into(),
+                ));
+            }
+            return Ok(original.clone());
+        }
+        if authz.profile_publications.values().any(|intent| {
+            intent.namespace == namespace && intent.workspace_id != request.workspace_id
+        }) {
+            return Err(RepositoryError::Conflict(
+                "profile namespace belongs to another Workspace".into(),
+            ));
+        }
+        if authz.active_profiles.get(&namespace.0).copied() != request.expected_active_revision {
+            return Err(RepositoryError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        let revision = authz
+            .profiles
+            .keys()
+            .filter(|(owner, _)| owner == &namespace.0)
+            .map(|(_, revision)| *revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::Backend("profile revision exhausted".into()))?;
+        let intent = ScopedAuthorizationProfileIntent {
+            namespace: namespace.clone(),
+            workspace_id: request.workspace_id,
+            request_key: request.request_key,
+            request_digest,
+            publisher,
+            revision,
+            checksum: checksum.clone(),
+            expected_active_revision: request.expected_active_revision,
+            created_at: request.profile.created_at.clone(),
+        };
+        authz.profiles.insert(
+            (namespace.0.clone(), revision),
+            AuthorizationProfile {
+                namespace,
+                revision,
+                lifecycle: ProfileLifecycle::Validated,
+                document: request.profile.document,
+                checksum,
+                created_at: request.profile.created_at,
+            },
+        );
+        authz.profile_publications.insert(key, intent.clone());
+        Ok(intent)
+    }
+
+    fn profile_publication(
+        &self,
+        namespace: &NamespaceId,
+        request_key: &str,
+    ) -> RepositoryResult<Option<awaken_iam_contract::ScopedAuthorizationProfileIntent>> {
+        Ok(self
+            .authz
+            .lock()
+            .unwrap()
+            .profile_publications
+            .get(&(namespace.0.clone(), request_key.into()))
+            .cloned())
+    }
     fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()> {
         let key = (profile.namespace.0.clone(), profile.revision);
         let mut authz = self.authz.lock().unwrap();

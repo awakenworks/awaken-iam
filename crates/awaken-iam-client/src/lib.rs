@@ -7,6 +7,8 @@ mod desktop_oauth;
 #[cfg(feature = "http")]
 mod http;
 mod remote;
+mod scoped_publication;
+pub use scoped_publication::ScopedProfilePublisher;
 mod snapshot;
 
 #[cfg(feature = "credential-cache")]
