@@ -215,15 +215,12 @@ impl AuthorizationProfileAdmin {
             .get_profile(namespace, receipt.intent.revision)?
             .ok_or(ProfileAdminError::NotFound)?;
         validate_scoped_document(namespace, &receipt.intent.workspace_id, &profile.document)?;
-        self.activate(
-            authz,
-            base,
+        let (previous, version) = self.repository.activate_scoped_profile(
             namespace,
             receipt.intent.revision,
-            ActivateAuthorizationProfile {
-                expected_active_revision: receipt.intent.expected_active_revision,
-            },
+            receipt.intent.expected_active_revision,
         )?;
+        self.install_activation(authz, base, profile, previous, version);
         self.scoped_publication_receipt(namespace, key)
     }
 }

@@ -502,6 +502,18 @@ pub trait AuthorizationProfileRepository: Send + Sync {
         revision: u64,
         expected_active_revision: Option<u64>,
     ) -> RepositoryResult<(Option<u64>, u64)>;
+    /// Scoped activation also fences initial absence against retired history,
+    /// atomically with the native head CAS. Legacy adapters fail closed.
+    fn activate_scoped_profile(
+        &self,
+        _namespace: &NamespaceId,
+        _revision: u64,
+        _expected_active_revision: Option<u64>,
+    ) -> RepositoryResult<(Option<u64>, u64)> {
+        Err(RepositoryError::Backend(
+            "scoped activation is unavailable".into(),
+        ))
+    }
     /// Compare-and-set removal of one active head while retaining the revision,
     /// and advance the shared policy fence in the same transaction.
     fn retire_active_profile(

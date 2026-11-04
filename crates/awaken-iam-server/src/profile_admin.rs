@@ -141,6 +141,17 @@ impl AuthorizationProfileAdmin {
             revision,
             request.expected_active_revision,
         )?;
+        Ok(self.install_activation(authz, base, profile, previous, policy_version))
+    }
+
+    fn install_activation(
+        &self,
+        authz: &mut AuthzApi,
+        base: &PolicySnapshot,
+        profile: AuthorizationProfile,
+        previous: Option<u64>,
+        policy_version: u64,
+    ) -> AuthorizationProfileActivated {
         let mut profiles = authz.snapshot().active_profiles;
         profiles.retain(|active| active.namespace != profile.namespace);
         profiles.push(profile.clone());
@@ -148,13 +159,13 @@ impl AuthorizationProfileAdmin {
             PolicySet::from_snapshot_and_profiles(base, &profiles),
             policy_version,
         );
-        Ok(AuthorizationProfileActivated {
-            namespace: namespace.clone(),
-            active_revision: revision,
+        AuthorizationProfileActivated {
+            namespace: profile.namespace,
+            active_revision: profile.revision,
             previous_active_revision: previous,
             policy_version,
             checksum: profile.checksum,
-        })
+        }
     }
 
     pub fn rollback(

@@ -50,6 +50,19 @@ impl AuthorizationProfileRepository for InMemoryStore {
                 "active profile revision changed".into(),
             ));
         }
+        if request.expected_active_revision.is_none()
+            && authz.profiles.values().any(|profile| {
+                profile.namespace == namespace
+                    && matches!(
+                        profile.lifecycle,
+                        ProfileLifecycle::Active | ProfileLifecycle::Retired
+                    )
+            })
+        {
+            return Err(RepositoryError::Conflict(
+                "retired namespace requires explicit administrative recovery".into(),
+            ));
+        }
         let revision = authz
             .profiles
             .keys()
@@ -169,32 +182,15 @@ impl AuthorizationProfileRepository for InMemoryStore {
         revision: u64,
         expected_active_revision: Option<u64>,
     ) -> RepositoryResult<(Option<u64>, u64)> {
-        let mut authz = self.authz.lock().unwrap();
-        let target = authz
-            .profiles
-            .get(&(namespace.0.clone(), revision))
-            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
-        if target.lifecycle == ProfileLifecycle::Draft {
-            return Err(RepositoryError::Conflict(
-                "profile revision is not validated".into(),
-            ));
-        }
-        let previous = authz.active_profiles.get(&namespace.0).copied();
-        if previous != expected_active_revision {
-            return Err(RepositoryError::Conflict(
-                "active profile revision changed".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous != revision
-            && let Some(profile) = authz.profiles.get_mut(&(namespace.0.clone(), previous))
-        {
-            profile.lifecycle = ProfileLifecycle::Retired;
-        }
-        authz.active_profiles.insert(namespace.0.clone(), revision);
-        let mut fence = self.fence.lock().unwrap();
-        fence.version += 1;
-        Ok((previous, fence.version))
+        self.activate_profile_head(namespace, revision, expected_active_revision, false)
+    }
+    fn activate_scoped_profile(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+    ) -> RepositoryResult<(Option<u64>, u64)> {
+        self.activate_profile_head(namespace, revision, expected_active_revision, true)
     }
 
     fn retire_active_profile(
@@ -267,5 +263,56 @@ impl AuthorizationProfileRepository for InMemoryStore {
                 Ok(profile)
             })
             .collect()
+    }
+}
+
+impl InMemoryStore {
+    fn activate_profile_head(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+        reject_retired_initial: bool,
+    ) -> RepositoryResult<(Option<u64>, u64)> {
+        let mut authz = self.authz.lock().unwrap();
+        let target = authz
+            .profiles
+            .get(&(namespace.0.clone(), revision))
+            .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
+        if target.lifecycle == ProfileLifecycle::Draft {
+            return Err(RepositoryError::Conflict(
+                "profile revision is not validated".into(),
+            ));
+        }
+        let previous = authz.active_profiles.get(&namespace.0).copied();
+        if previous != expected_active_revision {
+            return Err(RepositoryError::Conflict(
+                "active profile revision changed".into(),
+            ));
+        }
+        if reject_retired_initial
+            && previous.is_none()
+            && authz.profiles.values().any(|profile| {
+                profile.namespace == *namespace
+                    && matches!(
+                        profile.lifecycle,
+                        ProfileLifecycle::Active | ProfileLifecycle::Retired
+                    )
+            })
+        {
+            return Err(RepositoryError::Conflict(
+                "retired namespace is not initial absence".into(),
+            ));
+        }
+        if let Some(previous) = previous
+            && previous != revision
+            && let Some(profile) = authz.profiles.get_mut(&(namespace.0.clone(), previous))
+        {
+            profile.lifecycle = ProfileLifecycle::Retired;
+        }
+        authz.active_profiles.insert(namespace.0.clone(), revision);
+        let mut fence = self.fence.lock().unwrap();
+        fence.version += 1;
+        Ok((previous, fence.version))
     }
 }
