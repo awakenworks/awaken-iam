@@ -50,6 +50,13 @@ history instead of being activated again. Current head and the original effect
 are distinct receipt fields. Reads and retries still require current scoped
 authority; an old key never bypasses access control.
 
+Initial activation also checks never-published history inside the same native
+head transaction. Retirement makes the active head empty but cannot make an
+unactivated old draft eligible for initial activation again. A fresh scoped
+request against retired history is refused; explicit operator recovery remains
+with the separate generic PAP authority. This prevents an empty-head ABA without
+making unrelated namespaces share one publication revision.
+
 Cloud owns the confirmed publication plan, per-owner checkpoints and readiness
 coordination. It retains the original serialized request, key and expected head
 after a lost response. It does not claim an atomic transaction across profiles,

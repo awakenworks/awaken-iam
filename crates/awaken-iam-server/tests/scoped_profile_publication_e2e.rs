@@ -185,6 +185,21 @@ fn history(repository: Arc<dyn AuthorizationProfileRepository>) {
         baseline.has_published_revision,
         "retirement is not initial absence"
     );
+    assert!(
+        admin
+            .activate_scoped_publication(&mut authz, &base, &first.profile.namespace, "competitor")
+            .is_err(),
+        "an unactivated original draft cannot survive active-to-retired head ABA"
+    );
+    assert!(
+        admin
+            .prepare_scoped_publication(
+                request("tenant.a", "workspace-a", "after-retirement", None),
+                publisher()
+            )
+            .is_err(),
+        "retired head is not initial publication"
+    );
     assert_eq!(
         repository
             .list_profiles(&first.profile.namespace)
