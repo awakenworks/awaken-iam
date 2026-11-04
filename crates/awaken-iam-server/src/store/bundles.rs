@@ -169,6 +169,11 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "per-principal fences for atomic team access replacement",
                     AUTHZ_0011,
                 ),
+                (
+                    12,
+                    "immutable personal delegation consent and monotonic revocation",
+                    AUTHZ_0012,
+                ),
             ],
         ),
         bundle(
@@ -237,6 +242,14 @@ fn bundle(scope: BundleScope, steps: Vec<(i64, &'static str, &'static str)>) -> 
 }
 
 // --- iam.identity DDL ------------------------------------------------------
+const AUTHZ_0012: &str = "\
+CREATE TABLE {prefix}_personal_delegations (\
+ id TEXT PRIMARY KEY, \
+ owner TEXT NOT NULL, \
+ request_key TEXT NOT NULL, \
+ descriptor {json} NOT NULL, \
+ revoked_at TEXT, \
+ UNIQUE (owner, request_key));";
 //
 // Accounts, external identities, sessions, and in-flight login flows. The
 // external-identity natural key is (provider_key, subject); email is a mutable
@@ -787,15 +800,16 @@ mod tests {
             // either old receipt, and an exact retry below must apply no migration.
             let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             let privacy = backend.run_migrations("iam", &super::bundles()).unwrap();
-            // migration-allow-edit: only this test count changes because authz
-            // 11 is appended after privacy; no shipped SQL body is edited.
+            // migration-allow-edit: this test includes append-only authz 12;
+            // shipped SQL bodies and historical receipt comparisons are unchanged.
             assert_eq!(
                 privacy.len(),
-                2,
-                "only the appended privacy and principal-access steps apply"
+                3,
+                "only appended privacy, principal-access and personal-consent steps apply"
             );
             let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             assert!(current_receipts.contains_key(&10));
+            assert!(current_receipts.contains_key(&12));
             for version in [8, 9] {
                 assert_eq!(
                     current_receipts[&version], converged_receipts[&version],

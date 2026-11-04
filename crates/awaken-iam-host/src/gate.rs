@@ -171,6 +171,37 @@ pub(crate) enum GateInner {
 }
 
 impl IamGate {
+    /// Opt-in verification for an owner that additionally fences its exact
+    /// route and invokes live consent authorization. Generic bearer verification
+    /// deliberately continues rejecting this family, including in Local mode.
+    pub fn authenticate_personal_delegation(
+        &self,
+        token: &str,
+        now: i64,
+    ) -> Result<awaken_iam_contract::PersonalDelegationTokenClaims, AuthReject> {
+        let GateInner::Remote {
+            jwks: Some(jwks), ..
+        } = self.inner.as_ref()
+        else {
+            return Err(AuthReject::Invalid);
+        };
+        let issuer = self.issuer.as_deref().ok_or(AuthReject::Invalid)?;
+        let audience = self.audience.as_deref().ok_or(AuthReject::Invalid)?;
+        awaken_iam_server::verify_personal_delegation_token(token, jwks, issuer, audience, now)
+            .map_err(|_| AuthReject::Invalid)
+    }
+    /// No local/cache fallback can attest a live durable personal consent.
+    pub fn authorize_personal_delegation(
+        &self,
+        request: awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<AuthorizationOutcome, IamDecisionError> {
+        let GateInner::Remote { client, .. } = self.inner.as_ref() else {
+            return Err(IamDecisionError::Unavailable);
+        };
+        client
+            .authorize_personal_delegation(&request)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
     /// Open mode: no authentication, all requests allowed.
     pub fn open() -> Self {
         Self {

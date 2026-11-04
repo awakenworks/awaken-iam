@@ -1,5 +1,6 @@
 # Rust
 /target/
+/outputs/
 **/target/
 rust_out
 *.rs.bk

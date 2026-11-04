@@ -1526,15 +1526,16 @@ fn postgres_published_and_consumed_v8_upgrade_preserves_rows_and_receipts_when_c
         // either old receipt, and an exact retry below must apply no migration.
         let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
         let privacy = backend.run_migrations("iam", &bundles()).unwrap();
-        // migration-allow-edit: only this test count changes because authz
-        // 11 is appended after privacy; no shipped SQL body is edited.
+        // migration-allow-edit: include append-only personal consent authz 12;
+        // retain every shipped SQL body and old receipt assertion.
         assert_eq!(
             privacy.len(),
-            2,
-            "only the appended privacy and principal-access steps apply"
+            3,
+            "only appended privacy, principal-access and personal-consent steps apply"
         );
         let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
         assert!(current_receipts.contains_key(&10));
+        assert!(current_receipts.contains_key(&12));
         for version in [8, 9] {
             assert_eq!(
                 current_receipts[&version], converged_receipts[&version],

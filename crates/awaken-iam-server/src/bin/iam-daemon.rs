@@ -169,6 +169,12 @@ async fn serve<B: SqlConn + Clone + 'static>(
         .with_profile_body_limit(profile_body_limit),
     ));
     let router = daemon_router(state.clone())
+        .merge(awaken_iam_server::personal_delegation_router(
+            auth.clone(),
+            state.clone(),
+            profile_store,
+            issuer.clone(),
+        ))
         .merge(principal_access_router(state.clone()))
         .merge(projection_router(state))
         .merge(jwks_router(auth.clone()))

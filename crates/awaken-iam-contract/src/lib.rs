@@ -8,8 +8,14 @@
 mod admin;
 mod identity;
 mod license;
+mod personal_delegation;
 mod protocol;
 mod resource_authorization;
+pub use personal_delegation::{
+    AuthorizePersonalDelegation, CreatePersonalDelegation, MintPersonalDelegationToken,
+    PersonalDelegation, PersonalDelegationPurpose, PersonalDelegationTarget,
+    PersonalDelegationTokenClaims,
+};
 mod trust;
 
 pub use resource_authorization::{

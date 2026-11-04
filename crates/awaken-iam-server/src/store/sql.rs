@@ -44,6 +44,7 @@ mod directory;
 mod grants;
 mod identity_rows;
 mod invitations;
+mod personal_delegation;
 mod principal_access;
 mod privacy;
 mod profiles;

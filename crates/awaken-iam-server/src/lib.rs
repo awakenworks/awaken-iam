@@ -19,7 +19,15 @@ mod local_setup;
 mod oauth_client_admin;
 mod op_http;
 mod op_id_token;
+mod personal_delegation;
+mod personal_delegation_http;
 mod profile_admin;
+pub use personal_delegation::{
+    PERSONAL_DELEGATION_CLIENT_SCOPE, PERSONAL_DELEGATION_CONSENT_AUDIENCE,
+    PERSONAL_DELEGATION_CONSENT_SCOPE, PERSONAL_DELEGATION_TOKEN_TYP,
+    verify_personal_delegation_token,
+};
+pub use personal_delegation_http::personal_delegation_router;
 mod session;
 mod store;
 mod token_exchange;

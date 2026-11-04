@@ -256,6 +256,17 @@ impl HttpAuthzTransport {
 }
 
 impl AuthzTransport for HttpAuthzTransport {
+    fn authorize_personal_delegation(
+        &self,
+        request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authorize/personal-delegation"))
+                .json(request)
+        })?;
+        Self::decode(response)
+    }
     fn profile_publication_state(
         &self,
         namespace: &NamespaceId,

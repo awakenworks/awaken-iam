@@ -240,6 +240,14 @@ impl<S> DaemonState<S> {
 }
 
 impl<S: PolicyStore> DaemonState<S> {
+    /// Compound native protocols reuse the exact current PDP and HA fence.
+    pub(crate) fn authorize_current_resource(
+        &mut self,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationOutcome, AdminError> {
+        self.ensure_fresh()?;
+        Ok(self.authz.authorize_resource(request))
+    }
     /// Refresh the live PDP from the same repositories the PAP just committed.
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;

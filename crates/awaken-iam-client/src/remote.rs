@@ -84,6 +84,15 @@ impl RemoteError {
 /// shaping, decision mapping, fail-closed policy) be unit tested without network
 /// access. Implementations should be `Send + Sync` so the client can be shared.
 pub trait AuthzTransport {
+    /// Explicit durable-consent protocol. Legacy transports fail closed.
+    fn authorize_personal_delegation(
+        &self,
+        _request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        Err(RemoteError::new(
+            "personal delegation is unsupported".into(),
+        ))
+    }
     /// Read publication evidence; unsupported transports cannot attest absence.
     fn profile_publication_state(
         &self,
@@ -438,6 +447,12 @@ impl<T> RemoteIamClient<T> {
 }
 
 impl<T: AuthzTransport> RemoteIamClient<T> {
+    pub fn authorize_personal_delegation(
+        &self,
+        request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<AuthorizationOutcome, RemoteError> {
+        self.transport.authorize_personal_delegation(request)
+    }
     /// Resolve one authorization request into its reasoned outcome, surfacing
     /// transport errors.
     pub fn authorize_outcome(

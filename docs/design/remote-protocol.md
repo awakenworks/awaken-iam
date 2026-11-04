@@ -292,6 +292,29 @@ configured credential source
 | present | configured | any | configuration error; send no request |
 | absent | absent | n/a | anonymous transport, only where explicitly permitted |
 
+## Durable personal consent
+
+The daemon explicitly composes `personal_delegation_router` over its shared
+SQL store, OP signer and current PDP. Contract types live in
+`awaken-iam-contract::personal_delegation` (re-exported from the crate root).
+See [ADR-0019](../adr/0019-durable-personal-consent-and-action-bound-credentials.md)
+for the credential-family fence, live checks and original-outcome rule.
+
+| Route | Authority |
+|---|---|
+| POST `/v1/personal-delegations` | Direct owner consent token, exact original intent |
+| GET `/v1/personal-delegations/{id}` | Same direct owner |
+| POST `/v1/personal-delegations/{id}/revoke` | Same direct owner; first stamp retained |
+| POST `/v1/personal-delegations/token` | Registered confidential recipient; exact finite binding |
+| POST `/v1/personal-delegations/inspect` | Same admitted confidential recipient; public descriptor and current revocation |
+| POST `/v1/authorize/personal-delegation` | Signed execution binding plus current native owner facts |
+
+The native remote SDK transports the compound decision through the same
+authenticated HTTP client and timeout as other PDP requests. Generic legacy
+bearer verification remains unchanged; hosts must explicitly opt into this
+family and fence a supported owner route. Local hosts without a live durable
+consent owner fail closed.
+
 ## Out of scope
 
 - Login/OAuth endpoints — already served; see

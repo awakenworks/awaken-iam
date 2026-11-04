@@ -89,6 +89,7 @@ use serde::{Deserialize, Serialize};
 
 mod builder;
 mod delegation;
+mod personal;
 
 pub use delegation::{
     AUDIENCE_EXCHANGE_MAX_LIFETIME_SECS, AccessTokenExchange, AccessTokenExchangeError,
