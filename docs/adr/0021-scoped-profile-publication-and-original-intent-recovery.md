@@ -57,6 +57,12 @@ request against retired history is refused; explicit operator recovery remains
 with the separate generic PAP authority. This prevents an empty-head ABA without
 making unrelated namespaces share one publication revision.
 
+Preparation and activation also reuse the native erased-Org admission fence at
+the intent's explicit Workspace, including an empty profile. SQL activation
+reads admission after its policy-version marker and commits through that same
+fence; a concurrent privacy commit invalidates the activation CAS. Original
+intent recovery remains a read and cannot recreate the erased scope.
+
 Cloud owns the confirmed publication plan, per-owner checkpoints and readiness
 coordination. It retains the original serialized request, key and expected head
 after a lost response. It does not claim an atomic transaction across profiles,

@@ -48,6 +48,7 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                 }
                 result=Some(original);return Ok(());
             }
+            self.ensure_scope_admission(tx, &[ScopeRef::Workspace {workspace_id: request.workspace_id.clone()}], &[])?;
             let owner = tx.query(&format!("SELECT workspace_id FROM {publications} WHERE namespace=? LIMIT 1"), &[p(namespace.clone())])?;
             if owner.first().is_some_and(|row| row.first().and_then(Option::as_deref) != Some(request.workspace_id.0.as_str())) {
                 return Err(RepositoryError::Conflict("profile namespace belongs to another Workspace".into()));
@@ -323,6 +324,24 @@ impl<B: SqlConn> SqlStore<B> {
             ));
         }
         let previous_version = FenceStore::fence(self)?.version;
+        if reject_retired_initial {
+            let workspace = self
+                .profile_publication_workspace(namespace)?
+                .ok_or_else(|| {
+                    RepositoryError::NotFound("scoped publication intent is unavailable".into())
+                })?;
+            // Read after the version marker. Any concurrent privacy admission
+            // advances that same fence, so the final native CAS rolls back.
+            self.backend.with_transaction(&mut |tx| {
+                self.ensure_scope_admission(
+                    tx,
+                    &[ScopeRef::Workspace {
+                        workspace_id: workspace.clone(),
+                    }],
+                    &[],
+                )
+            })?;
+        }
         let policy_version = previous_version
             .checked_add(1)
             .ok_or_else(|| RepositoryError::Backend("IAM policy version exhausted".into()))?;
