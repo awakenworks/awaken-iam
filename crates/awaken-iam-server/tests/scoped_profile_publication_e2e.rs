@@ -8,6 +8,73 @@ use awaken_iam_server::{
 };
 use std::sync::{Arc, Barrier};
 
+fn erased_organization_admission<S>(store: S)
+where
+    S: AuthorizationProfileRepository
+        + awaken_iam_core::OrgRepository
+        + awaken_iam_core::ResourceModelRepository
+        + awaken_iam_core::OrgPrivacyRepository
+        + Clone
+        + 'static,
+{
+    use awaken_iam_core::{
+        OrgPrivacyRepository, OrgRepository, Organization, ResourceModelRepository,
+    };
+    let org = OrgId("erased".into());
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: org.clone(),
+            display_name: None,
+            owner: publisher(),
+            created_at: Timestamp("2026-11-05T00:00:00Z".into()),
+            updated_at: Timestamp("2026-11-05T00:00:00Z".into()),
+        },
+    )
+    .unwrap();
+    ResourceModelRepository::put_workspace_org(
+        &store,
+        WorkspaceOrgEdge {
+            workspace_id: WorkspaceId("workspace-a".into()),
+            org_id: org.clone(),
+        },
+    )
+    .unwrap();
+    let admin = AuthorizationProfileAdmin::new(Arc::new(store.clone()));
+    let mut empty = request("tenant.empty", "workspace-a", "before-erasure", None);
+    empty.profile.document = AuthorizationProfileDocument::default();
+    admin
+        .prepare_scoped_publication(empty, publisher())
+        .unwrap();
+    assert!(OrgPrivacyRepository::erase_org_privacy(&store, &org).unwrap());
+    assert!(
+        admin
+            .activate_scoped_publication(
+                &mut AuthzApi::new(),
+                &PolicySnapshot::default(),
+                &NamespaceId("tenant.empty".into()),
+                "before-erasure"
+            )
+            .is_err(),
+        "an empty prepared profile still belongs to its explicit erased Workspace"
+    );
+    assert!(
+        admin
+            .prepare_scoped_publication(
+                request("tenant.new", "workspace-a", "late-write", None),
+                publisher()
+            )
+            .is_err(),
+        "a late publisher cannot insert a scoped draft after native Org erasure"
+    );
+}
+
+#[test]
+fn scoped_publication_reuses_native_erased_organization_admission() {
+    erased_organization_admission(InMemoryStore::new());
+    erased_organization_admission(sqlite_in_memory_store("iam_scoped_erased").unwrap());
+}
+
 fn publisher() -> PrincipalRef {
     PrincipalRef::Service {
         service_id: "tenant-publisher".into(),

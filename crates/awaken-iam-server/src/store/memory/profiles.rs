@@ -45,6 +45,13 @@ impl AuthorizationProfileRepository for InMemoryStore {
                 "profile namespace belongs to another Workspace".into(),
             ));
         }
+        ensure_admitted(
+            &authz,
+            &[ScopeRef::Workspace {
+                workspace_id: request.workspace_id.clone(),
+            }],
+            &[],
+        )?;
         if authz.active_profiles.get(&namespace.0).copied() != request.expected_active_revision {
             return Err(RepositoryError::Conflict(
                 "active profile revision changed".into(),
@@ -283,6 +290,23 @@ impl InMemoryStore {
             return Err(RepositoryError::Conflict(
                 "profile revision is not validated".into(),
             ));
+        }
+        if reject_retired_initial {
+            let workspace = authz
+                .profile_publications
+                .values()
+                .find(|intent| intent.namespace == *namespace && intent.revision == revision)
+                .map(|intent| intent.workspace_id.clone())
+                .ok_or_else(|| {
+                    RepositoryError::NotFound("scoped publication intent is unavailable".into())
+                })?;
+            ensure_admitted(
+                &authz,
+                &[ScopeRef::Workspace {
+                    workspace_id: workspace,
+                }],
+                &[],
+            )?;
         }
         let previous = authz.active_profiles.get(&namespace.0).copied();
         if previous != expected_active_revision {
