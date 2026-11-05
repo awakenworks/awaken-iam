@@ -176,3 +176,12 @@ unavailable, with no fallback to a previously projected identity.
 UserInfo remains a profile projection. Consumers must retain the separately
 verified actor and consent when authorizing delegated operations; the projected
 subject does not turn a delegated call into a direct human call.
+
+The remote host exposes current direct-Account authentication over its original
+gate and client. The configured issuer and audience, signature, time bounds,
+Account kind and absence of an actor must all hold before the original bearer is
+presented to UserInfo. The resulting subject must match the verified Account.
+No profile fields, reusable Allow, delegated actor projection, API-token
+fallback, or new identity store enters this admission. Each request reobserves
+the current native Account and revocation authority; product scope, ownership
+and action authorization remain independent checks.
