@@ -1420,3 +1420,211 @@ async fn downstream_authorization_code_is_single_use() {
         AuthApiError::OAuthProvider(awaken_iam_core::OAuthProviderError::InvalidGrant)
     );
 }
+
+#[tokio::test]
+async fn userinfo_current_account_rechecks_disabled_and_missing_subjects() {
+    let mut api = api();
+    let (result, cookie) = logged_in_session(&mut api);
+    let id = result.session.account_id;
+    let token = api
+        .mint_access_token(MintAccessToken {
+            subject: id.0.clone(),
+            ..mint_request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(api.userinfo_for_access_token(&token).unwrap().sub, id.0);
+    assert!(
+        api.userinfo(&cookie, Timestamp("2026-06-19T02:00:00Z".into()))
+            .is_ok()
+    );
+    let mut account = api.account(&id).unwrap().unwrap();
+    account.status = AccountStatus::Disabled;
+    api.upsert_account(account).unwrap();
+    api.verify_access_token(&token).unwrap();
+    assert!(
+        matches!(
+            api.userinfo_for_access_token(&token),
+            Err(AuthApiError::AccountDisabled)
+        ),
+        "a still-signed token cannot project a disabled account"
+    );
+    assert!(
+        matches!(
+            api.userinfo(&cookie, Timestamp("2026-06-19T02:00:00Z".into())),
+            Err(AuthApiError::AccountDisabled)
+        ),
+        "a live session cookie cannot bypass current account state"
+    );
+    let missing = api
+        .mint_access_token(MintAccessToken {
+            subject: "missing-account".into(),
+            ..mint_request()
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            api.userinfo_for_access_token(&missing),
+            Err(AuthApiError::AccountDisabled)
+        ),
+        "a valid signature cannot invent a current account"
+    );
+}
+
+#[tokio::test]
+async fn userinfo_current_account_rejects_a_service_with_the_same_subject_string() {
+    let mut api = api();
+    let (result, _) = logged_in_session(&mut api);
+    let request = mint_request();
+    let claims = AccessTokenClaims {
+        iss: request.issuer,
+        sub: result.session.account_id.0,
+        subject_kind: crate::AccessTokenSubjectKind::Service,
+        aud: request.audience,
+        iat: request.issued_at,
+        exp: request.expires_at,
+        jti: "userinfo-service-collision".into(),
+        scope: request.scopes,
+    };
+    let token = api.tokens.mint(&claims).await.unwrap();
+    assert_eq!(
+        api.verify_access_token(&token).unwrap().subject_kind,
+        crate::AccessTokenSubjectKind::Service
+    );
+    assert!(
+        matches!(
+            api.userinfo_for_access_token(&token),
+            Err(AuthApiError::Unauthenticated)
+        ),
+        "Service and Account identities do not collapse when their local strings collide"
+    );
+}
+
+struct FailingUserInfoAccountRead(Arc<dyn AccountRepository>);
+impl AccountRepository for FailingUserInfoAccountRead {
+    fn get(&self, _id: &AccountId) -> awaken_iam_core::RepositoryResult<Option<Account>> {
+        Err(RepositoryError::Backend(
+            "injected current Account read failure".into(),
+        ))
+    }
+    fn upsert(&self, account: Account) -> awaken_iam_core::RepositoryResult<()> {
+        self.0.upsert(account)
+    }
+    fn list(&self) -> awaken_iam_core::RepositoryResult<Vec<Account>> {
+        self.0.list()
+    }
+}
+
+#[tokio::test]
+async fn userinfo_current_account_storage_failure_cannot_reuse_a_positive_projection() {
+    let mut api = api();
+    let (result, cookie) = logged_in_session(&mut api);
+    let token = api
+        .mint_access_token(MintAccessToken {
+            subject: result.session.account_id.0,
+            ..mint_request()
+        })
+        .await
+        .unwrap();
+    assert!(api.userinfo_for_access_token(&token).is_ok());
+    api.accounts = Arc::new(FailingUserInfoAccountRead(api.accounts.clone()));
+    assert!(matches!(
+        api.userinfo_for_access_token(&token),
+        Err(AuthApiError::Repository(RepositoryError::Backend(_)))
+    ));
+    assert!(matches!(
+        api.userinfo(&cookie, Timestamp("2026-06-19T02:00:00Z".into())),
+        Err(AuthApiError::Repository(RepositoryError::Backend(_)))
+    ));
+}
+
+#[tokio::test]
+async fn userinfo_current_account_http_distinguishes_invalid_identity_from_unavailable_storage() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+    let issuer = "https://iam.example";
+    let api = AuthApi::new().with_issuer(issuer);
+    let now = i64::try_from(crate::clock::unix_seconds()).unwrap();
+    let account = Account {
+        id: AccountId("userinfo-http-account".into()),
+        status: AccountStatus::Active,
+        display_name: None,
+        created_at: crate::clock::now_timestamp(),
+        updated_at: crate::clock::now_timestamp(),
+    };
+    api.upsert_account(account.clone()).unwrap();
+    let claims = AccessTokenClaims {
+        iss: issuer.into(),
+        sub: account.id.0.clone(),
+        subject_kind: crate::AccessTokenSubjectKind::Account,
+        aud: "userinfo-client".into(),
+        exp: now + 300,
+        iat: now,
+        jti: "userinfo-http-account-token".into(),
+        scope: vec!["openid".into()],
+    };
+    let token = api.tokens.mint(&claims).await.unwrap();
+    let service = api
+        .tokens
+        .mint(&AccessTokenClaims {
+            subject_kind: crate::AccessTokenSubjectKind::Service,
+            jti: "userinfo-http-service-token".into(),
+            ..claims.clone()
+        })
+        .await
+        .unwrap();
+    let missing = api
+        .tokens
+        .mint(&AccessTokenClaims {
+            sub: "userinfo-missing-account".into(),
+            jti: "userinfo-http-missing-token".into(),
+            ..claims
+        })
+        .await
+        .unwrap();
+    let auth = Arc::new(tokio::sync::Mutex::new(api));
+    let app = crate::op_http::op_router(
+        auth.clone(),
+        issuer,
+        crate::op_http::ProviderLoginRouteOwner::Iam,
+    );
+    let request = |token: &str| {
+        Request::builder()
+            .uri("/v1/oauth/userinfo")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request(&token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(body["sub"], account.id.0);
+    for rejected in [&service, &missing] {
+        let response = app.clone().oneshot(request(rejected)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "invalid_token");
+    }
+    let mut disabled = account.clone();
+    disabled.status = AccountStatus::Disabled;
+    auth.lock().await.upsert_account(disabled).unwrap();
+    assert_eq!(
+        app.clone().oneshot(request(&token)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "the same signed token observes the current Account update"
+    );
+    {
+        let mut api = auth.lock().await;
+        api.upsert_account(account).unwrap();
+        api.accounts = Arc::new(FailingUserInfoAccountRead(api.accounts.clone()));
+    }
+    let response = app.oneshot(request(&token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(body["error"], "temporarily_unavailable");
+}
