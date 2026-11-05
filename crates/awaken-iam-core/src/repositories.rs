@@ -351,6 +351,13 @@ pub trait RoleBindingRepository: Send + Sync {
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()>;
     /// List every binding held by a principal.
     fn list_for_principal(&self, principal: &PrincipalRef) -> RepositoryResult<Vec<RoleBinding>>;
+    /// Observe one exact native binding without enumerating other tenants.
+    /// Unsupported adapters fail closed instead of falling back to a full scan.
+    fn contains_exact(&self, _binding: &RoleBinding) -> RepositoryResult<bool> {
+        Err(RepositoryError::Backend(
+            "exact role binding observation is not supported by this adapter".into(),
+        ))
+    }
     /// List every binding.
     fn list(&self) -> RepositoryResult<Vec<RoleBinding>>;
     /// Remove an exact binding, failing closed when it is absent.

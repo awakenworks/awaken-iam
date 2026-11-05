@@ -126,6 +126,8 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
     let org = ScopeRef::Org {
         org_id: edge.org_id.clone(),
     };
+    let mut service_roles = super::scoped_service_roles::CurrentServiceRoles::default();
+    let mut unavailable_service_bindings = Vec::new();
     for principal in request.request.principal_chain() {
         match principal {
             PrincipalRef::Account { account_id } => {
@@ -141,6 +143,33 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
                     .iter()
                     .any(|binding| binding.scope == org);
                 if !active || !member {
+                    return Ok(denied(request));
+                }
+            }
+            PrincipalRef::Service { .. } => {
+                let direct = profile.document.grants.iter().any(|grant|
+                    matches!(&grant.subject, GrantSubjectRef::Principal { principal: named } if named == principal));
+                let mut held_role = false;
+                for binding in profile
+                    .document
+                    .role_bindings
+                    .iter()
+                    .filter(|binding| &binding.principal == principal)
+                {
+                    if service_roles
+                        .contains(state, principal, &binding.role_id, &binding.scope)
+                        .map_err(|_| Unavailable)?
+                    {
+                        held_role = true;
+                    } else {
+                        unavailable_service_bindings.push(awaken_iam_core::RoleBinding {
+                            principal: principal.clone(),
+                            role: awaken_iam_core::RoleId(binding.role_id.clone()),
+                            scope: binding.scope.clone(),
+                        });
+                    }
+                }
+                if !direct && !held_role {
                     return Ok(denied(request));
                 }
             }
@@ -175,14 +204,21 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
         {
             base.group_rosters.push(GroupRosterSnapshot {
                 group_id: id,
-                members: group.members,
+                members: group
+                    .members
+                    .into_iter()
+                    .filter(|member| matches!(member, PrincipalRef::Account { .. }))
+                    .collect(),
             });
         }
     }
     // Immutable document identity is retained. Base Allows and Workspace roles
     // cannot supply the profile's permission. Existing native Deny/approval
     // ceilings still constrain a scoped Allow.
-    let policy = PolicySet::from_snapshot_and_profiles(&base, &[profile]);
+    let mut policy = PolicySet::from_snapshot_and_profiles(&base, &[profile]);
+    for binding in unavailable_service_bindings {
+        policy.unbind_role(&binding);
+    }
     let mut evaluator = crate::AuthzApi::new();
     evaluator.replace_policy_at_version(policy, state.observed_store_version);
     let scoped = evaluator.authorize_resource(request);

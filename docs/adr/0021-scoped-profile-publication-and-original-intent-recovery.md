@@ -32,11 +32,18 @@ publication. Actual child ownership and signed Pack/source adoption remain the
 product owner's checks. The scoped publisher cannot reach the generic admin
 routes and receives no global administration credential.
 
-Account subjects must currently be active members of the Workspace's Org;
-non-account subjects must be the scoped publisher itself. A distinct runtime
-service needs a separately owned transport-grant protocol, not an arbitrary
-foreign service reference in a tenant profile. Unknown or noncanonical supplied
-fields fail before native draft creation, including nested constraint fields.
+Account subjects must currently be active members of the Workspace's Org.
+Direct non-account grants remain restricted to the scoped publisher itself.
+A runtime Service role reference (including its binding limits) must match an
+independently provisioned native role binding with the exact principal, role
+and scope. The existing tenant-access administration protocol owns that binding;
+scoped publication cannot create or restore it. Runtime decisions reobserve this
+same owner and remove unavailable Service role references from the request-local
+native evaluator. Company Group rosters contribute Account members only; they
+cannot supply an alternate Service role after its native reference is revoked.
+This keeps the publication and runtime principals distinct without a second
+grant store or policy interpreter. Unknown or noncanonical supplied fields fail
+before native draft creation, including nested constraint fields.
 The finite baseline read returns current policy and native publication history;
 an empty active head after retirement never means initial absence.
 
@@ -126,3 +133,19 @@ actor from that same record; the scoped publisher must not reauthenticate the
 secret or combine identity from one read with scope from another. Each new
 request still verifies the current durable token, owner and native policy. This
 introduces no authentication cache or change to revocation or request budgets.
+
+The runtime-role reference protocol (2026-11-06) uses request-local observations
+of the existing role repository, never a reusable Allow cache. Original profile
+documents and checksums remain immutable; an ephemeral evaluator unbinds only
+Service role tuples that their native owner no longer supplies. Missing role
+authority is unavailable, not a profile-derived permission. Existing publishers
+that assign themselves profile roles also need the independently provisioned
+native binding; direct publisher grants keep their existing behavior. Initial
+provisioning and migration must establish these exact references explicitly,
+and retries must never restore references removed after confirmation.
+
+Current Service references use an exact native repository lookup of principal,
+role and scope against the existing role-binding primary key. Neither publication
+nor a scoped decision enumerates a shared service's bindings in other tenants.
+Repeated references may share an observation within one request only. An adapter
+without this bounded primitive fails unavailable instead of using a full scan.

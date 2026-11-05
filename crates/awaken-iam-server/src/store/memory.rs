@@ -844,6 +844,16 @@ impl GrantRepository for InMemoryStore {
 }
 
 impl RoleBindingRepository for InMemoryStore {
+    fn contains_exact(&self, binding: &RoleBinding) -> RepositoryResult<bool> {
+        let key = json_key(
+            &(&binding.principal, &binding.role.0, &binding.scope),
+            "role binding",
+        )?;
+        Ok(checked_lock(&self.authz, "authz")?
+            .role_bindings
+            .contains_key(&key))
+    }
+
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
         let key = json_key(
             &(&binding.principal, &binding.role.0, &binding.scope),

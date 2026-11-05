@@ -15,6 +15,44 @@ fn database() -> Option<(String, String)> {
 }
 
 #[test]
+fn postgres_exact_runtime_reference_is_current_across_native_connections() {
+    use awaken_iam_contract::{ScopeRef, WorkspaceId};
+    use awaken_iam_core::{RoleBinding, RoleBindingRepository, RoleId};
+
+    let Some((url, prefix)) = database() else {
+        return;
+    };
+    let first = postgres_migrated_store(&url, &prefix).unwrap();
+    let second = postgres_migrated_store(&url, &prefix).unwrap();
+    let binding = RoleBinding {
+        principal: PrincipalRef::Service {
+            service_id: "shared-runtime-controller".into(),
+        },
+        role: RoleId("tenant.pg:controller".into()),
+        scope: ScopeRef::Workspace {
+            workspace_id: WorkspaceId("workspace-a".into()),
+        },
+    };
+    RoleBindingRepository::add(&first, binding.clone()).unwrap();
+    assert!(first.contains_exact(&binding).unwrap());
+    assert!(second.contains_exact(&binding).unwrap());
+    let mut foreign = binding.clone();
+    foreign.scope = ScopeRef::Workspace {
+        workspace_id: WorkspaceId("workspace-b".into()),
+    };
+    assert!(!second.contains_exact(&foreign).unwrap());
+    foreign = binding.clone();
+    foreign.role = RoleId("tenant.pg:other-role".into());
+    assert!(!second.contains_exact(&foreign).unwrap());
+    foreign = binding.clone();
+    foreign.principal = publisher();
+    assert!(!second.contains_exact(&foreign).unwrap());
+    RoleBindingRepository::remove(&second, &binding).unwrap();
+    assert!(!first.contains_exact(&binding).unwrap());
+    assert!(!second.contains_exact(&binding).unwrap());
+}
+
+#[test]
 fn postgres_original_intent_and_erasure_use_native_transactions() {
     let Some((url, prefix)) = database() else {
         return;
