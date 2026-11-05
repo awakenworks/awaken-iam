@@ -251,7 +251,8 @@ impl<S: PolicyStore> DaemonState<S> {
         request: &awaken_iam_contract::ResourceAuthorizationRequest,
     ) -> Result<awaken_iam_contract::AuthorizationOutcome, AdminError> {
         self.ensure_fresh()?;
-        Ok(self.authz.authorize_resource(request))
+        scoped_decisions::decide(self, request, None)
+            .map_err(|_| AdminError::Backend("current scoped policy is unavailable".into()))
     }
     /// Refresh the live PDP from the same repositories the PAP just committed.
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
