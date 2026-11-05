@@ -219,13 +219,34 @@ where
     for binding in &document.group_role_bindings {
         group(&binding.group_id)?;
     }
+    let mut service_roles = super::scoped_service_roles::CurrentServiceRoles::default();
+    let mut role_principal =
+        |value: &PrincipalRef, role: &str, scope: &ScopeRef| -> Result<(), Response> {
+            if matches!(value, PrincipalRef::Service { .. }) {
+                if !service_roles
+                    .contains(guard, value, role, scope)
+                    .map_err(|error| admin_error_response(&error))?
+                {
+                    return Err(error_response(
+                        StatusCode::FORBIDDEN,
+                        "unbound_runtime_role",
+                        "runtime role reference needs the exact current native binding",
+                    ));
+                }
+                Ok(())
+            } else {
+                principal(value)
+            }
+        };
     for binding in &document.role_bindings {
-        principal(&binding.principal)?;
+        role_principal(&binding.principal, &binding.role_id, &binding.scope)?;
     }
     for limit in &document.binding_limits {
         match &limit.subject {
             GrantSubjectRef::Group { group_id } => group(group_id)?,
-            GrantSubjectRef::Principal { principal: value } => principal(value)?,
+            GrantSubjectRef::Principal { principal: value } => {
+                role_principal(value, &limit.role_id, &limit.scope)?
+            }
             _ => {}
         }
     }

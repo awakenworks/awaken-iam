@@ -17,6 +17,8 @@ const NS: &str = "tenant.a";
 mod current_decisions;
 #[path = "scoped_profile_http_e2e/live_subjects.rs"]
 mod live_subjects;
+#[path = "scoped_profile_http_e2e/service_references.rs"]
+mod service_references;
 #[path = "scoped_profile_http_e2e/token_introspection.rs"]
 mod token_introspection;
 type Store = SqlStore<SqliteBackend>;

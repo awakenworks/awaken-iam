@@ -1308,6 +1308,24 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
 }
 
 impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
+    fn contains_exact(&self, binding: &RoleBinding) -> RepositoryResult<bool> {
+        let sql = format!(
+            "SELECT role FROM {} WHERE principal = ?j AND role = ? AND scope = ?j",
+            self.table("role_bindings")
+        );
+        Ok(!self
+            .backend
+            .query(
+                &sql,
+                &[
+                    p(json_encode(&binding.principal, "principal")?),
+                    p(binding.role.0.clone()),
+                    p(json_encode(&binding.scope, "binding scope")?),
+                ],
+            )?
+            .is_empty())
+    }
+
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
         self.with_policy_transaction(|transaction, _| {
             self.insert_role_binding_in(transaction, &binding)
