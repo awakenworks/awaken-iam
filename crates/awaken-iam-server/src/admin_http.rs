@@ -48,6 +48,7 @@ mod grants;
 mod oauth_clients;
 mod policy_cache;
 mod principal_access;
+mod scoped_decisions;
 mod scoped_profiles;
 pub use scoped_profiles::scoped_profile_router;
 mod resource_provisioning;
@@ -174,6 +175,7 @@ pub struct DaemonState<S> {
     observed_store_version: u64,
     composed: Option<ComposedPolicy>,
     profile_body_limit: usize,
+    scoped_decision: Option<scoped_decisions::DecisionPort<S>>,
 }
 
 /// Default body limit for `POST /v1/admin/authz/profiles`.
@@ -225,6 +227,7 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
             observed_store_version: version,
             composed: None,
             profile_body_limit: DEFAULT_PROFILE_BODY_LIMIT,
+            scoped_decision: None,
         };
         state.ensure_fresh()?;
         Ok(state)
@@ -303,8 +306,12 @@ impl<S: PolicyStore> DaemonState<S> {
         &mut self,
         render: impl FnOnce(&crate::AuthzApi) -> Response,
     ) -> Response {
+        self.with_fresh_state(|state| render(&state.authz))
+    }
+
+    fn with_fresh_state(&mut self, render: impl FnOnce(&Self) -> Response) -> Response {
         match self.ensure_fresh() {
-            Ok(()) => render(&self.authz),
+            Ok(()) => render(self),
             Err(_) => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "policy_unavailable",
@@ -758,7 +765,11 @@ async fn authorize(
     Json(request): Json<AuthorizationRequest>,
 ) -> Response {
     let mut guard = lock(&state);
-    guard.with_fresh_authorization(|authz| Json(authz.authorize(&request)).into_response())
+    let request = awaken_iam_contract::ResourceAuthorizationRequest {
+        request,
+        context: Default::default(),
+    };
+    guard.with_fresh_state(|state| scoped_decisions::response(state, &request, None))
 }
 
 async fn authorize_batch(
@@ -766,7 +777,31 @@ async fn authorize_batch(
     Json(request): Json<BatchAuthorizationRequest>,
 ) -> Response {
     let mut guard = lock(&state);
-    guard.with_fresh_authorization(|authz| Json(authz.authorize_batch(&request)).into_response())
+    guard.with_fresh_state(|state| {
+        let outcomes = request
+            .requests
+            .into_iter()
+            .map(|request| {
+                scoped_decisions::decide(
+                    state,
+                    &awaken_iam_contract::ResourceAuthorizationRequest {
+                        request,
+                        context: Default::default(),
+                    },
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>();
+        if state.admin.store_version().ok() != Some(state.observed_store_version) {
+            return scoped_decisions::unavailable();
+        }
+        match outcomes {
+            Ok(outcomes) => {
+                Json(awaken_iam_contract::BatchAuthorizationResponse { outcomes }).into_response()
+            }
+            Err(_) => scoped_decisions::unavailable(),
+        }
+    })
 }
 
 async fn authorize_resource(
@@ -774,7 +809,7 @@ async fn authorize_resource(
     Json(request): Json<awaken_iam_contract::ResourceAuthorizationRequest>,
 ) -> Response {
     let mut guard = lock(&state);
-    guard.with_fresh_authorization(|authz| Json(authz.authorize_resource(&request)).into_response())
+    guard.with_fresh_state(|state| scoped_decisions::response(state, &request, None))
 }
 
 async fn check_entitlement(

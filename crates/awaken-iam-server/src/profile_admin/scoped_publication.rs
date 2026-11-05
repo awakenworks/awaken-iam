@@ -59,6 +59,14 @@ pub(crate) fn validate_scoped_document(
 }
 
 impl AuthorizationProfileAdmin {
+    pub(crate) fn scoped_workspace(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<Option<WorkspaceId>, ProfileAdminError> {
+        self.repository
+            .profile_publication_workspace(namespace)
+            .map_err(Into::into)
+    }
     /// Exact-scope read of native publication history. Absence is explicit;
     /// retired history is never projected as a never-published namespace.
     pub fn scoped_publication_baseline(

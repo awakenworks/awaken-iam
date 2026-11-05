@@ -71,6 +71,27 @@ compiler supplies product policy semantics; IAM does not copy that compiler.
 
 ## Consequences
 
+### Current scoped decisions
+
+Publication admission is not continuing membership. For a namespace pinned by
+the native scoped-publication owner, daemon PDP calls must evaluate only its
+current active revision at that exact Workspace. An absent or retired head
+denies, including when a base policy grants a wildcard. Every Account in the
+authenticated principal chain must still be active and hold an exact native
+Org membership. Workspace roles and immutable profile bindings cannot supply
+that membership. Native Groups are read at decision time and contribute only
+while owned by that Org. Non-account callers must be explicitly named in the
+profile; a company Group cannot introduce an unrelated service identity.
+
+The scoped router installs the native Account-repository decision port. A daemon
+that finds a scoped namespace without that port fails closed. The explicit
+Workspace/profile decision endpoint also refuses unpinned namespaces, so a
+shared consumer cannot fall back to legacy grants before first publication.
+Decisions retain the original policy-version fence and the server clock; a
+changed fence or unavailable source returns no Allow. This is a remote daemon
+contract. Offline snapshot consumers remain unqualified for shared scoped
+decisions until their current membership facts and admission are integrated.
+
 Scoped publication can be deployed without another permission database or
 product credential store. Existing operator administration remains compatible.
 A new shared capability stays unavailable until exact publisher grants, native
