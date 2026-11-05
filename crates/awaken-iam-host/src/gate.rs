@@ -24,6 +24,7 @@ use awaken_iam_server::{
 };
 
 use crate::local_browser::LocalBrowserAuthError;
+mod scoped;
 
 type SharedBrowserSessions = Arc<Mutex<SessionGateway<OsEntropy>>>;
 type BrowserSessionAttachmentSlot = Arc<Mutex<Option<SharedBrowserSessions>>>;
