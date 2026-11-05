@@ -112,3 +112,10 @@ same-key body conflict, concurrent preparation, process reopen, lost activation
 responses and superseded-revision recovery. SQLite mechanism evidence and
 explicitly isolated PostgreSQL conformance are separate claims. Product binding,
 source admission and multi-owner readiness require composition acceptance.
+
+The standalone token-introspection route uses the same durable API-token
+verification owner as scoped publication. Newly issued keys and revocation are
+read from native storage on every request, independently of policy snapshot
+markers. The response retains the verified credential's Workspace binding;
+product adapters must preserve it when selecting a tenant. Storage failure is
+unavailable rather than permission to reuse a previous identity.

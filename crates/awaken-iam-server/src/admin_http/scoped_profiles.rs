@@ -8,11 +8,17 @@ use awaken_iam_core::{
 
 pub fn scoped_profile_router<S>(state: SharedDaemonState<S>) -> Router
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository + 'static,
+    S: PolicyStore
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository
+        + Clone
+        + 'static,
 {
     lock(&state).scoped_decision = Some(super::scoped_decisions::evaluate::<S>);
     let limit = lock(&state).profile_body_limit;
     Router::new()
+        .route("/v1/tokens/introspect", post(super::token_introspection::introspect::<S>).layer(DefaultBodyLimit::max(1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}", get(baseline::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize", post(super::scoped_decisions::authorize::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications",post(prepare::<S>).layer(DefaultBodyLimit::max(limit)))
