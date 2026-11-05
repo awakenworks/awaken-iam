@@ -92,6 +92,13 @@ changed fence or unavailable source returns no Allow. This is a remote daemon
 contract. Offline snapshot consumers remain unqualified for shared scoped
 decisions until their current membership facts and admission are integrated.
 
+The internal current-resource decision hook uses this same dispatch. In
+particular, the personal-delegation compound endpoint cannot substitute a valid
+signed consent for current scoped admission. Revoked native Org membership
+denies its still-live execution credential on every replica; a missing scoped
+decision port is unavailable. Consent identity, target fencing and monotonic
+revocation keep their original owner and do not create another policy evaluator.
+
 Scoped publication can be deployed without another permission database or
 product credential store. Existing operator administration remains compatible.
 A new shared capability stays unavailable until exact publisher grants, native

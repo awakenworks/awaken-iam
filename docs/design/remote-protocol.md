@@ -374,8 +374,10 @@ namespace denies. Current active Account/exact Org membership and same-Org Group
 rosters are resolved natively on each call; native Deny/approval ceilings still
 apply. An unavailable source/decision port or changed policy fence returns 503.
 There is no fallback to a legacy global Allow. Generic daemon decision calls
-also use this admission once the namespace has a scoped pin. Offline snapshot
-consumers are not qualified by this remote contract.
+and the internal current-resource hook used by personal-delegation compound
+authorization also use this admission once the namespace has a scoped pin.
+A valid signed consent cannot replace current Org membership or the scoped
+decision port. Offline snapshot consumers are not qualified by this contract.
 
 `RemoteIamClient<T>` carries `ScopedProfileConsumer` when its original transport
 supports it. The native remote `IamGate` delegates through that same client and
