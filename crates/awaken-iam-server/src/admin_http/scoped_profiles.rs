@@ -3,8 +3,10 @@ use super::*;
 use awaken_iam_contract::{PrepareScopedAuthorizationProfile, PrincipalRef, ScopeRef, WorkspaceId};
 use awaken_iam_core::{
     AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, ResourceModelRepository,
-    authenticate_stored_api_token,
 };
+
+#[cfg(test)]
+mod admission_tests;
 
 pub fn scoped_profile_router<S>(state: SharedDaemonState<S>) -> Router
 where
@@ -42,32 +44,12 @@ where
         workspace_id: WorkspaceId(workspace.into()),
     };
     let action = format!("iam.authorization-profile.{operation}:{namespace}");
-    let principal = super::principal_access::admit(guard, headers, &action, scope.clone())?
+    let token = super::principal_access::admit_with_token(guard, headers, &action, scope.clone())?
         .ok_or_else(|| {
             error_response(
                 StatusCode::FORBIDDEN,
                 "scoped_service_required",
                 "scoped publication needs an owned service identity",
-            )
-        })?;
-    let presented = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid_credential",
-                "live service credential required",
-            )
-        })?;
-    let token = authenticate_stored_api_token(guard.admin.store(), presented, &now_timestamp())
-        .map_err(|error| admin_error_response(&AdminError::from(error)))?
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid_credential",
-                "live service credential required",
             )
         })?;
     if token.workspace.0 != workspace {
@@ -77,6 +59,7 @@ where
             "publisher credential belongs to another Workspace",
         ));
     }
+    let principal = token.principal;
     let request = AuthorizationRequest::direct(
         principal.clone(),
         awaken_iam_contract::ActionKey(action.clone()),

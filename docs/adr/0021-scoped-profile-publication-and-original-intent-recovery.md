@@ -119,3 +119,10 @@ read from native storage on every request, independently of policy snapshot
 markers. The response retains the verified credential's Workspace binding;
 product adapters must preserve it when selecting a tenant. Storage failure is
 unavailable rather than permission to reuse a previous identity.
+
+Scoped publication derives the service principal and credential Workspace from
+one original native token observation. Personnel admission may project its audit
+actor from that same record; the scoped publisher must not reauthenticate the
+secret or combine identity from one read with scope from another. Each new
+request still verifies the current durable token, owner and native policy. This
+introduces no authentication cache or change to revocation or request budgets.
