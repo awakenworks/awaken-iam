@@ -377,6 +377,12 @@ There is no fallback to a legacy global Allow. Generic daemon decision calls
 also use this admission once the namespace has a scoped pin. Offline snapshot
 consumers are not qualified by this remote contract.
 
+`RemoteIamClient<T>` carries `ScopedProfileConsumer` when its original transport
+supports it. The native remote `IamGate` delegates through that same client and
+credential configuration. Open and embedded gates return an unsupported error
+for scoped decisions; they do not substitute legacy policy or an offline
+snapshot. Ordinary legacy decision APIs retain their existing mode behavior.
+
 Publication baseline/receipt reads require `iam.authorization-profile.read:{namespace}` and publication writes require
 `iam.authorization-profile.publish:{namespace}` at the exact Workspace, with a
 deciding direct grant to the owned service principal. Its live token must also

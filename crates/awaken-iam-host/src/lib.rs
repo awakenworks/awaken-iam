@@ -45,7 +45,7 @@ pub use middleware::{
 pub use remote::{ConnectError, RemoteHandle, connect_remote};
 
 // Convenience re-exports so callers rarely need to reach into sub-crates.
-pub use awaken_iam_client::{IamClient, IamClientMode, RemoteIamClient};
+pub use awaken_iam_client::{IamClient, IamClientMode, RemoteIamClient, ScopedProfileConsumer};
 pub use awaken_iam_contract::{ActionKey, JsonWebKey, Jwks, PrincipalRef, ScopeRef, WorkspaceId};
 pub use awaken_iam_server::AuthzApi;
 pub use awaken_iam_server::{
