@@ -7,6 +7,8 @@ use awaken_iam_server::{
     sqlite_migrated_store,
 };
 use std::sync::{Arc, Barrier};
+#[path = "scoped_profile_publication_e2e/postgres.rs"]
+mod postgres;
 
 fn erased_organization_admission<S>(store: S)
 where
