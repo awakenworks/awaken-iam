@@ -13,6 +13,8 @@ use awaken_iam_server::{
 use std::sync::{Arc, Mutex};
 
 const NS: &str = "tenant.a";
+#[path = "scoped_profile_http_e2e/current_decisions.rs"]
+mod current_decisions;
 #[path = "scoped_profile_http_e2e/live_subjects.rs"]
 mod live_subjects;
 type Store = SqlStore<SqliteBackend>;
@@ -111,6 +113,9 @@ fn seed(store: &Store) {
     .unwrap();
 }
 async fn serve(store: Store) -> String {
+    serve_with_scoped_admission(store, true).await
+}
+async fn serve_with_scoped_admission(store: Store, scoped: bool) -> String {
     let profiles: Arc<dyn AuthorizationProfileRepository> = Arc::new(store.clone());
     let state = Arc::new(Mutex::new(
         DaemonState::with_policy_store(
@@ -122,7 +127,11 @@ async fn serve(store: Store) -> String {
         )
         .unwrap(),
     ));
-    let router = daemon_router(state.clone()).merge(scoped_profile_router(state));
+    let router = if scoped {
+        daemon_router(state.clone()).merge(scoped_profile_router(state))
+    } else {
+        daemon_router(state)
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { http::serve(listener, router).await.unwrap() });

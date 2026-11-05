@@ -1,6 +1,6 @@
 //! Native HTTP projection of the finite publication contract.
 use super::*;
-use crate::ScopedProfilePublisher;
+use crate::{ScopedProfileConsumer, ScopedProfilePublisher};
 use awaken_iam_contract::{
     PrepareScopedAuthorizationProfile, ScopedAuthorizationProfileBaseline,
     ScopedAuthorizationProfileReceipt, WorkspaceId,
@@ -22,6 +22,18 @@ impl HttpAuthzTransport {
             .push(&namespace.0)
             .extend(suffix);
         Ok(url)
+    }
+}
+
+impl ScopedProfileConsumer for HttpAuthzTransport {
+    fn authorize_scoped_resource(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationOutcome, RemoteError> {
+        let url = self.scoped_profile_url(workspace, namespace, &["authorize"])?;
+        Self::decode(self.send_with_retry(|| self.client.post(url.clone()).json(request))?)
     }
 }
 

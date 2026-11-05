@@ -2,17 +2,19 @@
 use super::*;
 use awaken_iam_contract::{PrepareScopedAuthorizationProfile, PrincipalRef, ScopeRef, WorkspaceId};
 use awaken_iam_core::{
-    AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, PolicySet,
-    ResourceModelRepository, authenticate_stored_api_token,
+    AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, ResourceModelRepository,
+    authenticate_stored_api_token,
 };
 
 pub fn scoped_profile_router<S>(state: SharedDaemonState<S>) -> Router
 where
     S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository + 'static,
 {
+    lock(&state).scoped_decision = Some(super::scoped_decisions::evaluate::<S>);
     let limit = lock(&state).profile_body_limit;
     Router::new()
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}", get(baseline::<S>))
+        .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize", post(super::scoped_decisions::authorize::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications",post(prepare::<S>).layer(DefaultBodyLimit::max(limit)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}",get(receipt::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}/activate",post(activate::<S>))
@@ -171,7 +173,6 @@ where
             "organization is unavailable",
         ));
     }
-    let policy = PolicySet::from_snapshot(&guard.authz.snapshot());
     let org_scope = ScopeRef::Org {
         org_id: edge.org_id.clone(),
     };
@@ -205,7 +206,7 @@ where
                 .memberships_for_principal(value)
                 .map_err(|error| admin_error_response(&error))?
                 .iter()
-                .any(|binding| policy.scope_graph().covers(&org_scope, &binding.scope));
+                .any(|binding| binding.scope == org_scope);
             if account
                 .is_none_or(|account| account.status != awaken_iam_contract::AccountStatus::Active)
                 || !member

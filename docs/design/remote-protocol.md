@@ -361,12 +361,23 @@ Under `/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}`:
 
 | Method and suffix | Result |
 | --- | --- |
+| `POST /authorize` | Current remote `ResourceAuthorizationRequest` → `AuthorizationOutcome`, requiring this namespace's native Workspace pin and active head |
 | `GET` | Exact scoped baseline: current profile and native publication history |
 | `POST /publications` | Persist one immutable original request and validated revision |
 | `GET /publications/{key}` | Recover its original intent, effect and current head |
 | `POST /publications/{key}/activate` | Activate using the original expected head, or read its terminal effect |
 
-Reads require `iam.authorization-profile.read:{namespace}` and writes require
+`ScopedProfileConsumer` owns the explicit decision call. Product PEPs supply
+their verified principal chain and owner-resolved facts; this endpoint returns
+a decision, not a credential. A missing pin/head, wrong Workspace or action
+namespace denies. Current active Account/exact Org membership and same-Org Group
+rosters are resolved natively on each call; native Deny/approval ceilings still
+apply. An unavailable source/decision port or changed policy fence returns 503.
+There is no fallback to a legacy global Allow. Generic daemon decision calls
+also use this admission once the namespace has a scoped pin. Offline snapshot
+consumers are not qualified by this remote contract.
+
+Publication baseline/receipt reads require `iam.authorization-profile.read:{namespace}` and publication writes require
 `iam.authorization-profile.publish:{namespace}` at the exact Workspace, with a
 deciding direct grant to the owned service principal. Its live token must also
 belong to that Workspace. Broad or separate grants cannot compose this pair.

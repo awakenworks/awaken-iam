@@ -17,6 +17,7 @@ use crate::AuthzApi;
 #[path = "profile_admin/bundle_validation.rs"]
 mod bundle_validation;
 mod scoped_publication;
+pub(crate) use scoped_publication::validate_scoped_document;
 
 /// PAP failure with stable conflict/not-found/validation distinctions.
 #[derive(Debug, thiserror::Error)]
