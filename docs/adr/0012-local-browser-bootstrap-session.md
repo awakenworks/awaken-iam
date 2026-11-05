@@ -74,3 +74,20 @@ restart, the unchanged cookie therefore resolves through the reopened
 without a live session. Setup challenges remain deliberately transient,
 five-minute, and single-use.
 
+## Amendment — 2026-11-06: owner-authorized recovery without restart
+
+Reuse unchanged: `SessionGateway`, `SessionRepository`, `IamGate`, exchange,
+current-session and logout remain the only browser authentication path.
+Modify: `LocalSetupGateway` may rotate its existing challenge in place, retaining
+the account chosen at startup; `LocalBrowserAuth` exposes that operation to its
+host. New public anonymous issuance routes and additional stores are absent.
+The product owns the privileged operator entry and its PDP authorization.
+
+Rotation replaces only the challenge hash, expiry and consumed marker under the
+same mutex as exchange. The previous token immediately fails; a renewed token
+still expires after five minutes and exchanges once. Already established cookies
+are neither revoked nor reissued. Missing challenge, invalid time window or
+unavailable state fails closed without replacing the current challenge. A lost
+rotation response permits another explicit owner-authorized rotation; an unknown
+exchange response must first be resolved through the canonical session read.
+

@@ -31,6 +31,14 @@ pub struct BeginLocalSetup {
     pub expires_at: Timestamp,
 }
 
+/// Rotate an existing challenge without choosing another account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewLocalSetup {
+    pub id: LocalSetupId,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+}
+
 /// One-time cleartext hand-off returned to the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedLocalSetup {
@@ -95,6 +103,30 @@ impl<E: EntropySource> LocalSetupGateway<E> {
         if self.challenges.contains_key(&request.id) {
             return Err(LocalSetupError::InvalidChallenge);
         }
+        Ok(self.issue(request))
+    }
+
+    /// The host must authorize the operator before calling this operation.
+    /// Exchange and renewal share the host's original challenge mutex.
+    pub fn renew(&mut self, request: RenewLocalSetup) -> Result<IssuedLocalSetup, LocalSetupError> {
+        if request.expires_at.0 <= request.created_at.0 {
+            return Err(LocalSetupError::InvalidWindow);
+        }
+        let account_id = self
+            .challenges
+            .get(&request.id)
+            .ok_or(LocalSetupError::InvalidChallenge)?
+            .account_id
+            .clone();
+        Ok(self.issue(BeginLocalSetup {
+            id: request.id,
+            account_id,
+            created_at: request.created_at,
+            expires_at: request.expires_at,
+        }))
+    }
+
+    fn issue(&mut self, request: BeginLocalSetup) -> IssuedLocalSetup {
         let mut bytes = [0_u8; SETUP_TOKEN_BYTES];
         self.entropy.fill_bytes(&mut bytes);
         let setup_token = URL_SAFE_NO_PAD.encode(bytes);
@@ -107,11 +139,11 @@ impl<E: EntropySource> LocalSetupGateway<E> {
                 consumed_at: None,
             },
         );
-        Ok(IssuedLocalSetup {
+        IssuedLocalSetup {
             id: request.id,
             setup_token,
             expires_at: request.expires_at,
-        })
+        }
     }
 
     /// Consume the challenge once and establish a session through the existing
@@ -262,5 +294,84 @@ mod tests {
                 LocalSetupError::InvalidChallenge
             );
         }
+    }
+
+    #[test]
+    fn renewal_replaces_fresh_expired_or_consumed_challenges_without_changing_identity() {
+        // C/E rules: R1 fresh, R2 expired, R3 consumed + owner renew -> old
+        // token denied, successor exchanges once as the original account.
+        // R4 missing id or invalid window -> no mutation; prior token survives.
+        for prior in ["fresh", "expired", "consumed"] {
+            let mut gateway = LocalSetupGateway::new(SequentialEntropy::default());
+            let first = gateway.begin(begin()).unwrap();
+            let mut sessions = sessions();
+            if prior == "consumed" {
+                gateway
+                    .exchange(
+                        exchange(first.setup_token.clone(), "2026-07-28T00:01:00Z"),
+                        &mut sessions,
+                    )
+                    .unwrap();
+            }
+            let now = if prior == "expired" {
+                "2026-07-28T00:06:00Z"
+            } else {
+                "2026-07-28T00:02:00Z"
+            };
+            let next = gateway
+                .renew(RenewLocalSetup {
+                    id: first.id,
+                    created_at: Timestamp(now.into()),
+                    expires_at: Timestamp("2026-07-28T00:11:00Z".into()),
+                })
+                .unwrap();
+            assert_ne!(first.setup_token, next.setup_token);
+            assert_eq!(
+                gateway
+                    .exchange(exchange(first.setup_token, now), &mut sessions)
+                    .unwrap_err(),
+                LocalSetupError::InvalidChallenge
+            );
+            let mut request = exchange(next.setup_token.clone(), now);
+            request.session_id = SessionId("renewed-session".into());
+            let established = gateway.exchange(request, &mut sessions).unwrap();
+            assert_eq!(established.view.account_id, begin().account_id);
+            assert_eq!(
+                gateway
+                    .exchange(exchange(next.setup_token, now), &mut sessions)
+                    .unwrap_err(),
+                LocalSetupError::InvalidChallenge
+            );
+        }
+        let mut gateway = LocalSetupGateway::new(SequentialEntropy::default());
+        let first = gateway.begin(begin()).unwrap();
+        for id in [LocalSetupId("missing".into()), first.id] {
+            assert!(
+                gateway
+                    .renew(RenewLocalSetup {
+                        id,
+                        created_at: Timestamp("2026-07-28T00:02:00Z".into()),
+                        expires_at: Timestamp("2026-07-28T00:01:00Z".into()),
+                    })
+                    .is_err()
+            );
+        }
+        assert!(
+            gateway
+                .renew(RenewLocalSetup {
+                    id: LocalSetupId("missing".into()),
+                    created_at: begin().created_at,
+                    expires_at: begin().expires_at,
+                })
+                .is_err()
+        );
+        assert!(
+            gateway
+                .exchange(
+                    exchange(first.setup_token, "2026-07-28T00:01:00Z"),
+                    &mut sessions()
+                )
+                .is_ok()
+        );
     }
 }
