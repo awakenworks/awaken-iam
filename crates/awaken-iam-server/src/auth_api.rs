@@ -1149,8 +1149,8 @@ impl<E: EntropySource + Clone> AuthApi<E> {
             }
         };
 
-        match self.accounts.get(&account_id)? {
-            Some(account) if account.status == AccountStatus::Active => {
+        match self.require_active_account(&account_id) {
+            Ok(()) => {
                 let principal = PrincipalRef::Account { account_id };
                 self.audit.push(AuthAuditEvent::PrincipalResolved {
                     principal: principal.clone(),
@@ -1158,13 +1158,21 @@ impl<E: EntropySource + Clone> AuthApi<E> {
                 });
                 Ok(principal)
             }
-            _ => {
+            Err(AuthApiError::AccountDisabled) => {
                 self.audit.push(AuthAuditEvent::PrincipalResolutionFailed {
                     reason: PrincipalResolutionFailure::AccountDisabled,
                     at: now,
                 });
                 Err(AuthApiError::AccountDisabled)
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_active_account(&self, account_id: &AccountId) -> Result<(), AuthApiError> {
+        match self.accounts.get(account_id)? {
+            Some(account) if account.status == AccountStatus::Active => Ok(()),
+            _ => Err(AuthApiError::AccountDisabled),
         }
     }
 
@@ -1741,6 +1749,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         now: Timestamp,
     ) -> Result<UserInfo, AuthApiError> {
         let view = self.current_session(cookie_header, now)?;
+        self.require_active_account(&view.account_id)?;
         let identities = self
             .external_identities
             .list_for_account(&view.account_id)?;
@@ -1760,7 +1769,11 @@ impl<E: EntropySource + Clone> AuthApi<E> {
     /// Resolve OIDC UserInfo from a verified, unrevoked IAM bearer token.
     pub fn userinfo_for_access_token(&self, token: &str) -> Result<UserInfo, AuthApiError> {
         let claims = self.verify_access_token(token)?;
+        if claims.subject_kind != crate::AccessTokenSubjectKind::Account {
+            return Err(AuthApiError::Unauthenticated);
+        }
         let account_id = AccountId(claims.sub);
+        self.require_active_account(&account_id)?;
         let identity = self
             .external_identities
             .list_for_account(&account_id)?

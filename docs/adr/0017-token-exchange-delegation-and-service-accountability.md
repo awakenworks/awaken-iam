@@ -162,3 +162,17 @@ rows and bulk revocation.
 Token-endpoint tests cover every client-authentication row above and the
 discovery document; SQLite restart tests cover key persistence, a stable kid
 and refusal of a tampered kid.
+
+
+## Current Account projection
+
+OIDC UserInfo projects a current Account rather than treating a valid token
+signature as an Account row. Bearer subjects must have the Account kind;
+Service and Account identifiers remain distinct even when their strings match.
+Cookie and bearer projections both read the original Account repository on
+each request and refuse missing or disabled Accounts. Repository failure is
+unavailable, with no fallback to a previously projected identity.
+
+UserInfo remains a profile projection. Consumers must retain the separately
+verified actor and consent when authorizing delegated operations; the projected
+subject does not turn a delegated call into a direct human call.
