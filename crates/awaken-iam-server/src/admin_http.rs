@@ -50,6 +50,7 @@ mod policy_cache;
 mod principal_access;
 mod scoped_decisions;
 mod scoped_profiles;
+mod token_introspection;
 pub use scoped_profiles::scoped_profile_router;
 mod resource_provisioning;
 use grants::issue_grants;

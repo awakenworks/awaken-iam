@@ -183,6 +183,13 @@ it is present for forward-compatibility with any future offline/cached introspec
 path. Exposed on `AuthzTransport` as `introspect_token` (see the method table
 above).
 
+The standalone daemon resolves this endpoint through the scoped router's native
+API-token repository on each request, including keys issued after a replica
+started. Revocation and expiry do not depend on a policy-cache refresh marker.
+Storage or worker failure returns `503 credential_unavailable`; it never returns
+an identity from an older snapshot. Storage and Argon2 run outside async workers
+and without holding the daemon mutex. The request body is limited to 1 KiB.
+
 ### Capability issuance and introspection
 
 `POST /v1/admin/capabilities` is the single guarded HTTP adapter over IAM's
