@@ -315,6 +315,14 @@ bearer verification remains unchanged; hosts must explicitly opt into this
 family and fence a supported owner route. Local hosts without a live durable
 consent owner fail closed.
 
+For this personal authorization route, the remote SDK maps authoritative HTTP
+401/403 rejections to an explicit Deny outcome with reason
+`personal_delegation_rejected` and no matched grants. Revoked or invalid execution
+authority is therefore a refusal, not a dependency outage. Connection failures,
+malformed responses, unsupported endpoints and other statuses remain errors;
+hosts must withhold execution on all of them. The SDK uses the preserved numeric
+status, never diagnostic text, and does not cache or re-authorize a rejection.
+
 ## Out of scope
 
 - Login/OAuth endpoints — already served; see

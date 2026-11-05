@@ -451,7 +451,20 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         &self,
         request: &awaken_iam_contract::AuthorizePersonalDelegation,
     ) -> Result<AuthorizationOutcome, RemoteError> {
-        self.transport.authorize_personal_delegation(request)
+        match self.transport.authorize_personal_delegation(request) {
+            // The personal-consent endpoint rejects revoked or invalid execution
+            // authority with 401/403. Preserve that authoritative refusal as Deny
+            // so hosts do not misclassify it as an IAM outage. Other failures
+            // remain unavailable; none can produce an allow or cached fallback.
+            Err(error) if matches!(error.status(), Some(401 | 403)) => Ok(AuthorizationOutcome {
+                decision: AuthorizationDecision::Deny,
+                reason: "personal_delegation_rejected".into(),
+                matched_grants: vec![],
+                matched_roles: vec![],
+                obligation: None,
+            }),
+            result => result,
+        }
     }
     /// Resolve one authorization request into its reasoned outcome, surfacing
     /// transport errors.
@@ -932,6 +945,99 @@ mod tests {
     use super::*;
     use awaken_iam_contract::{AccountId, ActionKey, PrincipalRef, ScopeRef};
     use std::cell::Cell;
+
+    #[test]
+    fn personal_authority_rejection_is_a_deny_and_outages_remain_errors() {
+        struct PersonalTransport(Result<AuthorizationOutcome, RemoteError>);
+        impl AuthzTransport for PersonalTransport {
+            fn authorize_personal_delegation(
+                &self,
+                _: &awaken_iam_contract::AuthorizePersonalDelegation,
+            ) -> Result<AuthorizationOutcome, RemoteError> {
+                self.0.clone()
+            }
+            fn authorize(
+                &self,
+                _: &AuthorizationRequest,
+            ) -> Result<AuthorizationOutcome, RemoteError> {
+                unreachable!()
+            }
+            fn authorize_batch(
+                &self,
+                _: &BatchAuthorizationRequest,
+            ) -> Result<BatchAuthorizationResponse, RemoteError> {
+                unreachable!()
+            }
+            fn check_entitlement(
+                &self,
+                _: &EntitlementRequest,
+            ) -> Result<EntitlementCheckResponse, RemoteError> {
+                unreachable!()
+            }
+            fn register_resource_model(
+                &self,
+                _: &ProductResourceModelRequest,
+            ) -> Result<ResourceModelRegistered, RemoteError> {
+                unreachable!()
+            }
+            fn fetch_snapshot(&self) -> Result<PolicySnapshot, RemoteError> {
+                unreachable!()
+            }
+            fn fetch_signers(&self, _: &NamespaceId) -> Result<SignerSetSnapshot, RemoteError> {
+                unreachable!()
+            }
+        }
+        let request = awaken_iam_contract::AuthorizePersonalDelegation {
+            token: "opaque".into(),
+            audience: "product".into(),
+            target: awaken_iam_contract::PersonalDelegationTarget {
+                id: "human-unit".into(),
+                revision: 2,
+            },
+            request: ResourceAuthorizationRequest {
+                request: auth_request("business::review"),
+                context: Default::default(),
+            },
+        };
+        for status in [401, 403] {
+            let client = RemoteIamClient::new(PersonalTransport(Err(RemoteError::response(
+                status,
+                "rejected".into(),
+            ))));
+            let outcome = client.authorize_personal_delegation(&request).unwrap();
+            assert_eq!(outcome.decision, AuthorizationDecision::Deny);
+            assert_eq!(outcome.reason, "personal_delegation_rejected");
+            assert!(outcome.matched_grants.is_empty());
+            assert!(outcome.matched_roles.is_empty());
+            assert!(outcome.obligation.is_none());
+        }
+        for error in [
+            RemoteError::new("decode error mentions 403".into()),
+            RemoteError::response(400, "bad request".into()),
+            RemoteError::response(404, "unsupported endpoint".into()),
+            RemoteError::response(409, "conflict".into()),
+            RemoteError::response(429, "throttled".into()),
+            RemoteError::response(500, "failed".into()),
+            RemoteError::response(503, "unavailable".into()),
+        ] {
+            let client = RemoteIamClient::new(PersonalTransport(Err(error.clone())));
+            assert_eq!(client.authorize_personal_delegation(&request), Err(error));
+        }
+        for decision in [AuthorizationDecision::Allow, AuthorizationDecision::Deny] {
+            let outcome = AuthorizationOutcome {
+                decision,
+                reason: "current_policy".into(),
+                matched_grants: vec!["g1".into()],
+                matched_roles: vec![],
+                obligation: None,
+            };
+            let client = RemoteIamClient::new(PersonalTransport(Ok(outcome.clone())));
+            assert_eq!(
+                client.authorize_personal_delegation(&request).unwrap(),
+                outcome
+            );
+        }
+    }
 
     fn auth_request(action: &str) -> AuthorizationRequest {
         AuthorizationRequest::direct(
