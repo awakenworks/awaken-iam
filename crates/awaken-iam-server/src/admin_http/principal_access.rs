@@ -9,8 +9,8 @@
 //! | C5   | product Directory credential                 | 403 |
 
 use awaken_iam_contract::{
-    ActionKey, AuthorizationDecision, AuthorizationRequest, NamespaceId, PrincipalRef, ScopeRef,
-    TeamAccessReplacement,
+    ActionKey, ApiToken, AuthorizationDecision, AuthorizationRequest, NamespaceId, PrincipalRef,
+    ScopeRef, TeamAccessReplacement,
 };
 use awaken_iam_core::{ApiTokenOwnerRepository, ApiTokenRepository, authenticate_stored_api_token};
 
@@ -45,6 +45,23 @@ pub(super) fn admit<S>(
     action: &str,
     scope: ScopeRef,
 ) -> Result<Option<PrincipalRef>, Response>
+where
+    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
+{
+    admit_with_token(guard, headers, action, scope).map(|token| token.map(|token| token.principal))
+}
+
+/// Retain the original authenticated service token for callers which must also
+/// fence its Workspace. Administrator admission remains the explicit None case.
+/// Every invocation reads and verifies the current native credential; this is
+/// a request-local observation, never an authentication cache.
+#[allow(clippy::result_large_err)]
+pub(super) fn admit_with_token<S>(
+    guard: &mut DaemonState<S>,
+    headers: &HeaderMap,
+    action: &str,
+    scope: ScopeRef,
+) -> Result<Option<ApiToken>, Response>
 where
     S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
 {
@@ -104,7 +121,7 @@ where
             "the service account lacks this access administration action",
         ));
     }
-    Ok(Some(token.principal))
+    Ok(Some(token))
 }
 
 async fn replace_team_access<S>(
