@@ -373,6 +373,7 @@ Under `/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}`:
 | `POST /publications` | Persist one immutable original request and validated revision |
 | `GET /publications/{key}` | Recover its original intent, effect and current head |
 | `POST /publications/{key}/activate` | Activate using the original expected head, or read its terminal effect |
+| `POST /publications/{key}/retire` | Retire the exact active revision named by the original intent, or read its retired or superseded effect |
 
 `ScopedProfileConsumer` owns the explicit decision call. Product PEPs supply
 their verified principal chain and owner-resolved facts; this endpoint returns
@@ -400,4 +401,8 @@ Global PAP keys are refused by this interface. Missing/invalid credentials yield
 401; insufficient capabilities or foreign subjects yield 403; unknown fields or
 scope violations yield 422; original-body or native-head conflicts yield 409.
 Transport failures retain the same serialized request, key and expected head.
+Retirement requires the separate direct `iam.authorization-profile.retire:{namespace}`
+grant at the exact Workspace. An authorized service can retire a revision even
+after the original publisher loses access. The original request key identifies
+the immutable revision, and the native head comparison fences later revisions.
 Superseded and retired receipts never reactivate their historical revision.

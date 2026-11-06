@@ -26,6 +26,7 @@ where
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications",post(prepare::<S>).layer(DefaultBodyLimit::max(limit)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}",get(receipt::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}/activate",post(activate::<S>))
+        .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}/retire",post(retire::<S>))
         .with_state(state)
 }
 
@@ -420,4 +421,35 @@ where
         Err(error) => return admin_error_response(&error),
     };
     profile_result(profiles.activate_scoped_publication(&mut guard.authz, &base, &namespace, &key))
+}
+
+async fn retire<S>(
+    State(state): State<SharedDaemonState<S>>,
+    Path((workspace, namespace, key)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response
+where
+    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+{
+    let mut guard = lock(&state);
+    if let Err(error) = admit(&mut guard, &headers, &workspace, &namespace, "retire") {
+        return error;
+    }
+    let profiles = guard.profiles.clone();
+    let base = match guard.admin.policy().and_then(|policy| {
+        guard
+            .admin
+            .store_version()
+            .map(|version| policy.snapshot(version))
+    }) {
+        Ok(base) => base,
+        Err(error) => return admin_error_response(&error),
+    };
+    profile_result(profiles.retire_scoped_publication(
+        &mut guard.authz,
+        &base,
+        &WorkspaceId(workspace),
+        &NamespaceId(namespace),
+        &key,
+    ))
 }

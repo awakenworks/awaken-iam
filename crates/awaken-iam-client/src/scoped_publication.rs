@@ -53,6 +53,16 @@ pub trait ScopedProfilePublisher: Send + Sync {
         namespace: &NamespaceId,
         key: &str,
     ) -> Result<ScopedAuthorizationProfileReceipt, RemoteError>;
+    fn retire_scoped_profile(
+        &self,
+        _workspace: &WorkspaceId,
+        _namespace: &NamespaceId,
+        _key: &str,
+    ) -> Result<ScopedAuthorizationProfileReceipt, RemoteError> {
+        Err(RemoteError::new(
+            "scoped profile retirement is unsupported by this transport".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

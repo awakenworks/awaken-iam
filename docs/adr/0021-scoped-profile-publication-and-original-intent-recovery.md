@@ -149,3 +149,11 @@ role and scope against the existing role-binding primary key. Neither publicatio
 nor a scoped decision enumerates a shared service's bindings in other tenants.
 Repeated references may share an observation within one request only. An adapter
 without this bounded primitive fails unavailable instead of using a full scan.
+
+Scoped retirement uses a separate exact Workspace and namespace grant. It
+resolves the original publication key and retires only that revision through
+the native active-head comparison. The service authorized to withdraw policy
+may differ from the original publisher. Replays recover the original retired
+or superseded effect, including across replicas. Retirement keeps the original
+publication history and leaves the scoped data plane closed without an active
+head. The initial-absence activation rule still rejects a retired namespace.

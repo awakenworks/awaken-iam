@@ -403,3 +403,101 @@ async fn lost_response_replay_across_replicas_never_reactivates_old_policy_and_r
     .await;
     assert_eq!(status, 403, "{body}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_requires_exact_authority_and_never_withdraws_a_later_revision() {
+    let store = sqlite_in_memory_store("scoped_http_retirement").unwrap();
+    seed(&store);
+    let publish = format!("iam.authorization-profile.publish:{NS}");
+    let retire = format!("iam.authorization-profile.retire:{NS}");
+    grant(&store, "publisher", &publish, workspace("w1"));
+    grant(&store, "retirer", &retire, workspace("w1"));
+    grant(&store, "foreign", &retire, workspace("w1"));
+    let publisher = mint(&store, "publisher", "w1", true);
+    let retirer = mint(&store, "retirer", "w1", true);
+    let foreign = mint(&store, "foreign", "w2", true);
+    let first = serve(store.clone()).await;
+    let second = serve(store.clone()).await;
+    let client = reqwest::Client::new();
+    let empty = || serde_json::json!({});
+
+    for (key, head) in [("original", None), ("replacement", Some(1))] {
+        let (status, body) = post(
+            &client,
+            &path(&first, ""),
+            &publisher,
+            serde_json::to_value(command(key, head)).unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = post(
+            &client,
+            &path(&second, &format!("/{key}/activate")),
+            &publisher,
+            empty(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "active");
+    }
+
+    for token in [&publisher, &foreign] {
+        let (status, body) = post(
+            &client,
+            &path(&first, "/replacement/retire"),
+            token,
+            empty(),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+    }
+    let (status, body) = post(
+        &client,
+        &path(&second, "/original/retire"),
+        &retirer,
+        empty(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "superseded");
+    assert_eq!(body["current_active_revision"], 2);
+
+    let revoked = client
+        .delete(format!("{first}/v1/admin/grants/publisher:{publish}"))
+        .bearer_auth("admin-key")
+        .send()
+        .await
+        .unwrap();
+    assert!(revoked.status().is_success());
+
+    let first_retire = path(&first, "/replacement/retire");
+    let second_retire = path(&second, "/replacement/retire");
+    let (retired, replayed) = tokio::join!(
+        post(&client, &first_retire, &retirer, empty()),
+        post(&client, &second_retire, &retirer, empty()),
+    );
+    assert_eq!(retired.0, 200, "{}", retired.1);
+    assert_eq!(retired, replayed);
+    assert_eq!(retired.1["status"], "retired");
+    assert!(retired.1["current_active_revision"].is_null());
+    assert!(
+        store
+            .active_profile(&NamespaceId(NS.into()))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.list_profiles(&NamespaceId(NS.into())).unwrap().len(),
+        2
+    );
+
+    grant(&store, "publisher", &publish, workspace("w1"));
+    let reactivated = post(
+        &client,
+        &path(&second, "/replacement/activate"),
+        &publisher,
+        empty(),
+    )
+    .await;
+    assert_eq!(retired, reactivated);
+}
