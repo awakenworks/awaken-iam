@@ -1,9 +1,9 @@
 //! Finite publication client, separate from the decision-only `IamClient` seam.
 use crate::RemoteError;
 use awaken_iam_contract::{
-    AuthorizationOutcome, NamespaceId, PrepareScopedAuthorizationProfile,
-    ResourceAuthorizationRequest, ScopedAuthorizationProfileBaseline,
-    ScopedAuthorizationProfileReceipt, WorkspaceId,
+    ActivateScopedAuthorizationProfiles, AuthorizationOutcome, NamespaceId,
+    PrepareScopedAuthorizationProfile, ResourceAuthorizationRequest,
+    ScopedAuthorizationProfileBaseline, ScopedAuthorizationProfileReceipt, WorkspaceId,
 };
 
 /// Current remote scoped decisions. An unavailable/unknown endpoint is an
@@ -53,6 +53,15 @@ pub trait ScopedProfilePublisher: Send + Sync {
         namespace: &NamespaceId,
         key: &str,
     ) -> Result<ScopedAuthorizationProfileReceipt, RemoteError>;
+    fn activate_scoped_profile_set(
+        &self,
+        _workspace: &WorkspaceId,
+        _request: &ActivateScopedAuthorizationProfiles,
+    ) -> Result<Vec<ScopedAuthorizationProfileReceipt>, RemoteError> {
+        Err(RemoteError::new(
+            "atomic scoped activation is unsupported by this transport".into(),
+        ))
+    }
     fn retire_scoped_profile(
         &self,
         _workspace: &WorkspaceId,

@@ -415,3 +415,12 @@ and a map of Group identifiers to SHA-256 revisions. A missing or foreign
 Group refuses the entire observation. A native policy change during the
 observation returns unavailable. The digests are evidence for review, while
 the scoped decision path continues to read current membership itself.
+
+`POST /v1/scoped-authz/workspaces/{workspace}/activate-publication-set` accepts
+`ActivateScopedAuthorizationProfiles` with one to sixteen distinct original
+intents. The current owned Service requires the direct exact
+`iam.authorization-profile.activate-set:{namespace}` grant for every intent and
+must match each retained publisher. Durable SQL activates all prepared intents
+in one transaction. It returns receipts in request order. A complete terminal
+replay returns current observations. A mixture of prepared and terminal intents
+returns conflict without activating anything.

@@ -521,6 +521,16 @@ pub trait AuthorizationProfileRepository: Send + Sync {
             "scoped activation is unavailable".into(),
         ))
     }
+    /// Commit every prepared head under the fence that admitted the original intents.
+    fn activate_scoped_profiles(
+        &self,
+        _intents: &[awaken_iam_contract::ScopedAuthorizationProfileIntent],
+        _expected_policy_version: u64,
+    ) -> RepositoryResult<u64> {
+        Err(RepositoryError::Backend(
+            "atomic scoped activation is unavailable".into(),
+        ))
+    }
     /// Compare-and-set removal of one active head while retaining the revision,
     /// and advance the shared policy fence in the same transaction.
     fn retire_active_profile(

@@ -7,6 +7,7 @@ use awaken_iam_core::{
     AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, ResourceModelRepository,
 };
 
+mod activation_set;
 #[cfg(test)]
 mod admission_tests;
 mod group_sources;
@@ -24,6 +25,7 @@ where
     let limit = lock(&state).profile_body_limit;
     Router::new()
         .route("/v1/tokens/introspect", post(super::token_introspection::introspect::<S>).layer(DefaultBodyLimit::max(1024)))
+        .route("/v1/scoped-authz/workspaces/{workspace}/activate-publication-set", post(activation_set::activate::<S>).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}", get(baseline::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize", post(super::scoped_decisions::authorize::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/source-groups", post(group_sources::observe::<S>).layer(DefaultBodyLimit::max(16 * 1024)))

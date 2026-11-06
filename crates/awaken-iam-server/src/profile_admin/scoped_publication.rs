@@ -232,6 +232,46 @@ impl AuthorizationProfileAdmin {
         self.scoped_publication_receipt(namespace, key)
     }
 
+    pub(crate) fn activate_scoped_publication_set(
+        &self,
+        authz: &mut AuthzApi,
+        base: &PolicySnapshot,
+        targets: Vec<(ScopedAuthorizationProfileIntent, AuthorizationProfile)>,
+        expected_policy_version: u64,
+    ) -> Result<Vec<ScopedAuthorizationProfileReceipt>, ProfileAdminError> {
+        let mut intents = Vec::with_capacity(targets.len());
+        let mut profiles = authz.snapshot().active_profiles;
+        for (intent, mut profile) in targets {
+            if profile.namespace != intent.namespace
+                || profile.revision != intent.revision
+                || profile.checksum != intent.checksum
+                || profile.lifecycle != ProfileLifecycle::Validated
+            {
+                return Err(ProfileAdminError::Conflict(
+                    "activation target has changed".into(),
+                ));
+            }
+            validate_scoped_document(&intent.namespace, &intent.workspace_id, &profile.document)?;
+            profiles.retain(|active| active.namespace != intent.namespace);
+            profile.lifecycle = ProfileLifecycle::Active;
+            profiles.push(profile);
+            intents.push(intent);
+        }
+        let policy = PolicySet::from_snapshot_and_profiles(base, &profiles);
+        let version = self
+            .repository
+            .activate_scoped_profiles(&intents, expected_policy_version)?;
+        authz.replace_policy_at_version(policy, version);
+        Ok(intents
+            .into_iter()
+            .map(|intent| ScopedAuthorizationProfileReceipt {
+                current_active_revision: Some(intent.revision),
+                intent,
+                status: ScopedAuthorizationProfileStatus::Active,
+            })
+            .collect())
+    }
+
     /// Retire the active head created by this exact scoped publication.
     pub fn retire_scoped_publication(
         &self,
