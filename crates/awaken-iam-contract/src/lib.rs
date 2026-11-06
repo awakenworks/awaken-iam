@@ -40,9 +40,9 @@ pub use profile::{
     RetireAuthorizationProfile, ScopeKind,
 };
 pub use profile_publication::{
-    PrepareScopedAuthorizationProfile, ScopedAuthorizationProfileBaseline,
-    ScopedAuthorizationProfileIntent, ScopedAuthorizationProfileReceipt,
-    ScopedAuthorizationProfileStatus,
+    ObserveScopedProfileGroups, PrepareScopedAuthorizationProfile,
+    ScopedAuthorizationProfileBaseline, ScopedAuthorizationProfileIntent,
+    ScopedAuthorizationProfileReceipt, ScopedAuthorizationProfileStatus, ScopedProfileGroupSources,
 };
 
 pub use admin::{

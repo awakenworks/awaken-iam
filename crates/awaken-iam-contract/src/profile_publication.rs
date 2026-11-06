@@ -1,5 +1,5 @@
 //! Exact scoped policy publication; product policy compilation remains external.
-use crate::{CreateAuthorizationProfile, NamespaceId, PrincipalRef, Timestamp, WorkspaceId};
+use crate::{CreateAuthorizationProfile, NamespaceId, OrgId, PrincipalRef, Timestamp, WorkspaceId};
 
 /// Authoritative publication baseline for one finite namespace/Workspace pair.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -11,6 +11,23 @@ pub struct ScopedAuthorizationProfileBaseline {
     pub has_published_revision: bool,
 }
 use serde::{Deserialize, Serialize};
+
+/// Exact native Group references whose current revisions a compiler needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveScopedProfileGroups {
+    pub group_ids: Vec<String>,
+}
+
+/// Owner evidence for the requested Groups. It carries no roster or grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedProfileGroupSources {
+    pub org_id: OrgId,
+    pub workspace_id: WorkspaceId,
+    pub namespace: NamespaceId,
+    pub revisions: std::collections::BTreeMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

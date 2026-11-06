@@ -370,6 +370,7 @@ Under `/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}`:
 | --- | --- |
 | `POST /authorize` | Current remote `ResourceAuthorizationRequest` → `AuthorizationOutcome`, requiring this namespace's native Workspace pin and active head |
 | `GET` | Exact scoped baseline: current profile and native publication history |
+| `POST /source-groups` | Resolve at most 32 exact Flow Group references to current same-Org revision digests without returning membership |
 | `POST /publications` | Persist one immutable original request and validated revision |
 | `GET /publications/{key}` | Recover its original intent, effect and current head |
 | `POST /publications/{key}/activate` | Activate using the original expected head, or read its terminal effect |
@@ -406,3 +407,11 @@ grant at the exact Workspace. An authorized service can retire a revision even
 after the original publisher loses access. The original request key identifies
 the immutable revision, and the native head comparison fences later revisions.
 Superseded and retired receipts never reactivate their historical revision.
+
+`POST /source-groups` requires the separate exact
+`iam.authorization-profile.observe-groups:{namespace}` grant. It accepts
+`{ "group_ids": [...] }` and returns the resolved Org, Workspace, namespace
+and a map of Group identifiers to SHA-256 revisions. A missing or foreign
+Group refuses the entire observation. A native policy change during the
+observation returns unavailable. The digests are evidence for review, while
+the scoped decision path continues to read current membership itself.
