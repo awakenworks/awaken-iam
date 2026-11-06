@@ -215,6 +215,62 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
         self.activate_profile_head(namespace, revision, expected_active_revision, true)
     }
 
+    fn activate_scoped_profiles(
+        &self,
+        intents: &[awaken_iam_contract::ScopedAuthorizationProfileIntent],
+        expected_policy_version: u64,
+    ) -> RepositoryResult<u64> {
+        let first = intents
+            .first()
+            .ok_or_else(|| RepositoryError::Conflict("empty activation set".into()))?;
+        let mut ordered: Vec<_> = intents.iter().collect();
+        ordered.sort_unstable_by(|left, right| left.namespace.0.cmp(&right.namespace.0));
+        if ordered
+            .windows(2)
+            .any(|pair| pair[0].namespace == pair[1].namespace)
+            || ordered
+                .iter()
+                .any(|intent| intent.workspace_id != first.workspace_id)
+        {
+            return Err(RepositoryError::Conflict(
+                "activation set requires distinct namespaces in one Workspace".into(),
+            ));
+        }
+        self.backend.with_transaction(&mut |tx| {
+            self.ensure_scope_admission(
+                tx,
+                &[ScopeRef::Workspace {
+                    workspace_id: first.workspace_id.clone(),
+                }],
+                &[],
+            )
+        })?;
+        let version = expected_policy_version
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::Backend("IAM policy version exhausted".into()))?;
+        let mut writes = Vec::new();
+        for intent in ordered {
+            let profiles = self.table("authorization_profiles");
+            writes.push(self.head_write(
+                &intent.namespace,
+                intent.revision,
+                intent.expected_active_revision,
+                true,
+            ));
+            writes.push(SqlWrite {
+                sql: format!("UPDATE {profiles} SET lifecycle='active' WHERE namespace=? AND revision=? AND lifecycle='validated' AND checksum=?"),
+                params: vec![p(intent.namespace.0.clone()), p(revision_key(intent.revision)), p(intent.checksum.clone())],
+            });
+            if let Some(previous) = intent.expected_active_revision {
+                writes.push(self.retirement_write(&intent.namespace, previous));
+            }
+        }
+        writes.push(self.fence_write(expected_policy_version));
+        let checks: Vec<_> = (0..writes.len()).map(|index| (index, 1)).collect();
+        self.backend.execute_transaction_checked(&writes, &checks)?;
+        Ok(version)
+    }
+
     fn retire_active_profile(
         &self,
         namespace: &NamespaceId,
@@ -345,7 +401,38 @@ impl<B: SqlConn> SqlStore<B> {
         let policy_version = previous_version
             .checked_add(1)
             .ok_or_else(|| RepositoryError::Backend("IAM policy version exhausted".into()))?;
-        let head_write = match expected_active_revision {
+        let mut writes = vec![
+            self.head_write(
+                namespace,
+                revision,
+                expected_active_revision,
+                reject_retired_initial,
+            ),
+            self.fence_write(previous_version),
+            SqlWrite {
+                sql: format!(
+                    "UPDATE {} SET lifecycle = 'active' WHERE namespace = ? AND revision = ?",
+                    self.table("authorization_profiles")
+                ),
+                params: vec![p(namespace.0.clone()), p(revision_key(revision))],
+            },
+        ];
+        if let Some(previous) = previous.filter(|previous| *previous != revision) {
+            writes.push(self.retirement_write(namespace, previous));
+        }
+        self.backend
+            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1)])?;
+        Ok((previous, policy_version))
+    }
+
+    fn head_write(
+        &self,
+        namespace: &NamespaceId,
+        revision: u64,
+        expected_active_revision: Option<u64>,
+        reject_retired_initial: bool,
+    ) -> SqlWrite {
+        match expected_active_revision {
             None => {
                 let mut params = vec![p(namespace.0.clone()), p(revision_key(revision))];
                 let guard = if reject_retired_initial {
@@ -380,35 +467,26 @@ impl<B: SqlConn> SqlStore<B> {
                     ],
                 }
             }
-        };
-        let mut writes = vec![
-            head_write,
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET version = version + 1 WHERE id = 1 AND CAST(version AS TEXT) = ?",
-                    self.table("fence")
-                ),
-                params: vec![p(previous_version.to_string())],
-            },
-            SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET lifecycle = 'active' WHERE namespace = ? AND revision = ?",
-                    self.table("authorization_profiles")
-                ),
-                params: vec![p(namespace.0.clone()), p(revision_key(revision))],
-            },
-        ];
-        if let Some(previous) = previous.filter(|previous| *previous != revision) {
-            writes.push(SqlWrite {
-                sql: format!(
-                    "UPDATE {} SET lifecycle = 'retired' WHERE namespace = ? AND revision = ?",
-                    self.table("authorization_profiles")
-                ),
-                params: vec![p(namespace.0.clone()), p(revision_key(previous))],
-            });
         }
-        self.backend
-            .execute_transaction_checked(&writes, &[(0, 1), (1, 1), (2, 1)])?;
-        Ok((previous, policy_version))
+    }
+
+    fn fence_write(&self, previous_version: u64) -> SqlWrite {
+        SqlWrite {
+            sql: format!(
+                "UPDATE {} SET version = version + 1 WHERE id = 1 AND CAST(version AS TEXT) = ?",
+                self.table("fence")
+            ),
+            params: vec![p(previous_version.to_string())],
+        }
+    }
+
+    fn retirement_write(&self, namespace: &NamespaceId, previous: u64) -> SqlWrite {
+        SqlWrite {
+            sql: format!(
+                "UPDATE {} SET lifecycle = 'retired' WHERE namespace = ? AND revision = ?",
+                self.table("authorization_profiles")
+            ),
+            params: vec![p(namespace.0.clone()), p(revision_key(previous))],
+        }
     }
 }

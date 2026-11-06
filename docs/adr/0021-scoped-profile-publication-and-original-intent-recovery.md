@@ -157,3 +157,13 @@ may differ from the original publisher. Replays recover the original retired
 or superseded effect, including across replicas. Retirement keeps the original
 publication history and leaves the scoped data plane closed without an active
 head. The initial-absence activation rule still rejects a retired namespace.
+
+A composed application can activate a bounded set of prepared originals in
+one Workspace. A single current owned Service must hold the direct exact
+`activate-set` grant at every selected namespace and match each original
+publisher. Native admission compares the complete original intents and
+revalidates their current subjects. SQL compares every predecessor and the
+admitting policy fence in one transaction and advances the fence once. Any
+conflict rolls back the whole set. Replaying a fully observed effect reads the
+originals. A mixture of prepared and earlier effects is a conflict.
+Application and product readiness remain with the composing owner.

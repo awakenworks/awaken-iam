@@ -13,6 +13,8 @@ use awaken_iam_server::{
 use std::sync::{Arc, Mutex};
 
 const NS: &str = "tenant.a";
+#[path = "scoped_profile_http_e2e/activation_set.rs"]
+mod activation_set;
 #[path = "scoped_profile_http_e2e/current_decisions.rs"]
 mod current_decisions;
 #[path = "scoped_profile_http_e2e/group_sources.rs"]
@@ -144,7 +146,11 @@ async fn serve_with_scoped_admission(store: Store, scoped: bool) -> String {
     format!("http://{addr}")
 }
 fn command(key: &str, head: Option<u64>) -> PrepareScopedAuthorizationProfile {
-    let action = format!("{NS}::read");
+    command_for(NS, key, head)
+}
+
+fn command_for(namespace: &str, key: &str, head: Option<u64>) -> PrepareScopedAuthorizationProfile {
+    let action = format!("{namespace}::read");
     let mut document = AuthorizationProfileDocument::default();
     document
         .resource_model
@@ -155,7 +161,7 @@ fn command(key: &str, head: Option<u64>) -> PrepareScopedAuthorizationProfile {
         allowed_scope_kinds: vec![ScopeKind::Workspace],
     });
     document.grants.push(GrantSnapshot {
-        id: format!("{NS}:read"),
+        id: format!("{namespace}:read"),
         subject: GrantSubjectRef::Principal {
             principal: service("publisher"),
         },
@@ -167,7 +173,7 @@ fn command(key: &str, head: Option<u64>) -> PrepareScopedAuthorizationProfile {
         request_key: key.into(),
         workspace_id: WorkspaceId("w1".into()),
         profile: CreateAuthorizationProfile {
-            namespace: NamespaceId(NS.into()),
+            namespace: NamespaceId(namespace.into()),
             document,
             created_at: at(),
         },

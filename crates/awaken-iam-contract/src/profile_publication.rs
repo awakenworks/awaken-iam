@@ -70,3 +70,10 @@ pub struct ScopedAuthorizationProfileReceipt {
     pub status: ScopedAuthorizationProfileStatus,
     pub current_active_revision: Option<u64>,
 }
+
+/// One Workspace's already prepared original intents, to activate atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateScopedAuthorizationProfiles {
+    pub intents: Vec<ScopedAuthorizationProfileIntent>,
+}

@@ -2,15 +2,14 @@
 use super::*;
 use crate::{ScopedProfileConsumer, ScopedProfilePublisher};
 use awaken_iam_contract::{
-    PrepareScopedAuthorizationProfile, ScopedAuthorizationProfileBaseline,
-    ScopedAuthorizationProfileReceipt, WorkspaceId,
+    ActivateScopedAuthorizationProfiles, PrepareScopedAuthorizationProfile,
+    ScopedAuthorizationProfileBaseline, ScopedAuthorizationProfileReceipt, WorkspaceId,
 };
 
 impl HttpAuthzTransport {
-    fn scoped_profile_url(
+    fn scoped_workspace_url(
         &self,
         workspace: &WorkspaceId,
-        namespace: &NamespaceId,
         suffix: &[&str],
     ) -> Result<reqwest::Url, RemoteError> {
         let mut url = reqwest::Url::parse(&self.url("/v1/scoped-authz/workspaces"))
@@ -18,10 +17,19 @@ impl HttpAuthzTransport {
         url.path_segments_mut()
             .map_err(|_| RemoteError::new("IAM base URL cannot carry path segments".into()))?
             .push(&workspace.0)
-            .push("profiles")
-            .push(&namespace.0)
             .extend(suffix);
         Ok(url)
+    }
+
+    fn scoped_profile_url(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        suffix: &[&str],
+    ) -> Result<reqwest::Url, RemoteError> {
+        let mut path = vec!["profiles", namespace.0.as_str()];
+        path.extend_from_slice(suffix);
+        self.scoped_workspace_url(workspace, &path)
     }
 }
 
@@ -75,6 +83,14 @@ impl ScopedProfilePublisher for HttpAuthzTransport {
         let url =
             self.scoped_profile_url(workspace, namespace, &["publications", key, "activate"])?;
         Self::decode(self.send_with_retry(|| self.client.post(url.clone()))?)
+    }
+    fn activate_scoped_profile_set(
+        &self,
+        workspace: &WorkspaceId,
+        request: &ActivateScopedAuthorizationProfiles,
+    ) -> Result<Vec<ScopedAuthorizationProfileReceipt>, RemoteError> {
+        let url = self.scoped_workspace_url(workspace, &["activate-publication-set"])?;
+        Self::decode(self.send_with_retry(|| self.client.post(url.clone()).json(request))?)
     }
     fn retire_scoped_profile(
         &self,
