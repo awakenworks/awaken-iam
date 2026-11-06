@@ -499,7 +499,24 @@ async fn retire_requires_exact_authority_and_never_withdraws_a_later_revision() 
         2
     );
 
-    grant(&store, "publisher", &publish, workspace("w1"));
+    // Reissue through the policy owner so both replicas observe the new version.
+    let (status, body) = post(
+        &client,
+        &format!("{first}/v1/admin/grants"),
+        "admin-key",
+        serde_json::to_value(GrantSnapshot {
+            id: format!("publisher:{publish}"),
+            subject: GrantSubjectRef::Principal {
+                principal: service("publisher"),
+            },
+            action_pattern: publish,
+            scope: workspace("w1"),
+            effect: GrantEffect::Allow,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     let reactivated = post(
         &client,
         &path(&second, "/replacement/activate"),
