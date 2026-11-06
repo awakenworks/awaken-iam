@@ -76,6 +76,16 @@ impl ScopedProfilePublisher for HttpAuthzTransport {
             self.scoped_profile_url(workspace, namespace, &["publications", key, "activate"])?;
         Self::decode(self.send_with_retry(|| self.client.post(url.clone()))?)
     }
+    fn retire_scoped_profile(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        key: &str,
+    ) -> Result<ScopedAuthorizationProfileReceipt, RemoteError> {
+        let url =
+            self.scoped_profile_url(workspace, namespace, &["publications", key, "retire"])?;
+        Self::decode(self.send_with_retry(|| self.client.post(url.clone()))?)
+    }
 }
 
 #[cfg(test)]

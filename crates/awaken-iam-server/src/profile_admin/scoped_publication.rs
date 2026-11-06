@@ -231,4 +231,48 @@ impl AuthorizationProfileAdmin {
         self.install_activation(authz, base, profile, previous, version);
         self.scoped_publication_receipt(namespace, key)
     }
+
+    /// Retire the active head created by this exact scoped publication.
+    pub fn retire_scoped_publication(
+        &self,
+        authz: &mut AuthzApi,
+        base: &PolicySnapshot,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        key: &str,
+    ) -> Result<ScopedAuthorizationProfileReceipt, ProfileAdminError> {
+        let intent = self
+            .scoped_publication(namespace, key)?
+            .filter(|intent| &intent.workspace_id == workspace)
+            .ok_or(ProfileAdminError::NotFound)?;
+        let profile = self
+            .repository
+            .get_profile(namespace, intent.revision)?
+            .ok_or(ProfileAdminError::NotFound)?;
+        if profile.checksum != intent.checksum {
+            return Err(ProfileAdminError::Repository(
+                "publication intent checksum mismatch".into(),
+            ));
+        }
+        if profile.lifecycle == ProfileLifecycle::Retired {
+            return self.scoped_publication_receipt(namespace, key);
+        }
+        match self.retire(authz, base, namespace, intent.revision) {
+            Ok(_) => self.scoped_publication_receipt(namespace, key),
+            Err(error @ (ProfileAdminError::Conflict(_) | ProfileAdminError::NotFound)) => {
+                // A different replica can retire or supersede the exact revision first.
+                let receipt = self.scoped_publication_receipt(namespace, key)?;
+                if matches!(
+                    receipt.status,
+                    ScopedAuthorizationProfileStatus::Retired
+                        | ScopedAuthorizationProfileStatus::Superseded
+                ) {
+                    Ok(receipt)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
