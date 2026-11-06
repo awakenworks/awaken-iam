@@ -1,12 +1,15 @@
 //! Finite namespace/Workspace publication capabilities, never global PAP keys.
 use super::*;
-use awaken_iam_contract::{PrepareScopedAuthorizationProfile, PrincipalRef, ScopeRef, WorkspaceId};
+use awaken_iam_contract::{
+    OrgId, PrepareScopedAuthorizationProfile, PrincipalRef, ScopeRef, WorkspaceId,
+};
 use awaken_iam_core::{
     AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, ResourceModelRepository,
 };
 
 #[cfg(test)]
 mod admission_tests;
+mod group_sources;
 
 pub fn scoped_profile_router<S>(state: SharedDaemonState<S>) -> Router
 where
@@ -23,6 +26,7 @@ where
         .route("/v1/tokens/introspect", post(super::token_introspection::introspect::<S>).layer(DefaultBodyLimit::max(1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}", get(baseline::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize", post(super::scoped_decisions::authorize::<S>))
+        .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/source-groups", post(group_sources::observe::<S>).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications",post(prepare::<S>).layer(DefaultBodyLimit::max(limit)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}",get(receipt::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}/activate",post(activate::<S>))
@@ -133,15 +137,10 @@ fn decode(body: serde_json::Value) -> Result<PrepareScopedAuthorizationProfile, 
 }
 
 #[allow(clippy::result_large_err)]
-fn live_subjects<S>(
+fn workspace_org<S: PolicyStore>(
     guard: &DaemonState<S>,
     workspace: &WorkspaceId,
-    document: &awaken_iam_contract::AuthorizationProfileDocument,
-    publisher: &PrincipalRef,
-) -> Result<(), Response>
-where
-    S: PolicyStore + AccountRepository,
-{
+) -> Result<OrgId, Response> {
     let edge = ResourceModelRepository::workspace_org(guard.admin.store(), workspace)
         .map_err(|error| admin_error_response(&AdminError::from(error)))?
         .ok_or_else(|| {
@@ -163,15 +162,29 @@ where
             "organization is unavailable",
         ));
     }
+    Ok(edge.org_id)
+}
+
+#[allow(clippy::result_large_err)]
+fn live_subjects<S>(
+    guard: &DaemonState<S>,
+    workspace: &WorkspaceId,
+    document: &awaken_iam_contract::AuthorizationProfileDocument,
+    publisher: &PrincipalRef,
+) -> Result<(), Response>
+where
+    S: PolicyStore + AccountRepository,
+{
+    let org_id = workspace_org(guard, workspace)?;
     let org_scope = ScopeRef::Org {
-        org_id: edge.org_id.clone(),
+        org_id: org_id.clone(),
     };
     let group = |id: &str| -> Result<(), Response> {
         let current = guard
             .admin
             .get_group(&awaken_iam_core::GroupId(id.into()))
             .map_err(|error| admin_error_response(&error))?;
-        if current.is_none_or(|group| group.org != edge.org_id) {
+        if current.is_none_or(|group| group.org != org_id) {
             return Err(error_response(
                 StatusCode::FORBIDDEN,
                 "foreign_profile_group",

@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 const NS: &str = "tenant.a";
 #[path = "scoped_profile_http_e2e/current_decisions.rs"]
 mod current_decisions;
+#[path = "scoped_profile_http_e2e/group_sources.rs"]
+mod group_sources;
 #[path = "scoped_profile_http_e2e/live_subjects.rs"]
 mod live_subjects;
 #[path = "scoped_profile_http_e2e/service_references.rs"]
