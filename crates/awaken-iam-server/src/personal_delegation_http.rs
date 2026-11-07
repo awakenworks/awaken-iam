@@ -344,14 +344,15 @@ where
             .is_none_or(|d| d.service_id != grant.service_id)
         || !grant.consent.actions.contains(&body.binding.action)
         || !grant.consent.scopes.contains(&body.binding.scope)
-        || body.binding.purpose == PersonalDelegationPurpose::Execute
+        || !crate::personal_delegation::binding_shape_is_valid(&body.binding)
+        || crate::personal_delegation::bounded_by_consent(body.binding.purpose)
             && (grant.revoked_at.is_some()
                 || now < grant.consent.valid_from
                 || now >= grant.consent.valid_until)
     {
         return Err(denied());
     }
-    let exp = if body.binding.purpose == PersonalDelegationPurpose::Execute {
+    let exp = if crate::personal_delegation::bounded_by_consent(body.binding.purpose) {
         (now + 300).min(grant.consent.valid_until)
     } else {
         now + 300
@@ -407,7 +408,7 @@ where
             .delegation
             .as_ref()
             .is_none_or(|d| d.service_id != grant.service_id)
-        || claims.binding.target != body.target
+        || claims.binding.target.as_ref() != Some(&body.target)
         || claims.binding.action != body.request.request.action
         || claims.binding.scope != body.request.request.scope
         || !grant.consent.actions.contains(&claims.binding.action)

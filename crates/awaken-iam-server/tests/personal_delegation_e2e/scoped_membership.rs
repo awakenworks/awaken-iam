@@ -159,10 +159,10 @@ async fn scoped_consent_cannot_restore_revoked_membership_or_skip_its_admission_
         grant_id: "consent-1".into(),
         action: ActionKey(ACTION.into()),
         scope: scope(),
-        target: PersonalDelegationTarget {
+        target: Some(PersonalDelegationTarget {
             id: "native-task".into(),
             revision: 4,
-        },
+        }),
         purpose: PersonalDelegationPurpose::Execute,
         original_key: None,
     };

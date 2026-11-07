@@ -435,3 +435,151 @@ async fn explicit_personal_consent_uses_live_policy_and_revocation_even_for_issu
         "outcome credentials never authorize execution"
     );
 }
+
+#[tokio::test]
+async fn scope_level_read_credentials_are_read_only_untargeted_and_follow_consent() {
+    const READ: &str = "resource.read";
+    let store = Arc::new(sqlite_in_memory_store("iam").unwrap());
+    AccountRepository::upsert(
+        &*store,
+        Account {
+            id: AccountId("ada".into()),
+            status: AccountStatus::Active,
+            display_name: None,
+            created_at: Timestamp("2026-11-04T00:00:00Z".into()),
+            updated_at: Timestamp("2026-11-04T00:00:00Z".into()),
+        },
+    )
+    .unwrap();
+    let client = RegisteredClient::confidential(
+        "business",
+        "test-recipient-secret",
+        vec!["https://business.example/cb".into()],
+        [PERSONAL_DELEGATION_CLIENT_SCOPE],
+    )
+    .with_token_exchange(ClientTokenExchangePolicy {
+        audiences: Default::default(),
+        delegation: Some(ClientDelegation {
+            service_id: "business-service".into(),
+            audiences: ["flow".into()].into(),
+            subject_audiences: Default::default(),
+        }),
+    });
+    OAuthClientRepository::upsert(&*store, client).unwrap();
+    let mut auth = AuthApi::new()
+        .with_issuer(ISSUER)
+        .with_identity_repositories(store.clone(), store.clone(), store.clone())
+        .with_oauth_repositories(store.clone(), store.clone());
+    let owner = auth
+        .mint_access_token(MintAccessToken {
+            issuer: ISSUER.into(),
+            subject: "ada".into(),
+            audience: PERSONAL_DELEGATION_CONSENT_AUDIENCE.into(),
+            issued_at: now() - 1,
+            expires_at: now() + 3600,
+            scopes: vec![PERSONAL_DELEGATION_CONSENT_SCOPE.into()],
+        })
+        .await
+        .unwrap();
+    let signer = auth.token_authority();
+    let jwks = auth.jwks();
+    let daemon = Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            AuthzApi::new(),
+            AdminAuthPolicy::deny_all(),
+            store.clone(),
+            (*store).clone(),
+            signer,
+        )
+        .unwrap(),
+    ));
+    let app = personal_delegation_router(
+        Arc::new(tokio::sync::Mutex::new(auth)),
+        daemon,
+        store.clone(),
+        ISSUER.into(),
+    );
+    let mut wanted = consent();
+    wanted.request_key = "offline-reads".into();
+    wanted.actions = vec![ActionKey(READ.into()), ActionKey(ACTION.into())];
+    let (status, grant) = call(
+        &app,
+        Some(&owner),
+        "POST",
+        "/v1/personal-delegations",
+        serde_json::to_value(wanted).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    let grant_id = grant["id"].as_str().unwrap().to_owned();
+    let mint = |binding: Value| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                None,
+                "POST",
+                "/v1/personal-delegations/token",
+                json!({"client_id":"business","client_secret":"test-recipient-secret","binding":binding}),
+            )
+            .await
+        }
+    };
+    let read = json!({"grant_id":grant_id,"action":READ,"scope":scope(),"purpose":"read","original_key":null});
+    let (status, issued) = mint(read.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let token = issued["access_token"].as_str().unwrap();
+    let claims = verify_personal_delegation_token(token, &jwks, ISSUER, "flow", now()).unwrap();
+    assert_eq!(claims.binding.purpose, PersonalDelegationPurpose::Read);
+    assert_eq!(claims.binding.target, None);
+    assert!(claims.exp - claims.iat <= 300);
+    for (patch, why) in [
+        (
+            json!({"target":{"id":"native-task","revision":4}}),
+            "a read names no target",
+        ),
+        (json!({"action":ACTION}), "a read uses a .read action only"),
+        (
+            json!({"action":"issue.read"}),
+            "a read stays within consented actions",
+        ),
+        (
+            json!({"original_key":"k"}),
+            "a read carries no original key",
+        ),
+        (
+            json!({"scope":{"kind":"project","workspace_id":"w","project_id":"other"}}),
+            "a read stays within consented scopes",
+        ),
+    ] {
+        let mut binding = read.clone();
+        for (key, value) in patch.as_object().unwrap() {
+            binding[key] = value.clone();
+        }
+        assert_eq!(mint(binding).await.0, StatusCode::FORBIDDEN, "{why}");
+    }
+    let execute = json!({"token":token,"audience":"flow","target":{"id":"native-task","revision":4},"request":{"request":{"principal":{"kind":"service","service_id":"business-service"},"on_behalf_of":[{"kind":"account","account_id":"ada"}],"action":READ,"scope":scope()},"context":{}}});
+    assert_eq!(
+        call(
+            &app,
+            None,
+            "POST",
+            "/v1/authorize/personal-delegation",
+            execute
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "read credentials never authorize execution"
+    );
+    let revoke = format!("/v1/personal-delegations/{grant_id}/revoke");
+    assert_eq!(
+        call(&app, Some(&owner), "POST", &revoke, json!({})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        mint(read).await.0,
+        StatusCode::FORBIDDEN,
+        "revoked consent mints no further reads"
+    );
+}
