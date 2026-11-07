@@ -6,6 +6,8 @@
 //! pinned JWKS); policy evaluation, persistence, and server code live elsewhere.
 
 mod admin;
+mod channel;
+pub use channel::{CHANNEL_ASSERTION_GRANT_TYPE, ChannelAssertionClaims, ChannelPrincipalGrant};
 mod identity;
 mod license;
 mod personal_delegation;

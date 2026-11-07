@@ -88,6 +88,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 mod builder;
+mod channel;
+pub use channel::{ChannelAuthenticationError, ChannelVerifier};
 mod delegation;
 mod personal;
 
@@ -194,6 +196,10 @@ impl ReturnToPolicy {
 /// Audit event emitted as the auth API drives the login session loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthAuditEvent {
+    ChannelAuthentication {
+        accepted: bool,
+        at: Timestamp,
+    },
     /// A login challenge was started for a provider.
     LoginStarted {
         /// Provider the login targets.
@@ -789,6 +795,7 @@ pub enum AuthApiError {
 
 /// Browser-facing third-party auth API over the login session loop.
 pub struct AuthApi<E: EntropySource + Clone = OsEntropy> {
+    channel_authentication: channel::ChannelAuthentication,
     providers: Vec<RegisteredProvider>,
     challenge: OAuthChallengeService<E>,
     login_flows: Arc<dyn LoginFlowRepository>,

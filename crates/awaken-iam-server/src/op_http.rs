@@ -117,6 +117,7 @@ struct BrowserStartQuery {
 #[derive(Debug, Deserialize)]
 struct TokenForm {
     grant_type: String,
+    assertion: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
     code: Option<String>,
@@ -533,6 +534,38 @@ async fn grant(
     let refresh_expires_at = crate::clock::timestamp(now + REFRESH_TOKEN_TTL_SECS);
     let mut auth = state.auth.lock().await;
     let result = match form.grant_type.as_str() {
+        awaken_iam_contract::CHANNEL_ASSERTION_GRANT_TYPE => {
+            if form.audience.is_some()
+                || form.scope.is_some()
+                || form.actor_token.is_some()
+                || form.subject_token.is_some()
+                || form.refresh_token.is_some()
+                || form.resource.is_some()
+                || form.actor_token_type.is_some()
+                || form.subject_token_type.is_some()
+                || form.requested_token_type.is_some()
+                || form.code.is_some()
+                || form.redirect_uri.is_some()
+                || form.code_verifier.is_some()
+            {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            let Some(assertion) = form.assertion else {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+            };
+            return match auth
+                .authenticate_channel(&client_id, client_secret.as_deref(), &assertion, now as i64)
+                .await
+            {
+                Ok(grant) => Json(grant).into_response(),
+                Err(crate::ChannelAuthenticationError::Rejected) => {
+                    oauth_error(StatusCode::BAD_REQUEST, "invalid_grant")
+                }
+                Err(crate::ChannelAuthenticationError::Unavailable) => {
+                    oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+                }
+            };
+        }
         "authorization_code" => {
             let (Some(code), Some(redirect_uri)) = (form.code, form.redirect_uri) else {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");

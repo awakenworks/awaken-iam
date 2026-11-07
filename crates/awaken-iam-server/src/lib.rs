@@ -7,6 +7,7 @@ mod anthropic_admin;
 mod approval_discharge;
 mod assembly;
 mod auth_api;
+pub use auth_api::{ChannelAuthenticationError, ChannelVerifier};
 mod auth_redirect;
 mod auth_types;
 mod authz_api;
