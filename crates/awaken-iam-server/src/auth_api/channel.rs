@@ -665,13 +665,13 @@ mod tests {
         );
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires FLOW_CHANNEL_ADAPTER_TEST_BINARY from the qualified Flow worktree"]
+    #[ignore = "requires FLOW_CHANNEL_IAM_PROBE, built with cargo build -p awaken-flow-iam --example channel_iam_probe"]
     async fn channel_native_owner_composes_with_flow_http_adapter_and_revocation() {
-        let binary = std::env::var("FLOW_CHANNEL_ADAPTER_TEST_BINARY")
-            .expect("separately built Flow adapter test executable");
+        let binary = std::env::var_os("FLOW_CHANNEL_IAM_PROBE")
+            .expect("separately built Flow channel_iam_probe executable");
         let (api, store, _, _) = fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/v1/oauth/token", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap().to_string();
         let app = crate::op_http::op_router(
             Arc::new(tokio::sync::Mutex::new(api)),
             "https://iam.example",
@@ -680,27 +680,33 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        for revoked in [false, true] {
-            if revoked {
+        for expected in ["active", "disabled"] {
+            if expected == "disabled" {
                 let mut account = AccountRepository::get(&store, &AccountId("alice".into()))
                     .unwrap()
                     .unwrap();
                 account.status = AccountStatus::Disabled;
                 AccountRepository::upsert(&store, account).unwrap();
             }
-            let (binary, endpoint) = (binary.clone(), endpoint.clone());
-            let output=tokio::task::spawn_blocking(move || {
-                let mut command=std::process::Command::new(binary);
-                command.args(["--ignored","--exact","channel::tests::channel_native_iam_http_grant_resolves_current_account_without_fallback","--nocapture"])
-                    .env("FLOW_CHANNEL_TEST_TOKEN_ENDPOINT",endpoint).env("NO_PROXY","127.0.0.1,localhost,::1")
-                    .env_remove("HTTP_PROXY").env_remove("HTTPS_PROXY").env_remove("ALL_PROXY");
-                if revoked {command.env("FLOW_CHANNEL_TEST_EXPECT_REJECT","1");} else {command.env_remove("FLOW_CHANNEL_TEST_EXPECT_REJECT");}
-                command.output().unwrap()
-            }).await.unwrap();
+            let (binary, address) = (binary.clone(), address.clone());
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(binary)
+                    .args([address.as_str(), expected])
+                    .env("NO_PROXY", "127.0.0.1,localhost,::1")
+                    .env_remove("HTTP_PROXY")
+                    .env_remove("HTTPS_PROXY")
+                    .env_remove("ALL_PROXY")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let confirmation = format!("channel IAM probe passed: {expected}");
             assert!(
-                output.status.success(),
-                "Flow native adapter cohort failed: {}",
-                String::from_utf8_lossy(&output.stdout)
+                output.status.success() && stdout.lines().any(|line| line == confirmation),
+                "Flow native adapter cohort failed for {expected}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
             );
         }
         server.abort();
