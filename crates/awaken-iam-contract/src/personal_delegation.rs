@@ -34,6 +34,9 @@ pub struct PersonalDelegation {
 pub enum PersonalDelegationPurpose {
     Execute,
     OriginalOutcome,
+    /// A scope-level read on the owner's behalf: no target, a `.read` action
+    /// only, never a write. Each use is still evaluated against current policy.
+    Read,
 }
 
 /// The target is an opaque owner identifier, never a product type inside IAM.
@@ -50,7 +53,9 @@ pub struct MintPersonalDelegationToken {
     pub grant_id: String,
     pub action: ActionKey,
     pub scope: ScopeRef,
-    pub target: PersonalDelegationTarget,
+    /// The exact native target; absent only for a scope-level `Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PersonalDelegationTarget>,
     pub purpose: PersonalDelegationPurpose,
     /// Required only for a read of the original native outcome.
     pub original_key: Option<String>,

@@ -34,24 +34,49 @@ pub fn verify_personal_delegation_token(
             &claims.service_id,
             &claims.client_id,
             &claims.grant_id,
-            &binding.target.id,
             &binding.action.0,
         ]
         .iter()
         .any(|s| s.trim().is_empty() || s.len() > 500)
         || binding.grant_id != claims.grant_id
-        || binding.target.revision == 0
-        || match binding.purpose {
-            PersonalDelegationPurpose::Execute => binding.original_key.is_some(),
-            PersonalDelegationPurpose::OriginalOutcome => binding
-                .original_key
-                .as_ref()
-                .is_none_or(|s| s.trim().is_empty() || s.len() > 500),
-        }
+        || !binding_shape_is_valid(binding)
     {
         return Err(AccessTokenError::Malformed);
     }
     Ok(claims)
+}
+
+/// Execute and original-outcome reads name one exact native target; a `Read`
+/// names none, carries no original key and may only use a `.read` action.
+pub fn binding_shape_is_valid(binding: &MintPersonalDelegationToken) -> bool {
+    let target = |t: &Option<awaken_iam_contract::PersonalDelegationTarget>| {
+        t.as_ref()
+            .is_some_and(|t| !t.id.trim().is_empty() && t.id.len() <= 500 && t.revision != 0)
+    };
+    match binding.purpose {
+        PersonalDelegationPurpose::Execute => {
+            target(&binding.target) && binding.original_key.is_none()
+        }
+        PersonalDelegationPurpose::OriginalOutcome => {
+            target(&binding.target)
+                && binding
+                    .original_key
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 500)
+        }
+        PersonalDelegationPurpose::Read => {
+            binding.target.is_none()
+                && binding.original_key.is_none()
+                && binding.action.0.ends_with(".read")
+                && binding.action.0.len() > ".read".len()
+        }
+    }
+}
+
+/// Consent validity bounds every credential that acts on the owner's behalf now;
+/// only an original-outcome read may outlive the consent.
+pub fn bounded_by_consent(purpose: PersonalDelegationPurpose) -> bool {
+    purpose != PersonalDelegationPurpose::OriginalOutcome
 }
 
 pub(crate) async fn mint(
@@ -61,7 +86,7 @@ pub(crate) async fn mint(
     issuer: &str,
     now: i64,
 ) -> Result<String, AccessTokenError> {
-    let exp = if binding.purpose == PersonalDelegationPurpose::Execute {
+    let exp = if bounded_by_consent(binding.purpose) {
         (now + 300).min(grant.consent.valid_until)
     } else {
         now + 300
