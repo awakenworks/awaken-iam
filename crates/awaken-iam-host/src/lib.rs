@@ -42,7 +42,7 @@ pub use local_browser::{
 pub use middleware::{
     AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenActor, TokenWorkspace, auth_layer,
 };
-pub use remote::{ConnectError, RemoteHandle, connect_remote};
+pub use remote::{ConnectError, RemoteHandle, connect_remote, connect_remote_single_attempt};
 
 // Convenience re-exports so callers rarely need to reach into sub-crates.
 pub use awaken_iam_client::{IamClient, IamClientMode, RemoteIamClient, ScopedProfileConsumer};

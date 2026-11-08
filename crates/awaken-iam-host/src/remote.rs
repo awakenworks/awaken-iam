@@ -37,6 +37,27 @@ pub struct RemoteHandle {
 /// Returns [`ConnectError`] when the configuration is invalid or the JWKS
 /// cannot be fetched.
 pub fn connect_remote(cfg: &HostConfig) -> Result<RemoteHandle, ConnectError> {
+    connect_remote_with_retry_budget(cfg, None)
+}
+
+/// Connect with exactly one HTTP attempt for each remote authority operation.
+///
+/// Use this assembly when a failed current observation must remain unavailable
+/// for the caller's entire capture. It never retries a transient failure into a
+/// later decision. The ordinary [`connect_remote`] retains its retry budget.
+/// Credentials, audience, issuer and JWKS verification use the same constructor.
+///
+/// # Errors
+///
+/// Returns the same configuration and JWKS errors as [`connect_remote`].
+pub fn connect_remote_single_attempt(cfg: &HostConfig) -> Result<RemoteHandle, ConnectError> {
+    connect_remote_with_retry_budget(cfg, Some(0))
+}
+
+fn connect_remote_with_retry_budget(
+    cfg: &HostConfig,
+    max_retries: Option<u32>,
+) -> Result<RemoteHandle, ConnectError> {
     if cfg.mode != HostMode::Remote {
         return Err(ConnectError::Config(HostConfigError::MissingField(
             "mode == Remote",
@@ -52,6 +73,9 @@ pub fn connect_remote(cfg: &HostConfig) -> Result<RemoteHandle, ConnectError> {
             )))?;
 
     let mut transport_cfg = HttpTransportConfig::new(base_url);
+    if let Some(max_retries) = max_retries {
+        transport_cfg = transport_cfg.with_max_retries(max_retries);
+    }
     if cfg.service_token.is_some() && cfg.service_token_file.is_some() {
         return Err(ConnectError::Config(HostConfigError::InvalidValue(
             "service_token",
@@ -89,3 +113,6 @@ fn fetch_jwks(base_url: &str) -> Result<awaken_iam_contract::Jwks, ConnectError>
         .map_err(|e| ConnectError::JwksFetch(e.to_string()))?;
     Ok(jwks)
 }
+
+#[cfg(test)]
+mod single_attempt_tests;
