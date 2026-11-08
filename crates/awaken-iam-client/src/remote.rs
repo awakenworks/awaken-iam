@@ -84,6 +84,24 @@ impl RemoteError {
 /// shaping, decision mapping, fail-closed policy) be unit tested without network
 /// access. Implementations should be `Send + Sync` so the client can be shared.
 pub trait AuthzTransport {
+    /// Current decision metadata is an explicit capability. A legacy Allow
+    /// cannot establish native freshness or a cursor qualification.
+    fn authorize_resource_evaluation(
+        &self,
+        _request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        Err(RemoteError::new(
+            "authorization freshness is unsupported".into(),
+        ))
+    }
+    fn authorize_personal_delegation_evaluation(
+        &self,
+        _request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        Err(RemoteError::new(
+            "personal authorization freshness is unsupported".into(),
+        ))
+    }
     /// Explicit durable-consent protocol. Legacy transports fail closed.
     fn authorize_personal_delegation(
         &self,
@@ -447,6 +465,35 @@ impl<T> RemoteIamClient<T> {
 }
 
 impl<T: AuthzTransport> RemoteIamClient<T> {
+    pub fn authorize_resource_evaluation(
+        &self,
+        request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        self.transport.authorize_resource_evaluation(request)
+    }
+    pub fn authorize_personal_delegation_evaluation(
+        &self,
+        request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        match self
+            .transport
+            .authorize_personal_delegation_evaluation(request)
+        {
+            Err(error) if matches!(error.status(), Some(401 | 403)) => {
+                Ok(awaken_iam_contract::AuthorizationEvaluation {
+                    outcome: AuthorizationOutcome {
+                        decision: AuthorizationDecision::Deny,
+                        reason: "personal_delegation_rejected".into(),
+                        matched_grants: vec![],
+                        matched_roles: vec![],
+                        obligation: None,
+                    },
+                    freshness: None,
+                })
+            }
+            result => result,
+        }
+    }
     pub fn authorize_personal_delegation(
         &self,
         request: &awaken_iam_contract::AuthorizePersonalDelegation,

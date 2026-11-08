@@ -204,6 +204,29 @@ impl IamGate {
             .authorize_personal_delegation(&request)
             .map_err(|_| IamDecisionError::Unavailable)
     }
+    /// No cache or unsupported local provider can attest a complete native fence.
+    pub fn authorize_resource_evaluation(
+        &self,
+        request: ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, IamDecisionError> {
+        let GateInner::Remote { client, .. } = self.inner.as_ref() else {
+            return Err(IamDecisionError::Unavailable);
+        };
+        client
+            .authorize_resource_evaluation(&request)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
+    pub fn authorize_personal_delegation_evaluation(
+        &self,
+        request: awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, IamDecisionError> {
+        let GateInner::Remote { client, .. } = self.inner.as_ref() else {
+            return Err(IamDecisionError::Unavailable);
+        };
+        client
+            .authorize_personal_delegation_evaluation(&request)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
     /// Open mode: no authentication, all requests allowed.
     pub fn open() -> Self {
         Self {
@@ -260,6 +283,14 @@ impl IamGate {
     pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = Some(issuer.into());
         self
+    }
+
+    /// Read-only metadata of the actual verifier configuration, not identity
+    /// proof. Consumers still require a verified Account, never caller input.
+    pub fn expected_issuer(&self) -> Option<&str> {
+        self.issuer
+            .as_deref()
+            .filter(|issuer| !issuer.is_empty() && issuer.trim() == *issuer)
     }
 
     pub(crate) fn with_audience_opt(mut self, audience: Option<String>) -> Self {
@@ -499,7 +530,37 @@ fn introspected_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use awaken_iam_contract::ApiTokenStatus;
+    use awaken_iam_contract::{AccountId, ApiTokenStatus};
+
+    #[test]
+    fn open_allow_cannot_fabricate_freshness_without_a_native_store() {
+        let request = ResourceAuthorizationRequest {
+            request: AuthorizationRequest::direct(
+                PrincipalRef::Account {
+                    account_id: AccountId("ada".into()),
+                },
+                ActionKey("document.read".into()),
+                ScopeRef::Global,
+            ),
+            context: Default::default(),
+        };
+        assert!(
+            IamGate::open()
+                .authorize_resource_evaluation(request)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expected_issuer_is_exact_verifier_metadata_without_a_fallback() {
+        assert_eq!(IamGate::open().expected_issuer(), None);
+        let gate = IamGate::open().with_issuer("https://iam.example");
+        assert_eq!(gate.expected_issuer(), Some("https://iam.example"));
+        assert_eq!(gate.clone().expected_issuer(), Some("https://iam.example"));
+        for invalid in ["", "  ", " https://iam.example"] {
+            assert_eq!(IamGate::open().with_issuer(invalid).expected_issuer(), None);
+        }
+    }
 
     #[test]
     fn remote_authentication_uses_status_evidence_not_diagnostic_words() {

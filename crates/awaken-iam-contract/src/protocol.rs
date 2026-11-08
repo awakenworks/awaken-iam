@@ -118,6 +118,20 @@ pub struct AuthorizationOutcome {
     pub obligation: Option<ApprovalObligation>,
 }
 
+/// Non-authoritative current-decision metadata on native PDP responses.
+pub const AUTHORIZATION_FRESHNESS_HEADER: &str = "x-awaken-authorization-freshness";
+
+/// A current evaluation and an optional freshness observation, never a lease.
+/// An Allow is usable for cursor qualification only with native freshness.
+/// Explicit denials need no qualification and remain ordinary denials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationEvaluation {
+    pub outcome: AuthorizationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+}
+
 /// Request body for `POST /v1/authorize/batch`.
 ///
 /// A batch lets a caller resolve several authorization questions in one round

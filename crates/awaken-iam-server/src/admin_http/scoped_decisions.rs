@@ -31,10 +31,27 @@ pub(super) fn response<S: PolicyStore>(
     request: &ResourceAuthorizationRequest,
     expected: Option<(&WorkspaceId, &NamespaceId)>,
 ) -> Response {
-    match decide(state, request, expected) {
-        Ok(outcome) => Json(outcome).into_response(),
-        Err(_) => unavailable(),
+    let Ok(before) = state.admin.store().fence() else {
+        return unavailable();
+    };
+    let outcome = match decide(state, request, expected) {
+        Ok(outcome) => outcome,
+        Err(_) => return unavailable(),
+    };
+    let Ok(after) = state.admin.store().fence() else {
+        return unavailable();
+    };
+    if before != after {
+        return unavailable();
     }
+    (
+        [(
+            awaken_iam_contract::AUTHORIZATION_FRESHNESS_HEADER,
+            crate::authorization_freshness(after),
+        )],
+        Json(outcome),
+    )
+        .into_response()
 }
 
 pub(super) fn decide<S: PolicyStore>(

@@ -24,6 +24,9 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use tower::ServiceExt;
 
+#[path = "admin_http_e2e/freshness.rs"]
+mod freshness;
+
 const ADMIN_TOKEN: &str = "admin-secret";
 const AGENTS_TOKEN: &str = "agents-directory-secret";
 

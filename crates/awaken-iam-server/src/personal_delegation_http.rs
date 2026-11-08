@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -170,17 +171,6 @@ fn recipient<S: OAuthClientRepository>(
         return Err(denied());
     }
     Ok(client)
-}
-fn evaluate<S: PolicyStore>(
-    state: &PersonalState<S>,
-    request: &ResourceAuthorizationRequest,
-) -> Result<AuthorizationOutcome, Failure> {
-    state
-        .daemon
-        .lock()
-        .map_err(|_| unavailable())?
-        .authorize_current_resource(request)
-        .map_err(|_| unavailable())
 }
 fn chain(
     grant: &PersonalDelegation,
@@ -402,7 +392,7 @@ where
 async fn authorize<S>(
     State(state): State<PersonalState<S>>,
     Json(body): Json<AuthorizePersonalDelegation>,
-) -> Result<Json<AuthorizationOutcome>, Failure>
+) -> Result<Response, Failure>
 where
     S: PolicyStore + PersonalDelegationRepository + OAuthClientRepository + AccountRepository,
 {
@@ -461,5 +451,16 @@ where
     }
     let mut request = body.request;
     request.context.evaluated_at = Some(now * 1000);
-    Ok(Json(evaluate(&state, &request)?))
+    let evaluation = state
+        .daemon
+        .lock()
+        .map_err(|_| unavailable())?
+        .authorize_current_resource_evaluation(&request)
+        .map_err(|_| unavailable())?;
+    let freshness = evaluation.freshness.ok_or_else(unavailable)?;
+    Ok((
+        [(AUTHORIZATION_FRESHNESS_HEADER, freshness)],
+        Json(evaluation.outcome),
+    )
+        .into_response())
 }

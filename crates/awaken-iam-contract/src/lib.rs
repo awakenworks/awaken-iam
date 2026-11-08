@@ -71,10 +71,11 @@ pub use license::{
     LICENSE_CLAIM_SCHEMA_VERSION, LicenseClaim, LicenseSignature, LicenseVerifyError,
 };
 pub use protocol::{
-    ApiTokenStatus, ApprovalAuthority, ApprovalObligation, AuthorizationOutcome,
-    BatchAuthorizationRequest, BatchAuthorizationResponse, EntitlementCheckResponse, GrantBatch,
-    GrantEffect, GrantSnapshot, GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot,
-    NamespaceOrgEdge, PolicySnapshot, ProductResourceModelRequest, ResourceModelRegistered,
+    AUTHORIZATION_FRESHNESS_HEADER, ApiTokenStatus, ApprovalAuthority, ApprovalObligation,
+    AuthorizationEvaluation, AuthorizationOutcome, BatchAuthorizationRequest,
+    BatchAuthorizationResponse, EntitlementCheckResponse, GrantBatch, GrantEffect, GrantSnapshot,
+    GrantSubjectRef, GroupRoleBindingSnapshot, GroupRosterSnapshot, NamespaceOrgEdge,
+    PolicySnapshot, ProductResourceModelRequest, ResourceModelRegistered,
     ResourceModelRegistration, ResourceParentEdge, ResourceProjectionBatch,
     ResourceProjectionDisposition, ResourceProjectionReceipt, ResourceProvision,
     ResourceProvisionDisposition, ResourceProvisionReceipt, ResourceRetirement,
