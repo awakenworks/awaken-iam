@@ -29,6 +29,33 @@ pub struct PersonalDelegation {
     pub version: u64,
 }
 
+/// A bounded direct-owner inventory query. Unknown selectors are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListPersonalDelegations {
+    #[serde(default = "default_personal_delegation_limit")]
+    pub limit: u16,
+    /// Exclusive opaque identifier bound from the preceding page.
+    pub after: Option<String>,
+}
+fn default_personal_delegation_limit() -> u16 {
+    50
+}
+impl Default for ListPersonalDelegations {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            after: None,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalDelegationPage {
+    pub items: Vec<PersonalDelegation>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersonalDelegationPurpose {

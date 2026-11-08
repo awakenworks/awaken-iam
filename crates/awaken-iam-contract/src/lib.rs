@@ -12,9 +12,9 @@ mod personal_delegation;
 mod protocol;
 mod resource_authorization;
 pub use personal_delegation::{
-    AuthorizePersonalDelegation, CreatePersonalDelegation, MintPersonalDelegationToken,
-    PersonalDelegation, PersonalDelegationPurpose, PersonalDelegationTarget,
-    PersonalDelegationTokenClaims,
+    AuthorizePersonalDelegation, CreatePersonalDelegation, ListPersonalDelegations,
+    MintPersonalDelegationToken, PersonalDelegation, PersonalDelegationPage,
+    PersonalDelegationPurpose, PersonalDelegationTarget, PersonalDelegationTokenClaims,
 };
 mod trust;
 

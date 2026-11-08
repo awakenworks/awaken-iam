@@ -8,7 +8,7 @@ use awaken_iam_core::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -65,7 +65,7 @@ where
         + 'static,
 {
     Router::new()
-        .route("/v1/personal-delegations", post(create::<S>))
+        .route("/v1/personal-delegations", post(create::<S>).get(list::<S>))
         .route("/v1/personal-delegations/{id}", get(read::<S>))
         .route("/v1/personal-delegations/{id}/revoke", post(revoke::<S>))
         .route("/v1/personal-delegations/token", post(token::<S>))
@@ -123,6 +123,33 @@ async fn owner<S: AccountRepository>(
     let account = AccountId(c.sub);
     current_account(state, &account)?;
     Ok(account)
+}
+async fn list<S>(
+    State(state): State<PersonalState<S>>,
+    headers: HeaderMap,
+    Query(query): Query<ListPersonalDelegations>,
+) -> Result<Json<PersonalDelegationPage>, Failure>
+where
+    S: AccountRepository + PersonalDelegationRepository,
+{
+    let now = crate::clock::unix_seconds() as i64;
+    let account = owner(&state, &headers, now).await?;
+    if !(1..=100).contains(&query.limit)
+        || query.after.as_ref().is_some_and(|cursor| {
+            cursor.is_empty() || cursor.len() > 300 || cursor.trim() != cursor
+        })
+    {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "personal_delegation_invalid_page",
+        ));
+    }
+    Ok(Json(
+        state
+            .store
+            .list_personal_delegations(&account, &query)
+            .map_err(storage)?,
+    ))
 }
 fn recipient<S: OAuthClientRepository>(
     state: &PersonalState<S>,

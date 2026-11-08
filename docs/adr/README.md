@@ -24,3 +24,4 @@
 | [0020](0020-trusted-migration-predecessors-preserve-resource-limits.md) | Trusted migration predecessors preserve exact resource limits | Proposed |
 | [0021](0021-scoped-profile-publication-and-original-intent-recovery.md) | Scoped profile publication and original-intent recovery | Proposed |
 | [0022](0022-live-scope-read-consent-authorization.md) | Live authorization of scope-level personal reads | Proposed |
+| [0023](0023-direct-owner-personal-consent-listing.md) | Bounded direct-owner personal consent listing | Proposed |

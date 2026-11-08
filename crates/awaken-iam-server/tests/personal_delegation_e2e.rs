@@ -16,6 +16,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use tower::ServiceExt;
 const ISSUER: &str = "https://consent-iam.example";
 const ACTION: &str = "operations.business::models.quote.approve";
+#[path = "personal_delegation_e2e/listing.rs"]
+mod listing;
 #[path = "personal_delegation_e2e/scoped_membership.rs"]
 mod scoped_membership;
 fn now() -> i64 {
@@ -93,6 +95,7 @@ fn exercise_repository<S: PersonalDelegationRepository + Clone + Send + 'static>
         revoked,
         "replaying creation never resurrects consent"
     );
+    listing::exercise_listing(&store);
 }
 #[test]
 fn consent_sql_concurrency_and_monotonic_lifecycle() {
