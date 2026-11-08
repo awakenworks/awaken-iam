@@ -83,6 +83,8 @@ pub struct PersonalDelegationTokenClaims {
 pub struct AuthorizePersonalDelegation {
     pub token: String,
     pub audience: String,
-    pub target: PersonalDelegationTarget,
+    /// Exact execution target; absent only when authorizing a scope-level Read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PersonalDelegationTarget>,
     pub request: ResourceAuthorizationRequest,
 }

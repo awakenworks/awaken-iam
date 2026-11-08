@@ -395,7 +395,15 @@ where
         .ok_or_else(denied)?;
     current_account(&state, &grant.owner)?;
     let client = recipient(&state, &claims.client_id, &claims.aud)?;
-    if claims.binding.purpose != PersonalDelegationPurpose::Execute
+    let target_matches = match claims.binding.purpose {
+        PersonalDelegationPurpose::Execute => body
+            .target
+            .as_ref()
+            .is_some_and(|target| claims.binding.target.as_ref() == Some(target)),
+        PersonalDelegationPurpose::Read => body.target.is_none(),
+        PersonalDelegationPurpose::OriginalOutcome => false,
+    };
+    if !target_matches
         || grant.revoked_at.is_some()
         || now < grant.consent.valid_from
         || now >= grant.consent.valid_until
@@ -408,7 +416,6 @@ where
             .delegation
             .as_ref()
             .is_none_or(|d| d.service_id != grant.service_id)
-        || claims.binding.target.as_ref() != Some(&body.target)
         || claims.binding.action != body.request.request.action
         || claims.binding.scope != body.request.request.scope
         || !grant.consent.actions.contains(&claims.binding.action)
