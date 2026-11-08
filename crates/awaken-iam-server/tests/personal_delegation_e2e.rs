@@ -465,7 +465,35 @@ async fn scope_level_read_credentials_are_read_only_untargeted_and_follow_consen
             subject_audiences: Default::default(),
         }),
     });
-    OAuthClientRepository::upsert(&*store, client).unwrap();
+    OAuthClientRepository::upsert(&*store, client.clone()).unwrap();
+    let mut policy = PolicyAdminApi::new((*store).clone());
+    for (id, principal) in [
+        (
+            "read-human",
+            PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            },
+        ),
+        (
+            "read-service",
+            PrincipalRef::Service {
+                service_id: "business-service".into(),
+            },
+        ),
+    ] {
+        policy
+            .issue_grant(
+                Grant {
+                    id: GrantId(id.into()),
+                    subject: GrantSubject::Principal(principal),
+                    action_pattern: ActionPattern(READ.into()),
+                    scope: scope(),
+                    effect: Effect::Allow,
+                },
+                Timestamp("2026-11-09T00:00:00Z".into()),
+            )
+            .unwrap();
+    }
     let mut auth = AuthApi::new()
         .with_issuer(ISSUER)
         .with_identity_repositories(store.clone(), store.clone(), store.clone())
@@ -558,6 +586,103 @@ async fn scope_level_read_credentials_are_read_only_untargeted_and_follow_consen
         }
         assert_eq!(mint(binding).await.0, StatusCode::FORBIDDEN, "{why}");
     }
+    // Live-read decision table: the same signed credential must be accepted
+    // with current consent/policy, then refused after current authority changes.
+    // Shape, action, scope, human, service and audience remain exact.
+    let live = json!({"token":token,"audience":"flow","request":{"request":{"principal":{"kind":"service","service_id":"business-service"},"on_behalf_of":[{"kind":"account","account_id":"ada"}],"action":READ,"scope":scope()},"context":{}}});
+    let check = |request: Value| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                None,
+                "POST",
+                "/v1/authorize/personal-delegation",
+                request,
+            )
+            .await
+        }
+    };
+    let (status, allowed) = check(live.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["decision"], "allow");
+    for (pointer, changed) in [
+        ("/audience", json!("other")),
+        ("/request/request/action", json!("issue.read")),
+        ("/request/request/scope/project_id", json!("other")),
+        (
+            "/request/request/principal/service_id",
+            json!("other-service"),
+        ),
+        (
+            "/request/request/on_behalf_of/0/account_id",
+            json!("other-owner"),
+        ),
+    ] {
+        let mut wrong = live.clone();
+        *wrong.pointer_mut(pointer).unwrap() = changed;
+        assert_eq!(check(wrong).await.0, StatusCode::FORBIDDEN, "{pointer}");
+    }
+    let mut disabled = AccountRepository::get(&*store, &AccountId("ada".into()))
+        .unwrap()
+        .unwrap();
+    disabled.status = AccountStatus::Disabled;
+    AccountRepository::upsert(&*store, disabled.clone()).unwrap();
+    assert_eq!(
+        check(live.clone()).await.0,
+        StatusCode::FORBIDDEN,
+        "same token after owner disabled"
+    );
+    disabled.status = AccountStatus::Active;
+    AccountRepository::upsert(&*store, disabled).unwrap();
+    let mut withdrawn = client.clone();
+    withdrawn.token_exchange.delegation = None;
+    OAuthClientRepository::upsert(&*store, withdrawn).unwrap();
+    assert_eq!(
+        check(live.clone()).await.0,
+        StatusCode::FORBIDDEN,
+        "same token after recipient admission withdrawn"
+    );
+    OAuthClientRepository::upsert(&*store, client).unwrap();
+    for id in ["read-human", "read-service"] {
+        policy
+            .revoke_grant(
+                &GrantId(id.into()),
+                Timestamp("2026-11-09T00:00:01Z".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            check(live.clone()).await.1["decision"],
+            "deny",
+            "same token after {id} policy withdrawn"
+        );
+        let principal = if id == "read-human" {
+            PrincipalRef::Account {
+                account_id: AccountId("ada".into()),
+            }
+        } else {
+            PrincipalRef::Service {
+                service_id: "business-service".into(),
+            }
+        };
+        policy
+            .issue_grant(
+                Grant {
+                    id: GrantId(format!("{id}-restored")),
+                    subject: GrantSubject::Principal(principal),
+                    action_pattern: ActionPattern(READ.into()),
+                    scope: scope(),
+                    effect: Effect::Allow,
+                },
+                Timestamp("2026-11-09T00:00:02Z".into()),
+            )
+            .unwrap();
+    }
+    assert_eq!(check(live.clone()).await.1["decision"], "allow");
+    assert!(
+        verify_personal_delegation_token(token, &jwks, ISSUER, "flow", claims.exp).is_err(),
+        "same signed token expires"
+    );
     let execute = json!({"token":token,"audience":"flow","target":{"id":"native-task","revision":4},"request":{"request":{"principal":{"kind":"service","service_id":"business-service"},"on_behalf_of":[{"kind":"account","account_id":"ada"}],"action":READ,"scope":scope()},"context":{}}});
     assert_eq!(
         call(
@@ -576,6 +701,11 @@ async fn scope_level_read_credentials_are_read_only_untargeted_and_follow_consen
     assert_eq!(
         call(&app, Some(&owner), "POST", &revoke, json!({})).await.0,
         StatusCode::OK
+    );
+    assert_eq!(
+        check(live).await.0,
+        StatusCode::FORBIDDEN,
+        "same issued read token after consent revoked"
     );
     assert_eq!(
         mint(read).await.0,

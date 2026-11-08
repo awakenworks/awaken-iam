@@ -990,10 +990,10 @@ mod tests {
         let request = awaken_iam_contract::AuthorizePersonalDelegation {
             token: "opaque".into(),
             audience: "product".into(),
-            target: awaken_iam_contract::PersonalDelegationTarget {
+            target: Some(awaken_iam_contract::PersonalDelegationTarget {
                 id: "human-unit".into(),
                 revision: 2,
-            },
+            }),
             request: ResourceAuthorizationRequest {
                 request: auth_request("business::review"),
                 context: Default::default(),
