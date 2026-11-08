@@ -25,3 +25,4 @@
 | [0021](0021-scoped-profile-publication-and-original-intent-recovery.md) | Scoped profile publication and original-intent recovery | Proposed |
 | [0022](0022-live-scope-read-consent-authorization.md) | Live authorization of scope-level personal reads | Proposed |
 | [0023](0023-direct-owner-personal-consent-listing.md) | Bounded direct-owner personal consent listing | Proposed |
+| [0024](0024-authorization-freshness-is-observation-not-authority.md) | Authorization freshness is observation, not authority | Proposed |

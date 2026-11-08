@@ -9,6 +9,18 @@ use awaken_iam_contract::{
 /// Current remote scoped decisions. An unavailable/unknown endpoint is an
 /// error, never permission to retry through legacy global authorization.
 pub trait ScopedProfileConsumer: Send + Sync {
+    /// A current scoped decision with native freshness; never falls back to
+    /// legacy/global authorization when the endpoint or metadata is absent.
+    fn authorize_scoped_resource_evaluation(
+        &self,
+        _workspace: &WorkspaceId,
+        _namespace: &NamespaceId,
+        _request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        Err(RemoteError::new(
+            "scoped authorization freshness is unsupported".into(),
+        ))
+    }
     fn authorize_scoped_resource(
         &self,
         workspace: &WorkspaceId,
@@ -18,6 +30,15 @@ pub trait ScopedProfileConsumer: Send + Sync {
 }
 
 impl<T: ScopedProfileConsumer> ScopedProfileConsumer for crate::RemoteIamClient<T> {
+    fn authorize_scoped_resource_evaluation(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        self.transport()
+            .authorize_scoped_resource_evaluation(workspace, namespace, request)
+    }
     fn authorize_scoped_resource(
         &self,
         workspace: &WorkspaceId,

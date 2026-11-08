@@ -241,6 +241,45 @@ impl HttpAuthzTransport {
         }
     }
 
+    fn decode_evaluation(
+        response: Response,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        let values = response
+            .headers()
+            .get_all(awaken_iam_contract::AUTHORIZATION_FRESHNESS_HEADER)
+            .iter()
+            .collect::<Vec<_>>();
+        if values.len() > 1 {
+            return Err(RemoteError::new("duplicate authorization freshness".into()));
+        }
+        let freshness = values
+            .first()
+            .map(|value| {
+                let text = value
+                    .to_str()
+                    .map_err(|_| RemoteError::new("invalid authorization freshness".into()))?;
+                if !text.strip_prefix("iam-fence-v1:").is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) {
+                    return Err(RemoteError::new("invalid authorization freshness".into()));
+                }
+                Ok(text.to_owned())
+            })
+            .transpose()?;
+        let outcome: AuthorizationOutcome = Self::decode(response)?;
+        if outcome.decision == awaken_iam_contract::AuthorizationDecision::Allow
+            && freshness.is_none()
+        {
+            return Err(RemoteError::new(
+                "authorization freshness is unavailable".into(),
+            ));
+        }
+        Ok(awaken_iam_contract::AuthorizationEvaluation { outcome, freshness })
+    }
+
     /// Decode a successful JSON response into `T`, mapping a non-success status
     /// or a decode failure to a [`RemoteError`].
     fn decode<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, RemoteError> {
@@ -258,6 +297,28 @@ impl HttpAuthzTransport {
 }
 
 impl AuthzTransport for HttpAuthzTransport {
+    fn authorize_resource_evaluation(
+        &self,
+        request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authorize/resource"))
+                .json(request)
+        })?;
+        Self::decode_evaluation(response)
+    }
+    fn authorize_personal_delegation_evaluation(
+        &self,
+        request: &awaken_iam_contract::AuthorizePersonalDelegation,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/authorize/personal-delegation"))
+                .json(request)
+        })?;
+        Self::decode_evaluation(response)
+    }
     fn authorize_personal_delegation(
         &self,
         request: &awaken_iam_contract::AuthorizePersonalDelegation,
@@ -805,6 +866,10 @@ impl DirectoryClient for HttpAuthzTransport {
 }
 
 #[cfg(test)]
+#[path = "http/freshness_tests.rs"]
+mod freshness_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use awaken_iam_contract::{
@@ -818,9 +883,11 @@ mod tests {
 
     /// What a stub endpoint should answer with for a single request.
     #[derive(Clone)]
-    enum Reply {
+    pub(super) enum Reply {
         /// Send `200 OK` with this JSON body.
         Ok(String),
+        /// Response metadata alongside the unchanged native outcome JSON.
+        Headers(String, Vec<(String, String)>),
         /// Send this status with an empty body (e.g. `500`, `403`).
         Status(u16),
     }
@@ -829,14 +896,14 @@ mod tests {
     /// of replies in order, recording the raw request lines it received. It lets
     /// the transport be exercised end to end (request shaping, retry, decode)
     /// with no network dependency and no extra crates.
-    struct StubServer {
+    pub(super) struct StubServer {
         addr: String,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl StubServer {
-        fn start(replies: Vec<Reply>) -> Self {
+        pub(super) fn start(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -883,6 +950,16 @@ mod tests {
                             body.len(),
                             body
                         ),
+                        Reply::Headers(body, headers) => {
+                            let metadata = headers
+                                .into_iter()
+                                .map(|(key, value)| format!("{key}: {value}\r\n"))
+                                .collect::<String>();
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{metadata}\r\n{body}",
+                                body.len()
+                            )
+                        }
                         Reply::Status(code) => format!(
                             "HTTP/1.1 {code} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         ),
@@ -898,7 +975,7 @@ mod tests {
             }
         }
 
-        fn requests(&self) -> Vec<String> {
+        pub(super) fn requests(&self) -> Vec<String> {
             self.requests.lock().unwrap().clone()
         }
     }
@@ -911,7 +988,7 @@ mod tests {
         }
     }
 
-    fn transport(server: &StubServer) -> HttpAuthzTransport {
+    pub(super) fn transport(server: &StubServer) -> HttpAuthzTransport {
         HttpAuthzTransport::new(
             HttpTransportConfig::new(&server.addr)
                 .with_max_retries(0)

@@ -34,6 +34,17 @@ impl HttpAuthzTransport {
 }
 
 impl ScopedProfileConsumer for HttpAuthzTransport {
+    fn authorize_scoped_resource_evaluation(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        let url = self.scoped_profile_url(workspace, namespace, &["authorize"])?;
+        Self::decode_evaluation(
+            self.send_with_retry(|| self.client.post(url.clone()).json(request))?,
+        )
+    }
     fn authorize_scoped_resource(
         &self,
         workspace: &WorkspaceId,

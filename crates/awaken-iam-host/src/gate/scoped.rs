@@ -4,6 +4,21 @@ use awaken_iam_client::ScopedProfileConsumer;
 use awaken_iam_contract::NamespaceId;
 
 impl ScopedProfileConsumer for IamGate {
+    fn authorize_scoped_resource_evaluation(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        match self.inner.as_ref() {
+            GateInner::Remote { client, .. } => {
+                client.authorize_scoped_resource_evaluation(workspace, namespace, request)
+            }
+            GateInner::Open | GateInner::Local { .. } => Err(RemoteError::new(
+                "current scoped freshness requires the remote native authority".into(),
+            )),
+        }
+    }
     fn authorize_scoped_resource(
         &self,
         workspace: &WorkspaceId,

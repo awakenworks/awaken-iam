@@ -256,6 +256,23 @@ impl<S: PolicyStore> DaemonState<S> {
         scoped_decisions::decide(self, request, None)
             .map_err(|_| AdminError::Backend("current scoped policy is unavailable".into()))
     }
+    pub(crate) fn authorize_current_resource_evaluation(
+        &mut self,
+        request: &awaken_iam_contract::ResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, AdminError> {
+        let before = self.admin.store().fence()?;
+        let outcome = self.authorize_current_resource(request)?;
+        let after = self.admin.store().fence()?;
+        if before != after {
+            return Err(AdminError::Backend(
+                "authority changed during evaluation".into(),
+            ));
+        }
+        Ok(awaken_iam_contract::AuthorizationEvaluation {
+            outcome,
+            freshness: Some(crate::authorization_freshness(after)),
+        })
+    }
     /// Refresh the live PDP from the same repositories the PAP just committed.
     fn refresh_authorization(&mut self, version: u64) -> Result<(), AdminError> {
         let base = self.admin.policy()?;
