@@ -1,7 +1,10 @@
 //! Consent is immutable except for a monotonic revocation. Product conditions
 //! remain with the product; every use also requires current IAM policy.
 use crate::{RepositoryError, RepositoryResult};
-use awaken_iam_contract::{AccountId, CreatePersonalDelegation, PersonalDelegation, ScopeRef};
+use awaken_iam_contract::{
+    AccountId, CreatePersonalDelegation, ListPersonalDelegations, PersonalDelegation,
+    PersonalDelegationPage, ScopeRef,
+};
 
 pub trait PersonalDelegationRepository: Send + Sync {
     fn create_personal_delegation(
@@ -9,6 +12,12 @@ pub trait PersonalDelegationRepository: Send + Sync {
         value: PersonalDelegation,
     ) -> RepositoryResult<PersonalDelegation>;
     fn personal_delegation(&self, id: &str) -> RepositoryResult<Option<PersonalDelegation>>;
+    /// Stable id-ascending pages containing every lifecycle, only for this owner.
+    fn list_personal_delegations(
+        &self,
+        owner: &AccountId,
+        query: &ListPersonalDelegations,
+    ) -> RepositoryResult<PersonalDelegationPage>;
     fn revoke_personal_delegation(
         &self,
         id: &str,

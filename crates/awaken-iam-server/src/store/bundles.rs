@@ -179,6 +179,7 @@ pub fn bundles() -> Vec<MigrationBundle> {
                     "original scoped authorization profile publication intents",
                     AUTHZ_0013,
                 ),
+                (14, "bounded owner consent inventory index", AUTHZ_0014),
             ],
         ),
         bundle(
@@ -247,6 +248,9 @@ fn bundle(scope: BundleScope, steps: Vec<(i64, &'static str, &'static str)>) -> 
 }
 
 // --- iam.identity DDL ------------------------------------------------------
+const AUTHZ_0014: &str = "\
+CREATE INDEX {prefix}_personal_delegations_owner_id \
+ON {prefix}_personal_delegations (owner, id);";
 const AUTHZ_0012: &str = "\
 CREATE TABLE {prefix}_personal_delegations (\
  id TEXT PRIMARY KEY, \
@@ -813,17 +817,18 @@ mod tests {
             // either old receipt, and an exact retry below must apply no migration.
             let converged_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             let privacy = backend.run_migrations("iam", &super::bundles()).unwrap();
-            // migration-allow-edit: this test includes append-only authz 13;
+            // migration-allow-edit: this test includes append-only authz 14;
             // shipped SQL bodies and historical receipt comparisons are unchanged.
             assert_eq!(
                 privacy.len(),
-                4,
-                "only appended privacy, principal-access, personal-consent and scoped-publication steps apply"
+                5,
+                "only appended privacy, principal-access, personal-consent, scoped-publication and owner-index steps apply"
             );
             let current_receipts = backend.applied_versions("iam", "iam.authz").unwrap();
             assert!(current_receipts.contains_key(&10));
             assert!(current_receipts.contains_key(&12));
             assert!(current_receipts.contains_key(&13));
+            assert!(current_receipts.contains_key(&14));
             for version in [8, 9] {
                 assert_eq!(
                     current_receipts[&version], converged_receipts[&version],

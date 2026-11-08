@@ -1,6 +1,6 @@
 //! One portable, durable consent owner for SQLite and PostgreSQL.
 use super::*;
-use awaken_iam_contract::PersonalDelegation;
+use awaken_iam_contract::{ListPersonalDelegations, PersonalDelegation, PersonalDelegationPage};
 use awaken_iam_core::PersonalDelegationRepository;
 
 fn decode(row: &SqlRow) -> RepositoryResult<PersonalDelegation> {
@@ -58,6 +58,37 @@ impl<B: SqlConn> PersonalDelegationRepository for SqlStore<B> {
             .first()
             .map(decode)
             .transpose()
+    }
+    fn list_personal_delegations(
+        &self,
+        owner: &AccountId,
+        query: &ListPersonalDelegations,
+    ) -> RepositoryResult<PersonalDelegationPage> {
+        if !(1..=100).contains(&query.limit)
+            || query.after.as_ref().is_some_and(|cursor| {
+                cursor.is_empty() || cursor.len() > 300 || cursor.trim() != cursor
+            })
+        {
+            return Err(RepositoryError::Conflict(
+                "invalid personal consent page".into(),
+            ));
+        }
+        // The interpolated limit is a validated integer, never caller SQL.
+        let rows = self.backend.query(
+            &format!(
+                "SELECT CAST(descriptor AS TEXT), revoked_at FROM {} WHERE owner=? AND id>? ORDER BY id ASC LIMIT {}",
+                self.table("personal_delegations"), u32::from(query.limit) + 1
+            ),
+            &[p(owner.0.clone()), p(query.after.clone().unwrap_or_default())],
+        )?;
+        let mut items = rows
+            .iter()
+            .map(decode)
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        let more = items.len() > usize::from(query.limit);
+        items.truncate(usize::from(query.limit));
+        let next_cursor = more.then(|| items.last().expect("nonempty bounded page").id.clone());
+        Ok(PersonalDelegationPage { items, next_cursor })
     }
     fn revoke_personal_delegation(
         &self,
