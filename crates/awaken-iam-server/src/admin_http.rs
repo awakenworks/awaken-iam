@@ -48,6 +48,7 @@ mod grants;
 mod oauth_clients;
 mod policy_cache;
 mod principal_access;
+mod registered_resource;
 mod scoped_decisions;
 mod scoped_profiles;
 mod scoped_service_roles;

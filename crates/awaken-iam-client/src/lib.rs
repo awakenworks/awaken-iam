@@ -6,7 +6,9 @@ mod cache;
 mod desktop_oauth;
 #[cfg(feature = "http")]
 mod http;
+mod registered_resource;
 mod remote;
+pub use registered_resource::RegisteredResourceAuthzTransport;
 mod scoped_publication;
 pub use scoped_publication::{ScopedProfileConsumer, ScopedProfilePublisher};
 mod snapshot;

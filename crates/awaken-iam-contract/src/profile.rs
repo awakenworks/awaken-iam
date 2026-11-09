@@ -32,6 +32,12 @@ pub struct ActionScopeRule {
 /// Immutable policy content stored under one profile revision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationProfileDocument {
+    /// Explicit product owner of this namespace's resource vocabulary. Adoption
+    /// requires a new revision. Once declared, retained history prevents change
+    /// or removal, including after retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_product: Option<crate::ProductId>,
+
     #[serde(default)]
     pub resource_model: ResourceModelRegistration,
     #[serde(default)]

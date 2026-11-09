@@ -48,6 +48,7 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                 }
                 result=Some(original);return Ok(());
             }
+            self.ensure_profile_resource_product(tx,&request.profile.namespace,request.profile.document.resource_product.as_ref())?;
             self.ensure_scope_admission(tx, &[ScopeRef::Workspace {workspace_id: request.workspace_id.clone()}], &[])?;
             let owner = tx.query(&format!("SELECT workspace_id FROM {publications} WHERE namespace=? LIMIT 1"), &[p(namespace.clone())])?;
             if owner.first().is_some_and(|row| row.first().and_then(Option::as_deref) != Some(request.workspace_id.0.as_str())) {
@@ -108,23 +109,15 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
     }
     fn create_profile(&self, profile: AuthorizationProfile) -> RepositoryResult<()> {
         let document = json_encode(&profile.document, "authorization profile document")?;
-        let sql = format!(
-            "INSERT INTO {} (namespace, revision, lifecycle, document, checksum, created_at) \
-             VALUES (?, ?, ?, ?j, ?, ?)",
-            self.table("authorization_profiles")
-        );
-        self.backend.execute(
-            &sql,
-            &[
-                p(profile.namespace.0),
-                p(revision_key(profile.revision)),
-                p(lifecycle_name(profile.lifecycle)),
-                p(document),
-                p(profile.checksum),
-                p(profile.created_at.0),
-            ],
-        )?;
-        Ok(())
+        self.backend.with_transaction(&mut |tx| {
+            if tx.execute(&format!("UPDATE {} SET version=version WHERE id=1",self.table("fence")), &[])? != 1 {
+                return Err(RepositoryError::Backend("profile ownership serialization is unavailable".into()));
+            }
+            self.ensure_profile_resource_product(tx,&profile.namespace,profile.document.resource_product.as_ref())?;
+            tx.execute(&format!("INSERT INTO {} (namespace,revision,lifecycle,document,checksum,created_at) VALUES (?,?,?,?j,?,?)",self.table("authorization_profiles")),
+                &[p(&profile.namespace.0),p(revision_key(profile.revision)),p(lifecycle_name(profile.lifecycle)),p(&document),p(&profile.checksum),p(&profile.created_at.0)])?;
+            Ok(())
+        })
     }
 
     fn get_profile(

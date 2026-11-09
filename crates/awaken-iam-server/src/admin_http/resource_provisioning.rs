@@ -8,9 +8,16 @@ use super::*;
 /// in-memory adapter.
 pub fn projection_router<S>(state: SharedDaemonState<S>) -> Router
 where
-    S: PolicyStore + ResourceProjectionStore + 'static,
+    S: PolicyStore
+        + ResourceProjectionStore
+        + awaken_iam_core::AuthorizationProfileRepository
+        + 'static,
 {
     Router::new()
+        .route(
+            "/v1/authorize/resource/registered",
+            post(super::registered_resource::authorize::<S>),
+        )
         .route(
             "/v1/authz/resource-model",
             post(register_product_resource_model::<S>),

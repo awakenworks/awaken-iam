@@ -825,6 +825,23 @@ impl<B: SqlConn> SqlStore<B> {
 }
 
 impl<B: SqlConn> crate::store::ResourceProjectionStore for SqlStore<B> {
+    fn registered_product_action(
+        &self,
+        product: &ProductId,
+        resource_type: &ResourceType,
+        action: &awaken_iam_contract::ActionKey,
+    ) -> RepositoryResult<bool> {
+        self.registered_resource_action(product, resource_type, action)
+    }
+
+    fn observe_resource_projection(
+        &self,
+        resource_type: &ResourceType,
+        resource_id: &ResourceId,
+    ) -> RepositoryResult<Option<crate::store::ResourceProjectionObservation>> {
+        self.registered_resource_projection(resource_type, resource_id)
+    }
+
     fn apply_projection(
         &self,
         batch: &ResourceProjectionBatch,
