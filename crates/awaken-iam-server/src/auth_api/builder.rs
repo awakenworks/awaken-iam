@@ -40,6 +40,7 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let identity_store = crate::store::InMemoryStore::new();
         Self {
             providers: Vec::new(),
+            channel_authentication: Default::default(),
             challenge: OAuthChallengeService::new(entropy.clone()),
             login_flows: Arc::new(crate::store::InMemoryStore::new()),
             sessions: SessionGateway::with_entropy(entropy.clone(), SessionCookieConfig::default()),

@@ -122,6 +122,14 @@ async fn serve<B: SqlConn + Clone + 'static>(
         .with_login_repository(login_flows)
         .with_session_repository(sessions)
         .with_oauth_repositories(oauth_clients, oauth_codes);
+    auth = auth.with_channel_groups(profile_store.clone());
+    if let Ok(path) = std::env::var("IAM_CHANNEL_VERIFIERS_FILE") {
+        let verifiers: Vec<awaken_iam_server::ChannelVerifier> =
+            serde_json::from_slice(&std::fs::read(path)?)?;
+        for verifier in verifiers {
+            auth.register_channel_verifier(verifier)?;
+        }
+    }
     // Sign with the store's persisted key so restarts and replicas publish one
     // stable JWKS entry; the first start persists a freshly generated seed.
     let mut candidate_seed = [0u8; 32];
