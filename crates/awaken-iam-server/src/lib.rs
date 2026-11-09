@@ -25,6 +25,7 @@ mod op_id_token;
 mod personal_delegation;
 mod personal_delegation_http;
 mod profile_admin;
+mod profile_resource_product;
 pub use personal_delegation::{
     PERSONAL_DELEGATION_CLIENT_SCOPE, PERSONAL_DELEGATION_CONSENT_AUDIENCE,
     PERSONAL_DELEGATION_CONSENT_SCOPE, PERSONAL_DELEGATION_TOKEN_TYP,
@@ -104,8 +105,9 @@ pub use session::{
 pub use store::{
     BundleScope, Dialect, Fence, FenceStore, IamStore, InMemoryStore, Liveness, MigrateReport,
     Migration, MigrationBundle, MigrationExecutor, PlannedMigration, PostgresBackend, Readiness,
-    RecordingExecutor, SqlConn, SqlParam, SqlRow, SqlStore, SqlTransaction, SqliteBackend, bundles,
-    postgres_migrated_store, sqlite_in_memory_store, sqlite_migrated_store,
+    RecordingExecutor, ResourceProjectionObservation, ResourceProjectionStore, SqlConn, SqlParam,
+    SqlRow, SqlStore, SqlTransaction, SqliteBackend, bundles, postgres_migrated_store,
+    sqlite_in_memory_store, sqlite_migrated_store,
 };
 pub use token_exchange::{
     BEARER_TOKEN_TYPE, ISSUED_TOKEN_TYPE_ACCESS_TOKEN, SUBJECT_TOKEN_TYPE_ACCESS_TOKEN,

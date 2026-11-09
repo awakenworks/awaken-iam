@@ -152,6 +152,7 @@ const AUTH_ROUTES: &[RouteSpec] = &[
 const AUTHZ_ROUTES: &[RouteSpec] = &[
     RouteSpec::post("/v1/authorize"),
     RouteSpec::post("/v1/authorize/resource"),
+    RouteSpec::post("/v1/authorize/resource/registered"),
     RouteSpec::post("/v1/authorize/batch"),
     RouteSpec::post("/v1/entitlements/check"),
     RouteSpec::post("/v1/tokens/introspect"),

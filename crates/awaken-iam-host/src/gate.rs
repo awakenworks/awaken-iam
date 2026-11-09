@@ -204,6 +204,19 @@ impl IamGate {
             .authorize_personal_delegation(&request)
             .map_err(|_| IamDecisionError::Unavailable)
     }
+    /// Strict registration has no legacy, open-mode or cached Allow fallback.
+    pub fn authorize_registered_resource(
+        &self,
+        request: awaken_iam_contract::RegisteredResourceAuthorizationRequest,
+    ) -> Result<awaken_iam_contract::RegisteredResourceAuthorizationEvaluation, IamDecisionError>
+    {
+        let GateInner::Remote { client, .. } = self.inner.as_ref() else {
+            return Err(IamDecisionError::Unavailable);
+        };
+        client
+            .authorize_registered_resource(&request)
+            .map_err(|_| IamDecisionError::Unavailable)
+    }
     /// No cache or unsupported local provider can attest a complete native fence.
     pub fn authorize_resource_evaluation(
         &self,
@@ -733,6 +746,28 @@ impl IamClient for IamGate {
                 Ok(guard.authz.check_entitlement(&request).decision)
             }
             GateInner::Remote { client, .. } => client.check_entitlement_result(request),
+        }
+    }
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::*;
+    #[test]
+    fn open_and_embedded_modes_cannot_supply_registered_resource_authority() {
+        let request:awaken_iam_contract::RegisteredResourceAuthorizationRequest=serde_json::from_value(serde_json::json!({
+            "authorization":{"request":{"principal":{"kind":"account","account_id":"owner"},"action":"awaken.workspace::agent.use","scope":{"kind":"resource","resource_type":"awaken.agent","resource_id":"agent"}},"context":{}},
+            "namespace":"awaken.workspace","product_id":"awaken","workspace_id":"workspace","resource_type":"awaken.agent"
+        })).unwrap();
+        let local = IamGate::from_local_state(Arc::new(Mutex::new(LocalIamState {
+            authz: AuthzApi::new(),
+            directory: ApiTokenDirectory::new(),
+        })));
+        for gate in [IamGate::open(), local] {
+            assert_eq!(
+                gate.authorize_registered_resource(request.clone()),
+                Err(IamDecisionError::Unavailable)
+            );
         }
     }
 }

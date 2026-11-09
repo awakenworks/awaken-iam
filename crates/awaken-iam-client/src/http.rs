@@ -1852,3 +1852,5 @@ mod tests {
         );
     }
 }
+
+mod registered_resource;

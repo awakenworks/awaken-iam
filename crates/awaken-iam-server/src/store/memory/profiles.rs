@@ -70,6 +70,14 @@ impl AuthorizationProfileRepository for InMemoryStore {
                 "retired namespace requires explicit administrative recovery".into(),
             ));
         }
+        crate::profile_resource_product::ensure_owner(
+            authz
+                .profiles
+                .values()
+                .filter(|old| old.namespace == namespace)
+                .map(|old| &old.document),
+            request.profile.document.resource_product.as_ref(),
+        )?;
         let revision = authz
             .profiles
             .keys()
@@ -126,6 +134,14 @@ impl AuthorizationProfileRepository for InMemoryStore {
                 "profile revision already exists".into(),
             ));
         }
+        crate::profile_resource_product::ensure_owner(
+            authz
+                .profiles
+                .values()
+                .filter(|old| old.namespace == profile.namespace)
+                .map(|old| &old.document),
+            profile.document.resource_product.as_ref(),
+        )?;
         authz.profiles.insert(key, profile);
         Ok(())
     }

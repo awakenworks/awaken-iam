@@ -50,6 +50,7 @@ mod privacy;
 mod profiles;
 mod projections;
 mod provisioning;
+mod registered_resource;
 mod signing_keys;
 mod token_mutations;
 

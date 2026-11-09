@@ -12,11 +12,16 @@ mod identity;
 mod license;
 mod personal_delegation;
 mod protocol;
+mod registered_resource;
 mod resource_authorization;
 pub use personal_delegation::{
     AuthorizePersonalDelegation, CreatePersonalDelegation, ListPersonalDelegations,
     MintPersonalDelegationToken, PersonalDelegation, PersonalDelegationPage,
     PersonalDelegationPurpose, PersonalDelegationTarget, PersonalDelegationTokenClaims,
+};
+pub use registered_resource::{
+    RegisteredResourceAuthorizationEvaluation, RegisteredResourceAuthorizationRequest,
+    ResourceRegistrationQualification,
 };
 mod trust;
 

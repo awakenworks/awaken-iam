@@ -34,7 +34,32 @@ pub use sqlite::{
 
 /// Atomic product projection and vocabulary persistence used by the guarded
 /// standalone-daemon routes. The SQL adapters implement the same contract.
+/// Active, durable versioned ownership, never inferred from a bare scope leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceProjectionObservation {
+    pub product_id: awaken_iam_contract::ProductId,
+    pub org_id: awaken_iam_contract::OrgId,
+    pub projection_id: String,
+    pub epoch: u64,
+    pub parent: awaken_iam_contract::ScopeRef,
+}
+
 pub trait ResourceProjectionStore: Send + Sync {
+    /// Exact typed vocabulary registered by this product's guarded PAP command.
+    fn registered_product_action(
+        &self,
+        product: &awaken_iam_contract::ProductId,
+        resource_type: &awaken_iam_contract::ResourceType,
+        action: &awaken_iam_contract::ActionKey,
+    ) -> awaken_iam_core::RepositoryResult<bool>;
+
+    /// Resolve only a currently owned, non-retired edge in a committed stream.
+    fn observe_resource_projection(
+        &self,
+        resource_type: &awaken_iam_contract::ResourceType,
+        resource_id: &awaken_iam_contract::ResourceId,
+    ) -> awaken_iam_core::RepositoryResult<Option<ResourceProjectionObservation>>;
+
     fn apply_projection(
         &self,
         batch: &awaken_iam_contract::ResourceProjectionBatch,
