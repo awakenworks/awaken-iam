@@ -7,7 +7,10 @@
 
 mod admin;
 mod channel;
-pub use channel::{CHANNEL_ASSERTION_GRANT_TYPE, ChannelAssertionClaims, ChannelPrincipalGrant};
+pub use channel::{
+    CHANNEL_ASSERTION_GRANT_TYPE, CHANNEL_MESSAGE_PROOF_TOKEN_TYPE, CHANNEL_MESSAGE_PROOF_TYP,
+    ChannelAssertionClaims, ChannelMessageProofClaims, ChannelPrincipalGrant,
+};
 mod identity;
 mod license;
 mod personal_delegation;

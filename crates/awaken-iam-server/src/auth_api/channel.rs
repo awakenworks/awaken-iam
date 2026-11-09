@@ -197,21 +197,26 @@ impl<E: EntropySource + Clone> AuthApi<E> {
         let scope = format!("channel.message:{}", claims.body_sha256);
         let access_token = self
             .tokens
-            .mint(&AccessTokenClaims {
-                iss: self.iam_issuer.clone(),
-                sub: identity.account_id.0,
-                subject_kind: crate::AccessTokenSubjectKind::Account,
-                aud: "urn:awaken:iam:channel-principal".into(),
-                exp: claims.exp,
-                iat: claims.iat,
-                jti: evidence_id.clone(),
-                scope: vec![scope.clone()],
-            })
+            .sign_jwt(
+                awaken_iam_contract::CHANNEL_MESSAGE_PROOF_TYP,
+                &awaken_iam_contract::ChannelMessageProofClaims {
+                    iss: self.iam_issuer.clone(),
+                    aud: "urn:awaken:iam:channel-principal".into(),
+                    principal: principal.clone(),
+                    evidence_id: evidence_id.clone(),
+                    issued_at: claims.iat,
+                    expires_at: claims.exp,
+                    installation_id: claims.installation_id.clone(),
+                    connector_id: claims.connector_id.clone(),
+                    message_id: claims.message_id.clone(),
+                    body_sha256: claims.body_sha256.clone(),
+                },
+            )
             .await
             .map_err(|_| Unavailable)?;
         Ok(ChannelPrincipalGrant {
             access_token,
-            token_type: "Bearer".into(),
+            token_type: awaken_iam_contract::CHANNEL_MESSAGE_PROOF_TOKEN_TYPE.into(),
             expires_in: claims.exp - now,
             scope,
             principal,
@@ -234,7 +239,7 @@ mod tests {
     use awaken_iam_core::{
         AccountRepository, ExternalIdentityRepository, Group, GroupRepository, RegisteredClient,
     };
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         AuthApi,
         InMemoryStore,
         AccessTokenAuthority,
@@ -333,6 +338,14 @@ mod tests {
     }
     #[tokio::test]
     async fn registered_channel_proof_is_message_bound_idempotent_and_current() {
+        // Cause/effect rules for the one channel owner: R1 exact signed message
+        // + active Account/current installation membership => dedicated proof
+        // with the same principal/message/digest and no Account bearer decode.
+        // R2 exact redelivery + unchanged owners => identical signed proof and
+        // expiry, with only remaining duration reduced. R3 membership removed
+        // after R1 => rejection on the same assertion; no cached grant fallback.
+        // Main's multi-installation and active/disabled Flow probe cases below
+        // retain their original independent namespace and current-read oracles.
         let (mut api, store, signer, claims) = fixture();
         let assertion = signer.sign_claims(&claims).await.unwrap();
         let original = api
@@ -354,13 +367,22 @@ mod tests {
         assert_eq!(replay.access_token, original.access_token);
         assert_eq!(replay.expires_at, original.expires_at);
         assert_eq!(replay.expires_in, 119);
-        let token: AccessTokenClaims =
-            crate::verify_signed_claims(&replay.access_token, &api.jwks()).unwrap();
+        let token: awaken_iam_contract::ChannelMessageProofClaims =
+            crate::access_token::verify_jwt(
+                &replay.access_token,
+                &api.jwks(),
+                awaken_iam_contract::CHANNEL_MESSAGE_PROOF_TYP,
+            )
+            .unwrap();
         assert_eq!(token.aud, "urn:awaken:iam:channel-principal");
+        assert_eq!(token.body_sha256, claims.body_sha256);
+        assert_eq!(token.message_id, claims.message_id);
+        assert_eq!(token.principal, original.principal);
         assert_eq!(
-            token.scope,
-            vec![format!("channel.message:{}", claims.body_sha256)]
+            replay.token_type,
+            awaken_iam_contract::CHANNEL_MESSAGE_PROOF_TOKEN_TYPE
         );
+        assert!(api.verify_access_token(&replay.access_token).is_err());
         let mut group = GroupRepository::get(&store, &GroupId("members".into()))
             .unwrap()
             .unwrap();
@@ -712,3 +734,9 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+mod proof_tests;
+
+#[cfg(test)]
+mod sql_tests;

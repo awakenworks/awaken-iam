@@ -1,6 +1,26 @@
 //! Message-bound authentication at a deployment-registered channel verifier.
 use crate::PrincipalRef;
 use serde::{Deserialize, Serialize};
+/// Dedicated message evidence, never an OAuth Account access-token family.
+pub const CHANNEL_MESSAGE_PROOF_TYP: &str = "awaken-channel-message-proof+jwt";
+pub const CHANNEL_MESSAGE_PROOF_TOKEN_TYPE: &str = "AwakenChannelProof";
+
+/// The intentionally distinct payload cannot decode as ordinary Account claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelMessageProofClaims {
+    pub iss: String,
+    pub aud: String,
+    pub principal: PrincipalRef,
+    pub evidence_id: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub installation_id: String,
+    pub connector_id: String,
+    pub message_id: String,
+    pub body_sha256: String,
+}
+
 pub const CHANNEL_ASSERTION_GRANT_TYPE: &str =
     "urn:awaken:params:oauth:grant-type:channel-assertion";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,7 +40,9 @@ pub struct ChannelAssertionClaims {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelPrincipalGrant {
-    /// Message-scoped native IAM credential. Never a general product bearer.
+    /// Compatibility field carrying the dedicated signed message proof.
+    /// It is not an Account access token and must never be sent as Bearer.
+    /// Consumers authenticate actual product operations independently.
     pub access_token: String,
     pub token_type: String,
     pub expires_in: i64,
