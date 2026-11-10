@@ -177,3 +177,17 @@ lifecycle; production reconnecting consumers use the pool constructor.
 Live tests distinguish TLS admission, encryption, shared-slot replacement and
 non-replayed effects. Plaintext CI fixtures alone cannot establish those TLS
 properties.
+
+## Amendment: one patched SQLite link owner (2026-11-10)
+
+The existing SQLite adapter requires `rusqlite >=0.41.1, <0.42` with its bundled
+engine. This follows [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html):
+an attacker-controlled database/WAL pair with mismatched page sizes can expose
+process memory on older SQLite engines. The reviewed composition resolves one
+`libsqlite3-sys 0.39.1` / SQLite 3.54.1 across IAM and its embedding hosts.
+
+The original `rusqlite-floor` job pins and tests 0.41.1. The existing ledger
+bootstrap test checks the actual linked engine before its unchanged complete,
+empty and torn-ledger cases. Foundation continues to own the portable bundle,
+checksum and ledger decisions; IAM's same synchronous adapter executes them
+under its existing single-connection and transaction boundary.
