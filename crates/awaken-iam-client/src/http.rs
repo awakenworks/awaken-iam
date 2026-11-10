@@ -1854,3 +1854,4 @@ mod tests {
 }
 
 mod registered_resource;
+mod resource_projection;

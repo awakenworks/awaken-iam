@@ -7,6 +7,8 @@ mod desktop_oauth;
 #[cfg(feature = "http")]
 mod http;
 mod registered_resource;
+mod resource_projection;
+pub use resource_projection::ResourceProjectionTransport;
 mod remote;
 pub use registered_resource::RegisteredResourceAuthzTransport;
 mod scoped_publication;

@@ -805,3 +805,84 @@ async fn projection_survives_a_disk_sqlite_daemon_restart() {
     let _ = third_handle.await;
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_projection_sdk_composes_with_the_guarded_owner_and_keeps_stale_distinct() {
+    // SDK1 native product-scoped credential/model registration; SDK2 exact
+    // apply/replay; SDK3 changed same epoch/body or foreign product rejected;
+    // SDK4 retirement then old delivery stays Stale and cannot restore access.
+    let store = sqlite_in_memory_store("iam_projection_sdk").unwrap();
+    seed(&store);
+    let (base, handle) = serve(store.clone()).await;
+    let native = base.clone();
+    let persisted = store.clone();
+    tokio::task::spawn_blocking(move || {
+        use awaken_iam_client::{HttpAuthzTransport, HttpTransportConfig, RemoteIamClient};
+        let transport = HttpAuthzTransport::new(
+            HttpTransportConfig::new(&native).with_service_token("tutor-product-token"),
+        )
+        .unwrap();
+        let sdk = RemoteIamClient::new(transport);
+        sdk.register_resource_model(&model()).unwrap();
+        let original = create();
+        let applied = sdk.apply_resource_projection(&original).unwrap();
+        assert_eq!(applied.disposition, ResourceProjectionDisposition::Applied);
+        assert!(
+            GrantRepository::get(&persisted, &GrantId("campus-creator-manage".into()))
+                .unwrap()
+                .is_some()
+        );
+        let replayed = sdk.apply_resource_projection(&original).unwrap();
+        assert_eq!(
+            replayed.disposition,
+            ResourceProjectionDisposition::Replayed
+        );
+        assert_eq!(replayed.version, applied.version);
+        let mut changed = original.clone();
+        changed.grants.clear();
+        assert!(
+            sdk.apply_resource_projection(&changed)
+                .unwrap_err()
+                .to_string()
+                .contains("409")
+        );
+        let mut foreign = original.clone();
+        foreign.product_id = ProductId::new("other").unwrap();
+        assert!(
+            sdk.apply_resource_projection(&foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("403")
+        );
+        let mut retirement = original.clone();
+        retirement.epoch = 2;
+        retirement.idempotency_key = "campus:campus-1:2".into();
+        retirement.grants.clear();
+        retirement.scope_edges.clear();
+        retirement.retirements = vec![ResourceRetirement {
+            resource_type: ResourceType("tutor.campus".into()),
+            resource_id: ResourceId("campus-1".into()),
+            grant_ids: vec!["campus-creator-manage".into()],
+        }];
+        assert_eq!(
+            sdk.apply_resource_projection(&retirement)
+                .unwrap()
+                .disposition,
+            ResourceProjectionDisposition::Applied
+        );
+        let stale = sdk.apply_resource_projection(&original).unwrap();
+        assert_eq!(stale.disposition, ResourceProjectionDisposition::Stale);
+        assert_eq!(stale.idempotency_key, original.idempotency_key);
+        assert_eq!(stale.epoch, original.epoch);
+        // This is not a historical outcome query. In particular, Stale cannot
+        // establish whether an earlier lost-ack request originally committed.
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        authorize(&reqwest::Client::new(), &base).await,
+        AuthorizationDecision::Deny
+    );
+    handle.abort();
+    let _ = handle.await;
+}
