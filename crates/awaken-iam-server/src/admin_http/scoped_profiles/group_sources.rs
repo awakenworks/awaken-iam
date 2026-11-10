@@ -13,7 +13,7 @@ pub(super) async fn observe<S>(
     Json(request): Json<ObserveScopedProfileGroups>,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
+    S: PolicyStore + AuthorizationProfileRepository + ApiTokenRepository + ApiTokenOwnerRepository,
 {
     match current_groups(&state, &headers, workspace, namespace, request) {
         Ok(observed) => Json(observed).into_response(),
@@ -30,7 +30,7 @@ fn current_groups<S>(
     request: ObserveScopedProfileGroups,
 ) -> Result<ScopedProfileGroupSources, Response>
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
+    S: PolicyStore + AuthorizationProfileRepository + ApiTokenRepository + ApiTokenOwnerRepository,
 {
     let mut guard = lock(state);
     admit(

@@ -138,6 +138,22 @@ pub struct HttpAuthzTransport {
 }
 
 impl HttpAuthzTransport {
+    /// The configured authority without caller credentials. Providers whose
+    /// URL embeds userinfo, a query or a fragment cannot expose a safe hint.
+    /// Equal endpoints do not prove equal or continuous underlying stores.
+    pub fn configured_endpoint(&self) -> Option<&str> {
+        let parsed = reqwest::Url::parse(&self.base_url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        Some(&self.base_url)
+    }
+
     /// Build a transport from `config`, constructing the underlying client with
     /// the configured timeout. Fails only if the platform cannot initialise the
     /// TLS/HTTP stack.
@@ -241,9 +257,7 @@ impl HttpAuthzTransport {
         }
     }
 
-    fn decode_evaluation(
-        response: Response,
-    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+    fn evaluation_freshness(response: &Response) -> Result<Option<String>, RemoteError> {
         let values = response
             .headers()
             .get_all(awaken_iam_contract::AUTHORIZATION_FRESHNESS_HEADER)
@@ -269,6 +283,13 @@ impl HttpAuthzTransport {
                 Ok(text.to_owned())
             })
             .transpose()?;
+        Ok(freshness)
+    }
+
+    fn decode_evaluation(
+        response: Response,
+    ) -> Result<awaken_iam_contract::AuthorizationEvaluation, RemoteError> {
+        let freshness = Self::evaluation_freshness(&response)?;
         let outcome: AuthorizationOutcome = Self::decode(response)?;
         if outcome.decision == awaken_iam_contract::AuthorizationDecision::Allow
             && freshness.is_none()
@@ -868,6 +889,9 @@ impl DirectoryClient for HttpAuthzTransport {
 #[cfg(test)]
 #[path = "http/freshness_tests.rs"]
 mod freshness_tests;
+#[cfg(test)]
+#[path = "http/resource_reads_tests.rs"]
+mod resource_reads_tests;
 
 #[cfg(test)]
 mod tests {

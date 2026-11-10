@@ -4,6 +4,35 @@ use super::*;
 use awaken_iam_contract::ScopeRef;
 
 impl<B: SqlConn> SqlStore<B> {
+    /// A native authorization-source write and its observation epoch publish
+    /// under the same original transaction/commit ACK. PAP event versions are
+    /// still owned by their existing application commands.
+    pub(super) fn with_authorization_change<T: Send>(
+        &self,
+        operation: impl FnOnce(&mut dyn SqlTransaction) -> RepositoryResult<T> + Send,
+    ) -> RepositoryResult<T> {
+        self.with_policy_transaction(|transaction, _| {
+            let value = operation(transaction)?;
+            self.advance_authorization_epoch(transaction)?;
+            Ok(value)
+        })
+    }
+
+    pub(super) fn advance_authorization_epoch(
+        &self,
+        transaction: &mut dyn SqlTransaction,
+    ) -> RepositoryResult<()> {
+        let rows = transaction.query(
+                &format!(
+                    "UPDATE {} SET epoch=epoch+1 WHERE id=1 AND epoch>=0 AND epoch<9223372036854775807 RETURNING CAST(epoch AS TEXT)",
+                    self.table("fence")
+                ),
+                &[],
+            )?;
+        parse_fence_value(rows.first().and_then(|row| row.first()), "epoch")?;
+        Ok(())
+    }
+
     pub(super) fn lock_policy(
         &self,
         transaction: &mut dyn SqlTransaction,

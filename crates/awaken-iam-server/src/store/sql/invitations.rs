@@ -177,6 +177,7 @@ impl<B: SqlConn> InvitationRepository for SqlStore<B> {
         if affected.first().copied() != Some(1) {
             return Ok(None);
         }
+        self.advance_authorization_epoch(transaction)?;
         self.read_invitation_with(id,|sql,params| transaction.query(sql,params))
 
         })

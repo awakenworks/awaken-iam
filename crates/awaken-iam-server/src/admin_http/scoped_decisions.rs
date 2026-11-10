@@ -4,8 +4,11 @@ use awaken_iam_contract::{
     AuthorizationOutcome, AuthorizationProfileDocument, GroupRosterSnapshot, PrincipalRef,
     ResourceAuthorizationRequest, ScopeRef, WorkspaceId,
 };
-use awaken_iam_core::{AccountRepository, PolicySet, ResourceModelRepository};
+use awaken_iam_core::{
+    AccountRepository, AuthorizationProfileRepository, PolicySet, ResourceModelRepository,
+};
 use std::collections::BTreeSet;
+pub(super) mod resource_reads;
 
 pub(super) struct Unavailable;
 pub(super) type DecisionPort<S> = fn(
@@ -14,6 +17,30 @@ pub(super) type DecisionPort<S> = fn(
     &NamespaceId,
     &ResourceAuthorizationRequest,
 ) -> Result<AuthorizationOutcome, Unavailable>;
+pub(super) type WorkspacePort<S> =
+    fn(&DaemonState<S>, &NamespaceId) -> Result<Option<WorkspaceId>, Unavailable>;
+
+pub(super) fn native_workspace<S: PolicyStore + AuthorizationProfileRepository>(
+    state: &DaemonState<S>,
+    namespace: &NamespaceId,
+) -> Result<Option<WorkspaceId>, Unavailable> {
+    let native = AuthorizationProfileRepository::profile_publication_workspace(
+        state.admin.store(),
+        namespace,
+    )
+    .map_err(|_| Unavailable)?;
+    let legacy = state
+        .profiles
+        .scoped_workspace(namespace)
+        .map_err(|_| Unavailable)?;
+    // A foreign scoped declaration cannot be mistaken for native absence and
+    // thereby re-enter the legacy '*' fallback. Same-owner document contents
+    // never supply authority: every policy read below is from the native store.
+    if native != legacy {
+        return Err(Unavailable);
+    }
+    Ok(native)
+}
 
 pub(super) fn unavailable() -> Response {
     error_response(
@@ -59,7 +86,7 @@ pub(super) fn decide<S: PolicyStore>(
     request: &ResourceAuthorizationRequest,
     expected: Option<(&WorkspaceId, &NamespaceId)>,
 ) -> Result<AuthorizationOutcome, Unavailable> {
-    let version = state.observed_store_version;
+    let observed = state.observed_fence();
     let namespace = request
         .request
         .action
@@ -71,9 +98,14 @@ pub(super) fn decide<S: PolicyStore>(
     }
     let owner = namespace
         .as_ref()
-        .map(|namespace| state.profiles.scoped_workspace(namespace))
-        .transpose()
-        .map_err(|_| Unavailable)?
+        .map(|namespace| match state.scoped_workspace {
+            Some(lookup) => lookup(state, namespace),
+            None => state
+                .profiles
+                .scoped_workspace(namespace)
+                .map_err(|_| Unavailable),
+        })
+        .transpose()?
         .flatten();
     let outcome = match (namespace, owner) {
         (Some(namespace), Some(workspace)) => {
@@ -85,7 +117,7 @@ pub(super) fn decide<S: PolicyStore>(
         _ if expected.is_some() => denied(request),
         _ => state.authz.authorize_resource(request),
     };
-    if state.admin.store_version().map_err(|_| Unavailable)? != version {
+    if state.admin.store().fence().map_err(|_| Unavailable)? != observed {
         return Err(Unavailable);
     }
     Ok(outcome)
@@ -112,25 +144,30 @@ fn explicitly_named(document: &AuthorizationProfileDocument, principal: &Princip
         document.grants.iter().any(|grant| matches!(&grant.subject, GrantSubjectRef::Principal { principal: named } if named == principal))
 }
 
-pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
+pub(super) fn policy_for_request<
+    S: PolicyStore + AccountRepository + AuthorizationProfileRepository,
+>(
     state: &DaemonState<S>,
     workspace: &WorkspaceId,
     namespace: &NamespaceId,
     request: &ResourceAuthorizationRequest,
-) -> Result<AuthorizationOutcome, Unavailable> {
+) -> Result<Option<PolicySet>, Unavailable> {
     if !matches!(&request.request.scope, ScopeRef::Workspace { workspace_id } | ScopeRef::Project { workspace_id, .. } if workspace_id == workspace)
     {
-        return Ok(denied(request));
+        return Ok(None);
     }
-    let Some(profile) = state.profiles.active(namespace).map_err(|_| Unavailable)? else {
-        return Ok(denied(request));
+    let Some(profile) =
+        AuthorizationProfileRepository::active_profile(state.admin.store(), namespace)
+            .map_err(|_| Unavailable)?
+    else {
+        return Ok(None);
     };
     crate::profile_admin::validate_scoped_document(namespace, workspace, &profile.document)
         .map_err(|_| Unavailable)?;
     let Some(edge) = ResourceModelRepository::workspace_org(state.admin.store(), workspace)
         .map_err(|_| Unavailable)?
     else {
-        return Ok(denied(request));
+        return Ok(None);
     };
     if state
         .admin
@@ -138,7 +175,7 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
         .map_err(|_| Unavailable)?
         .is_none()
     {
-        return Ok(denied(request));
+        return Ok(None);
     }
     let org = ScopeRef::Org {
         org_id: edge.org_id.clone(),
@@ -160,7 +197,7 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
                     .iter()
                     .any(|binding| binding.scope == org);
                 if !active || !member {
-                    return Ok(denied(request));
+                    return Ok(None);
                 }
             }
             PrincipalRef::Service { .. } => {
@@ -187,10 +224,10 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
                     }
                 }
                 if !direct && !held_role {
-                    return Ok(denied(request));
+                    return Ok(None);
                 }
             }
-            _ if !explicitly_named(&profile.document, principal) => return Ok(denied(request)),
+            _ if !explicitly_named(&profile.document, principal) => return Ok(None),
             _ => {}
         }
     }
@@ -236,10 +273,23 @@ pub(super) fn evaluate<S: PolicyStore + AccountRepository>(
     for binding in unavailable_service_bindings {
         policy.unbind_role(&binding);
     }
+    Ok(Some(policy))
+}
+
+pub(super) fn evaluate<S: PolicyStore + AccountRepository + AuthorizationProfileRepository>(
+    state: &DaemonState<S>,
+    workspace: &WorkspaceId,
+    namespace: &NamespaceId,
+    request: &ResourceAuthorizationRequest,
+) -> Result<AuthorizationOutcome, Unavailable> {
+    let Some(policy) = policy_for_request(state, workspace, namespace, request)? else {
+        return Ok(denied(request));
+    };
     let mut evaluator = crate::AuthzApi::new();
     evaluator.replace_policy_at_version(policy, state.observed_store_version);
     let scoped = evaluator.authorize_resource(request);
-    let inherited = state.authz.authorize_resource(request);
+    let inherited =
+        super::registered_resource::native_current_evaluator(state)?.authorize_resource(request);
     use awaken_iam_contract::AuthorizationDecision::{Allow, Deny, RequireApproval};
     Ok(match (scoped.decision, inherited.decision) {
         (_, Deny) | (Allow, RequireApproval) => inherited,

@@ -198,6 +198,19 @@ impl AuthzApi {
         self.core.policy().evaluate_resource(&trusted).to_outcome()
     }
 
+    /// Read-only access to the same current native policy. Callers retain their
+    /// native hydrate/fence lock; planning must not bump the policy version.
+    pub fn resource_candidates(
+        &self,
+        request: &awaken_iam_contract::ResourceCandidateRequest,
+        evaluated_at: i64,
+    ) -> Result<awaken_iam_contract::ResourceCandidatePlan, awaken_iam_core::ResourceCandidateError>
+    {
+        self.core
+            .policy()
+            .resource_candidates(request, evaluated_at)
+    }
+
     /// `POST /v1/authorize/batch`: evaluate several requests in one round trip,
     /// preserving order one-to-one.
     pub fn authorize_batch(
@@ -391,6 +404,55 @@ mod tests {
         assert_eq!(outcome.decision, AuthorizationDecision::Deny);
         assert_eq!(outcome.reason, "default_deny");
         assert!(outcome.matched_grants.is_empty());
+    }
+
+    #[test]
+    fn native_candidate_reads_do_not_mutate_policy_version_or_create_authorization() {
+        let mut api = AuthzApi::new();
+        api.policy_mut().add_grant(Grant {
+            id: GrantId("candidate-reader".into()),
+            subject: GrantSubject::Principal(service("svc")),
+            action_pattern: ActionPattern("tenant::document.read".into()),
+            scope: ScopeRef::Workspace {
+                workspace_id: awaken_iam_contract::WorkspaceId("w".into()),
+            },
+            effect: Effect::Allow,
+        });
+        let version = api.policy_version();
+        let request = awaken_iam_contract::ResourceCandidateRequest {
+            mode: awaken_iam_contract::ResourceAuthorizationMode::Scoped,
+            request: request(
+                service("svc"),
+                "tenant::document.read",
+                ScopeRef::Workspace {
+                    workspace_id: awaken_iam_contract::WorkspaceId("w".into()),
+                },
+            ),
+            resource_type: Some("document".into()),
+            access: awaken_iam_contract::AuthorizationAccess::Read,
+        };
+        for _ in 0..2 {
+            let plan = api.resource_candidates(&request, 100).unwrap();
+            assert_eq!(
+                plan.predicate,
+                awaken_iam_contract::ResourceCandidatePredicate::All
+            );
+            assert_eq!(api.policy_version(), version);
+        }
+        assert_eq!(
+            api.authorize(&request.request).decision,
+            AuthorizationDecision::Allow
+        );
+        let mut different = request;
+        different.request.principal = service("ungranted");
+        assert_eq!(
+            api.resource_candidates(&different, 100).unwrap().predicate,
+            awaken_iam_contract::ResourceCandidatePredicate::None
+        );
+        assert_eq!(
+            api.authorize(&different.request).decision,
+            AuthorizationDecision::Deny
+        );
     }
 
     #[test]

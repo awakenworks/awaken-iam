@@ -74,6 +74,9 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
                 &[p(namespace.clone()),p(revision_key(revision)),p(json_encode(&request.profile.document,"profile document")?),p(checksum.clone()),p(request.profile.created_at.0.clone())])?;
             tx.execute(&format!("INSERT INTO {publications} (namespace,request_key,workspace_id,descriptor) VALUES (?,?,?,?j)"),
                 &[p(namespace.clone()),p(request.request_key.clone()),p(request.workspace_id.0.clone()),p(json_encode(&intent,"profile publication intent")?)])?;
+            // The first durable Workspace pin changes the decision family even
+            // before activation: a legacy wildcard may no longer supply it.
+            if owner.is_empty() { self.advance_authorization_epoch(tx)?; }
             result=Some(intent);Ok(())
         })?;
         result.ok_or_else(|| {
@@ -175,20 +178,22 @@ impl<B: SqlConn> AuthorizationProfileRepository for SqlStore<B> {
             "UPDATE {} SET lifecycle = ? WHERE namespace = ? AND revision = ?",
             self.table("authorization_profiles")
         );
-        let affected = self.backend.execute(
-            &sql,
-            &[
-                p(lifecycle_name(lifecycle)),
-                p(namespace.0.clone()),
-                p(revision_key(revision)),
-            ],
-        )?;
-        if affected == 0 {
-            return Err(RepositoryError::NotFound(
-                "profile revision not found".into(),
-            ));
-        }
-        Ok(())
+        self.with_authorization_change(|transaction| {
+            let affected = transaction.execute(
+                &sql,
+                &[
+                    p(lifecycle_name(lifecycle)),
+                    p(namespace.0.clone()),
+                    p(revision_key(revision)),
+                ],
+            )?;
+            if affected == 0 {
+                return Err(RepositoryError::NotFound(
+                    "profile revision not found".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn activate_profile(

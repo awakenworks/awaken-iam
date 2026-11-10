@@ -4,7 +4,8 @@ use awaken_iam_contract::{
     OrgId, PrepareScopedAuthorizationProfile, PrincipalRef, ScopeRef, WorkspaceId,
 };
 use awaken_iam_core::{
-    AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, ResourceModelRepository,
+    AccountRepository, ApiTokenOwnerRepository, ApiTokenRepository, AuthorizationProfileRepository,
+    ResourceModelRepository,
 };
 
 mod activation_set;
@@ -15,19 +16,26 @@ mod group_sources;
 pub fn scoped_profile_router<S>(state: SharedDaemonState<S>) -> Router
 where
     S: PolicyStore
+        + AuthorizationProfileRepository
         + ApiTokenRepository
         + ApiTokenOwnerRepository
         + AccountRepository
         + Clone
         + 'static,
 {
-    lock(&state).scoped_decision = Some(super::scoped_decisions::evaluate::<S>);
+    {
+        let mut guard = lock(&state);
+        guard.scoped_decision = Some(super::scoped_decisions::evaluate::<S>);
+        guard.scoped_workspace = Some(super::scoped_decisions::native_workspace::<S>);
+    }
     let limit = lock(&state).profile_body_limit;
     Router::new()
         .route("/v1/tokens/introspect", post(super::token_introspection::introspect::<S>).layer(DefaultBodyLimit::max(1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/activate-publication-set", post(activation_set::activate::<S>).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}", get(baseline::<S>))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize", post(super::scoped_decisions::authorize::<S>))
+        .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/authorize-resources", post(super::scoped_decisions::resource_reads::authorize_batch::<S>).layer(DefaultBodyLimit::max(2 * 1024 * 1024)))
+        .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/resource-candidates", post(super::scoped_decisions::resource_reads::candidates::<S>).layer(DefaultBodyLimit::max(64 * 1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/source-groups", post(group_sources::observe::<S>).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications",post(prepare::<S>).layer(DefaultBodyLimit::max(limit)))
         .route("/v1/scoped-authz/workspaces/{workspace}/profiles/{namespace}/publications/{key}",get(receipt::<S>))
@@ -37,7 +45,7 @@ where
 }
 
 #[allow(clippy::result_large_err)]
-fn admit<S>(
+pub(super) fn admit<S>(
     guard: &mut DaemonState<S>,
     headers: &HeaderMap,
     workspace: &str,
@@ -45,14 +53,17 @@ fn admit<S>(
     operation: &str,
 ) -> Result<PrincipalRef, Response>
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
+    S: PolicyStore + AuthorizationProfileRepository + ApiTokenRepository + ApiTokenOwnerRepository,
 {
     let scope = ScopeRef::Workspace {
         workspace_id: WorkspaceId(workspace.into()),
     };
     let action = format!("iam.authorization-profile.{operation}:{namespace}");
-    let token = super::principal_access::admit_with_token(guard, headers, &action, scope.clone())?
-        .ok_or_else(|| {
+    guard
+        .ensure_fresh()
+        .map_err(|_| super::scoped_decisions::unavailable())?;
+    let token =
+        super::principal_access::authenticate_service_token(guard, headers)?.ok_or_else(|| {
             error_response(
                 StatusCode::FORBIDDEN,
                 "scoped_service_required",
@@ -72,8 +83,10 @@ where
         awaken_iam_contract::ActionKey(action.clone()),
         scope.clone(),
     );
-    let decision = guard.authz.authorize(&request);
-    let exact = guard.authz.snapshot().grants.iter().any(|grant| {
+    let evaluator = super::registered_resource::native_current_evaluator(guard)
+        .map_err(|_| super::scoped_decisions::unavailable())?;
+    let decision = evaluator.authorize(&request);
+    let exact = evaluator.snapshot().grants.iter().any(|grant| {
         grant.action_pattern == action
             && grant.scope == scope
             && grant.subject
@@ -276,7 +289,11 @@ async fn prepare<S>(
     Json(body): Json<serde_json::Value>,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut guard = lock(&state);
     let actor = match admit(&mut guard, &headers, &workspace, &namespace, "publish") {
@@ -337,7 +354,11 @@ async fn baseline<S>(
     headers: HeaderMap,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut guard = lock(&state);
     let actor = match admit(&mut guard, &headers, &workspace, &namespace, "read") {
@@ -361,7 +382,11 @@ async fn receipt<S>(
     headers: HeaderMap,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut guard = lock(&state);
     if let Err(error) = admit(&mut guard, &headers, &workspace, &namespace, "read") {
@@ -387,7 +412,11 @@ async fn activate<S>(
     headers: HeaderMap,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut guard = lock(&state);
     let actor = match admit(&mut guard, &headers, &workspace, &namespace, "publish") {
@@ -444,7 +473,11 @@ async fn retire<S>(
     headers: HeaderMap,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut guard = lock(&state);
     if let Err(error) = admit(&mut guard, &headers, &workspace, &namespace, "retire") {

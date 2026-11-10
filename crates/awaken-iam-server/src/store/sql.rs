@@ -549,17 +549,19 @@ impl<B: SqlConn> AccountRepository for SqlStore<B> {
              created_at = excluded.created_at, updated_at = excluded.updated_at",
             t = self.table("accounts")
         );
-        self.backend.execute(
-            &sql,
-            &[
-                p(account.id.0),
-                p(status),
-                account.display_name,
-                p(account.created_at.0),
-                p(account.updated_at.0),
-            ],
-        )?;
-        Ok(())
+        self.with_authorization_change(|transaction| {
+            transaction.execute(
+                &sql,
+                &[
+                    p(account.id.0),
+                    p(status),
+                    account.display_name,
+                    p(account.created_at.0),
+                    p(account.updated_at.0),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn list(&self) -> RepositoryResult<Vec<Account>> {
@@ -660,7 +662,7 @@ impl<B: SqlConn> AccountIdentityRepository for SqlStore<B> {
             .to_owned();
         let key = identity.key();
         let claims = json_encode(&identity.claims, "claims")?;
-        self.backend.execute_transaction(&[
+        let writes = [
             SqlWrite {
                 sql: format!(
                     "INSERT INTO {} (id, status, display_name, created_at, updated_at) \
@@ -692,8 +694,11 @@ impl<B: SqlConn> AccountIdentityRepository for SqlStore<B> {
                     p(identity.last_seen_at.0),
                 ],
             },
-        ])?;
-        Ok(())
+        ];
+        self.with_authorization_change(|transaction| {
+            transaction.execute_checked(&writes, &[])?;
+            Ok(())
+        })
     }
 
     fn unlink(
@@ -992,14 +997,12 @@ impl<B: SqlConn> ApiTokenOwnerRepository for SqlStore<B> {
             "UPDATE {} SET owner = ? WHERE id = ?",
             self.table("api_tokens")
         );
-        if self
-            .backend
-            .execute(&sql, &[p(owner.0.clone()), p(id.0.clone())])?
-            == 0
-        {
-            return Err(RepositoryError::NotFound(format!("api token {}", id.0)));
-        }
-        Ok(())
+        self.with_authorization_change(|transaction| {
+            if transaction.execute(&sql, &[p(owner.0.clone()), p(id.0.clone())])? == 0 {
+                return Err(RepositoryError::NotFound(format!("api token {}", id.0)));
+            }
+            Ok(())
+        })
     }
 
     fn api_token_owner(&self, id: &ApiTokenId) -> RepositoryResult<Option<AccountId>> {
@@ -1018,7 +1021,7 @@ impl<B: SqlConn> ApiTokenOwnerRepository for SqlStore<B> {
 
 impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     fn create(&self, token: ApiToken) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| self.insert_api_token_in(transaction, &token))
+        self.with_authorization_change(|transaction| self.insert_api_token_in(transaction, &token))
     }
 
     fn get(&self, id: &ApiTokenId) -> RepositoryResult<Option<ApiToken>> {
@@ -1050,7 +1053,7 @@ impl<B: SqlConn> ApiTokenRepository for SqlStore<B> {
     }
 
     fn update(&self, token: ApiToken) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             let previous =
                 self.read_token_with(&token.id, |sql, params| transaction.query(sql, params))?;
             self.update_api_token_in(transaction, &token, previous.as_ref())
@@ -1066,7 +1069,7 @@ impl<B: SqlConn> OrgRepository for SqlStore<B> {
     }
 
     fn upsert(&self, org: Organization) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.ensure_scope_admission(
                 transaction,
                 &[ScopeRef::Org {
@@ -1117,7 +1120,7 @@ impl<B: SqlConn> OrgRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &OrgId) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             let sql = format!(
                 "DELETE FROM {} WHERE id = ? AND erasure_version IS NULL",
                 self.table("orgs")
@@ -1139,7 +1142,7 @@ impl<B: SqlConn> GroupRepository for SqlStore<B> {
     }
 
     fn upsert(&self, group: Group) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             let mut scopes = vec![ScopeRef::Org {
                 org_id: group.org.clone(),
             }];
@@ -1190,7 +1193,7 @@ impl<B: SqlConn> GroupRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &GroupId) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.ensure_scope_admission(transaction, &[], &[id.0.clone()])?;
 
             let sql = format!("DELETE FROM {} WHERE id = ?", self.table("groups"));
@@ -1267,7 +1270,7 @@ impl<B: SqlConn> RoleRepository for SqlStore<B> {
 
 impl<B: SqlConn> GrantRepository for SqlStore<B> {
     fn put(&self, grant: Grant) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| self.write_grant(transaction, &grant))
+        self.with_authorization_change(|transaction| self.write_grant(transaction, &grant))
     }
 
     fn get(&self, id: &GrantId) -> RepositoryResult<Option<Grant>> {
@@ -1288,7 +1291,7 @@ impl<B: SqlConn> GrantRepository for SqlStore<B> {
     }
 
     fn remove(&self, id: &GrantId) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.grant_admission(transaction, &[id.0.clone()], &[], &[])?;
 
             let sql = format!(
@@ -1328,7 +1331,7 @@ impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
     }
 
     fn add(&self, binding: RoleBinding) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.insert_role_binding_in(transaction, &binding)
         })
     }
@@ -1361,7 +1364,7 @@ impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
     }
 
     fn remove(&self, binding: &RoleBinding) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.ensure_scope_admission(transaction, &[binding.scope.clone()], &[])?;
 
             let principal = json_encode(&binding.principal, "principal")?;
@@ -1388,7 +1391,7 @@ impl<B: SqlConn> RoleBindingRepository for SqlStore<B> {
         managed_roles: &[RoleId],
         replacement_roles: &[RoleId],
     ) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.ensure_scope_admission(transaction, &[scope.clone()], &[])?;
             if !replacement_roles.is_empty() {
                 self.require_live_effect_scopes(transaction, &[scope.clone()])?;
@@ -1443,7 +1446,7 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
     }
 
     fn put_edge(&self, edge: ResourceEdge) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.edge_admission(transaction, &edge)?;
             self.require_raw_edge_effect(transaction, &edge)?;
 
@@ -1474,7 +1477,7 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
         resource_type: &ResourceType,
         resource_id: &ResourceId,
     ) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             self.ensure_scope_admission(
                 transaction,
                 &[ScopeRef::Resource {
@@ -1502,7 +1505,7 @@ impl<B: SqlConn> ResourceModelRepository for SqlStore<B> {
     }
 
     fn put_workspace_org(&self, edge: WorkspaceOrgEdge) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             let mut scopes = vec![
                 ScopeRef::Workspace {
                     workspace_id: edge.workspace_id.clone(),

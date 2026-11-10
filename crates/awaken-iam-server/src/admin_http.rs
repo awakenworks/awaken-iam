@@ -176,9 +176,11 @@ pub struct DaemonState<S> {
     capability_tokens: AccessTokenAuthority,
     auth: AdminAuthPolicy,
     observed_store_version: u64,
+    observed_store_epoch: u64,
     composed: Option<ComposedPolicy>,
     profile_body_limit: usize,
     scoped_decision: Option<scoped_decisions::DecisionPort<S>>,
+    scoped_workspace: Option<scoped_decisions::WorkspacePort<S>>,
 }
 
 /// Default body limit for `POST /v1/admin/authz/profiles`.
@@ -212,7 +214,8 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
         let directory = crate::DirectoryApi::new(store.clone());
         let oauth_clients = OAuthClientAdminApi::new(store.clone());
         let admin = PolicyAdminApi::new(store);
-        let version = admin.store_version()?;
+        let initial_fence = admin.store().fence()?;
+        let version = initial_fence.version;
         let base = admin.policy()?;
         let base = base.snapshot(version);
         let profiles = AuthorizationProfileAdmin::new(profiles);
@@ -228,9 +231,11 @@ impl<S: PolicyStore + awaken_iam_core::DirectoryRepository + OAuthClientReposito
             capability_tokens,
             auth,
             observed_store_version: version,
+            observed_store_epoch: initial_fence.epoch,
             composed: None,
             profile_body_limit: DEFAULT_PROFILE_BODY_LIMIT,
             scoped_decision: None,
+            scoped_workspace: None,
         };
         state.ensure_fresh()?;
         Ok(state)
@@ -248,6 +253,12 @@ impl<S> DaemonState<S> {
 }
 
 impl<S: PolicyStore> DaemonState<S> {
+    fn observed_fence(&self) -> crate::Fence {
+        crate::Fence {
+            version: self.observed_store_version,
+            epoch: self.observed_store_epoch,
+        }
+    }
     /// Compound native protocols reuse the exact current PDP and HA fence.
     pub(crate) fn authorize_current_resource(
         &mut self,
@@ -296,6 +307,12 @@ impl<S: PolicyStore> DaemonState<S> {
         version: u64,
         delta: Option<PolicyDelta>,
     ) -> Result<(), AdminError> {
+        // A version delta cannot prove that no other raw prerequisite changed
+        // alongside this command's epoch, so use the existing full hydration.
+        if self.admin.store().fence()?.epoch != self.observed_store_epoch {
+            self.composed = None;
+            return self.ensure_fresh();
+        }
         let observed = self.observed_store_version;
         let served = self.authz.policy_version();
         let advanced = self
@@ -343,12 +360,15 @@ impl<S: PolicyStore> DaemonState<S> {
 
     fn ensure_fresh(&mut self) -> Result<(), AdminError> {
         for _ in 0..3 {
-            let latest = self.admin.store_version()?;
-            if latest == self.observed_store_version {
+            let latest = self.admin.store().fence()?;
+            if latest.version == self.observed_store_version
+                && latest.epoch == self.observed_store_epoch
+            {
                 return Ok(());
             }
-            self.refresh_authorization(latest)?;
-            if self.admin.store_version()? == latest {
+            self.refresh_authorization(latest.version)?;
+            if self.admin.store().fence()? == latest {
+                self.observed_store_epoch = latest.epoch;
                 return Ok(());
             }
         }
@@ -813,7 +833,7 @@ async fn authorize_batch(
                 )
             })
             .collect::<Result<Vec<_>, _>>();
-        if state.admin.store_version().ok() != Some(state.observed_store_version) {
+        if state.admin.store().fence().ok() != Some(state.observed_fence()) {
             return scoped_decisions::unavailable();
         }
         match outcomes {

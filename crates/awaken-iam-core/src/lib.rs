@@ -39,7 +39,7 @@ pub use api_token::{
 };
 pub use authorization::{
     ActionPattern, AuthorizationTrace, DecisionReason, Effect, Grant, GrantId, GrantSubject,
-    GroupRoleBinding, PolicySet, RoleBinding, RoleId, ScopeGraph,
+    GroupRoleBinding, PolicySet, ResourceCandidateError, RoleBinding, RoleId, ScopeGraph,
 };
 pub use consumer_namespace::{ConsumerNamespaces, action_namespace};
 pub use directory::{

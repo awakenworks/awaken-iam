@@ -98,6 +98,19 @@ impl AuthorizationProfileRepository for InMemoryStore {
             expected_active_revision: request.expected_active_revision,
             created_at: request.profile.created_at.clone(),
         };
+        // Pinning this namespace first selects the scoped decision family;
+        // validated-only later revisions do not change that owner observation.
+        let publication_epoch = if authz
+            .profile_publications
+            .values()
+            .all(|intent| intent.namespace != namespace)
+        {
+            let fence = checked_lock(&self.fence, "fence")?;
+            let epoch = next_authorization_epoch(*fence)?;
+            Some((fence, epoch))
+        } else {
+            None
+        };
         authz.profiles.insert(
             (namespace.0.clone(), revision),
             AuthorizationProfile {
@@ -110,6 +123,9 @@ impl AuthorizationProfileRepository for InMemoryStore {
             },
         );
         authz.profile_publications.insert(key, intent.clone());
+        if let Some((mut fence, epoch)) = publication_epoch {
+            fence.epoch = epoch;
+        }
         Ok(intent)
     }
 
@@ -195,7 +211,10 @@ impl AuthorizationProfileRepository for InMemoryStore {
             .profiles
             .get_mut(&(namespace.0.clone(), revision))
             .ok_or_else(|| RepositoryError::NotFound("profile revision not found".into()))?;
+        let mut fence = checked_lock(&self.fence, "fence")?;
+        let epoch = next_authorization_epoch(*fence)?;
         profile.lifecycle = lifecycle;
+        fence.epoch = epoch;
         Ok(())
     }
 

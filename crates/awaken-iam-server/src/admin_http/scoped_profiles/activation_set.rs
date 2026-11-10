@@ -13,7 +13,11 @@ pub(super) async fn activate<S>(
     Json(request): Json<ActivateScopedAuthorizationProfiles>,
 ) -> Response
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     match activate_current(&state, &headers, &workspace, request) {
         Ok(receipts) => Json(receipts).into_response(),
@@ -29,7 +33,11 @@ fn activate_current<S>(
     request: ActivateScopedAuthorizationProfiles,
 ) -> Result<Vec<ScopedAuthorizationProfileReceipt>, Response>
 where
-    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository + AccountRepository,
+    S: PolicyStore
+        + AuthorizationProfileRepository
+        + ApiTokenRepository
+        + ApiTokenOwnerRepository
+        + AccountRepository,
 {
     let mut namespaces = std::collections::HashSet::new();
     if request.intents.is_empty()

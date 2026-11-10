@@ -17,6 +17,7 @@ mod personal_delegation;
 mod protocol;
 mod registered_resource;
 mod resource_authorization;
+mod resource_candidates;
 pub use personal_delegation::{
     AuthorizePersonalDelegation, CreatePersonalDelegation, ListPersonalDelegations,
     MintPersonalDelegationToken, PersonalDelegation, PersonalDelegationPage,
@@ -25,6 +26,13 @@ pub use personal_delegation::{
 pub use registered_resource::{
     RegisteredResourceAuthorizationEvaluation, RegisteredResourceAuthorizationRequest,
     ResourceRegistrationQualification,
+};
+pub use resource_candidates::{
+    RESOURCE_AUTHORIZATION_BATCH_MAX, RESOURCE_AUTHORIZATION_CHAIN_MAX,
+    RESOURCE_CANDIDATE_NODE_MAX, RESOURCE_CANDIDATE_VALUE_MAX,
+    ResourceAuthorizationBatchEvaluation, ResourceAuthorizationBatchRequest,
+    ResourceAuthorizationMode, ResourceCandidateEvaluation, ResourceCandidatePlan,
+    ResourceCandidatePredicate, ResourceCandidateReason, ResourceCandidateRequest,
 };
 mod trust;
 

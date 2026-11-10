@@ -220,6 +220,14 @@ fn current_outcome<S: PolicyStore + AuthorizationProfileRepository>(
     state: &DaemonState<S>,
     request: &RegisteredResourceAuthorizationRequest,
 ) -> Result<AuthorizationOutcome, scoped_decisions::Unavailable> {
+    Ok(native_current_evaluator(state)?.authorize_resource(&request.authorization))
+}
+
+/// One native policy/profile source for compound protocols; a separately
+/// supplied legacy profile repository cannot qualify this evaluator.
+pub(super) fn native_current_evaluator<S: PolicyStore + AuthorizationProfileRepository>(
+    state: &DaemonState<S>,
+) -> Result<crate::AuthzApi, scoped_decisions::Unavailable> {
     let version = state
         .admin
         .store()
@@ -238,5 +246,5 @@ fn current_outcome<S: PolicyStore + AuthorizationProfileRepository>(
         PolicySet::from_snapshot_and_profiles(&base, &profiles),
         version,
     );
-    Ok(evaluator.authorize_resource(&request.authorization))
+    Ok(evaluator)
 }

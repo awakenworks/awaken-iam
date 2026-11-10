@@ -39,6 +39,11 @@ use crate::GroupId;
 #[path = "authorization/constraints.rs"]
 mod constraints;
 use constraints::ConstraintMatch;
+#[path = "authorization/bindings.rs"]
+mod bindings;
+#[path = "authorization/candidates.rs"]
+mod candidates;
+pub use candidates::ResourceCandidateError;
 
 /// Identifier of a role (a reusable bundle of grants).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -613,51 +618,15 @@ impl PolicySet {
         context: Option<&awaken_iam_contract::AuthorizationContext>,
     ) -> Vec<RoleId> {
         let mut roles: Vec<RoleId> = Vec::new();
-        for binding in &self.role_bindings {
-            if &binding.principal != principal {
-                continue;
-            }
-            if !self.scope_graph.covers(&binding.scope, scope) {
-                continue;
-            }
-            if !self.bundle_owner_allows(&binding.role, scope)
-                || !self.binding_limit_allows(
-                    &GrantSubjectRef::Principal {
-                        principal: principal.clone(),
-                    },
-                    &binding.role,
-                    &binding.scope,
-                    scope,
-                    context,
-                )
+        for binding in self.applicable_role_bindings(principal, scope) {
+            if self.binding_limit_allows(
+                &binding.subject,
+                binding.role,
+                binding.scope,
+                scope,
+                context,
+            ) && !roles.contains(binding.role)
             {
-                continue;
-            }
-            if !roles.contains(&binding.role) {
-                roles.push(binding.role.clone());
-            }
-        }
-        for binding in &self.group_role_bindings {
-            if !self.group_contains(&binding.group, principal) {
-                continue;
-            }
-            if !self.scope_graph.covers(&binding.scope, scope) {
-                continue;
-            }
-            if !self.bundle_owner_allows(&binding.role, scope)
-                || !self.binding_limit_allows(
-                    &GrantSubjectRef::Group {
-                        group_id: binding.group.0.clone(),
-                    },
-                    &binding.role,
-                    &binding.scope,
-                    scope,
-                    context,
-                )
-            {
-                continue;
-            }
-            if !roles.contains(&binding.role) {
                 roles.push(binding.role.clone());
             }
         }

@@ -9,6 +9,33 @@ use awaken_iam_contract::{
 /// Current remote scoped decisions. An unavailable/unknown endpoint is an
 /// error, never permission to retry through legacy global authorization.
 pub trait ScopedProfileConsumer: Send + Sync {
+    /// The actual configured HTTP authority, when this provider has one. This
+    /// source hint is not a store incarnation or authorization credential.
+    fn configured_endpoint(&self) -> Option<&str> {
+        None
+    }
+    fn authorize_scoped_resources_evaluation(
+        &self,
+        _workspace: &WorkspaceId,
+        _namespace: &NamespaceId,
+        _request: &awaken_iam_contract::ResourceAuthorizationBatchRequest,
+    ) -> Result<awaken_iam_contract::ResourceAuthorizationBatchEvaluation, RemoteError> {
+        Err(RemoteError::response(
+            501,
+            "scoped contextual batch capability is unsupported".into(),
+        ))
+    }
+    fn scoped_resource_candidates(
+        &self,
+        _workspace: &WorkspaceId,
+        _namespace: &NamespaceId,
+        _request: &awaken_iam_contract::ResourceCandidateRequest,
+    ) -> Result<awaken_iam_contract::ResourceCandidateEvaluation, RemoteError> {
+        Err(RemoteError::response(
+            501,
+            "scoped resource candidate capability is unsupported".into(),
+        ))
+    }
     /// A current scoped decision with native freshness; never falls back to
     /// legacy/global authorization when the endpoint or metadata is absent.
     fn authorize_scoped_resource_evaluation(
@@ -30,6 +57,27 @@ pub trait ScopedProfileConsumer: Send + Sync {
 }
 
 impl<T: ScopedProfileConsumer> ScopedProfileConsumer for crate::RemoteIamClient<T> {
+    fn configured_endpoint(&self) -> Option<&str> {
+        self.transport().configured_endpoint()
+    }
+    fn authorize_scoped_resources_evaluation(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &awaken_iam_contract::ResourceAuthorizationBatchRequest,
+    ) -> Result<awaken_iam_contract::ResourceAuthorizationBatchEvaluation, RemoteError> {
+        self.transport()
+            .authorize_scoped_resources_evaluation(workspace, namespace, request)
+    }
+    fn scoped_resource_candidates(
+        &self,
+        workspace: &WorkspaceId,
+        namespace: &NamespaceId,
+        request: &awaken_iam_contract::ResourceCandidateRequest,
+    ) -> Result<awaken_iam_contract::ResourceCandidateEvaluation, RemoteError> {
+        self.transport()
+            .scoped_resource_candidates(workspace, namespace, request)
+    }
     fn authorize_scoped_resource_evaluation(
         &self,
         workspace: &WorkspaceId,
@@ -106,6 +154,54 @@ mod tests {
     struct ScopedOnly {
         calls: Calls,
         outcome: Result<AuthorizationOutcome, RemoteError>,
+    }
+    #[test]
+    fn a_legacy_consumer_explicitly_lacks_new_capabilities_without_calling_single_pdp() {
+        use awaken_iam_contract::{
+            AuthorizationAccess, ResourceAuthorizationBatchRequest, ResourceAuthorizationMode,
+            ResourceCandidateRequest,
+        };
+        let calls = Arc::new(Mutex::new(vec![]));
+        let client = crate::RemoteIamClient::new(ScopedOnly {
+            calls: calls.clone(),
+            outcome: Err(RemoteError::new("legacy must not be called".into())),
+        });
+        let request = ResourceAuthorizationBatchRequest {
+            mode: ResourceAuthorizationMode::Scoped,
+            requests: vec![],
+        };
+        let workspace = WorkspaceId("w".into());
+        let namespace = NamespaceId("tenant".into());
+        assert_eq!(client.configured_endpoint(), None);
+        assert_eq!(
+            client
+                .authorize_scoped_resources_evaluation(&workspace, &namespace, &request)
+                .unwrap_err()
+                .status(),
+            Some(501)
+        );
+        let request = ResourceCandidateRequest {
+            mode: ResourceAuthorizationMode::Scoped,
+            request: AuthorizationRequest::direct(
+                PrincipalRef::Service {
+                    service_id: "owner".into(),
+                },
+                ActionKey("tenant::read".into()),
+                ScopeRef::Workspace {
+                    workspace_id: workspace.clone(),
+                },
+            ),
+            resource_type: None,
+            access: AuthorizationAccess::Read,
+        };
+        assert_eq!(
+            client
+                .scoped_resource_candidates(&workspace, &namespace, &request)
+                .unwrap_err()
+                .status(),
+            Some(501)
+        );
+        assert!(calls.lock().unwrap().is_empty());
     }
     // No legacy AuthzTransport implementation: this adapter has only the
     // explicit scoped protocol and cannot provide a permissive fallback.

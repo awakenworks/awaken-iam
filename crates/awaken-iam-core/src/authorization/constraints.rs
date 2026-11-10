@@ -13,6 +13,10 @@ pub(super) enum ConstraintMatch {
     MissingFacts,
 }
 
+pub(super) fn binding_time_allows(expiry: Option<i64>, evaluated_at: Option<i64>) -> bool {
+    expiry.is_none_or(|expiry| evaluated_at.is_some_and(|now| now >= 0 && now < expiry))
+}
+
 impl PolicySet {
     /// Evaluate the same effect lattice with owner-resolved resource facts.
     pub fn evaluate_resource(&self, request: &ResourceAuthorizationRequest) -> AuthorizationTrace {
@@ -41,19 +45,12 @@ impl PolicySet {
         target_scope: &ScopeRef,
         context: Option<&AuthorizationContext>,
     ) -> bool {
-        self.binding_limits
-            .iter()
-            .filter(|limit| {
-                &limit.subject == subject
-                    && limit.role_id == role.0
-                    && &limit.scope == binding_scope
-            })
+        self.matching_binding_limits(subject, role, binding_scope)
             .all(|limit| {
-                if let Some(expiry) = limit.expires_at
-                    && !context
-                        .and_then(|facts| facts.evaluated_at)
-                        .is_some_and(|now| now >= 0 && now < expiry)
-                {
+                if !binding_time_allows(
+                    limit.expires_at,
+                    context.and_then(|facts| facts.evaluated_at),
+                ) {
                     return false;
                 }
                 limit.resource_ids.as_ref().is_none_or(|allowed| {
@@ -61,6 +58,17 @@ impl PolicySet {
                         .is_some_and(|facts| resource_limit_matches(allowed, facts, target_scope))
                 })
             })
+    }
+
+    pub(super) fn matching_binding_limits<'a>(
+        &'a self,
+        subject: &'a GrantSubjectRef,
+        role: &'a RoleId,
+        binding_scope: &'a ScopeRef,
+    ) -> impl Iterator<Item = &'a awaken_iam_contract::RoleBindingLimit> + 'a {
+        self.binding_limits.iter().filter(move |limit| {
+            &limit.subject == subject && limit.role_id == role.0 && &limit.scope == binding_scope
+        })
     }
 
     pub(super) fn constraint_matches(

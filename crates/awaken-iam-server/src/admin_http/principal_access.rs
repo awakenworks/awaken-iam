@@ -65,6 +65,39 @@ pub(super) fn admit_with_token<S>(
 where
     S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
 {
+    let Some(token) = authenticate_service_token(guard, headers)? else {
+        return Ok(None);
+    };
+    let request =
+        AuthorizationRequest::direct(token.principal.clone(), ActionKey(action.into()), scope);
+    let mut allowed = false;
+    let rendered = guard.with_fresh_authorization(|authz| {
+        allowed = authz.authorize(&request).decision == AuthorizationDecision::Allow;
+        StatusCode::OK.into_response()
+    });
+    if rendered.status() != StatusCode::OK {
+        return Err(rendered);
+    }
+    if !allowed {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the service account lacks this access administration action",
+        ));
+    }
+    Ok(Some(token))
+}
+
+/// Reuse the current native credential owner without selecting a policy source.
+/// Compound scoped protocols subsequently evaluate the exact native capability.
+#[allow(clippy::result_large_err)]
+pub(super) fn authenticate_service_token<S>(
+    guard: &DaemonState<S>,
+    headers: &HeaderMap,
+) -> Result<Option<ApiToken>, Response>
+where
+    S: PolicyStore + ApiTokenRepository + ApiTokenOwnerRepository,
+{
     match directory_credential_access(&guard.auth, headers) {
         Ok(DirectoryCredentialAccess::Administrator) => return Ok(None),
         Ok(DirectoryCredentialAccess::Product(_)) => {
@@ -102,23 +135,6 @@ where
             StatusCode::FORBIDDEN,
             "forbidden",
             "access administration needs an owned service-account token",
-        ));
-    }
-    let request =
-        AuthorizationRequest::direct(token.principal.clone(), ActionKey(action.into()), scope);
-    let mut allowed = false;
-    let rendered = guard.with_fresh_authorization(|authz| {
-        allowed = authz.authorize(&request).decision == AuthorizationDecision::Allow;
-        StatusCode::OK.into_response()
-    });
-    if rendered.status() != StatusCode::OK {
-        return Err(rendered);
-    }
-    if !allowed {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "the service account lacks this access administration action",
         ));
     }
     Ok(Some(token))

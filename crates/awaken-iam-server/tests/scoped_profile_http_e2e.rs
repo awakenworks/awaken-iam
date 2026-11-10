@@ -21,6 +21,8 @@ mod current_decisions;
 mod group_sources;
 #[path = "scoped_profile_http_e2e/live_subjects.rs"]
 mod live_subjects;
+#[path = "scoped_profile_http_e2e/resource_reads.rs"]
+mod resource_reads;
 #[path = "scoped_profile_http_e2e/service_references.rs"]
 mod service_references;
 #[path = "scoped_profile_http_e2e/token_introspection.rs"]

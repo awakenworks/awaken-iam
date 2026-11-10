@@ -10,6 +10,9 @@
 use awaken_iam_server::FenceStore;
 use awaken_iam_server::InMemoryStore;
 
+#[path = "fence_e2e/authorization_sources.rs"]
+mod authorization_sources;
+
 #[test]
 fn fence_initial_is_version_one_epoch_zero_and_eq_to_default() {
     use awaken_iam_server::Fence;

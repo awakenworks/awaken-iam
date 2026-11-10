@@ -140,6 +140,130 @@ async fn postgres_native_freshness_uses_the_same_owner_contract() {
     exercise_native_freshness(store, &prefix).await;
 }
 
+async fn exercise_raw_authorization_epochs<B: SqlConn + Clone + 'static>(store: SqlStore<B>) {
+    use awaken_iam_core::{
+        GrantRepository, Group, GroupId, GroupRepository, OrgRepository, Organization,
+        RoleBindingRepository,
+    };
+    let at = Timestamp("2026-11-10T00:00:00Z".into());
+    let actor = PrincipalRef::Account {
+        account_id: AccountId("ada".into()),
+    };
+    OrgRepository::upsert(
+        &store,
+        Organization {
+            id: awaken_iam_contract::OrgId("epoch-org".into()),
+            display_name: None,
+            owner: actor.clone(),
+            created_at: at.clone(),
+            updated_at: at.clone(),
+        },
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            AuthzApi::new(),
+            AdminAuthPolicy::deny_all(),
+            Arc::new(store.clone()),
+            store.clone(),
+            AuthApi::new().token_authority(),
+        )
+        .unwrap(),
+    ));
+    let router = daemon_router(state);
+    let (denied, initial) = evaluate(&router).await;
+    assert_eq!(denied.decision, AuthorizationDecision::Deny);
+    let version = store.fence().unwrap().version;
+    GrantRepository::put(
+        &store,
+        Grant {
+            id: GrantId("raw-role-read".into()),
+            subject: GrantSubject::Role(RoleId("reader".into())),
+            action_pattern: ActionPattern("document.read".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        },
+    )
+    .unwrap();
+    let binding = RoleBinding {
+        principal: actor.clone(),
+        role: RoleId("reader".into()),
+        scope: ScopeRef::Global,
+    };
+    RoleBindingRepository::add(&store, binding.clone()).unwrap();
+    let (allowed, member) = evaluate(&router).await;
+    assert_eq!(allowed.decision, AuthorizationDecision::Allow);
+    assert_ne!(member, initial);
+    RoleBindingRepository::remove(&store, &binding).unwrap();
+    let (denied, revoked) = evaluate(&router).await;
+    assert_eq!(
+        denied.decision,
+        AuthorizationDecision::Deny,
+        "the hydrated legacy PDP cannot retain a raw revoked role under a new epoch"
+    );
+    assert_ne!(revoked, member);
+    GrantRepository::put(
+        &store,
+        Grant {
+            id: GrantId("raw-group-read".into()),
+            subject: GrantSubject::Group(GroupId("epoch-readers".into())),
+            action_pattern: ActionPattern("document.read".into()),
+            scope: ScopeRef::Global,
+            effect: Effect::Allow,
+        },
+    )
+    .unwrap();
+    GroupRepository::upsert(
+        &store,
+        Group {
+            id: GroupId("epoch-readers".into()),
+            org: awaken_iam_contract::OrgId("epoch-org".into()),
+            display_name: None,
+            members: vec![actor],
+            created_at: at.clone(),
+            updated_at: at,
+        },
+    )
+    .unwrap();
+    let (allowed, roster) = evaluate(&router).await;
+    assert_eq!(allowed.decision, AuthorizationDecision::Allow);
+    assert_ne!(roster, revoked);
+    GroupRepository::remove(&store, &GroupId("epoch-readers".into())).unwrap();
+    let (denied, removed) = evaluate(&router).await;
+    assert_eq!(denied.decision, AuthorizationDecision::Deny);
+    assert_ne!(removed, roster);
+    assert_eq!(
+        store.fence().unwrap().version,
+        version,
+        "raw source epochs do not fabricate PAP domain events"
+    );
+}
+
+#[tokio::test]
+async fn raw_native_role_and_roster_epochs_refresh_the_actual_http_pdp_without_a_pap_version_change()
+ {
+    exercise_raw_authorization_epochs(sqlite_in_memory_store("raw_source_http_epoch").unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn postgres_raw_source_epochs_refresh_the_actual_http_pdp() {
+    let Ok(url) = std::env::var("IAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let prefix = format!(
+        "raw_epoch_pg_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    exercise_raw_authorization_epochs(
+        awaken_iam_server::postgres_migrated_store(&url, &prefix).unwrap(),
+    )
+    .await;
+}
+
 #[derive(Clone)]
 struct EpochRace {
     inner: SqliteBackend,
@@ -247,4 +371,133 @@ async fn a_native_epoch_write_during_admission_cannot_qualify_an_allow() {
         changed, original,
         "a fresh admission observes the committed new epoch"
     );
+}
+
+#[tokio::test]
+async fn scoped_batch_and_candidates_refuse_a_real_epoch_write_during_their_shared_admission() {
+    use awaken_iam_contract::*;
+    use awaken_iam_core::{
+        ApiTokenDirectory, ApiTokenMinter, ApiTokenOwnerRepository, ApiTokenRepository,
+        MintApiToken, OsEntropy, PolicySet, RoleId,
+    };
+    let base = sqlite_in_memory_store("epoch_race").unwrap();
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = SqlStore::with_prefix(
+        EpochRace {
+            inner: base.backend().clone(),
+            remaining: remaining.clone(),
+        },
+        "epoch_race",
+    )
+    .unwrap();
+    let principal = PrincipalRef::Service {
+        service_id: "scoped-reader".into(),
+    };
+    let workspace = ScopeRef::Workspace {
+        workspace_id: WorkspaceId("w".into()),
+    };
+    PolicyAdminApi::new(store.clone())
+        .issue_grant(
+            Grant {
+                id: GrantId("scoped-read".into()),
+                subject: GrantSubject::Principal(principal.clone()),
+                action_pattern: ActionPattern("iam.authorization-profile.read:tenant.a".into()),
+                scope: workspace.clone(),
+                effect: Effect::Allow,
+            },
+            Timestamp("2026-11-10T00:00:00Z".into()),
+        )
+        .unwrap();
+    let mut minter = ApiTokenMinter::new(OsEntropy);
+    let issued = minter
+        .mint_service_account(
+            &mut ApiTokenDirectory::new(),
+            &mut PolicySet::new(),
+            MintApiToken {
+                id: ApiTokenId("scoped-reader".into()),
+                principal: principal.clone(),
+                workspace: WorkspaceId("w".into()),
+                role: RoleId("reader".into()),
+                created_at: Timestamp("2026-11-10T00:00:00Z".into()),
+                expires_at: Some(Timestamp("2099-01-01T00:00:00Z".into())),
+            },
+            AccountId("owner".into()),
+        )
+        .unwrap()
+        .issued;
+    ApiTokenRepository::create(&store, issued.token.clone()).unwrap();
+    store
+        .record_api_token_owner(&issued.token.id, &AccountId("owner".into()))
+        .unwrap();
+    let state = Arc::new(Mutex::new(
+        DaemonState::with_policy_store(
+            AuthzApi::new(),
+            AdminAuthPolicy::deny_all(),
+            Arc::new(store.clone()),
+            store,
+            AuthApi::new().token_authority(),
+        )
+        .unwrap(),
+    ));
+    let router =
+        daemon_router(state.clone()).merge(awaken_iam_server::scoped_profile_router(state));
+    let request = ResourceAuthorizationRequest {
+        request: AuthorizationRequest::direct(
+            principal,
+            ActionKey("tenant.a::read".into()),
+            workspace,
+        ),
+        context: Default::default(),
+    };
+    let plan = ResourceCandidateRequest {
+        mode: ResourceAuthorizationMode::Scoped,
+        request: request.request.clone(),
+        resource_type: None,
+        access: AuthorizationAccess::Read,
+    };
+    let batch = ResourceAuthorizationBatchRequest {
+        mode: ResourceAuthorizationMode::Scoped,
+        requests: vec![request],
+    };
+    for (suffix, body) in [
+        ("resource-candidates", serde_json::to_value(plan).unwrap()),
+        ("authorize-resources", serde_json::to_value(batch).unwrap()),
+    ] {
+        let uri = format!("/v1/scoped-authz/workspaces/w/profiles/tenant.a/{suffix}");
+        let make = || {
+            Request::builder()
+                .method("POST")
+                .uri(uri.as_str())
+                .header("authorization", format!("Bearer {}", issued.secret))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let baseline = router.clone().oneshot(make()).await.unwrap();
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let original = baseline
+            .headers()
+            .get(AUTHORIZATION_FRESHNESS_HEADER)
+            .unwrap()
+            .clone();
+        // Commit a real epoch change immediately after the first captured read.
+        remaining.store(1, std::sync::atomic::Ordering::SeqCst);
+        let changed = router.clone().oneshot(make()).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            changed
+                .headers()
+                .get(AUTHORIZATION_FRESHNESS_HEADER)
+                .is_none()
+        );
+        let current = router.clone().oneshot(make()).await.unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        assert_ne!(
+            current
+                .headers()
+                .get(AUTHORIZATION_FRESHNESS_HEADER)
+                .unwrap(),
+            &original
+        );
+    }
 }

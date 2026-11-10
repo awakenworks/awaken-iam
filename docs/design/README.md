@@ -4,6 +4,7 @@
 - [Domain model (DDD)](domain-model.md)
 - [Permission mechanisms](permission-mechanisms.md)
 - [Authorization engine](authorization-engine.md)
+- [Resource candidate and contextual batch test design](resource-candidate-authorization-testing.md)
 - [Seeding and provisioning](seeding-and-provisioning.md)
 - [Consumer integration](consumer-integration.md)
 - [Identity and auth server](auth-server.md)

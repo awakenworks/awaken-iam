@@ -12,7 +12,7 @@ impl<B: SqlConn> SqlStore<B> {
         token: &ApiToken,
         binding: &RoleBinding,
     ) -> RepositoryResult<()> {
-        self.with_policy_transaction(|transaction, _| {
+        self.with_authorization_change(|transaction| {
             if token.principal != binding.principal
                 || !matches!(&binding.scope, ScopeRef::Workspace { workspace_id } if workspace_id == &token.workspace)
             {
@@ -52,6 +52,7 @@ impl<B: SqlConn> SqlStore<B> {
                 let mut revoked = current.clone();
                 revoked.revoked_at = Some(stamp.clone());
                 self.update_api_token_in(transaction, &revoked, Some(&current))?;
+                self.advance_authorization_epoch(transaction)?;
             } else {
                 self.admit_api_token_in(transaction, &current, Some(&current))?;
             }
