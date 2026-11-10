@@ -130,6 +130,13 @@ dispatch and both v8 histories remain owned by [ADR-0015](../adr/0015-reconcile-
 The local `AuthzApi`/Core model-registration method retains its embedded model
 input and does not simulate the daemon's product-admission policy.
 
+Embedded HTTP hosts use `AdminAuthPolicy::authenticated_product` to recover the
+exact product identity of a configured product credential through the same
+matcher as the native command routes. Unknown credentials and unrestricted
+administrator credentials have no product identity. Hosts still constrain their
+published operations and action namespaces; this accessor introduces no token
+issuer, credential repository, or new wire authentication format.
+
 ### GET /v1/authz/snapshot
 
 Returns the versioned [`AuthzSnapshot`](authorization-engine.md#snapshot) for
