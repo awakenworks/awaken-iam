@@ -47,10 +47,9 @@ impl<B: SqlConn> SqlStore<B> {
         if request.resource_model.resource_types.is_empty() && actions.is_empty() {
             return Err(RepositoryError::Conflict("resource model is empty".into()));
         }
-        let namespace = format!("{product}.");
         if actions
             .iter()
-            .any(|action| !action.starts_with(&namespace) || action.contains('*'))
+            .any(|action| !request.product_id.owns_action(action))
         {
             return Err(RepositoryError::Conflict(
                 "action must use its product namespace without a wildcard".into(),

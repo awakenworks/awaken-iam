@@ -81,3 +81,34 @@ client with rotation and revocation.
   domain events, repository contracts-and-adapters, and no speculative policy language beyond
   hierarchical RBAC until a second need appears.
 
+## Amendment 2026-11-11: organization identity federation is product independent
+
+Organization login-connection rules and their public request/response contracts
+belong to IAM. Move the existing Cloud implementation into the existing IAM
+server and contract crates; remove the displaced Cloud rules in the same change.
+The existing `ProductId` and `OrgId` bind every management and login-routing
+operation. Products register their OAuth client, callbacks and credentials as
+deployment data, rather than adding product variants to an identity service.
+
+The broker remains the sole owner of upstream connector records and secrets.
+Its transport and the distributed mutation lease are injected outbound ports;
+IAM adds no connector table, credential store, token issuer or session loop.
+Cloud supplies the deployed Dex adapter, TLS material, mutation admission and
+its existing current-identity/organization-administrator enforcement. Tutor
+continues to own institution business permissions and its settings UI.
+
+For a management request, the existing host authenticates the registered product
+audience and current organization administrator before invoking IAM's connection
+command. The command validates discovery, acquires the existing mutation guard,
+checks the retained version, writes through the broker and confirms its actual
+state. Uncertain responses are observed on retry, never rolled back by assumption.
+Login hints select only a verified product/organization connection; the original
+AuthApi retains challenge, PKCE, callback, account and token authority.
+
+Connection identifiers keep the existing `<product>-<organization hash>-<IdP
+hash>` spelling. In particular, migrating the implementation preserves every
+already-deployed connector identifier and its upstream subject mapping.
+Tests must cover two unrelated products, cross-product and cross-organization
+refusals, stale versions, uncertain writes, secret redaction and unchanged login
+proofs. Their decision tables live next to the corresponding test cases.
+

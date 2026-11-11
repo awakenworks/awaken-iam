@@ -145,6 +145,16 @@ impl AdminAuthPolicy {
         self
     }
 
+    /// Resolve a configured product credential through the native matcher.
+    /// An unrestricted administrator is deliberately not a product principal;
+    /// embedded hosts must not infer an arbitrary product from that authority.
+    pub fn authenticated_product(&self, credential: &AdminCredential) -> Option<&ProductId> {
+        match self.access(credential) {
+            Some(DirectoryCredentialAccess::Product(product)) => Some(product),
+            Some(DirectoryCredentialAccess::Administrator) | None => None,
+        }
+    }
+
     /// A policy that rejects every admin caller (the secure default before an
     /// admin secret is configured).
     pub fn deny_all() -> Self {
@@ -1836,6 +1846,48 @@ mod tests {
         // An empty token never grants access.
         assert!(
             !AdminAuthPolicy::new([String::new()]).accepts(&AdminCredential::Bearer("".into()))
+        );
+    }
+
+    #[test]
+    fn embedded_product_admission_reuses_the_exact_native_credential_scope() {
+        // Cause/effect table: configured product key (ApiKey OR Bearer) ->
+        // its exact product; foreign product -> that foreign identity, never
+        // the host's preferred product. Unknown/empty/deny-all -> none;
+        // administrator -> none even though ordinary admin admission succeeds.
+        let tutor = ProductId::new("tutor").unwrap();
+        let flow = ProductId::new("flow").unwrap();
+        let policy = AdminAuthPolicy::new(["test-admin".into()])
+            .with_product_token(tutor.clone(), "test-tutor")
+            .with_product_token(flow.clone(), "test-flow")
+            .with_product_token(tutor.clone(), "");
+        for credential in [
+            AdminCredential::ApiKey("test-tutor".into()),
+            AdminCredential::Bearer("test-tutor".into()),
+        ] {
+            assert_eq!(policy.authenticated_product(&credential), Some(&tutor));
+        }
+        assert_eq!(
+            policy.authenticated_product(&AdminCredential::Bearer("test-flow".into())),
+            Some(&flow)
+        );
+        for token in ["unknown", "", "test-admin"] {
+            assert_eq!(
+                policy.authenticated_product(&AdminCredential::Bearer(token.into())),
+                None
+            );
+        }
+        assert!(policy.accepts(&AdminCredential::Bearer("test-admin".into())));
+        assert_eq!(
+            AdminAuthPolicy::deny_all()
+                .authenticated_product(&AdminCredential::Bearer("test-tutor".into())),
+            None
+        );
+        assert_eq!(
+            policy
+                .clone()
+                .authenticated_product(&AdminCredential::Bearer("test-tutor".into())),
+            Some(&tutor)
         );
     }
 

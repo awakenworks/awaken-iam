@@ -251,3 +251,6 @@ mod tests {
         );
     }
 }
+
+/// Organization federation contracts and commands; provider custody stays external.
+pub mod organization_login;

@@ -447,3 +447,9 @@ mod tests {
         );
     }
 }
+
+mod organization_login;
+pub use organization_login::{
+    CreateOrganizationLoginConnection, OrganizationLoginConfiguration, OrganizationLoginConnection,
+    OrganizationLoginOption, UpdateOrganizationLoginConnection,
+};

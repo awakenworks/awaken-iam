@@ -57,6 +57,19 @@ impl ProductId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The one product-action namespace rule, shared by resource-model
+    /// admission and authenticated product decision transports.
+    pub fn owns_action(&self, action: &str) -> bool {
+        action
+            .strip_prefix(self.as_str())
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && !suffix.contains(['*', ':'])
+                    && !suffix.chars().any(char::is_whitespace)
+            })
+    }
 }
 
 impl<'de> Deserialize<'de> for ProductId {
