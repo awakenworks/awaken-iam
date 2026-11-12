@@ -60,15 +60,27 @@ impl ProductId {
 
     /// The one product-action namespace rule, shared by resource-model
     /// admission and authenticated product decision transports.
+    /// Dotted actions and product-owned profile actions share one concrete suffix rule.
     pub fn owns_action(&self, action: &str) -> bool {
-        action
-            .strip_prefix(self.as_str())
-            .and_then(|suffix| suffix.strip_prefix('.'))
-            .is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && !suffix.contains(['*', ':'])
-                    && !suffix.chars().any(char::is_whitespace)
-            })
+        let Some(product_suffix) = action.strip_prefix(self.as_str()) else {
+            return false;
+        };
+        let local_action = match product_suffix.split_once("::") {
+            Some((namespace_suffix, local_action)) => {
+                let owned_namespace =
+                    namespace_suffix.is_empty() || namespace_suffix.starts_with('.');
+                let valid_namespace = namespace_suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+                (owned_namespace && valid_namespace).then_some(local_action)
+            }
+            None => product_suffix.strip_prefix('.'),
+        };
+        local_action.is_some_and(|suffix| {
+            !suffix.is_empty()
+                && !suffix.contains(['*', ':'])
+                && !suffix.chars().any(char::is_whitespace)
+        })
     }
 }
 
