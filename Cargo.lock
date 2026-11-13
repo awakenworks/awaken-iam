@@ -172,7 +172,7 @@ dependencies = [
 [[package]]
 name = "awaken-scoped-migration"
 version = "0.1.0-dev"
-source = "git+https://github.com/awakenworks/awaken-foundation.git?rev=247ee33a1d8f56f362217176886c346c87d207d9#247ee33a1d8f56f362217176886c346c87d207d9"
+source = "git+https://github.com/awakenworks/awaken-foundation.git?rev=36f855b929a3e22133229af2b0e3158281e22e51#36f855b929a3e22133229af2b0e3158281e22e51"
 dependencies = [
  "sha2 0.10.9",
  "thiserror",

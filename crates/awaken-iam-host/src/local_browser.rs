@@ -12,7 +12,7 @@ use awaken_iam_contract::{AccountId, SessionId, SessionView, Timestamp};
 use awaken_iam_core::{EntropySource, OsEntropy, SessionRepository};
 use awaken_iam_server::{
     BeginLocalSetup, ExchangeLocalSetup, LocalSetupError, LocalSetupGateway, LocalSetupId,
-    SameSite, SessionCookieConfig, SessionGateway,
+    RenewLocalSetup, SameSite, SessionCookieConfig, SessionGateway,
 };
 use axum::extract::State;
 use axum::http::header::{COOKIE, HOST, ORIGIN, SET_COOKIE};
@@ -30,7 +30,7 @@ const SESSION_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const LOCAL_COOKIE_NAME: &str = "awaken_local_session";
 
 /// Cleartext value the CLI hands to the local operator exactly once.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalSetupHandoff {
     pub setup_token: String,
     pub expires_at: Timestamp,
@@ -46,6 +46,25 @@ pub struct LocalBrowserAuth {
 }
 
 impl LocalBrowserAuth {
+    /// Rotate this authority's original challenge after product authorization.
+    /// Existing sessions, gate attachment and account binding are unchanged.
+    pub fn renew_handoff(&self) -> Result<LocalSetupHandoff, LocalBrowserAuthError> {
+        let (now_secs, now) = wall_clock_now();
+        let issued = self
+            .setup
+            .lock()
+            .map_err(|_| LocalBrowserAuthError::Unavailable)?
+            .renew(RenewLocalSetup {
+                id: self.setup_id.clone(),
+                created_at: now,
+                expires_at: timestamp_after(now_secs, SETUP_LIFETIME_SECS),
+            })?;
+        Ok(LocalSetupHandoff {
+            setup_token: issued.setup_token,
+            expires_at: issued.expires_at,
+        })
+    }
+
     /// Start one five-minute setup window for a stable local account.
     pub fn begin(
         account_id: AccountId,
@@ -266,7 +285,7 @@ fn cookie_header(headers: &HeaderMap) -> Result<&str, LocalBrowserAuthError> {
 
 /// A browser exchange must be same-origin when the browser supplies `Origin`.
 /// Requests without `Origin` remain valid for same-host tools and tests.
-fn require_same_origin(headers: &HeaderMap) -> Result<(), LocalBrowserAuthError> {
+pub fn require_same_origin(headers: &HeaderMap) -> Result<(), LocalBrowserAuthError> {
     let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
         return Ok(());
     };
@@ -408,6 +427,32 @@ mod tests {
             awaken_iam_contract::PrincipalRef::Account {
                 account_id: AccountId("local-admin".into())
             }
+        );
+
+        // R3 consumed setup + explicit host renewal -> same router accepts the
+        // successor while the original cookie still resolves the same account.
+        let next = auth.renew_handoff().unwrap();
+        assert_ne!(next.setup_token, handoff.setup_token);
+        assert_eq!(
+            app.clone()
+                .oneshot(exchange_request(&next.setup_token, "http://127.0.0.1:8080"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::get("/v1/session")
+                        .header(COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
         );
 
         let replay = app

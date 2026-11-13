@@ -91,7 +91,7 @@ pub use license::{
 };
 pub use local_setup::{
     BeginLocalSetup, ExchangeLocalSetup, IssuedLocalSetup, LocalSetupError, LocalSetupGateway,
-    LocalSetupId,
+    LocalSetupId, RenewLocalSetup,
 };
 pub use oauth_client_admin::{IssuedClientSecret, OAuthClientAdminApi, OAuthClientEvent};
 pub use op_http::{ProviderLoginRouteOwner, SharedAuthApi, jwks_router, op_router};

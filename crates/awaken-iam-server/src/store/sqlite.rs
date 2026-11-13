@@ -406,9 +406,16 @@ mod migration_tests {
     #[test]
     fn ledger_bootstrap_is_deterministic_and_fail_closed() {
         // Cause/effect decision table:
-        // R1 neither table exists -> create the foundation v1 schema once;
+        // R0 the declared rusqlite floor and shared bundled FFI are resolved ->
+        // the actual linked engine is at least the reviewed SQLite 3.54.1;
+        // an old bundled binary fails before any ledger operation, regardless
+        // of manifest text. R1 neither table exists -> create the foundation v1 schema once;
         // R2 both exist -> validate, leaving one metadata row;
         // R3/R4 exactly one exists -> Backend(IncompleteLedger), with no repair.
+        assert!(
+            rusqlite::version_number() >= 3_054_001,
+            "R0 actual linked SQLite predates the reviewed security floor"
+        );
         let mut fresh = Connection::open_in_memory().unwrap();
         SqliteBackend::ensure_ledger(&mut fresh, "iam").unwrap();
         SqliteBackend::ensure_ledger(&mut fresh, "iam").unwrap();

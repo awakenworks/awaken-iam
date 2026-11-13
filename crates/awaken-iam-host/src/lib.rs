@@ -38,6 +38,7 @@ pub use gate::{AuthReject, BrowserSessionAttachment, IamGate, LocalIamState, Ver
 pub use local::{EmbedError, LocalHandle, embed_local};
 pub use local_browser::{
     LocalBrowserAuth, LocalBrowserAuthError, LocalSetupHandoff, local_browser_router,
+    require_same_origin,
 };
 pub use middleware::{
     AuthError, IamAuthLayer, IamAuthService, RouteActions, TokenActor, TokenWorkspace, auth_layer,
