@@ -5,27 +5,31 @@
 //! bindings, evaluated through [`PolicySet`] like any account (ADR-0008
 //! decision 3). A token is two halves: a public, non-secret
 //! *prefix* used to locate the row, and a high-entropy *secret* that is hashed
-//! with **argon2id** and stored only as its PHC hash. The full cleartext token
+//! with a versioned, prefix-bound SHA-256 verifier. Legacy Argon2 PHC verifiers
+//! remain readable until operators rotate their tokens. The full cleartext token
 //! (`sk-awaken-<prefix>.<secret>`) is returned exactly once at mint time and is
-//! never recoverable afterwards — mirroring how sessions and login secrets are
-//! handled, but with a memory-hard hash because the secret is a long-lived
-//! credential rather than a short-TTL challenge.
+//! never recoverable afterwards. The 256-bit OS-generated secret provides the
+//! entropy required by the fast verifier; passwords and caller-chosen secrets
+//! cannot be minted through this API.
 //!
-//! [`ApiTokenMinter`] draws the prefix, secret, and argon2 salt from the same
+//! [`ApiTokenMinter`] draws the prefix and secret from the same
 //! [`EntropySource`] seam the rest of the crate uses, so deployments inject the
 //! OS CSPRNG while tests inject a deterministic generator. [`ApiTokenDirectory`]
 //! resolves a presented token by its prefix, verifies the secret against the
-//! stored argon2id hash in constant time, and fails closed on an unknown prefix,
+//! stored verifier in constant time, and fails closed on an unknown prefix,
 //! a wrong secret, revocation, or expiry. Unknown-prefix and wrong-secret both
-//! collapse to one opaque [`IamError::ApiTokenInvalid`] so a caller cannot probe
-//! which tokens exist.
+//! collapse to the same opaque [`IamError::ApiTokenInvalid`] result.
 
 use std::collections::HashMap;
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
+#[cfg(test)]
+use argon2::password_hash::{PasswordHasher, SaltString};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use awaken_iam_contract::{
     AccountId, ApiToken, ApiTokenId, ApiTokenPrefix, PrincipalRef, ScopeRef, Timestamp, WorkspaceId,
@@ -58,8 +62,8 @@ const PREFIX_BYTES: usize = 8;
 /// Random bytes drawn for the secret half (256 bits).
 const SECRET_BYTES: usize = 32;
 
-/// Random bytes drawn for the per-token argon2id salt (128 bits).
-const SALT_BYTES: usize = 16;
+/// Versioned encoding of a 32-byte, prefix-bound API-token verifier.
+const TOKEN_HASH_V1_PREFIX: &str = "sha256:v1:";
 
 /// Request to mint a new API token.
 ///
@@ -94,11 +98,11 @@ pub struct MintApiToken {
 /// Result of minting a token: the persisted row plus its one-time cleartext.
 ///
 /// The `secret` is the full `sk-awaken-<prefix>.<secret>` credential to hand to
-/// the caller exactly once; only the argon2id hash on [`IssuedApiToken::token`]
+/// the caller exactly once; only the versioned verifier on [`IssuedApiToken::token`]
 /// is persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedApiToken {
-    /// The persisted token row (argon2id hash only).
+    /// The persisted token row (versioned verifier only).
     pub token: ApiToken,
     /// One-time cleartext token presented by the caller on later requests.
     pub secret: String,
@@ -208,7 +212,7 @@ pub enum ServiceAccountTokenError {
     Mint(#[from] IamError),
 }
 
-/// Mints argon2id-hashed API tokens and persists their rows.
+/// Mints high-entropy API tokens and persists their verifier rows.
 #[derive(Debug, Default, Clone)]
 pub struct ApiTokenMinter<E: EntropySource> {
     entropy: E,
@@ -220,7 +224,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         Self { entropy }
     }
 
-    /// Mint a token, persist its argon2id hash, bind its workspace role, and
+    /// Mint a token, persist its versioned verifier, bind its workspace role, and
     /// return the one-time cleartext credential.
     ///
     /// The credential and the [`RoleBinding`] are written in one step: the row
@@ -257,11 +261,13 @@ impl<E: EntropySource> ApiTokenMinter<E> {
         }
 
         let prefix = self.random_b64(PREFIX_BYTES);
-        let secret = self.random_b64(SECRET_BYTES);
-
-        let mut salt = [0u8; SALT_BYTES];
-        self.entropy.fill_bytes(&mut salt);
-        let secret_hash = hash_secret_argon2(&secret, &salt)?;
+        let mut secret_bytes = [0u8; SECRET_BYTES];
+        self.entropy.fill_bytes(&mut secret_bytes);
+        let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
+        let secret_hash = format!(
+            "{TOKEN_HASH_V1_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(api_token_secret_digest(&prefix, &secret_bytes))
+        );
 
         let token = ApiToken {
             id: request.id,
@@ -345,7 +351,7 @@ impl<E: EntropySource> ApiTokenMinter<E> {
 ///
 /// A token is indexed by its public prefix (for presented-credential lookup) and
 /// by its id (for management operations like revoke). Authentication verifies
-/// the secret against the stored argon2id hash and applies liveness; there is no
+/// the secret against the stored verifier and applies liveness; there is no
 /// per-key authorization path — an authenticated key's authority is resolved by
 /// [`PolicySet::evaluate`] from its principal's role bindings (ADR-0008).
 #[derive(Debug, Default)]
@@ -434,9 +440,9 @@ impl ApiTokenDirectory {
     /// Authenticate a presented cleartext token, returning the live row.
     ///
     /// Resolves the row by the presented prefix and verifies the secret against
-    /// the stored argon2id hash in constant time. An unparseable token, an
+    /// the stored verifier in constant time. An unparseable token, an
     /// unknown prefix, and a wrong secret all collapse to the opaque
-    /// [`IamError::ApiTokenInvalid`] so callers cannot probe which tokens exist.
+    /// [`IamError::ApiTokenInvalid`] result.
     /// A verified-but-revoked or verified-but-expired token fails with
     /// [`IamError::ApiTokenRevoked`] / [`IamError::ApiTokenExpired`].
     pub fn authenticate(&self, presented: &str, now: &Timestamp) -> Result<&ApiToken, IamError> {
@@ -445,7 +451,7 @@ impl ApiTokenDirectory {
             .by_prefix
             .get(&prefix)
             .ok_or(IamError::ApiTokenInvalid)?;
-        if !verify_secret_argon2(&secret, &token.secret_hash) {
+        if !verify_api_token_secret(&token.prefix, &secret, &token.secret_hash) {
             return Err(IamError::ApiTokenInvalid);
         }
         if token.revoked_at.is_some() {
@@ -547,7 +553,7 @@ fn render_token(prefix: &str, secret: &str) -> String {
 /// Authenticate a presented token against a durable repository with the same
 /// rules as [`ApiTokenDirectory::authenticate`]. `Ok(None)` covers every
 /// refusal (unparseable, unknown, wrong secret, revoked, expired) so callers
-/// cannot probe which tokens exist; only storage failures are errors.
+/// receive one opaque authentication result. Storage failures remain errors.
 pub fn authenticate_stored_api_token<R: crate::ApiTokenRepository + ?Sized>(
     repository: &R,
     presented: &str,
@@ -559,7 +565,7 @@ pub fn authenticate_stored_api_token<R: crate::ApiTokenRepository + ?Sized>(
     let Some(token) = repository.get_by_prefix(&prefix)? else {
         return Ok(None);
     };
-    let live = verify_secret_argon2(&secret, &token.secret_hash)
+    let live = verify_api_token_secret(&token.prefix, &secret, &token.secret_hash)
         && token.revoked_at.is_none()
         && token
             .expires_at
@@ -579,6 +585,35 @@ pub fn parse_presented_token(presented: &str) -> Option<(ApiTokenPrefix, String)
     Some((ApiTokenPrefix(prefix.to_owned()), secret.to_owned()))
 }
 
+/// Bind the verifier to this token's public lookup prefix and random secret.
+fn api_token_secret_digest(prefix: &str, secret: &[u8; SECRET_BYTES]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"awaken-iam/api-token/v1\0");
+    digest.update((prefix.len() as u64).to_be_bytes());
+    digest.update(prefix.as_bytes());
+    digest.update(secret);
+    digest.finalize().into()
+}
+
+fn verify_api_token_secret(prefix: &ApiTokenPrefix, secret: &str, stored: &str) -> bool {
+    let Some(encoded) = stored.strip_prefix(TOKEN_HASH_V1_PREFIX) else {
+        return verify_secret_argon2(secret, stored);
+    };
+    let mut secret_bytes = [0u8; SECRET_BYTES];
+    let mut expected = [0u8; 32];
+    // Each v1 field encodes exactly 256 bits with canonical unpadded base64url.
+    if secret.len() != 43
+        || encoded.len() != 43
+        || URL_SAFE_NO_PAD.decode_slice(secret, &mut secret_bytes) != Ok(SECRET_BYTES)
+        || URL_SAFE_NO_PAD.decode_slice(encoded, &mut expected) != Ok(32)
+    {
+        return false;
+    }
+    let actual = api_token_secret_digest(&prefix.0, &secret_bytes);
+    bool::from(actual.as_slice().ct_eq(expected.as_slice()))
+}
+
+#[cfg(test)]
 /// Hash a token secret with argon2id, returning its PHC-string representation.
 fn hash_secret_argon2(secret: &str, salt_bytes: &[u8]) -> Result<String, IamError> {
     let salt = SaltString::encode_b64(salt_bytes).map_err(|err| IamError::ApiTokenHashFailure {
@@ -606,6 +641,75 @@ fn verify_secret_argon2(secret: &str, phc: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct StoredTokenRepository {
+        token: Mutex<Option<ApiToken>>,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        fail_reads: AtomicBool,
+    }
+
+    impl ApiTokenRepository for StoredTokenRepository {
+        fn create(&self, token: ApiToken) -> RepositoryResult<()> {
+            let mut stored = self.token.lock().unwrap();
+            if stored.is_some() {
+                return Err(crate::RepositoryError::Conflict("duplicate token".into()));
+            }
+            *stored = Some(token);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn get(&self, id: &ApiTokenId) -> RepositoryResult<Option<ApiToken>> {
+            Ok(self
+                .token
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|token| &token.id == id))
+        }
+
+        fn get_by_prefix(&self, prefix: &ApiTokenPrefix) -> RepositoryResult<Option<ApiToken>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fail_reads.load(Ordering::Relaxed) {
+                return Err(crate::RepositoryError::Backend(
+                    "injected token read failure".into(),
+                ));
+            }
+            Ok(self
+                .token
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|token| &token.prefix == prefix))
+        }
+
+        fn list_for_principal(&self, principal: &PrincipalRef) -> RepositoryResult<Vec<ApiToken>> {
+            Ok(self
+                .token
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|token| &token.principal == principal)
+                .cloned()
+                .collect())
+        }
+
+        fn update(&self, token: ApiToken) -> RepositoryResult<()> {
+            let mut stored = self.token.lock().unwrap();
+            if stored.as_ref().is_none_or(|current| current.id != token.id) {
+                return Err(crate::RepositoryError::NotFound("token".into()));
+            }
+            *stored = Some(token);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     /// Deterministic counter-based entropy so each minted value is distinct and
     /// reproducible across calls.
@@ -839,8 +943,8 @@ mod tests {
         // The cleartext carries the scheme + the stored public prefix.
         assert!(issued.secret.starts_with(TOKEN_SCHEME));
         assert!(issued.secret.contains(&issued.token.prefix.0));
-        // The secret hash is an argon2id PHC string, never the cleartext.
-        assert!(issued.token.secret_hash.starts_with("$argon2id$"));
+        // The stored versioned verifier never contains the cleartext token.
+        assert!(issued.token.secret_hash.starts_with(TOKEN_HASH_V1_PREFIX));
         assert!(!issued.secret.contains(&issued.token.secret_hash));
 
         // The persisted row is the one held in the directory.
@@ -1135,5 +1239,184 @@ mod tests {
             service_id: "other".into(),
         };
         assert!(directory.list_for_principal(&other).is_empty());
+    }
+
+    #[test]
+    fn v1_mint_keeps_256_secret_bits_separate_from_the_public_prefix() {
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let issued = minter
+            .mint(
+                &mut ApiTokenDirectory::new(),
+                &mut PolicySet::new(),
+                mint_request("tok_v1", None),
+            )
+            .unwrap();
+        let (prefix, secret) = parse_presented_token(&issued.secret).unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&prefix.0).unwrap(),
+            (0..8).collect::<Vec<u8>>()
+        );
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&secret).unwrap(),
+            (8..40).collect::<Vec<u8>>()
+        );
+        assert_eq!(secret.len(), 43);
+        assert!(verify_api_token_secret(
+            &prefix,
+            &secret,
+            &issued.token.secret_hash
+        ));
+        assert!(!verify_api_token_secret(
+            &ApiTokenPrefix("different-prefix".into()),
+            &secret,
+            &issued.token.secret_hash,
+        ));
+    }
+
+    #[test]
+    fn v1_verifier_rejects_unknown_truncated_padded_and_noncanonical_fields() {
+        let prefix = ApiTokenPrefix("public-prefix".into());
+        let secret = URL_SAFE_NO_PAD.encode([0x33; SECRET_BYTES]);
+        let encoded =
+            URL_SAFE_NO_PAD.encode(api_token_secret_digest(&prefix.0, &[0x33; SECRET_BYTES]));
+        let stored = format!("{TOKEN_HASH_V1_PREFIX}{encoded}");
+        assert!(verify_api_token_secret(&prefix, &secret, &stored));
+        assert_eq!(
+            stored,
+            "sha256:v1:nmYAFIr0iB3dV_hTFNMEZ43zIjDTqAr6F-ToNt2ut5k"
+        );
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(api_token_secret_digest("préfix", &[0x33; SECRET_BYTES])),
+            "40KXkU_GtG8lhZe8BahP1Y6a7USUOPiQTrvi4-NjMic"
+        );
+        for invalid in [
+            format!("sha256:v2:{encoded}"),
+            TOKEN_HASH_V1_PREFIX.to_owned(),
+            format!("{stored}="),
+            stored[..stored.len() - 1].to_owned(),
+            format!(
+                "{TOKEN_HASH_V1_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode([0u8; 31])
+            ),
+            format!("{TOKEN_HASH_V1_PREFIX}{}", "/".repeat(43)),
+            format!("{TOKEN_HASH_V1_PREFIX}{}B", "A".repeat(42)),
+            format!(
+                "{TOKEN_HASH_V1_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode([0u8; 32])
+            ),
+        ] {
+            assert!(!verify_api_token_secret(&prefix, &secret, &invalid));
+        }
+        for invalid in [
+            URL_SAFE_NO_PAD.encode([0x44; SECRET_BYTES]),
+            "short-secret".to_owned(),
+            format!("{secret}="),
+            secret[..42].to_owned(),
+            format!("{secret}A"),
+            "!".repeat(43),
+            format!("{}B", "A".repeat(42)),
+        ] {
+            assert!(!verify_api_token_secret(&prefix, &invalid, &stored));
+        }
+    }
+
+    #[test]
+    fn legacy_phc_keeps_its_original_secret_and_scheme_compatibility() {
+        let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+        let mut issued = minter
+            .mint(
+                &mut ApiTokenDirectory::new(),
+                &mut PolicySet::new(),
+                mint_request("tok_legacy", None),
+            )
+            .unwrap();
+        let legacy_fixture = "existing-legacy-secret";
+        issued.token.secret_hash = hash_secret_argon2(legacy_fixture, &[0x55; 16]).unwrap();
+        let mut directory = ApiTokenDirectory::new();
+        directory.create(issued.token.clone()).unwrap();
+        let now = Timestamp("2026-06-19T06:00:00Z".into());
+        for scheme in [TOKEN_SCHEME, LEGACY_TOKEN_SCHEME] {
+            let presented = format!("{scheme}{}.{legacy_fixture}", issued.token.prefix.0);
+            assert_eq!(
+                directory.authenticate(&presented, &now).unwrap(),
+                &issued.token
+            );
+        }
+        assert!(!verify_api_token_secret(
+            &issued.token.prefix,
+            "wrong-secret",
+            &issued.token.secret_hash
+        ));
+        assert!(!verify_api_token_secret(
+            &issued.token.prefix,
+            legacy_fixture,
+            "$argon2id$malformed"
+        ));
+    }
+
+    #[test]
+    fn stored_verifiers_read_live_liveness_and_fail_closed_for_both_formats() {
+        let now = Timestamp("2026-06-19T06:00:00Z".into());
+        for legacy in [false, true] {
+            let mut minter = ApiTokenMinter::new(SequentialEntropy::default());
+            let mut issued = minter
+                .mint(
+                    &mut ApiTokenDirectory::new(),
+                    &mut PolicySet::new(),
+                    mint_request("tok_stored", None),
+                )
+                .unwrap();
+            if legacy {
+                let (_, secret) = parse_presented_token(&issued.secret).unwrap();
+                issued.token.secret_hash = hash_secret_argon2(&secret, &[0x55; 16]).unwrap();
+            }
+            let repository = StoredTokenRepository::default();
+            repository.create(issued.token.clone()).unwrap();
+            assert_eq!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now).unwrap(),
+                Some(issued.token.clone())
+            );
+
+            let mut expired = issued.token.clone();
+            expired.expires_at = Some(now.clone());
+            repository.update(expired).unwrap();
+            assert!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let mut revoked = issued.token.clone();
+            revoked.revoked_at = Some(now.clone());
+            repository.update(revoked).unwrap();
+            assert!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let mut changed_verifier = issued.token.clone();
+            changed_verifier.secret_hash = "sha256:v2:unrecognized".into();
+            repository.update(changed_verifier).unwrap();
+            assert!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now)
+                    .unwrap()
+                    .is_none()
+            );
+
+            *repository.token.lock().unwrap() = None;
+            assert!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now)
+                    .unwrap()
+                    .is_none()
+            );
+            repository.fail_reads.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                authenticate_stored_api_token(&repository, &issued.secret, &now),
+                Err(crate::RepositoryError::Backend(_))
+            ));
+            assert_eq!(repository.reads.load(Ordering::Relaxed), 6);
+            assert_eq!(repository.writes.load(Ordering::Relaxed), 4);
+        }
     }
 }

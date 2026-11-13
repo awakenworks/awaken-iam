@@ -35,7 +35,7 @@ pub enum ApiTokenStatus {
 ///
 /// The caller presents the full cleartext bearer token; IAM resolves the
 /// principal and workspace without the caller ever holding the `secret_hash`.
-/// Token verification (argon2id) stays in IAM — consumers never re-implement it.
+/// IAM owns versioned token verification and resolves the live credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenIntrospectionRequest {
     /// The full cleartext bearer token (`sk-awaken-<prefix>.<secret>`) to verify.

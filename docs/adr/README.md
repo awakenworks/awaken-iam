@@ -27,3 +27,4 @@
 | [0023](0023-direct-owner-personal-consent-listing.md) | Bounded direct-owner personal consent listing | Proposed |
 | [0024](0024-authorization-freshness-is-observation-not-authority.md) | Authorization freshness is observation, not authority | Proposed |
 | [0027](0027-scoped-contextual-batches-and-positive-resource-candidates.md) | Scoped contextual batches and positive Resource candidates | Proposed |
+| [0028](0028-versioned-api-token-verifiers.md) | Versioned API token verifiers | Proposed |

@@ -70,7 +70,7 @@ impl From<IamError> for IntrospectionError {
 /// Also holds an in-memory [`ApiTokenDirectory`] for the token-introspection
 /// plane: API tokens registered via [`register_api_token`](AuthzApi::register_api_token)
 /// are verified by `POST /v1/tokens/introspect` so the consumer never holds the
-/// `secret_hash` and never re-implements the argon2id check.
+/// `secret_hash`. IAM owns the versioned verifier and live token checks.
 #[derive(Debug)]
 pub struct AuthzApi {
     core: IamCore,

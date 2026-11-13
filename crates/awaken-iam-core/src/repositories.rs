@@ -110,7 +110,7 @@ pub trait SessionRepository: Send + Sync {
 /// Persistence for long-lived, principal-scoped [`ApiToken`] rows.
 ///
 /// The natural lookup key on the authentication path is the public
-/// [`ApiTokenPrefix`]; only the argon2id `secret_hash` is stored, never the
+/// [`ApiTokenPrefix`]; the IAM-owned versioned `secret_hash` is stored, never the
 /// cleartext token. Revocation is an in-place update of an existing row.
 pub trait ApiTokenRepository: Send + Sync {
     /// Persist a newly minted token, failing closed on a duplicate id or prefix.

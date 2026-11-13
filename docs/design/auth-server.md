@@ -315,6 +315,15 @@ Two token families, mirroring the reference design:
 | API token | opaque, hashed, principal-scoped | until revoked | service / automation principals |
 | Capability token | JWT, asymmetric, scope-narrowed, epoch-fenced | short, bounded | sub-process / sandbox delegation |
 
+API token minting and authentication use the versioned verifier owned by
+[ADR 0028](../adr/0028-versioned-api-token-verifiers.md). New tokens carry a
+256-bit CSPRNG secret and a prefix-bound SHA-256 v1 stored verifier. Existing
+PHC rows retain their Argon2 verifier. Each repository-backed authentication
+reads current revocation and expiry before the principal enters policy evaluation.
+Operators obtain the new verifier by minting a new credential, validating it,
+and revoking the prior credential. Deploy compatible readers across the token
+repository before admitting v1 minting.
+
 Rules adopted from the reference's hard-won lessons:
 
 - **Refresh-token rotation with reuse detection.** Each refresh issues a new

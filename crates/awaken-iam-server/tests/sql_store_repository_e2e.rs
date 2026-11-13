@@ -399,3 +399,87 @@ fn service_account_owner_persists_and_bulk_revocation_is_durable() {
             .is_empty()
     );
 }
+
+#[test]
+fn api_token_verifier_formats_survive_reopen_and_peer_revocation() {
+    use awaken_iam_core::{
+        ApiTokenDirectory, ApiTokenMinter, MintApiToken, OsEntropy, PolicySet,
+        authenticate_stored_api_token,
+    };
+    use awaken_iam_server::{SqliteBackend, sqlite_migrated_store};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("token-verifiers.sqlite");
+    let created_at = Timestamp("2026-06-20T00:00:00Z".into());
+    let now = ts();
+    let issued = ApiTokenMinter::new(OsEntropy)
+        .mint(
+            &mut ApiTokenDirectory::new(),
+            &mut PolicySet::new(),
+            MintApiToken {
+                id: ApiTokenId("tok_v1".into()),
+                principal: PrincipalRef::Service {
+                    service_id: "verifier-test".into(),
+                },
+                workspace: WorkspaceId("wrkspc_test".into()),
+                role: RoleId("workspace_developer".into()),
+                created_at: created_at.clone(),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+    assert!(issued.token.secret_hash.starts_with("sha256:v1:"));
+    // Public Argon2 0.5.3 reference_argon2id_v0x13_2_8_1 known-answer fixture.
+    let legacy = ApiToken {
+        id: ApiTokenId("tok_legacy".into()),
+        prefix: ApiTokenPrefix("legacy-prefix".into()),
+        principal: issued.token.principal.clone(),
+        secret_hash:
+            "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"
+                .into(),
+        workspace: issued.token.workspace.clone(),
+        created_at,
+        expires_at: None,
+        revoked_at: None,
+    };
+    let credentials = [
+        (issued.token, issued.secret),
+        (legacy, "sk-ant-legacy-prefix.password".into()),
+    ];
+    {
+        let store =
+            sqlite_migrated_store(SqliteBackend::open_path(&path).unwrap(), "tokens").unwrap();
+        for (token, secret) in &credentials {
+            ApiTokenRepository::create(&store, token.clone()).unwrap();
+            assert_eq!(
+                authenticate_stored_api_token(&store, secret, &now).unwrap(),
+                Some(token.clone())
+            );
+            assert_eq!(
+                ApiTokenRepository::get(&store, &token.id).unwrap(),
+                Some(token.clone())
+            );
+        }
+    }
+
+    let reader = sqlite_migrated_store(SqliteBackend::open_path(&path).unwrap(), "tokens").unwrap();
+    let peer = sqlite_migrated_store(SqliteBackend::open_path(&path).unwrap(), "tokens").unwrap();
+    for (token, secret) in credentials {
+        assert_eq!(
+            authenticate_stored_api_token(&reader, &secret, &now).unwrap(),
+            Some(token.clone())
+        );
+        let mut revoked = token.clone();
+        revoked.revoked_at = Some(now.clone());
+        ApiTokenRepository::update(&peer, revoked.clone()).unwrap();
+        assert!(
+            authenticate_stored_api_token(&reader, &secret, &now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            ApiTokenRepository::get(&reader, &token.id).unwrap(),
+            Some(revoked)
+        );
+    }
+}

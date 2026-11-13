@@ -450,7 +450,7 @@ pub struct ApiTokenId(pub String);
 ///
 /// A presented token carries this prefix in cleartext so the row can be located
 /// without scanning, while the secret half is verified against the stored
-/// argon2id hash. The prefix is safe to display in token-management UIs.
+/// IAM-owned versioned verifier. The prefix is safe to display in token-management UIs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ApiTokenPrefix(pub String);
 
@@ -462,8 +462,8 @@ pub struct ApiTokenPrefix(pub String);
 /// rate-limit accounting), matching the one-workspace API key; its **authority** is
 /// not carried per-key but is whatever its principal's role bindings cover,
 /// evaluated through the same policy engine as any account (ADR-0008 decision 3).
-/// Only the public [`prefix`](ApiToken::prefix) and the argon2id
-/// [`secret_hash`](ApiToken::secret_hash) are stored; the cleartext token is shown
+/// The public [`prefix`](ApiToken::prefix) and the IAM-owned versioned
+/// [`secret_hash`](ApiToken::secret_hash) are stored. The cleartext token is shown
 /// exactly once at mint time and never again. Liveness is the conjunction of "not
 /// revoked" and "not past `expires_at`"; a token with no `expires_at` never expires
 /// and lives until it is revoked.
