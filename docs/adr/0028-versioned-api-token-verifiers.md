@@ -1,6 +1,6 @@
 # ADR 0028 — Versioned API token verifiers
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Implementation:** done
 - **Date:** 2026-11-12
 - **Owner:** IAM Core API token minting and authentication
