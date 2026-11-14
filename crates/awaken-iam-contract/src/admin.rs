@@ -385,6 +385,21 @@ pub struct ScopeMembershipQuery {
     pub scope: ScopeRef,
 }
 
+/// Read optional human labels for Account principals bound at one exact Org.
+/// No caller-supplied account selector or identity claim is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrganizationMemberLabelsQuery {
+    pub org_id: OrgId,
+}
+
+/// Presentation only: neither a membership receipt nor permission evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationMemberLabel {
+    pub account_id: AccountId,
+    pub display_name: Option<String>,
+}
+
 /// Atomically replace one caller-owned family of exact-scope role bindings.
 ///
 /// `managed_role_ids` declares the finite role family the caller is authorized

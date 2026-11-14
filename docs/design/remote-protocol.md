@@ -39,6 +39,7 @@ Directory methods.
 | `fetch_signers` | `GET /v1/namespaces/{id}/signers` |
 | `fetch_snapshot` / `fetch_snapshot_since` | `GET /v1/authz/snapshot` |
 | `introspect_token` | `POST /v1/tokens/introspect` |
+| `organization_member_labels` (admin-only, OrgId input; account id and optional display name output) | `POST /v1/admin/memberships/organization-labels` |
 The independent `DirectoryClient` maps one-to-one to:
 
 | Directory method | HTTP endpoint |

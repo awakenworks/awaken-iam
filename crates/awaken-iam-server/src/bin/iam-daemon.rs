@@ -183,6 +183,9 @@ async fn serve<B: SqlConn + Clone + 'static>(
             profile_store,
             issuer.clone(),
         ))
+        .merge(awaken_iam_server::organization_member_labels_router(
+            state.clone(),
+        ))
         .merge(principal_access_router(state.clone()))
         .merge(scoped_profile_router(state.clone()))
         .merge(projection_router(state))

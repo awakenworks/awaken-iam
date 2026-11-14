@@ -205,3 +205,27 @@ therefore **closed**: the credential rendering is implemented as `sk-awaken-`, n
 `sk-ant-`. The `x-api-key: sk-ant-admin...` example in the Context section
 describes the upstream Anthropic Admin API surface (their key format), not Awaken's
 minted tokens, and remains accurate.
+
+## Amendment: exact-Org member labels are a non-authoritative read (2026-11-14)
+
+A relying product may need a recognizable label for people already in its
+organization member projection. The PAP exposes one bounded read accepting only
+`OrgId`: list exact Org RoleBindings, deduplicate Account principals, then read
+those original Account rows by id. The response contains only immutable
+`account_id` and optional `display_name`; Workspace-only, parent, sibling,
+Service and API-token bindings cannot select accounts for this read. IAM does
+not interpret consumer role names or create another membership directory.
+
+The standalone endpoint uses the existing unrestricted admin credential/read
+guard through a capability-specific subrouter on the same DaemonState. Generic
+policy-only daemon routes do not acquire an AccountRepository requirement.
+Embedded and remote consumers call the same PAP projection. Neither arbitrary
+account selectors nor global account/email enumeration is exposed.
+
+A missing profile or blank display name is missing presentation information;
+any repository read failure fails the whole observation, never a partial
+successful roster. Labels are not a policy snapshot, grant, membership proof,
+CAS input, or current account authority. A consumer still gates the read by its
+own existing organization-administration contract, intersects labels with its
+own member projection, and rechecks authority on every write. These sequential
+observations do not claim cross-repository atomicity or introduce a label cache.

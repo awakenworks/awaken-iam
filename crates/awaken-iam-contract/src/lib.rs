@@ -69,11 +69,11 @@ pub use admin::{
     EnsureProductSpacePlacement, GroupView, InvalidOrgPrivacyReceipt, InvalidProductId,
     InvitationBinding, InvitationId, InvitationQuery, InvitationStatus, InvitationView,
     IssuedInvitation, MembershipQuery, MoveDirectoryNode, ORG_PRIVACY_RECEIPT_VERSION,
-    OrgPrivacyCommitReceipt, OrgView, ProductId, ProductSpaceLifecycleResult,
-    ProductSpacePlacement, ProductSpacePlacementQuery, ProductSpacePlacementResult,
-    ProductSpacePlacementStatus, ProductSpaceRef, ProvisionOrganization, ReplaceScopedMemberships,
-    ResendInvitation, RetireProductSpacePlacement, RoleView, ScopeMembershipQuery,
-    UpdateDirectoryNode,
+    OrgPrivacyCommitReceipt, OrgView, OrganizationMemberLabel, OrganizationMemberLabelsQuery,
+    ProductId, ProductSpaceLifecycleResult, ProductSpacePlacement, ProductSpacePlacementQuery,
+    ProductSpacePlacementResult, ProductSpacePlacementStatus, ProductSpaceRef,
+    ProvisionOrganization, ReplaceScopedMemberships, ResendInvitation, RetireProductSpacePlacement,
+    RoleView, ScopeMembershipQuery, UpdateDirectoryNode,
 };
 pub use identity::{
     Account, AccountStatus, ApiToken, ApiTokenId, ApiTokenPrefix, ApiTokenView, ExternalIdentity,

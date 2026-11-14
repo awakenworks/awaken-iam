@@ -35,6 +35,7 @@
 //! here propagates to in-process evaluators on their next poll.
 
 mod grants;
+mod member_labels;
 mod principal_access;
 mod privacy;
 mod provisioning;
@@ -54,10 +55,6 @@ use awaken_iam_contract::{
     AcceptInvitation, AcceptedInvitation, CreateInvitation, InvitationId, InvitationStatus,
     IssuedInvitation, OrgId, PrincipalRef, ResourceModelRegistration, ScopeRef, Timestamp,
     WorkspaceId, WorkspaceOrgEdge,
-};
-#[cfg(test)]
-use awaken_iam_contract::{
-    CreateDirectoryNode, DirectoryNodeId, MoveDirectoryNode, ProductSpaceRef,
 };
 use awaken_iam_core::{
     AuditEvent, AuditSink, Grant, GrantId, GrantRepository, Group, GroupId, GroupRepository,
@@ -1083,7 +1080,9 @@ where
 mod tests {
     use super::*;
     use crate::InMemoryStore;
-    use awaken_iam_contract::AccountId;
+    use awaken_iam_contract::{
+        AccountId, CreateDirectoryNode, DirectoryNodeId, MoveDirectoryNode, ProductSpaceRef,
+    };
     use awaken_iam_core::{ActionPattern, Effect, GrantSubject};
 
     fn at() -> Timestamp {

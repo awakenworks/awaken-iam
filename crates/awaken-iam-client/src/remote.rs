@@ -274,6 +274,16 @@ pub trait AuthzTransport {
         Err(RemoteError::new("membership PAP is not supported".into()))
     }
 
+    /// Read exact-Org member presentation; unsupported is never an empty roster.
+    fn organization_member_labels(
+        &self,
+        _query: &awaken_iam_contract::OrganizationMemberLabelsQuery,
+    ) -> Result<Vec<awaken_iam_contract::OrganizationMemberLabel>, RemoteError> {
+        Err(RemoteError::new(
+            "organization member labels are not supported".into(),
+        ))
+    }
+
     fn memberships_for_scope(
         &self,
         _query: &ScopeMembershipQuery,
@@ -672,6 +682,13 @@ impl<T: AuthzTransport> RemoteIamClient<T> {
         query: &MembershipQuery,
     ) -> Result<Vec<RoleBindingSnapshot>, RemoteError> {
         self.transport.memberships_for_principal(query)
+    }
+
+    pub fn organization_member_labels(
+        &self,
+        query: &awaken_iam_contract::OrganizationMemberLabelsQuery,
+    ) -> Result<Vec<awaken_iam_contract::OrganizationMemberLabel>, RemoteError> {
+        self.transport.organization_member_labels(query)
     }
 
     pub fn memberships_for_scope(
@@ -1376,6 +1393,23 @@ mod tests {
         assert_eq!(
             client.check_entitlement_response(&ent_request()),
             Err(RemoteError::new("boom".into()))
+        );
+    }
+
+    #[test]
+    fn organization_member_labels_default_transport_is_explicitly_unsupported() {
+        // L6 an unchanged authorization-only transport has no account-label
+        // capability. Reuse its existing stub; never report an empty roster.
+        let client = RemoteIamClient::new(StubTransport { fail: false });
+        let query = awaken_iam_contract::OrganizationMemberLabelsQuery {
+            org_id: awaken_iam_contract::OrgId("acme".into()),
+        };
+        assert!(
+            client
+                .organization_member_labels(&query)
+                .unwrap_err()
+                .message()
+                .contains("not supported")
         );
     }
 

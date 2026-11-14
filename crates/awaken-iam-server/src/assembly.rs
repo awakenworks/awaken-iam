@@ -197,6 +197,7 @@ const ADMIN_ROUTES: &[RouteSpec] = &[
     RouteSpec::delete("/v1/admin/memberships"),
     RouteSpec::put("/v1/admin/memberships/scoped"),
     RouteSpec::post("/v1/admin/memberships/query"),
+    RouteSpec::post("/v1/admin/memberships/organization-labels"),
     RouteSpec::post("/v1/admin/scope/workspace-orgs"),
     RouteSpec::post("/v1/admin/authz/profiles"),
     RouteSpec::get("/v1/admin/authz/profiles/{namespace}"),

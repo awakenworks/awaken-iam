@@ -45,6 +45,8 @@
 //! seam is exposed over HTTP only by the standalone daemon.
 
 mod grants;
+mod member_labels;
+pub use member_labels::organization_member_labels_router;
 mod oauth_clients;
 mod policy_cache;
 mod principal_access;

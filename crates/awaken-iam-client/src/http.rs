@@ -596,6 +596,18 @@ impl AuthzTransport for HttpAuthzTransport {
         Self::decode(response)
     }
 
+    fn organization_member_labels(
+        &self,
+        query: &awaken_iam_contract::OrganizationMemberLabelsQuery,
+    ) -> Result<Vec<awaken_iam_contract::OrganizationMemberLabel>, RemoteError> {
+        let response = self.send_with_retry(|| {
+            self.client
+                .post(self.url("/v1/admin/memberships/organization-labels"))
+                .json(query)
+        })?;
+        Self::decode(response)
+    }
+
     fn memberships_for_scope(
         &self,
         query: &ScopeMembershipQuery,
@@ -1019,6 +1031,57 @@ mod tests {
                 .with_timeout(Duration::from_secs(2)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn organization_member_labels_preserve_org_only_request_and_fail_closed() {
+        // L6 native DTO + original credential transport -> exact Org POST/decode;
+        // forbidden, unavailable, missing endpoint, or malformed body -> error,
+        // never a successful empty/partial label set. Original retry policy owns
+        // transport attempts; this existing stub uses its standard no-retry setup.
+        use crate::RemoteIamClient;
+        use awaken_iam_contract::{OrgId, OrganizationMemberLabel, OrganizationMemberLabelsQuery};
+        let query = OrganizationMemberLabelsQuery {
+            org_id: OrgId("acme".into()),
+        };
+        for (reply, success) in [
+            (
+                Reply::Ok(r#"[{"account_id":"ada","display_name":"Ada"},{"account_id":"bob","display_name":null}]"#.into()),
+                true,
+            ),
+            (Reply::Status(403), false),
+            (Reply::Status(404), false),
+            (Reply::Status(503), false),
+            (Reply::Ok("not-json".into()), false),
+        ] {
+            let server = StubServer::start(vec![reply]);
+            let transport = HttpAuthzTransport::new(
+                HttpTransportConfig::new(&server.addr)
+                    .with_service_token("admin-test")
+                    .with_max_retries(0),
+            ).unwrap();
+            let result = RemoteIamClient::new(transport).organization_member_labels(&query);
+            if success {
+                assert_eq!(result.unwrap(), vec![
+                    OrganizationMemberLabel {
+                        account_id: AccountId("ada".into()),
+                        display_name: Some("Ada".into()),
+                    },
+                    OrganizationMemberLabel {
+                        account_id: AccountId("bob".into()),
+                        display_name: None,
+                    },
+                ]);
+            } else {
+                assert!(result.is_err());
+            }
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /v1/admin/memberships/organization-labels HTTP/1.1"));
+            assert!(requests[0].to_lowercase().contains("authorization: bearer admin-test"));
+            let body = requests[0].split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(serde_json::from_str::<serde_json::Value>(body).unwrap(), serde_json::json!({"org_id":"acme"}));
+        }
     }
 
     fn auth_request(action: &str) -> AuthorizationRequest {
